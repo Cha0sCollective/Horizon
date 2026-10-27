@@ -33,6 +33,14 @@ side with separate state/storage. Quotas must not be silently expanded. File ide
 must remain coherent between validation and execution; the prototype does not solve
 concurrent package replacement or archive admission.
 
+With both `runtime` and `paired-packages`, `Mods::preflight_pair` compiles the
+captured code, checks declared interface capabilities and supported API functions,
+and validates required exports with generated client/server `*Pre` bindings.
+It uses pre-instantiation only: no Store or instance is made and no guest callback
+or init runs. The returned `CheckedPair` exposes immutable compiled components and
+their prepared declarations. It does not certify mutable content files or perform
+peer/world admission, discovery, registry registration or side activation.
+
 No machine lifecycle, inventory, save, replication or retained rendering API is
 implemented here. This format remains experimental until those concrete callers
 and admission checks exist. It is deliberately absent from `manifest::find`, so a

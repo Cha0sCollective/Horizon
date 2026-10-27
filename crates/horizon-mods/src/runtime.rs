@@ -33,6 +33,116 @@ mod server_bindings {
         },
     });
 }
+
+/// Captured code checked against both existing WIT worlds. No instance or Store
+/// exists yet; this does not admit a package or certify its mutable content files.
+#[cfg(feature = "paired-packages")]
+pub struct CheckedPair<'a> {
+    prepared: &'a crate::paired::PreparedBundle,
+    client: Component,
+    server: Component,
+}
+#[cfg(feature = "paired-packages")]
+impl CheckedPair<'_> {
+    pub fn prepared(&self) -> &crate::paired::PreparedBundle {
+        self.prepared
+    }
+    pub fn component(&self, side: Side) -> Result<&Component, String> {
+        match side {
+            Side::Client => Ok(&self.client),
+            Side::Server => Ok(&self.server),
+            Side::Both => Err("select one component side".into()),
+        }
+    }
+}
+
+#[cfg(feature = "paired-packages")]
+fn checked_component(
+    engine: &Engine,
+    linker: &Linker<State>,
+    manifest: &Manifest,
+    bytes: &[u8],
+) -> Result<Component, String> {
+    let component = Component::new(engine, bytes).map_err(|e| format!("not a component: {e}"))?;
+    let imports: Vec<_> = component
+        .component_type()
+        .imports(engine)
+        .map(|(name, _)| name.to_string())
+        .collect();
+    manifest.check_imports(imports.iter().map(String::as_str))?;
+    let functions = crate::api_level::imports(bytes)?;
+    let (level, function) = crate::api_level::needed(functions.iter().map(String::as_str));
+    if let Some(reason) = crate::api_level::too_new(level, function) {
+        return Err(reason);
+    }
+    let pre = linker.instantiate_pre(&component).map_err(|e| reason(&e))?;
+    check_callback_types(&component, &pre, manifest.side)?;
+    if manifest.side == Side::Server {
+        server_bindings::HorizonServerModPre::new(pre).map_err(|e| reason(&e))?;
+    } else {
+        bindings::HorizonModPre::new(pre).map_err(|e| reason(&e))?;
+    }
+    Ok(component)
+}
+
+/// Wasmtime 48's generated interface `*Pre` checks names, but defers function
+/// types until loading an instance. Check the existing callback ABI here too.
+#[cfg(feature = "paired-packages")]
+fn check_callback_types(
+    component: &Component,
+    pre: &wasmtime::component::InstancePre<State>,
+    side: Side,
+) -> Result<(), String> {
+    use wasmtime::component::types::ComponentItem;
+    let context = pre.instance_type();
+    let interface = if side == Side::Server {
+        "horizon:mods/server-events@0.1.0"
+    } else {
+        "horizon:mods/events@0.1.0"
+    };
+    let index = component
+        .get_export_index(None, interface)
+        .ok_or_else(|| format!("no exported instance named `{interface}`"))?;
+    macro_rules! check {
+        ($name:literal, $params:ty, $results:ty) => {{
+            let Some((ComponentItem::ComponentFunc(function), _)) =
+                component.get_export(Some(&index), $name)
+            else {
+                return Err(format!("{interface}.{} is not an exported function", $name));
+            };
+            if function.async_() {
+                return Err(format!("{interface}.{} must be synchronous", $name));
+            }
+            function
+                .typecheck::<$params, $results>(&context)
+                .map_err(|e| format!("{interface}.{}: {e:#}", $name))?;
+        }};
+    }
+    check!("tick", (u64,), ());
+    if side == Side::Server {
+        check!("init", (), (Result<ServerRegistration, String>,));
+        check!("player-joined", (ServerPlayer,), ());
+        check!("player-left", (ServerPlayer,), ());
+        check!("chat", (ServerPlayer, String), ());
+        check!(
+            "command",
+            (ServerPlayer, String, String, Vec<(String, ArgumentValue)>),
+            (Result<Option<String>, String>,)
+        );
+        check!("block-broken", (ServerPlayer, BlockPos, String), ());
+        check!("block-placed", (ServerPlayer, BlockPos, String), ());
+    } else {
+        check!("init", (), (Result<Registration, String>,));
+        check!("frame", (f32,), ());
+        check!(
+            "command",
+            (String, String),
+            (Result<Option<String>, String>,)
+        );
+        check!("chat", (String,), ());
+    }
+    Ok(())
+}
 /// Capability `ui`'s world beyond `horizon-mod` (docs/mods.md): a second
 /// world, so mods built before it (no `ui-events` export) still instantiate
 /// as `horizon-mod` and simply hear nothing of their widgets.
@@ -444,6 +554,37 @@ pub struct Mods {
 }
 
 impl Mods {
+    /// Check both captured halves without instantiating or running either one.
+    /// Full content/peer admission and actual side activation remain separate.
+    #[cfg(feature = "paired-packages")]
+    pub fn preflight_pair<'a>(
+        &mut self,
+        prepared: &'a crate::paired::PreparedBundle,
+    ) -> Result<CheckedPair<'a>, String> {
+        use crate::paired::Role;
+        let (engine, linker) = self.engine()?;
+        let client_plan = prepared.bundle().plan(Role::Client);
+        let server_plan = prepared.bundle().plan(Role::Server);
+        let client = checked_component(
+            engine,
+            linker,
+            client_plan.executables[0].manifest(),
+            prepared.code(Side::Client)?,
+        )
+        .map_err(|e| format!("client.wasm: {e}"))?;
+        let server = checked_component(
+            engine,
+            linker,
+            server_plan.executables[0].manifest(),
+            prepared.code(Side::Server)?,
+        )
+        .map_err(|e| format!("server.wasm: {e}"))?;
+        Ok(CheckedPair {
+            prepared,
+            client,
+            server,
+        })
+    }
     /// Changes whenever the running mods (so their commands) change.
     pub fn generation(&self) -> u64 {
         self.generation
