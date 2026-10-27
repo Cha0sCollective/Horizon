@@ -13,6 +13,8 @@ pub mod content;
 pub mod index;
 pub mod manifest;
 pub mod modpack;
+#[cfg(feature = "paired-packages")]
+pub mod paired;
 #[cfg(feature = "runtime")]
 mod runtime;
 #[cfg(feature = "runtime")]

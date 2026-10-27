@@ -22,14 +22,14 @@ pub const APIS: [&str; 3] = [API, "0.2", SERVER_API];
 pub const SERVER_API: &str = "0.3";
 /// Namespaces no mod may claim: vanilla's, the convention tags' (mods add
 /// to those, docs/mods.md) and the game's own.
-const RESERVED_NAMESPACES: [&str; 3] = ["minecraft", "c", "horizon"];
+pub(crate) const RESERVED_NAMESPACES: [&str; 3] = ["minecraft", "c", "horizon"];
 /// A mod's data (capability `storage`), in `horizon-mods/` beside the mods
 /// (`find` never mistakes it for a mod: it has no manifest).
 pub const STORAGE_DIR: &str = ".horizon-mod-data";
 /// The biggest `mod.wasm` a mod may ship.
 const MAX_WASM: u64 = 32 << 20;
 
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
     /// `[a-z0-9_]`, 1 to 64 characters: the mod's folder, log and settings key.
