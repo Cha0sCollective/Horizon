@@ -81,6 +81,8 @@ pub struct World {
     /// Separate passive host observation; never enabled for a default world.
     #[cfg(feature = "paired-packages")]
     mutation_observer: Option<Box<crate::mutation_observer::Observer>>,
+    #[cfg(feature = "paired-packages")]
+    residency_observer: Option<Box<crate::residency_observer::Observer>>,
     /// `ChunkAccess.inhabitedTime` of resident chunks: ticks a player spent
     /// within spawning range (local difficulty).
     pub inhabited: HashMap<(i32, i32), i64>,
@@ -188,6 +190,8 @@ impl World {
             watched_writes: Vec::new(),
             #[cfg(feature = "paired-packages")]
             mutation_observer: None,
+            #[cfg(feature = "paired-packages")]
+            residency_observer: None,
             inhabited: HashMap::new(),
             game_time: 0,
             day_time: 1000,
@@ -235,6 +239,81 @@ impl World {
     #[cfg(feature = "paired-packages")]
     pub fn take_mutation_observer(&mut self) -> Option<crate::mutation_observer::Observer> {
         self.mutation_observer.take().map(|observer| *observer)
+    }
+    /// Host opt-in, after establishing authoritative scope. This reports current
+    /// membership separately and does not load chunks or fabricate load history.
+    #[cfg(feature = "paired-packages")]
+    pub fn enable_residency_observer(
+        &mut self,
+        scope: crate::mutation_observer::AuthorityScope,
+        watched: impl IntoIterator<Item = (i32, i32)>,
+        capacity: usize,
+    ) -> Result<crate::residency_observer::Snapshot, crate::residency_observer::ConfigError> {
+        if self.residency_observer.is_some() {
+            return Err(crate::residency_observer::ConfigError::AlreadyEnabled);
+        }
+        let observer = crate::residency_observer::Observer::new(scope, watched, capacity)?;
+        let snapshot = observer.snapshot(self.game_time, |c| self.chunks.contains_key(&c));
+        self.residency_observer = Some(Box::new(observer));
+        Ok(snapshot)
+    }
+    #[cfg(feature = "paired-packages")]
+    pub fn residency_observer(&self) -> Option<&crate::residency_observer::Observer> {
+        self.residency_observer.as_deref()
+    }
+    /// Current watched membership, without draining or fabricating history.
+    /// A queue fault does not make this a replacement for the lost history.
+    #[cfg(feature = "paired-packages")]
+    pub fn residency_snapshot(&self) -> Option<crate::residency_observer::Snapshot> {
+        self.residency_observer
+            .as_ref()
+            .map(|o| o.snapshot(self.game_time, |c| self.chunks.contains_key(&c)))
+    }
+    #[cfg(feature = "paired-packages")]
+    pub fn drain_residency(
+        &mut self,
+    ) -> Option<Result<Vec<crate::residency_observer::Event>, crate::residency_observer::Fault>>
+    {
+        self.residency_observer.as_mut().map(|o| o.drain())
+    }
+    /// Explicit teardown retains pending history/faults in the returned observer.
+    #[cfg(feature = "paired-packages")]
+    pub fn take_residency_observer(&mut self) -> Option<crate::residency_observer::Observer> {
+        self.residency_observer.take().map(|o| *o)
+    }
+    /// Ordinary authoritative streaming admission, distinct from replica writes
+    /// and temporary lending of the map to the SDK.
+    pub(crate) fn insert_streamed_chunk(&mut self, chunk: Chunk) -> Option<Arc<Chunk>> {
+        let key = (chunk.x, chunk.z);
+        let previous = self.chunks.insert(key, Arc::new(chunk));
+        #[cfg(feature = "paired-packages")]
+        if let Some(observer) = &mut self.residency_observer {
+            use crate::residency_observer::Kind;
+            observer.record(
+                key,
+                if previous.is_some() {
+                    Kind::Replaced
+                } else {
+                    Kind::Loaded
+                },
+                self.game_time,
+            );
+        }
+        previous
+    }
+    pub(crate) fn remove_streamed_chunk(&mut self, key: &(i32, i32)) -> Option<Arc<Chunk>> {
+        let previous = self.chunks.remove(key);
+        #[cfg(feature = "paired-packages")]
+        if previous.is_some()
+            && let Some(observer) = &mut self.residency_observer
+        {
+            observer.record(
+                *key,
+                crate::residency_observer::Kind::Unloaded,
+                self.game_time,
+            );
+        }
+        previous
     }
     /// A controlled blockstate scene for the native scene probes: material
     /// layers, a stepped pyramid and the model gallery. Not generated terrain.
@@ -475,6 +554,138 @@ mod tests {
         // Past the top, and the palette of air below it.
         assert!(!world.may_hold([0, 400, 0], [0, 401, 0], nine));
         assert!(world.may_hold([0, 400, 0], [0, 401, 0], |s| s.0 == 0));
+    }
+}
+
+#[cfg(all(test, feature = "paired-packages"))]
+mod residency_tests {
+    use super::*;
+    use crate::{
+        mutation_observer::AuthorityScope,
+        residency_observer::{ConfigError, Fault, Kind},
+    };
+    fn scope(dimension: &str) -> AuthorityScope {
+        AuthorityScope::new(7, dimension).unwrap()
+    }
+    #[test]
+    fn residency_snapshot_is_not_history_and_transitions_preserve_order() {
+        let mut world = World::new(BlockStateId(0), 0);
+        world.chunks.insert((2, 0), Arc::new(Chunk::empty(2, 0)));
+        world.game_time = 10;
+        let snapshot = world
+            .enable_residency_observer(scope("minecraft:overworld"), [(2, 0), (-1, 0), (2, 0)], 8)
+            .unwrap();
+        assert_eq!(snapshot.entries(), &[((-1, 0), false), ((2, 0), true)]);
+        assert_eq!(snapshot.game_time(), 10);
+        assert_eq!(snapshot.scope().dimension(), "minecraft:overworld");
+        assert!(world.drain_residency().unwrap().unwrap().is_empty());
+        let revision = world.chunks.membership_revision();
+        let old = world.insert_streamed_chunk(Chunk::empty(2, 0)).unwrap();
+        let old_weak = Arc::downgrade(&old);
+        drop(old);
+        assert!(
+            old_weak.upgrade().is_none(),
+            "observer retained a whole old chunk"
+        );
+        assert_eq!(world.chunks.membership_revision(), revision);
+        world.insert_streamed_chunk(Chunk::empty(50, 0)); // Unwatched.
+        assert!(world.remove_streamed_chunk(&(-1, 0)).is_none());
+        world.game_time = 11;
+        world.remove_streamed_chunk(&(2, 0)).unwrap();
+        world.insert_streamed_chunk(Chunk::empty(2, 0));
+        let events = world.drain_residency().unwrap().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .map(|e| (e.coordinate(), e.kind(), e.game_time(), e.sequence()))
+                .collect::<Vec<_>>(),
+            [
+                ((2, 0), Kind::Replaced, 10, 1),
+                ((2, 0), Kind::Unloaded, 11, 2),
+                ((2, 0), Kind::Loaded, 11, 3)
+            ]
+        );
+        for event in events {
+            assert_eq!(event.scope(), snapshot.scope());
+        }
+        world.remove_streamed_chunk(&(2, 0));
+        let current = world.residency_snapshot().unwrap();
+        assert_eq!(current.entries(), &[((-1, 0), false), ((2, 0), false)]);
+        assert_eq!(current.game_time(), 11);
+        assert_eq!(current.scope(), snapshot.scope());
+        let pending = world.drain_residency().unwrap().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].sequence(), 4);
+        assert_eq!(snapshot.entries()[1], ((2, 0), true)); // Immutable enable snapshot.
+    }
+    #[test]
+    fn residency_faults_are_sticky_and_changes_still_commit() {
+        let mut world = World::new(BlockStateId(0), 0);
+        world.insert_streamed_chunk(Chunk::empty(0, 0));
+        assert!(world.residency_observer().is_none());
+        assert!(world.residency_snapshot().is_none());
+        assert!(world.drain_residency().is_none());
+        assert_eq!(
+            world.enable_residency_observer(scope("minecraft:overworld"), [], 1),
+            Err(ConfigError::InvalidWatch)
+        );
+        assert!(world.residency_observer().is_none());
+        world
+            .enable_residency_observer(scope("minecraft:overworld"), [(0, 0)], 1)
+            .unwrap();
+        assert_eq!(
+            world.enable_residency_observer(scope("minecraft:the_nether"), [(1, 0)], 2),
+            Err(ConfigError::AlreadyEnabled)
+        );
+        world.insert_streamed_chunk(Chunk::empty(0, 0));
+        assert!(world.remove_streamed_chunk(&(0, 0)).is_some());
+        let fault = Fault::Overflow {
+            capacity: 1,
+            sequence: 2,
+        };
+        assert_eq!(world.drain_residency(), Some(Err(fault)));
+        world.insert_streamed_chunk(Chunk::empty(0, 0));
+        assert!(world.chunks.contains_key(&(0, 0)));
+        assert_eq!(
+            world.residency_snapshot().unwrap().entries(),
+            &[((0, 0), true)]
+        );
+        assert_eq!(world.drain_residency(), Some(Err(fault)));
+        let mut observer = world.take_residency_observer().unwrap();
+        assert_eq!(observer.pending_len(), 1);
+        assert_eq!(observer.fault(), Some(fault));
+        assert_eq!(observer.drain(), Err(fault));
+        world.remove_streamed_chunk(&(0, 0));
+        assert!(world.drain_residency().is_none());
+    }
+    #[test]
+    fn residency_scope_moves_with_world_and_sdk_lending_is_not_unload() {
+        let mut first = World::new(BlockStateId(0), 0);
+        let mut second = World::new(BlockStateId(0), 0);
+        for (world, dimension, time) in [
+            (&mut first, "minecraft:overworld", 10),
+            (&mut second, "minecraft:the_nether", 20),
+        ] {
+            world
+                .enable_residency_observer(scope(dimension), [(0, 0)], 8)
+                .unwrap();
+            world.game_time = time;
+            world.insert_streamed_chunk(Chunk::empty(0, 0));
+        }
+        std::mem::swap(&mut first, &mut second);
+        let lent = std::mem::take(&mut first.chunks);
+        first.chunks = lent;
+        first.remove_streamed_chunk(&(0, 0));
+        let moved = first.drain_residency().unwrap().unwrap();
+        assert_eq!(moved.len(), 2);
+        for event in moved {
+            assert_eq!(event.scope().dimension(), "minecraft:the_nether");
+            assert_eq!(event.game_time(), 20);
+        }
+        let parked = second.drain_residency().unwrap().unwrap();
+        assert_eq!(parked.len(), 1);
+        assert_eq!(parked[0].scope().dimension(), "minecraft:overworld");
+        assert_eq!(parked[0].game_time(), 10);
     }
 }
 

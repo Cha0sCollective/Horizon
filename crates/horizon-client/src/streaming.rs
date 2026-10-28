@@ -770,7 +770,7 @@ impl Streaming {
         // A chunk saved with its light needs no light job; its unlit
         // neighbours still light themselves from it.
         let loaded = chunk.light_loaded;
-        world.chunks.insert(key, Arc::new(chunk));
+        world.insert_streamed_chunk(chunk);
         if loaded {
             self.lit.insert(key);
             for sy in 0..SECTIONS as i32 {
@@ -979,7 +979,7 @@ impl Streaming {
         }
         let mut removed = Vec::with_capacity(far.len());
         for key in &far {
-            if let Some(chunk) = world.chunks.remove(key) {
+            if let Some(chunk) = world.remove_streamed_chunk(key) {
                 removed.push(chunk);
             }
             self.lit.remove(key);
@@ -1835,6 +1835,101 @@ fn rank_again(queue: &mut BinaryHeap<Queued>, distance: impl Fn(i32, i32) -> i64
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "paired-packages")]
+    #[test]
+    #[ignore = "owned prepared resources: explicit authoritative residency seams"]
+    fn residency_streaming_admission_unload_and_replica_separation() {
+        use crate::{
+            assets::Assets, biome::Biomes, blocks::BlockFacts, models,
+            mutation_observer::AuthorityScope, residency_observer::Kind,
+        };
+        use horizon_world::registry::BlockStateId;
+        let root = std::env::var_os("HORIZON_TEST_RESOURCES")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../.local/horizon-client/26.3")
+            });
+        assert!(
+            root.join("items.json").is_file(),
+            "owned prepared resources required"
+        );
+        let assets = Arc::new(Assets::load(&root).unwrap());
+        let render = Arc::new(assets.reload(&root).unwrap());
+        let facts = BlockFacts::load(&root, assets.registry).unwrap();
+        let biomes = Arc::new(Biomes::load(&root).unwrap());
+        let generator =
+            Arc::new(crate::testgen::TestTerrain::new(assets.registry, &biomes).unwrap());
+        let visibility = models::load_visibility(&root, assets.registry).unwrap();
+        let context = Arc::new(WorkerContext {
+            tables: Arc::new(MeshTables::new(&assets, &render, &facts, visibility).unwrap()),
+            light: Arc::new(LightTables::load(&root, assets.registry, &facts).unwrap()),
+            biomes,
+            assets,
+            render,
+        });
+        let mut streaming = Streaming::new(generator, context, 1);
+        streaming.radius = 2;
+        streaming.mesh = false;
+        // Fill the in-flight budget so updates request no unrelated generation.
+        streaming
+            .generating
+            .extend([(1000, 0), (1001, 0), (1002, 0)]);
+        let mut world = World::new(BlockStateId(0), 0);
+        world
+            .enable_residency_observer(
+                AuthorityScope::new(7, "minecraft:overworld").unwrap(),
+                [(0, 0)],
+                8,
+            )
+            .unwrap();
+        let mut generated = Chunk::empty(0, 0);
+        generated.fresh = true;
+        let mut saved = Chunk::empty(0, 0);
+        saved.light_loaded = true;
+        saved.lit = true;
+        world.game_time = 42;
+        streaming
+            .deferred
+            .extend([Done::Generated(generated), Done::Generated(saved.clone())]);
+        assert!(streaming.update(&mut world).1.is_empty());
+        assert!(
+            world.modified.contains(&(0, 0)),
+            "fresh admission keeps normal save marking"
+        );
+        world.game_time = 43;
+        streaming.center = (100, 100);
+        let removed = streaming.update(&mut world).1;
+        assert_eq!(removed.len(), 1);
+        assert_eq!((removed[0].x, removed[0].z), (0, 0));
+        assert!(!world.chunks.contains_key(&(0, 0)));
+        world.game_time = 44;
+        streaming.center = (0, 0);
+        streaming.deferred.push(Done::Generated(saved));
+        streaming.update(&mut world);
+        let events = world.drain_residency().unwrap().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .map(|e| (e.kind(), e.game_time(), e.sequence()))
+                .collect::<Vec<_>>(),
+            [
+                (Kind::Loaded, 42, 1),
+                (Kind::Replaced, 42, 2),
+                (Kind::Unloaded, 43, 3),
+                (Kind::Loaded, 44, 4)
+            ]
+        );
+        for event in events {
+            assert_eq!(event.coordinate(), (0, 0));
+            assert_eq!(event.scope().dimension(), "minecraft:overworld");
+        }
+        streaming.remote = true;
+        streaming.insert_remote(&mut world, Chunk::empty(0, 0));
+        assert!(streaming.forget(&mut world, 0, 0).is_some());
+        assert!(world.drain_residency().unwrap().unwrap().is_empty());
+    }
 
     #[test]
     fn queued_jobs_follow_the_centre_and_the_loading_screen() {
