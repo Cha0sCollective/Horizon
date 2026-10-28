@@ -1356,7 +1356,12 @@ impl Game<'_> {
         log("INFO", "Saving players");
         if let Some(h) = self.lan.as_mut() {
             for g in &h.hub.guests {
-                horizon_client::lan::playerdata::save(g, &self.world_root);
+                if let Err(error) = horizon_client::lan::playerdata::save(g, &self.world_root) {
+                    log(
+                        "ERROR",
+                        &format!("player NBT record was not written: {error}"),
+                    );
+                }
             }
         }
         if let Some(h) = self.lan.as_ref() {

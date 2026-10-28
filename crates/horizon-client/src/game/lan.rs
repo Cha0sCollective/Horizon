@@ -1306,8 +1306,8 @@ impl Game<'_> {
             if guest.placed {
                 playerdata::store(guest, &mut self.level);
             }
-        } else {
-            playerdata::save(guest, &self.world_root);
+        } else if let Err(error) = playerdata::save(guest, &self.world_root) {
+            log::warn!("player NBT record was not written: {error}");
         }
         if let Err(error) = self.save_guest_records(host, guest) {
             log::warn!("player JSON records were not written: {error}");
