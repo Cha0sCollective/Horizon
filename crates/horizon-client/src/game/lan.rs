@@ -128,6 +128,75 @@ pub(super) struct Owner {
     pub saved: Option<Box<horizon_client::save::Level>>,
 }
 
+fn record_uuid(
+    owner_uuid: Option<u128>,
+    level_uuid: Option<[i32; 4]>,
+    guest_uuid: u128,
+) -> Option<[i32; 4]> {
+    if owner_uuid == Some(guest_uuid) {
+        level_uuid
+    } else {
+        Some(playerdata::uuid_ints(guest_uuid))
+    }
+}
+
+fn save_guest_records_to(
+    world: &std::path::Path,
+    tree: &horizon_client::advancements::Tree,
+    owner_uuid: Option<u128>,
+    level_uuid: Option<[i32; 4]>,
+    guest: &horizon_client::lan::guest::Guest,
+    play: Option<&super::lan_actions::GuestPlay>,
+) -> Result<()> {
+    if !guest.placed || tree.list.is_empty() {
+        return Ok(());
+    }
+    let Some(uuid) = record_uuid(owner_uuid, level_uuid, guest.uuid) else {
+        return Ok(());
+    };
+    let advancement_result = super::advancements::write_progress(
+        &super::stats::player_json(world, "advancements", uuid),
+        &guest.advancements,
+        tree,
+    );
+    // Both independent records are attempted, in the original advancement-then-stats order.
+    let stats_result = match play {
+        Some(play) => play
+            .stats
+            .write(&super::stats::player_json(world, "stats", uuid)),
+        None => Ok(()),
+    };
+    advancement_result.and(stats_result)
+}
+
+fn store_owner_records_to(
+    world: &std::path::Path,
+    level: &mut horizon_client::save::Level,
+    owner_uuid: Option<u128>,
+    guests: &[horizon_client::lan::guest::Guest],
+    play: &HashMap<u32, super::lan_actions::GuestPlay>,
+    tree: &horizon_client::advancements::Tree,
+) -> Result<()> {
+    let Some(uuid) = owner_uuid else {
+        return Ok(());
+    };
+    let Some(guest) = guests
+        .iter()
+        .find(|guest| guest.uuid == uuid && guest.placed)
+    else {
+        return Ok(());
+    };
+    playerdata::store(guest, level);
+    save_guest_records_to(
+        world,
+        tree,
+        owner_uuid,
+        level.player_uuid,
+        guest,
+        play.get(&guest.conn),
+    )
+}
+
 /// A stable UUID for an entity that has none.
 pub(super) fn entity_uuid(id: u32) -> u128 {
     0x4856_5a4e_0000_0000_0000_0000_0000_0000u128 | u128::from(id)
@@ -1240,43 +1309,33 @@ impl Game<'_> {
         } else {
             playerdata::save(guest, &self.world_root);
         }
-        self.save_guest_records(host, guest);
+        if let Err(error) = self.save_guest_records(host, guest) {
+            log::warn!("player JSON records were not written: {error}");
+        }
     }
     /// The file name of a player's advancements and statistics: an
     /// integrated server's owner keeps single player's.
     fn records_uuid(&self, host: &LanHost, uuid: u128) -> Option<[i32; 4]> {
-        if host.owner.as_ref().is_some_and(|o| o.uuid == uuid) {
-            self.level.player_uuid
-        } else {
-            Some(playerdata::uuid_ints(uuid))
-        }
+        record_uuid(
+            host.owner.as_ref().map(|owner| owner.uuid),
+            self.level.player_uuid,
+            uuid,
+        )
     }
     /// `PlayerAdvancements.save` and `ServerStatsCounter.save` of a network player.
     pub(super) fn save_guest_records(
         &self,
         host: &LanHost,
         guest: &horizon_client::lan::guest::Guest,
-    ) {
-        if !guest.placed || self.adv.tree.list.is_empty() {
-            return;
-        }
-        let Some(uuid) = self.records_uuid(host, guest.uuid) else {
-            return;
-        };
-        let path = super::stats::player_json(&self.world_root, "advancements", uuid);
-        let json = guest
-            .advancements
-            .to_json(&self.adv.tree, horizon_world::DATA_VERSION);
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        if let Ok(text) = serde_json::to_string_pretty(&json) {
-            let _ = std::fs::write(path, text);
-        }
-        if let Some(play) = host.play.get(&guest.conn) {
-            play.stats
-                .write(&super::stats::player_json(&self.world_root, "stats", uuid));
-        }
+    ) -> Result<()> {
+        save_guest_records_to(
+            &self.world_root,
+            &self.adv.tree,
+            host.owner.as_ref().map(|owner| owner.uuid),
+            self.level.player_uuid,
+            guest,
+            host.play.get(&guest.conn),
+        )
     }
     /// `PlayerAdvancements.load` and `ServerStatsCounter.parseLocal` of a
     /// network player who joined; every statistic goes out on the first
@@ -1311,17 +1370,18 @@ impl Game<'_> {
         host.play.entry(conn).or_default().stats = stats;
     }
     /// The integrated server's owner into the world's player, for `Level::write`.
-    pub(super) fn store_owner(&mut self) {
+    pub(super) fn store_owner(&mut self) -> Result<()> {
         let Some(host) = &self.lan else {
-            return;
+            return Ok(());
         };
-        let Some(uuid) = host.owner.as_ref().map(|o| o.uuid) else {
-            return;
-        };
-        if let Some(g) = host.hub.guests.iter().find(|g| g.uuid == uuid && g.placed) {
-            playerdata::store(g, &mut self.level);
-            self.save_guest_records(host, g);
-        }
+        store_owner_records_to(
+            &self.world_root,
+            &mut self.level,
+            host.owner.as_ref().map(|owner| owner.uuid),
+            &host.hub.guests,
+            &host.play,
+            &self.adv.tree,
+        )
     }
 
     /// The world's default game mode (`defaultgamemode`).
@@ -2284,4 +2344,268 @@ impl Game<'_> {
 /// it is the off hand's.
 pub(super) fn living_flags(using: Option<(usize, u32)>) -> i8 {
     using.map_or(0, |(slot, _)| if slot == OFFHAND_SLOT { 3 } else { 1 })
+}
+
+#[cfg(test)]
+mod player_json_tests {
+    use super::*;
+    use horizon_client::lan::{Joined, PlayerSender, guest::Guest};
+    use horizon_protocol::packets::configuration::ClientInformation;
+    use std::sync::{atomic::AtomicI32, mpsc};
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "horizon-guest-json-{name}-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+    fn guest(uuid: u128, conn: u32) -> Guest {
+        let (send, _receive) = mpsc::channel();
+        let mut guest = Guest::new(
+            Joined {
+                conn,
+                uuid,
+                name: format!("Guest{conn}"),
+                properties: Vec::new(),
+                info: ClientInformation::new(8),
+                brand: "test".into(),
+                sender: PlayerSender::new(send, Arc::default()),
+                latency: Arc::new(AtomicI32::new(0)),
+                address: "127.0.0.1:25565".parse().unwrap(),
+            },
+            conn as i32,
+            [0.0, 64.0, 0.0],
+            8,
+        );
+        guest.placed = true;
+        guest
+            .advancements
+            .grant("test:goal", "criterion", "2026-10-28 12:00:00 +0000");
+        guest
+    }
+    fn play() -> super::super::lan_actions::GuestPlay {
+        let mut play = super::super::lan_actions::GuestPlay::default();
+        play.stats.add("mined", "minecraft:stone", 7);
+        play
+    }
+    fn read(path: &std::path::Path) -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+    }
+    fn paths(world: &std::path::Path, uuid: [i32; 4]) -> [std::path::PathBuf; 2] {
+        [
+            super::super::stats::player_json(world, "advancements", uuid),
+            super::super::stats::player_json(world, "stats", uuid),
+        ]
+    }
+
+    #[test]
+    fn guest_json_attempts_both_records_returns_first_error_and_retries_shared_projection() {
+        let tree = super::super::advancements::json_test_tree();
+        for failed in [0, 1, 2] {
+            let world = scratch(&format!("attempts-{failed}"));
+            let guest = guest(42, 7);
+            let play = play();
+            let before_progress = guest.advancements.criteria.clone();
+            let before_stats = play.stats.values.clone();
+            let before_events = play.stats.events.clone();
+            let [adv_path, stats_path] = paths(&world, playerdata::uuid_ints(guest.uuid));
+            if failed != 1 {
+                std::fs::create_dir_all(&adv_path).unwrap();
+            }
+            if failed != 0 {
+                std::fs::create_dir_all(&stats_path).unwrap();
+            }
+            let error =
+                save_guest_records_to(&world, &tree, None, None, &guest, Some(&play)).unwrap_err();
+            assert!(error.to_string().contains(if failed == 1 {
+                stats_path.to_str().unwrap()
+            } else {
+                adv_path.to_str().unwrap()
+            }));
+            if failed == 0 {
+                assert_eq!(
+                    read(&stats_path),
+                    serde_json::json!({"stats":{"minecraft:mined":{"minecraft:stone":7}},"DataVersion":horizon_world::DATA_VERSION})
+                );
+            } else if failed == 1 {
+                assert_eq!(
+                    read(&adv_path),
+                    guest
+                        .advancements
+                        .to_json(&tree, horizon_world::DATA_VERSION)
+                );
+            }
+            assert_eq!(guest.advancements.criteria, before_progress);
+            assert_eq!(play.stats.values, before_stats);
+            assert_eq!(play.stats.events, before_events);
+            assert!(!play.stats.loaded); // Guest record writing does not adopt the local loaded guard.
+            if failed != 1 {
+                std::fs::remove_dir(&adv_path).unwrap();
+            }
+            if failed != 0 {
+                std::fs::remove_dir(&stats_path).unwrap();
+            }
+            save_guest_records_to(&world, &tree, None, None, &guest, Some(&play)).unwrap();
+            assert_eq!(
+                read(&adv_path),
+                guest
+                    .advancements
+                    .to_json(&tree, horizon_world::DATA_VERSION)
+            );
+            assert_eq!(
+                read(&stats_path)["stats"]["minecraft:mined"]["minecraft:stone"],
+                7
+            );
+            assert_eq!(guest.advancements.criteria, before_progress);
+            assert_eq!(play.stats.values, before_stats);
+            assert_eq!(play.stats.events, before_events);
+            std::fs::remove_dir_all(world).unwrap();
+        }
+    }
+
+    #[test]
+    fn guest_record_identity_gates_and_missing_play_keep_existing_behavior() {
+        let profile = 0x8000_0000_ffff_ffff_0123_4567_89ab_cdef_u128;
+        let local = [-1, 0, i32::MIN, i32::MAX];
+        assert_eq!(
+            record_uuid(Some(profile), Some(local), profile),
+            Some(local)
+        );
+        assert_eq!(record_uuid(Some(profile), None, profile), None);
+        let ordinary = record_uuid(None, None, profile).unwrap();
+        let world = scratch("identity");
+        assert_eq!(
+            paths(&world, ordinary)[0],
+            world.join("players/advancements/80000000-ffff-ffff-0123-456789abcdef.json")
+        );
+        std::fs::remove_dir_all(world).unwrap();
+        let tree = super::super::advancements::json_test_tree();
+        for gate in [0, 1, 2] {
+            let world = scratch("gates");
+            let mut guest = guest(profile, 7);
+            let play = play();
+            if gate == 0 {
+                guest.placed = false;
+            }
+            let empty_tree = horizon_client::advancements::Tree::default();
+            save_guest_records_to(
+                &world,
+                if gate == 1 { &empty_tree } else { &tree },
+                Some(profile),
+                if gate == 2 { None } else { Some(local) },
+                &guest,
+                Some(&play),
+            )
+            .unwrap();
+            assert!(std::fs::read_dir(&world).unwrap().next().is_none());
+            std::fs::remove_dir_all(world).unwrap();
+        }
+        let world = scratch("missing-play");
+        let guest = guest(profile, 7);
+        save_guest_records_to(&world, &tree, None, None, &guest, None).unwrap();
+        let [adv_path, stats_path] = paths(&world, ordinary);
+        assert_eq!(
+            read(&adv_path),
+            guest
+                .advancements
+                .to_json(&tree, horizon_world::DATA_VERSION)
+        );
+        assert!(!stats_path.exists());
+        std::fs::remove_dir_all(world).unwrap();
+    }
+
+    #[test]
+    fn integrated_owner_selection_stores_level_state_and_propagates_checked_owner_json() {
+        let world = scratch("owner");
+        let local = [-1, 0, i32::MIN, i32::MAX];
+        let tree = super::super::advancements::json_test_tree();
+        let mut owner = guest(42, 7);
+        owner.position = [10.5, 80.0, -3.25];
+        owner.inventory[0] = Some(ItemStack::new("minecraft:stone", 3));
+        let mut other = guest(43, 8);
+        other.position = [99.0, 99.0, 99.0];
+        let guests = vec![other, owner];
+        let play = HashMap::from([(7, play())]);
+        let mut level = horizon_client::save::Level {
+            player_uuid: Some(local),
+            ..Default::default()
+        };
+        let [adv_path, stats_path] = paths(&world, local);
+        std::fs::create_dir_all(&adv_path).unwrap();
+        let error = store_owner_records_to(&world, &mut level, Some(42), &guests, &play, &tree)
+            .unwrap_err();
+        assert!(error.to_string().contains(adv_path.to_str().unwrap()));
+        assert_eq!(level.position, Some([10.5, 80.0, -3.25]));
+        assert_eq!(level.player_uuid, Some(local));
+        assert!(
+            level
+                .inventory
+                .iter()
+                .any(|(slot, id, count, _)| *slot == 0 && id == "minecraft:stone" && *count == 3)
+        );
+        assert_eq!(
+            read(&stats_path)["stats"]["minecraft:mined"]["minecraft:stone"],
+            7
+        );
+        for guest in &guests {
+            assert!(!paths(&world, playerdata::uuid_ints(guest.uuid))[0].exists());
+        }
+        std::fs::remove_dir(adv_path).unwrap();
+        store_owner_records_to(&world, &mut level, Some(42), &guests, &play, &tree).unwrap();
+        assert_eq!(
+            read(&paths(&world, local)[0]),
+            guests[1]
+                .advancements
+                .to_json(&tree, horizon_world::DATA_VERSION)
+        );
+        std::fs::remove_dir_all(world).unwrap();
+    }
+
+    #[test]
+    fn owner_missing_unplaced_and_empty_tree_paths_preserve_existing_selection_rules() {
+        let tree = super::super::advancements::json_test_tree();
+        for (owner, placed) in [(None, true), (Some(999), true), (Some(42), false)] {
+            let world = scratch("owner-guard");
+            let mut guest = guest(42, 7);
+            guest.placed = placed;
+            let mut level = horizon_client::save::Level::default();
+            store_owner_records_to(
+                &world,
+                &mut level,
+                owner,
+                std::slice::from_ref(&guest),
+                &HashMap::new(),
+                &tree,
+            )
+            .unwrap();
+            assert!(level.position.is_none());
+            assert!(std::fs::read_dir(&world).unwrap().next().is_none());
+            std::fs::remove_dir_all(world).unwrap();
+        }
+        let world = scratch("owner-empty-tree");
+        let mut guest = guest(42, 7);
+        guest.position = [7.0, 8.0, 9.0];
+        let mut level = horizon_client::save::Level {
+            player_uuid: Some([1, 2, 3, 4]),
+            ..Default::default()
+        };
+        store_owner_records_to(
+            &world,
+            &mut level,
+            Some(42),
+            std::slice::from_ref(&guest),
+            &HashMap::new(),
+            &horizon_client::advancements::Tree::default(),
+        )
+        .unwrap();
+        assert_eq!(level.position, Some([7.0, 8.0, 9.0]));
+        assert!(std::fs::read_dir(&world).unwrap().next().is_none());
+        std::fs::remove_dir_all(world).unwrap();
+    }
 }

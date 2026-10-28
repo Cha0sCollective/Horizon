@@ -444,11 +444,22 @@ impl Game<'_> {
             self.lan = Some(host);
         }
         std::thread::sleep(Duration::from_millis(100));
-        self.save_game()?;
+        let save_result = self.save_game();
         self.lan_close(false);
-        self.save.flush()?;
-        self.session_lock = None;
-        Ok(())
+        let flush_result = self.save.flush();
+        match (save_result, flush_result) {
+            (Err(error), flush_result) => {
+                if let Err(flush_error) = flush_result {
+                    log::warn!("the region writer also failed during shutdown: {flush_error}");
+                }
+                Err(error)
+            }
+            (Ok(()), Err(error)) => Err(error),
+            (Ok(()), Ok(())) => {
+                self.session_lock = None;
+                Ok(())
+            }
+        }
     }
 }
 

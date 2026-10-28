@@ -11357,16 +11357,20 @@ impl Game<'_> {
         self.save_fight()?;
         self.save_wandering_trader()?;
         self.save_portal_arrivals()?;
-        self.save_stats();
-        self.save_advancements();
+        let stats_result = self.save_stats();
+        let advancements_result = self.save_advancements();
         self.save_scoreboard()?;
         self.save_bossbars()?;
         self.save_schedule()?;
         self.save_warden_tracker();
         self.sync_level();
-        self.store_owner();
+        let owner_result = self.store_owner();
         self.level.write(&self.world_root)?;
         self.save_world_state()?;
+        // JSON failures must not skip the existing world-metadata save attempts.
+        stats_result?;
+        advancements_result?;
+        owner_result?;
         self.message = Some(("Saved the game".into(), Instant::now()));
         Ok(())
     }

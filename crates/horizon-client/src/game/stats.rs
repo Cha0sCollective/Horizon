@@ -131,7 +131,7 @@ impl Stats {
         stats
     }
     /// `ServerStatsCounter.save`.
-    pub(super) fn write(&self, path: &Path) {
+    pub(super) fn write(&self, path: &Path) -> horizon_client::Result<()> {
         let stats: serde_json::Map<String, serde_json::Value> = self
             .values
             .iter()
@@ -147,11 +147,24 @@ impl Stats {
             "DataVersion": horizon_world::DATA_VERSION,
         });
         if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
+            std::fs::create_dir_all(dir).map_err(|error| format!("{}: {error}", path.display()))?;
         }
-        if let Ok(text) = serde_json::to_string_pretty(&json) {
-            let _ = std::fs::write(path, text);
+        let text = serde_json::to_string_pretty(&json)
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+        std::fs::write(path, text).map_err(|error| format!("{}: {error}", path.display()).into())
+    }
+    fn save_local_to(
+        &self,
+        world: &Path,
+        uuid: Option<[i32; 4]>,
+        remote: bool,
+        no_player: bool,
+    ) -> horizon_client::Result<()> {
+        if !self.loaded || remote || no_player {
+            return Ok(());
         }
+        let Some(uuid) = uuid else { return Ok(()) };
+        self.write(&player_json(world, "stats", uuid))
     }
 }
 /// `players/<dir>/<uuid>.json` of a world (advancements, stats).
@@ -186,13 +199,13 @@ impl Game<'_> {
         }
     }
     /// `ServerStatsCounter.save`.
-    pub(super) fn save_stats(&self) {
-        if !self.stats.loaded || self.remote.is_some() || self.no_player_here() {
-            return;
-        }
-        if let Some(path) = self.stats_path() {
-            self.stats.write(&path);
-        }
+    pub(super) fn save_stats(&self) -> horizon_client::Result<()> {
+        self.stats.save_local_to(
+            &self.world_root,
+            self.level.player_uuid,
+            self.remote.is_some(),
+            self.no_player_here(),
+        )
     }
     /// The per-tick counters (`Player.tick`/`ServerPlayer.tick` awardStat).
     pub(super) fn tick_stats(&mut self) {
@@ -424,6 +437,148 @@ impl Game<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn json_scratch(name: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "horizon-stats-json-{name}-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+    fn json_read(path: &Path) -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn checked_stats_file_failures_retry_and_zero_reset_preserves_network_dirty_and_events() {
+        for leaf in [false, true] {
+            let root = json_scratch(if leaf { "leaf" } else { "parent" });
+            let path = root.join("nested/stats.json");
+            if leaf {
+                std::fs::create_dir_all(&path).unwrap();
+            } else {
+                std::fs::write(root.join("nested"), b"blocked parent").unwrap();
+            }
+            let mut stats = Stats {
+                loaded: true,
+                phantom_tick: 31,
+                ..Stats::default()
+            };
+            stats.add("mined", "minecraft:stone", 9);
+            let before = (
+                stats.values.clone(),
+                stats.events.clone(),
+                stats.dirty.clone(),
+                stats.loaded,
+                stats.phantom_tick,
+            );
+            assert!(
+                stats
+                    .write(&path)
+                    .unwrap_err()
+                    .to_string()
+                    .contains(path.to_str().unwrap())
+            );
+            assert_eq!(
+                (
+                    stats.values.clone(),
+                    stats.events.clone(),
+                    stats.dirty.clone(),
+                    stats.loaded,
+                    stats.phantom_tick
+                ),
+                before
+            );
+            if leaf {
+                std::fs::remove_dir(&path).unwrap();
+            } else {
+                std::fs::remove_file(root.join("nested")).unwrap();
+            }
+            stats.write(&path).unwrap();
+            assert_eq!(
+                json_read(&path),
+                serde_json::json!({"stats":{"minecraft:mined":{"minecraft:stone":9}},"DataVersion":horizon_world::DATA_VERSION})
+            );
+            assert_eq!(
+                (
+                    stats.values.clone(),
+                    stats.events.clone(),
+                    stats.dirty.clone(),
+                    stats.loaded,
+                    stats.phantom_tick
+                ),
+                before
+            );
+            stats.reset("mined", "minecraft:stone");
+            let events = stats.events.clone();
+            let dirty = stats.dirty.clone();
+            stats.write(&path).unwrap();
+            assert_eq!(
+                json_read(&path),
+                serde_json::json!({"stats":{"minecraft:mined":{"minecraft:stone":0}},"DataVersion":horizon_world::DATA_VERSION})
+            );
+            assert_eq!(Stats::read(&path).get("mined", "minecraft:stone"), 0);
+            assert_eq!(stats.events, events);
+            assert_eq!(stats.dirty, dirty);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn local_stats_json_guards_keep_sentinel_and_missing_identity_creates_no_filename() {
+        let uuid = [-1, 0, i32::MIN, i32::MAX];
+        for (loaded, remote, no_player) in [
+            (false, false, false),
+            (true, true, false),
+            (true, false, true),
+        ] {
+            let root = json_scratch("guard");
+            let path = player_json(&root, "stats", uuid);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"sentinel").unwrap();
+            let mut stats = Stats {
+                loaded,
+                ..Stats::default()
+            };
+            stats.custom("play_time", 5);
+            let before = (
+                stats.values.clone(),
+                stats.events.clone(),
+                stats.dirty.clone(),
+            );
+            stats
+                .save_local_to(&root, Some(uuid), remote, no_player)
+                .unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), b"sentinel");
+            assert_eq!(stats.loaded, loaded);
+            assert_eq!(
+                (
+                    stats.values.clone(),
+                    stats.events.clone(),
+                    stats.dirty.clone()
+                ),
+                before
+            );
+            std::fs::remove_dir_all(root).unwrap();
+        }
+        let root = json_scratch("identity");
+        let stats = Stats {
+            loaded: true,
+            ..Stats::default()
+        };
+        stats.save_local_to(&root, None, false, false).unwrap();
+        assert!(std::fs::read_dir(&root).unwrap().next().is_none());
+        assert_eq!(
+            player_json(&root, "stats", uuid),
+            root.join("players/stats/ffffffff-0000-0000-8000-00007fffffff.json")
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn counters_events_and_dirty_entries() {

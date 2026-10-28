@@ -101,6 +101,39 @@ pub(super) struct AdvState {
     /// `inventory_changed`'s criteria by item, built for `tree`.
     inventory_index: Option<(Arc<Tree>, Arc<adv::InventoryIndex>)>,
 }
+/// One borrowed advancement projection for local and network player records.
+pub(super) fn write_progress(
+    path: &std::path::Path,
+    progress: &Progress,
+    tree: &Tree,
+) -> horizon_client::Result<()> {
+    let json = progress.to_json(tree, horizon_world::DATA_VERSION);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|error| format!("{}: {error}", path.display()))?;
+    }
+    let text = serde_json::to_string_pretty(&json)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    std::fs::write(path, text).map_err(|error| format!("{}: {error}", path.display()).into())
+}
+impl AdvState {
+    fn save_local_to(
+        &self,
+        world: &std::path::Path,
+        uuid: Option<[i32; 4]>,
+        remote: bool,
+        no_player: bool,
+    ) -> horizon_client::Result<()> {
+        if !self.loaded || remote || no_player {
+            return Ok(());
+        }
+        let Some(uuid) = uuid else { return Ok(()) };
+        write_progress(
+            &super::stats::player_json(world, "advancements", uuid),
+            &self.progress,
+            &self.tree,
+        )
+    }
+}
 /// The game's world for predicates.
 struct View<'a, 'g>(&'a Game<'g>);
 impl adv::World for View<'_, '_> {
@@ -302,23 +335,13 @@ impl Game<'_> {
         self.adv.progress = progress;
         self.ui.registries.advancements = tree.list.iter().map(|a| a.id.clone()).collect();
     }
-    pub(super) fn save_advancements(&self) {
-        if !self.adv.loaded || self.remote.is_some() || self.no_player_here() {
-            return;
-        }
-        let Some(path) = self.adv_path() else {
-            return;
-        };
-        let json = self
-            .adv
-            .progress
-            .to_json(&self.adv.tree, horizon_world::DATA_VERSION);
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        if let Ok(text) = serde_json::to_string_pretty(&json) {
-            let _ = std::fs::write(path, text);
-        }
+    pub(super) fn save_advancements(&self) -> horizon_client::Result<()> {
+        self.adv.save_local_to(
+            &self.world_root,
+            self.level.player_uuid,
+            self.remote.is_some(),
+            self.no_player_here(),
+        )
     }
     /// The player as predicates see it.
     /// The predicate view of a command target.
@@ -1379,8 +1402,168 @@ pub(super) fn text_of(v: &Value) -> Text {
 }
 
 #[cfg(test)]
+pub(super) fn json_test_tree() -> Arc<Tree> {
+    let mut tree = Tree::default();
+    tree.list.push(adv::Advancement {
+        id: "test:goal".into(),
+        parent: None,
+        display: None,
+        criteria: vec![adv::Criterion {
+            name: "criterion".into(),
+            trigger: "minecraft:impossible".into(),
+            conditions: Value::Null,
+        }],
+        requirements: vec![vec!["criterion".into()]],
+        rewards: Default::default(),
+    });
+    tree.by_id.insert("test:goal".into(), 0);
+    Arc::new(tree)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    fn json_scratch(name: &str) -> std::path::PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "horizon-adv-json-{name}-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+    fn json_state() -> AdvState {
+        let mut state = AdvState {
+            tree: json_test_tree(),
+            loaded: true,
+            positions: Some(vec![(1.0, 2.0)]),
+            quiet: true,
+            last_inventory: 99,
+            levitation: Some(([1.0, 2.0, 3.0], 17)),
+            changed: BTreeSet::from([0]),
+            unlocked: vec!["test:recipe".into()],
+            announced: vec![Text::literal("announcement")],
+            toasts: VecDeque::from([Toast::recipe(vec![(
+                "minecraft:crafting_table".into(),
+                ItemStack::new("minecraft:stone", 1),
+            )])]),
+            ..AdvState::default()
+        };
+        state
+            .progress
+            .grant("test:goal", "criterion", "2026-10-28 12:00:00 +0000");
+        state
+    }
+    fn assert_json_ui(state: &AdvState, tree: &Arc<Tree>) {
+        assert!(Arc::ptr_eq(&state.tree, tree));
+        assert_eq!(state.positions, Some(vec![(1.0, 2.0)]));
+        assert!(state.quiet);
+        assert_eq!(state.last_inventory, 99);
+        assert_eq!(state.levitation, Some(([1.0, 2.0, 3.0], 17)));
+        assert_eq!(state.changed, BTreeSet::from([0]));
+        assert_eq!(state.unlocked, ["test:recipe"]);
+        assert_eq!(state.announced.len(), 1);
+        assert_eq!(state.announced[0].plain(), "announcement");
+        assert_eq!(state.toasts.len(), 1);
+        let toast = state.toasts.front().unwrap();
+        assert!(toast.changed);
+        assert_eq!(toast.last_changed, 0);
+        assert_eq!(toast.recipes.len(), 1);
+        assert!(toast.slot.is_none());
+        assert!(state.pending_tree.is_none());
+    }
+
+    #[test]
+    fn checked_advancement_json_failures_retry_and_last_revocation_preserve_borrowed_ui() {
+        for leaf in [false, true] {
+            let root = json_scratch(if leaf { "leaf" } else { "parent" });
+            let uuid = [1, 2, 3, 4];
+            let path = super::super::stats::player_json(&root, "advancements", uuid);
+            if leaf {
+                std::fs::create_dir_all(&path).unwrap();
+            } else {
+                std::fs::create_dir_all(root.join("players")).unwrap();
+                std::fs::write(root.join("players/advancements"), b"blocked parent").unwrap();
+            }
+            let mut state = json_state();
+            let tree = state.tree.clone();
+            let before = state.progress.criteria.clone();
+            assert!(
+                state
+                    .save_local_to(&root, Some(uuid), false, false)
+                    .unwrap_err()
+                    .to_string()
+                    .contains(path.to_str().unwrap())
+            );
+            assert_eq!(state.progress.criteria, before);
+            assert!(state.loaded);
+            assert_json_ui(&state, &tree);
+            if leaf {
+                std::fs::remove_dir(&path).unwrap();
+            } else {
+                std::fs::remove_file(root.join("players/advancements")).unwrap();
+            }
+            state
+                .save_local_to(&root, Some(uuid), false, false)
+                .unwrap();
+            let written: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(
+                written,
+                serde_json::json!({"test:goal":{"criteria":{"criterion":"2026-10-28 12:00:00 +0000"},"done":true},"DataVersion":horizon_world::DATA_VERSION})
+            );
+            assert_eq!(state.progress.criteria, before);
+            assert_json_ui(&state, &tree);
+            assert!(state.progress.revoke("test:goal", "criterion"));
+            let revoked = state.progress.criteria.clone();
+            state
+                .save_local_to(&root, Some(uuid), false, false)
+                .unwrap();
+            let written: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(
+                written,
+                serde_json::json!({"DataVersion":horizon_world::DATA_VERSION})
+            );
+            assert_eq!(state.progress.criteria, revoked);
+            assert_json_ui(&state, &tree);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn local_advancement_json_guards_keep_sentinel_and_missing_identity_is_noop() {
+        for (loaded, remote, no_player) in [
+            (false, false, false),
+            (true, true, false),
+            (true, false, true),
+        ] {
+            let root = json_scratch("guard");
+            let uuid = [-1, 0, i32::MIN, i32::MAX];
+            let path = super::super::stats::player_json(&root, "advancements", uuid);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"sentinel").unwrap();
+            let mut state = json_state();
+            state.loaded = loaded;
+            let tree = state.tree.clone();
+            let before = state.progress.criteria.clone();
+            state
+                .save_local_to(&root, Some(uuid), remote, no_player)
+                .unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), b"sentinel");
+            assert_eq!(state.loaded, loaded);
+            assert_eq!(state.progress.criteria, before);
+            assert_json_ui(&state, &tree);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+        let root = json_scratch("identity");
+        let state = json_state();
+        state.save_local_to(&root, None, false, false).unwrap();
+        assert!(std::fs::read_dir(&root).unwrap().next().is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     fn recipes(n: usize) -> Toast {
         Toast::recipe(

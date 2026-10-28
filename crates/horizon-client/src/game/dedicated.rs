@@ -1361,7 +1361,12 @@ impl Game<'_> {
         }
         if let Some(h) = self.lan.as_ref() {
             for g in &h.hub.guests {
-                self.save_guest_records(h, g);
+                if let Err(error) = self.save_guest_records(h, g) {
+                    log(
+                        "ERROR",
+                        &format!("player JSON records were not written: {error}"),
+                    );
+                }
             }
         }
         if let Some(h) = self.lan.as_mut() {
