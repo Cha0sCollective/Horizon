@@ -138,7 +138,7 @@ impl Game<'_> {
                     if save.started.elapsed() > Duration::from_secs(30) {
                         return Err("chunk generation did not finish before saving".into());
                     }
-                    if self.streaming.poll_save(&mut self.world) {
+                    if self.streaming.poll_save(&mut self.world)? {
                         save.stage = Stage::Chunks(self.world.modified.iter().copied().collect());
                     }
                     Ok(false)

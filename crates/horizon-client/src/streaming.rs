@@ -1393,24 +1393,42 @@ impl Streaming {
     /// otherwise a worker saves them (vanilla's autosave hands its chunks to
     /// the IOWorker too), and those out in jobs are saved later, as they
     /// unload or at the next save.
-    pub fn save(&mut self, world: &mut World, wait: bool) {
+    pub fn save(&mut self, world: &mut World, wait: bool) -> crate::Result<()> {
         if !wait {
             let written: Vec<(i32, i32)> = self.written.drain().collect();
             self.save_checked_out(written);
-            return;
+            return Ok(());
         }
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        while self.decorating > 0 || !self.finishing.is_empty() || self.saving > 0 {
+        self.save_until(world, deadline)
+    }
+    // The deadline bounds waiting for the tracked decoration/finish/save jobs.
+    // Plain generation and errors inside generator save callbacks are separate.
+    fn save_until(&mut self, world: &mut World, deadline: std::time::Instant) -> crate::Result<()> {
+        for done in std::mem::take(&mut self.deferred) {
+            self.receive_save_result(done, world);
+        }
+        while self.save_in_flight() {
             let left = deadline.saturating_duration_since(std::time::Instant::now());
             match self.results.recv_timeout(left) {
-                Ok(Done::Decorated(x, z, region)) => self.receive_decorated(x, z, *region),
-                Ok(Done::Generated(chunk)) => self.receive_generated(chunk, world),
-                Ok(Done::Saved(protos)) => self.receive_saved(protos),
-                Ok(other) => self.deferred.push(other),
-                Err(_) => {
-                    log::warn!("Horizon: chunk generation did not finish before saving");
-                    break;
+                Ok(done) => {
+                    self.receive_save_result(done, world);
                 }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    return Err(
+                        "chunk generation did not finish before saving: deadline exceeded".into(),
+                    );
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(
+                        "chunk generation workers disconnected before saving finished".into(),
+                    );
+                }
+            }
+            if self.save_in_flight() && std::time::Instant::now() >= deadline {
+                return Err(
+                    "chunk generation did not finish before saving: deadline exceeded".into(),
+                );
             }
         }
         let protos: Vec<&Proto> = self
@@ -1422,30 +1440,69 @@ impl Streaming {
             self.saves.save_protos(&protos);
         }
         self.written.clear();
+        Ok(())
+    }
+    fn save_in_flight(&self) -> bool {
+        self.decorating > 0 || !self.finishing.is_empty() || self.saving > 0
+    }
+    // Returns whether the result was reconciled, leaving every unrelated result
+    // in arrival order for normal update. `wait` may already have deferred it.
+    fn receive_save_result(&mut self, done: Done, world: &mut World) -> bool {
+        match done {
+            Done::Decorated(x, z, region) => self.receive_decorated(x, z, *region),
+            Done::Generated(chunk) => self.receive_generated(chunk, world),
+            Done::Saved(protos) => self.receive_saved(protos),
+            other => {
+                self.deferred.push(other);
+                return false;
+            }
+        }
+        true
     }
     /// Finish generation for a closing world without waiting on the event
     /// loop. No new generation is scheduled while the save screen is shown.
     /// Proto snapshots are checked out to workers before chunk writes, just as
     /// in `save(true)`, so older generation cannot overwrite the final chunks.
-    pub fn poll_save(&mut self, world: &mut World) -> bool {
+    pub fn poll_save(&mut self, world: &mut World) -> crate::Result<bool> {
         let started = std::time::Instant::now();
-        while let Ok(done) = self.results.try_recv() {
-            match done {
-                Done::Decorated(x, z, region) => self.receive_decorated(x, z, *region),
-                Done::Generated(chunk) => self.receive_generated(chunk, world),
-                Done::Saved(protos) => self.receive_saved(protos),
-                other => self.deferred.push(other),
-            }
-            if started.elapsed() >= std::time::Duration::from_millis(2) {
-                return false;
+        let budget = std::time::Duration::from_millis(2);
+        let mut deferred = std::mem::take(&mut self.deferred).into_iter();
+        while let Some(done) = deferred.next() {
+            // Skip unrelated results until a completion makes progress; an
+            // unrelated prefix must not repeatedly exhaust the polling budget.
+            // Scanning that existing prefix is linear, not a strict time bound.
+            if self.receive_save_result(done, world) && started.elapsed() >= budget {
+                self.deferred.extend(deferred);
+                return Ok(false);
             }
         }
-        if self.decorating > 0 || !self.finishing.is_empty() || self.saving > 0 {
-            return false;
+        let disconnected = loop {
+            match self.results.try_recv() {
+                Ok(done) => {
+                    self.receive_save_result(done, world);
+                    if started.elapsed() >= budget {
+                        return Ok(false);
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => break false,
+                Err(mpsc::TryRecvError::Disconnected) => break true,
+            }
+        };
+        if disconnected
+            && (self.save_in_flight()
+                || self
+                    .written
+                    .iter()
+                    .any(|key| self.protos.get(key).is_some_and(Option::is_some)))
+        {
+            return Err("chunk generation workers disconnected before saving finished".into());
+        }
+        if self.save_in_flight() {
+            return Ok(false);
         }
         let written: Vec<_> = self.written.drain().collect();
         self.save_checked_out(written);
-        self.saving == 0
+        Ok(self.saving == 0)
     }
     fn in_range(&self, x: i32, z: i32, margin: i32) -> bool {
         self.ranges().in_range(x, z, margin)
@@ -1835,6 +1892,251 @@ fn rank_again(queue: &mut BinaryHeap<Queued>, distance: impl Fn(i32, i32) -> i64
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct SaveProbe {
+        gate: Mutex<Option<mpsc::Receiver<()>>>,
+        started: mpsc::Sender<()>,
+        writes: Mutex<Vec<u64>>,
+    }
+    impl ChunkGenerator for SaveProbe {
+        type Worker = ();
+        fn worker(&self) {}
+        fn proto(&self, _: &mut (), _: i32, _: i32) -> Proto {
+            unreachable!()
+        }
+        fn finish(&self, _: Proto) -> Chunk {
+            unreachable!()
+        }
+        fn save_protos(&self, protos: &[&Proto]) {
+            if let Some(gate) = self.gate.lock().unwrap().take() {
+                self.started.send(()).unwrap();
+                gate.recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap();
+            }
+            self.writes
+                .lock()
+                .unwrap()
+                .extend(protos.iter().map(|p| *p.downcast_ref::<u64>().unwrap()));
+        }
+    }
+    fn save_probe(
+        gated: bool,
+    ) -> (
+        Streaming,
+        Arc<SaveProbe>,
+        mpsc::Receiver<()>,
+        mpsc::Sender<()>,
+    ) {
+        use crate::{assets::Assets, biome::Biomes, blocks::BlockFacts, models};
+        static CONTEXT: std::sync::OnceLock<Arc<WorkerContext>> = std::sync::OnceLock::new();
+        let context = CONTEXT
+            .get_or_init(|| {
+                let root = std::env::var_os("HORIZON_TEST_RESOURCES")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| {
+                        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                            .join("../../.local/horizon-client/26.3")
+                    });
+                assert!(
+                    root.join("items.json").is_file(),
+                    "owned prepared resources required"
+                );
+                let assets = Arc::new(Assets::load(&root).unwrap());
+                let render = Arc::new(assets.reload(&root).unwrap());
+                let facts = BlockFacts::load(&root, assets.registry).unwrap();
+                let visibility = models::load_visibility(&root, assets.registry).unwrap();
+                Arc::new(WorkerContext {
+                    tables: Arc::new(
+                        MeshTables::new(&assets, &render, &facts, visibility).unwrap(),
+                    ),
+                    light: Arc::new(LightTables::load(&root, assets.registry, &facts).unwrap()),
+                    biomes: Arc::new(Biomes::load(&root).unwrap()),
+                    assets,
+                    render,
+                })
+            })
+            .clone();
+        let (started, began) = mpsc::channel();
+        let (release, gate) = mpsc::channel();
+        let probe = Arc::new(SaveProbe {
+            gate: Mutex::new(gated.then_some(gate)),
+            started,
+            writes: Mutex::new(Vec::new()),
+        });
+        (
+            Streaming::new(probe.clone(), context, 1),
+            probe,
+            began,
+            release,
+        )
+    }
+    fn save_world() -> World {
+        World::new(horizon_world::registry::BlockStateId(0), 0)
+    }
+    fn finish_polling(streaming: &mut Streaming, world: &mut World) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !streaming.poll_save(world).unwrap() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "save polling did not finish"
+            );
+            thread::yield_now();
+        }
+    }
+
+    #[test]
+    #[ignore = "owned prepared resources: controlled generation-save worker"]
+    fn save_completion_timeout_preserves_checkout_and_deferred_retry() {
+        let (mut streaming, probe, started, release) = save_probe(true);
+        let mut world = save_world();
+        world.modified.insert((3, 4));
+        streaming.protos.insert((0, 0), Some(Box::new(7u64)));
+        streaming.written.insert((0, 0));
+        streaming.save(&mut world, false).unwrap(); // Returns while the worker is gated.
+        started
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        streaming.protos.insert((1, 0), Some(Box::new(11u64)));
+        streaming.written.insert((1, 0));
+        let error = streaming
+            .save_until(&mut world, std::time::Instant::now())
+            .unwrap_err();
+        assert!(error.to_string().contains("deadline exceeded"));
+        assert_eq!(streaming.saving, 1);
+        assert!(streaming.protos[&(0, 0)].is_none());
+        assert!(streaming.written.contains(&(1, 0)));
+        assert_eq!(
+            *streaming.protos[&(1, 0)]
+                .as_ref()
+                .unwrap()
+                .downcast_ref::<u64>()
+                .unwrap(),
+            11
+        );
+        assert_eq!(world.modified, HashSet::from([(3, 4)]));
+        assert!(probe.writes.lock().unwrap().is_empty());
+        release.send(()).unwrap();
+        streaming.wait(std::time::Duration::from_secs(5));
+        assert!(matches!(streaming.deferred.as_slice(), [Done::Saved(_)]));
+        assert_eq!(streaming.saving, 1); // Deferred result still owns the proto.
+        streaming
+            .save_until(&mut world, std::time::Instant::now())
+            .unwrap();
+        assert_eq!(streaming.saving, 0);
+        assert_eq!(
+            *streaming.protos[&(0, 0)]
+                .as_ref()
+                .unwrap()
+                .downcast_ref::<u64>()
+                .unwrap(),
+            7
+        );
+        assert!(streaming.deferred.is_empty());
+        assert!(streaming.poll_save(&mut world).unwrap());
+        assert_eq!(*probe.writes.lock().unwrap(), [7, 11]);
+        assert_eq!(world.modified, HashSet::from([(3, 4)]));
+    }
+
+    #[test]
+    #[ignore = "owned prepared resources: queued generation-save completions"]
+    fn save_completion_queued_and_deferred_results_preserve_unrelated_order() {
+        let (mut streaming, probe, _, _) = save_probe(false);
+        let mut world = save_world();
+        streaming.protos.insert((0, 0), Some(Box::new(8u64)));
+        streaming.written.insert((0, 0));
+        streaming.deferred.extend([
+            Done::Proto(1, 0, Box::new(1u64), false),
+            Done::Proto(2, 0, Box::new(2u64), false),
+        ]);
+        streaming.save(&mut world, false).unwrap();
+        streaming
+            .save_until(
+                &mut world,
+                std::time::Instant::now() + std::time::Duration::from_secs(5),
+            )
+            .unwrap();
+        assert_eq!(streaming.saving, 0);
+        streaming
+            .deferred
+            .push(Done::Proto(3, 0, Box::new(3u64), false));
+        finish_polling(&mut streaming, &mut world);
+        let unrelated: Vec<_> = streaming
+            .deferred
+            .iter()
+            .map(|done| match done {
+                Done::Proto(x, _, payload, _) => (*x, *payload.downcast_ref::<u64>().unwrap()),
+                _ => panic!("save completion was left deferred"),
+            })
+            .collect();
+        assert_eq!(unrelated, [(1, 1), (2, 2), (3, 3)]);
+        assert_eq!(*probe.writes.lock().unwrap(), [8]);
+        // Incremental reconciliation must consume deferred decoration/finish too.
+        streaming.decorating = 1;
+        streaming.finishing.insert((0, 0));
+        streaming.deferred.extend([
+            Done::Decorated(
+                0,
+                0,
+                Box::new(std::array::from_fn(|i| Box::new(i as u64) as Proto)),
+            ),
+            Done::Generated(Chunk::empty(0, 0)),
+        ]);
+        finish_polling(&mut streaming, &mut world);
+        assert_eq!(streaming.decorating, 0);
+        assert!(streaming.finishing.is_empty());
+        assert!(world.chunks.contains_key(&(0, 0)));
+        assert_eq!(streaming.deferred.len(), 3);
+        let mut writes = probe.writes.lock().unwrap()[1..].to_vec();
+        writes.sort_unstable();
+        assert_eq!(writes, (0..9).collect::<Vec<_>>());
+    }
+
+    #[test]
+    #[ignore = "owned prepared resources: disconnected generation-save worker"]
+    fn save_completion_disconnection_fails_required_work_but_idle_succeeds() {
+        let (mut streaming, probe, _, _) = save_probe(false);
+        let mut world = save_world();
+        world.modified.insert((3, 4));
+        let (send, results) = mpsc::channel();
+        drop(send);
+        streaming.results = results;
+        assert!(streaming.poll_save(&mut world).unwrap());
+        streaming
+            .save_until(&mut world, std::time::Instant::now())
+            .unwrap();
+        streaming.saving = 1;
+        streaming.protos.insert((0, 0), None);
+        let error = streaming
+            .save_until(
+                &mut world,
+                std::time::Instant::now() + std::time::Duration::from_secs(5),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("workers disconnected"));
+        assert!(
+            streaming
+                .poll_save(&mut world)
+                .unwrap_err()
+                .to_string()
+                .contains("workers disconnected")
+        );
+        assert_eq!(streaming.saving, 1);
+        assert!(streaming.protos[&(0, 0)].is_none());
+        assert_eq!(world.modified, HashSet::from([(3, 4)]));
+        // No worker is needed for the synchronous path's direct proto callback.
+        streaming.saving = 0;
+        streaming.protos.insert((0, 0), Some(Box::new(9u64)));
+        streaming.written.insert((0, 0));
+        assert!(streaming.poll_save(&mut world).is_err());
+        assert!(streaming.written.contains(&(0, 0)));
+        assert!(streaming.protos[&(0, 0)].is_some());
+        streaming
+            .save_until(&mut world, std::time::Instant::now())
+            .unwrap();
+        assert_eq!(*probe.writes.lock().unwrap(), [9]);
+        assert!(streaming.written.is_empty());
+        assert_eq!(world.modified, HashSet::from([(3, 4)]));
+    }
 
     #[cfg(feature = "paired-packages")]
     #[test]

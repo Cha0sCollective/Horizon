@@ -9046,7 +9046,7 @@ impl Game<'_> {
     pub(super) fn switch_level(&mut self, target: Dim, from: Vec3) -> Result<Vec3> {
         // Save the departing dimension's changed chunks.
         self.save.save_forced_chunks(&self.streaming.forced)?;
-        self.streaming.save(&mut self.world, true);
+        self.streaming.save(&mut self.world, true)?;
         let keys: Vec<_> = self.world.modified.drain().collect();
         let chunks = self.with_entities(keys.iter().filter_map(|k| self.world.chunks.get(k)));
         self.save
@@ -11373,7 +11373,7 @@ impl Game<'_> {
     /// Save the level in place: its changed chunks, its entities and its raids.
     fn save_level(&mut self, wait: bool) -> Result<()> {
         self.save.save_forced_chunks(&self.streaming.forced)?;
-        self.streaming.save(&mut self.world, wait);
+        self.streaming.save(&mut self.world, wait)?;
         let keys: Vec<_> = self.world.modified.drain().collect();
         let chunks = self.with_entities(keys.iter().filter_map(|k| self.world.chunks.get(k)));
         self.save

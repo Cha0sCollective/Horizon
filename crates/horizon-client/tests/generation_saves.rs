@@ -154,11 +154,11 @@ impl Session {
     }
     /// The autosave: proto chunks are saved on a worker, nothing waits.
     fn autosave(&mut self) {
-        self.streaming.save(&mut self.world, false);
+        self.streaming.save(&mut self.world, false).unwrap();
     }
     fn save(&mut self) {
         let deadline = Instant::now() + Duration::from_secs(120);
-        while !self.streaming.poll_save(&mut self.world) {
+        while !self.streaming.poll_save(&mut self.world).unwrap() {
             assert!(Instant::now() < deadline, "incremental save never finished");
             thread::sleep(Duration::from_millis(1));
         }
