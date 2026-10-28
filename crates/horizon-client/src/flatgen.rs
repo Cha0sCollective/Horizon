@@ -212,6 +212,9 @@ impl ChunkGenerator for FlatTerrain {
         }
         Box::new(chunk)
     }
+    fn light_view(&self, proto: &crate::streaming::Proto) -> Option<Chunk> {
+        proto.downcast_ref::<Chunk>().cloned()
+    }
     /// FlatLevelSource.spawnOriginalMobs is empty: no generation-time spawns.
     fn finish(&self, proto: crate::streaming::Proto) -> Chunk {
         *proto.downcast::<Chunk>().expect("flat terrain proto")
@@ -231,6 +234,27 @@ mod tests {
             |b| ["minecraft:stone", "minecraft:bedrock"].contains(&b),
             |b| ["minecraft:plains", "minecraft:desert"].contains(&b),
         )
+    }
+
+    #[test]
+    fn proto_lighting_snapshot_keeps_source_and_normal_finish_intact() {
+        let terrain = FlatTerrain {
+            layers: vec![6, 1, 2, 3],
+            biome: 10,
+            surface: None,
+        };
+        let proto = terrain.proto(&mut (), -2, 3);
+        let mut view = terrain
+            .light_view(&proto)
+            .expect("complete proto light view");
+        assert_eq!((view.x, view.z), (-2, 3));
+        assert_eq!(view.get(0, -61, 0), 3);
+        assert!(view.sections.iter().all(|s| s.biomes.get(0) == 10));
+        view.set(0, -61, 0, 99);
+        assert_eq!(proto.downcast_ref::<Chunk>().unwrap().get(0, -61, 0), 3);
+        let finished = terrain.finish(proto);
+        assert_eq!((finished.x, finished.z), (-2, 3));
+        assert_eq!(finished.get(0, -61, 0), 3);
     }
 
     #[test]

@@ -32,6 +32,55 @@ fn resources() -> Option<std::path::PathBuf> {
     root.join("items.json").exists().then_some(root)
 }
 
+#[test]
+#[ignore = "owned prepared resources: explicit radius-2 arrival regression"]
+fn radius_two_arrival_lights_corners_from_nonresident_proto_neighbours() {
+    let root = std::env::var_os("HORIZON_TEST_RESOURCES")
+        .map(std::path::PathBuf::from)
+        .or_else(resources)
+        .expect("prepared resources are required for the arrival regression");
+    let assets = Arc::new(Assets::load(&root).unwrap());
+    let render = Arc::new(assets.reload(&root).unwrap());
+    let facts = BlockFacts::load(&root, assets.registry).unwrap();
+    let biomes = Arc::new(Biomes::load(&root).unwrap());
+    let generator =
+        Arc::new(horizon_client::testgen::TestTerrain::new(assets.registry, &biomes).unwrap());
+    let visibility = models::load_visibility(&root, assets.registry).unwrap();
+    let context = Arc::new(WorkerContext {
+        tables: Arc::new(MeshTables::new(&assets, &render, &facts, visibility).unwrap()),
+        light: Arc::new(LightTables::load(&root, assets.registry, &facts).unwrap()),
+        biomes,
+        assets,
+        render,
+    });
+    let mut streaming = Streaming::new(generator, context, 2);
+    streaming.radius = 2;
+    streaming.loading = true;
+    streaming.mesh = false;
+    streaming.center = (-1, -1);
+    let mut world = World::new(BlockStateId(0), 0);
+    let arrived = |streaming: &Streaming| {
+        (-2..=2).all(|dz| (-2..=2).all(|dx| streaming.is_lit(-1 + dx, -1 + dz)))
+    };
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !arrived(&streaming) {
+        assert!(
+            Instant::now() < deadline,
+            "radius-2 arrival never finished lighting"
+        );
+        streaming.update(&mut world);
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        world.chunks.contains_key(&(1, 1)),
+        "arrival corner is resident"
+    );
+    assert!(
+        !world.chunks.contains_key(&(2, 2)),
+        "proto neighbour stays outside resident range"
+    );
+}
+
 /// A saved world: every column loads with its light, as saved chunks do.
 struct Saved;
 impl ChunkGenerator for Saved {

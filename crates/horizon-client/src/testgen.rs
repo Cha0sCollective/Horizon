@@ -80,6 +80,9 @@ impl ChunkGenerator for TestTerrain {
     fn proto(&self, w: &mut (), x: i32, z: i32) -> crate::streaming::Proto {
         Box::new(self.generate(w, x, z))
     }
+    fn light_view(&self, proto: &crate::streaming::Proto) -> Option<Chunk> {
+        proto.downcast_ref::<Chunk>().cloned()
+    }
     fn finish(&self, proto: crate::streaming::Proto) -> Chunk {
         let mut chunk = *proto.downcast::<Chunk>().expect("test terrain proto");
         chunk.fresh = true;
@@ -154,9 +157,8 @@ impl TestTerrain {
 mod tests {
     use super::*;
 
-    #[test]
-    fn far_surface_agrees_with_generated_land_and_water() {
-        let terrain = TestTerrain {
+    fn terrain() -> TestTerrain {
+        TestTerrain {
             stone: 1,
             dirt: 2,
             grass: 3,
@@ -167,7 +169,34 @@ mod tests {
             leaves: 8,
             short_grass: 9,
             plains: 10,
-        };
+        }
+    }
+
+    #[test]
+    fn proto_lighting_snapshot_keeps_source_and_normal_finish_intact() {
+        let terrain = terrain();
+        let proto = terrain.proto(&mut (), -2, 3);
+        let mut view = terrain
+            .light_view(&proto)
+            .expect("complete proto light view");
+        let original = proto.downcast_ref::<Chunk>().unwrap().get(0, 64, 0);
+        assert_eq!((view.x, view.z), (-2, 3));
+        assert_eq!(view.get(0, 64, 0), original);
+        assert!(view.sections.iter().all(|s| s.biomes.get(0) == 10));
+        view.set(0, 64, 0, 99);
+        assert_eq!(
+            proto.downcast_ref::<Chunk>().unwrap().get(0, 64, 0),
+            original
+        );
+        let finished = terrain.finish(proto);
+        assert_eq!((finished.x, finished.z), (-2, 3));
+        assert_eq!(finished.get(0, 64, 0), original);
+        assert!(finished.fresh);
+    }
+
+    #[test]
+    fn far_surface_agrees_with_generated_land_and_water() {
+        let terrain = terrain();
         let mut wet = false;
         for (cx, cz) in [(0, 0), (-7, 3), (15, -12), (-21, -8)] {
             let chunk = terrain.generate(&mut (), cx, cz);
