@@ -864,119 +864,122 @@ impl Game<'_> {
             }
         }
         for key in keys {
-            let unknown = if remove {
-                self.persist.unknown.remove(key)
-            } else {
-                self.persist.unknown.get(key).cloned()
-            };
+            let unknown = self.persist.unknown.get(key).cloned();
             if let Some(list) = unknown {
                 out.entry(*key).or_default().extend(list);
             }
         }
         if remove {
-            let gone = |p: Vec3| keys.contains(&chunk_of(p));
-            let mut removed: Vec<u32> = Vec::new();
-            let riding = self.riding;
-            self.boats.retain(|b| {
-                let keep = !gone(b.position) || Some(b.id) == riding;
-                if !keep {
-                    removed.push(b.id);
-                }
-                keep
-            });
-            self.crystals.retain(|c| !gone(c.position));
-            self.ominous_spawners
-                .retain(|s| !gone(Vec3::new(s.position[0], s.position[1], s.position[2])));
-            if self.dragon.as_ref().is_some_and(|d| gone(d.position)) {
-                self.dragon = None;
-            }
-            self.carts.retain(|c| {
-                let keep = !gone(c.position) || Some(c.id) == riding;
-                if !keep {
-                    removed.push(c.id);
-                }
-                keep
-            });
-            self.others.retain(|o| {
-                let keep = !gone(o.position);
-                if !keep {
-                    removed.push(o.id);
-                }
-                keep
-            });
-            self.armor_stands.retain(|a| {
-                let keep = !gone(a.position);
-                if !keep {
-                    removed.push(a.id);
-                }
-                keep
-            });
-            self.item_frames.retain(|f| {
-                let (lo, hi) = f.bounds();
-                let keep = !gone(Vec3::new(
-                    (lo[0] + hi[0]) / 2.0,
-                    (lo[1] + hi[1]) / 2.0,
-                    (lo[2] + hi[2]) / 2.0,
-                ));
-                if !keep {
-                    removed.push(f.id);
-                }
-                keep
-            });
-            self.paintings.retain(|p| {
-                let keep = !gone(painting_center(p));
-                if !keep {
-                    removed.push(p.id);
-                }
-                keep
-            });
-            self.cushions.retain(|c| {
-                let keep = !gone(c.position);
-                if !keep {
-                    removed.push(c.id);
-                }
-                keep
-            });
-            // Riders leave with their root vehicle, a boat's with the boat.
-            let leaving: HashSet<u32> = (0..self.mobs.len())
-                .filter(|&i| {
-                    let r = self.mob_root(i);
-                    match self.mobs[r].extra.mount {
-                        Some(v) if removed.contains(&v) => true,
-                        Some(v) if self.boats.iter().any(|b| b.id == v) => false,
-                        _ => gone(self.mobs[r].position),
-                    }
-                })
-                .map(|i| self.mobs[i].id)
-                .collect();
-            self.mobs.retain(|m| {
-                let keep = !leaving.contains(&m.id);
-                if !keep {
-                    removed.push(m.id);
-                }
-                keep
-            });
-            self.dropped.retain(|e| {
-                let keep = !gone(e.position);
-                if !keep {
-                    removed.push(e.id);
-                }
-                keep
-            });
-            self.orbs.retain(|o| !gone(o.position));
-            self.creatures
-                .projectiles
-                .retain(|p| p.arrow.is_none() || !gone(p.position));
-            self.falling.retain(|f| !gone(f.position));
-            self.persist
-                .anon
-                .retain(|_, (at, _, _)| !keys.contains(&chunk_of(*at)));
-            for id in removed {
-                self.persist.uuids.remove(&id);
-                self.persist.raw.remove(&id);
-            }
+            self.remove_saved_entities(keys);
         }
         out.into_iter().collect()
+    }
+    /// Release only the entities selected by the saved coordinate set.
+    pub(super) fn remove_saved_entities(&mut self, keys: &HashSet<(i32, i32)>) {
+        for key in keys {
+            self.persist.unknown.remove(key);
+        }
+        let gone = |p: Vec3| keys.contains(&chunk_of(p));
+        let mut removed: Vec<u32> = Vec::new();
+        let riding = self.riding;
+        self.boats.retain(|b| {
+            let keep = !gone(b.position) || Some(b.id) == riding;
+            if !keep {
+                removed.push(b.id);
+            }
+            keep
+        });
+        self.crystals.retain(|c| !gone(c.position));
+        self.ominous_spawners
+            .retain(|s| !gone(Vec3::new(s.position[0], s.position[1], s.position[2])));
+        if self.dragon.as_ref().is_some_and(|d| gone(d.position)) {
+            self.dragon = None;
+        }
+        self.carts.retain(|c| {
+            let keep = !gone(c.position) || Some(c.id) == riding;
+            if !keep {
+                removed.push(c.id);
+            }
+            keep
+        });
+        self.others.retain(|o| {
+            let keep = !gone(o.position);
+            if !keep {
+                removed.push(o.id);
+            }
+            keep
+        });
+        self.armor_stands.retain(|a| {
+            let keep = !gone(a.position);
+            if !keep {
+                removed.push(a.id);
+            }
+            keep
+        });
+        self.item_frames.retain(|f| {
+            let (lo, hi) = f.bounds();
+            let keep = !gone(Vec3::new(
+                (lo[0] + hi[0]) / 2.0,
+                (lo[1] + hi[1]) / 2.0,
+                (lo[2] + hi[2]) / 2.0,
+            ));
+            if !keep {
+                removed.push(f.id);
+            }
+            keep
+        });
+        self.paintings.retain(|p| {
+            let keep = !gone(painting_center(p));
+            if !keep {
+                removed.push(p.id);
+            }
+            keep
+        });
+        self.cushions.retain(|c| {
+            let keep = !gone(c.position);
+            if !keep {
+                removed.push(c.id);
+            }
+            keep
+        });
+        // Riders leave with their root vehicle, a boat's with the boat.
+        let leaving: HashSet<u32> = (0..self.mobs.len())
+            .filter(|&i| {
+                let r = self.mob_root(i);
+                match self.mobs[r].extra.mount {
+                    Some(v) if removed.contains(&v) => true,
+                    Some(v) if self.boats.iter().any(|b| b.id == v) => false,
+                    _ => gone(self.mobs[r].position),
+                }
+            })
+            .map(|i| self.mobs[i].id)
+            .collect();
+        self.mobs.retain(|m| {
+            let keep = !leaving.contains(&m.id);
+            if !keep {
+                removed.push(m.id);
+            }
+            keep
+        });
+        self.dropped.retain(|e| {
+            let keep = !gone(e.position);
+            if !keep {
+                removed.push(e.id);
+            }
+            keep
+        });
+        self.orbs.retain(|o| !gone(o.position));
+        self.creatures
+            .projectiles
+            .retain(|p| p.arrow.is_none() || !gone(p.position));
+        self.falling.retain(|f| !gone(f.position));
+        self.persist
+            .anon
+            .retain(|_, (at, _, _)| !keys.contains(&chunk_of(*at)));
+        for id in removed {
+            self.persist.uuids.remove(&id);
+            self.persist.raw.remove(&id);
+        }
     }
     /// Write the entities of every resident chunk (an autosave or quit).
     /// Without `wait` (the autosave) they are written on the region writer
@@ -1023,13 +1026,13 @@ impl Game<'_> {
             log::warn!("Horizon: failed to save entities: {e}");
         }
     }
-    /// Leaving a dimension: its entities are saved with it.
-    pub(super) fn save_dimension_entities(&mut self) -> Result<()> {
+    /// Keep native ownership until both saving and the caller's target preparation succeed.
+    pub(super) fn save_dimension_entities(&mut self) -> Result<HashSet<(i32, i32)>> {
         self.spawn_loaded_entities();
         let keys: HashSet<(i32, i32)> = self.world.chunks.keys().copied().collect();
-        let chunks = self.entity_chunks(&keys, true);
-        self.persist = EntityMemory::default();
-        self.save.save_entities(chunks)
+        let chunks = self.entity_chunks(&keys, false);
+        self.save.save_entities(chunks)?;
+        Ok(keys)
     }
 }
 /// Only a mob is finalized; another entity drops the request.

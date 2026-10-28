@@ -9034,7 +9034,13 @@ impl Game<'_> {
             return Ok(());
         };
         let from = self.dim;
-        let destination = self.switch_level(target, player.position)?;
+        let destination = match self.switch_level(target, player.position) {
+            Ok(destination) => destination,
+            Err(error) => {
+                self.player = Some(player);
+                return Err(error);
+            }
+        };
         self.trigger_dimension(from, target);
         self.travelling = Some((player, destination));
         self.end_travel = (target == Dim::End || from == Dim::End) && self.end_portal_travel;
@@ -9047,11 +9053,14 @@ impl Game<'_> {
         // Save the departing dimension's changed chunks.
         self.save.save_forced_chunks(&self.streaming.forced)?;
         self.streaming.save(&mut self.world, true)?;
-        let keys: Vec<_> = self.world.modified.drain().collect();
+        let keys: Vec<_> = self.world.modified.iter().copied().collect();
         let chunks = self.with_entities(keys.iter().filter_map(|k| self.world.chunks.get(k)));
         self.save
             .save(&chunks, self.pack.assets.registry, self.res.biomes())?;
-        self.save_dimension_entities()?;
+        for chunk in &chunks {
+            self.world.modified.remove(&(chunk.x, chunk.z));
+        }
+        let departing_entities = self.save_dimension_entities()?;
         // Coordinates scale by 8 between the Overworld and the Nether.
         let scale = match (self.dim, target) {
             (Dim::Overworld, Dim::Nether) => 1.0 / 8.0,
@@ -9081,6 +9090,8 @@ impl Game<'_> {
         self.streaming = streaming;
         #[cfg(feature = "paired-packages")]
         self.retire_counter_trial("dimension-switch");
+        self.remove_saved_entities(&departing_entities);
+        self.persist = Default::default();
         self.world = world;
         self.save = save;
         self.dim = target;

@@ -825,6 +825,9 @@ fn server_game(
 }
 
 #[cfg(test)]
+mod transition_ownership_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
