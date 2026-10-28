@@ -197,6 +197,8 @@ pub mod widgets;
 pub mod win_screen;
 pub mod window;
 pub mod world;
+#[cfg(feature = "paired-packages")]
+pub mod world_slot_trial;
 pub mod world_spawn;
 pub mod worldborder;
 pub mod zip;

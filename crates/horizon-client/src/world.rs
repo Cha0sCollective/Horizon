@@ -85,6 +85,8 @@ pub struct World {
     residency_observer: Option<Box<crate::residency_observer::Observer>>,
     #[cfg(feature = "paired-packages")]
     counter_trial: Option<Box<crate::counter_trial::Trial>>,
+    #[cfg(feature = "paired-packages")]
+    pub(crate) world_slot_trial: Option<Box<crate::world_slot_trial::Trial>>,
     /// `ChunkAccess.inhabitedTime` of resident chunks: ticks a player spent
     /// within spawning range (local difficulty).
     pub inhabited: HashMap<(i32, i32), i64>,
@@ -196,6 +198,8 @@ impl World {
             residency_observer: None,
             #[cfg(feature = "paired-packages")]
             counter_trial: None,
+            #[cfg(feature = "paired-packages")]
+            world_slot_trial: None,
             inhabited: HashMap::new(),
             game_time: 0,
             day_time: 1000,
@@ -429,7 +433,20 @@ impl World {
                 let [x, y, z] = t.configuration().position();
                 chunk.block(x & 15, y, z & 15)
             });
+        #[cfg(feature = "paired-packages")]
+        let slot_state = self
+            .world_slot_trial
+            .as_ref()
+            .filter(|t| t.watches_chunk(key))
+            .map(|t| {
+                let [x, y, z] = t.position();
+                chunk.block(x & 15, y, z & 15)
+            });
         let previous = self.chunks.insert(key, Arc::new(chunk));
+        #[cfg(feature = "paired-packages")]
+        if let (Some(trial), Some(state)) = (&mut self.world_slot_trial, slot_state) {
+            trial.inserted(previous.is_some(), state, self.game_time);
+        }
         #[cfg(feature = "paired-packages")]
         if let (Some(trial), Some(state)) = (&mut self.counter_trial, counter_state) {
             trial.inserted(previous.is_some(), state, self.game_time);
@@ -451,6 +468,15 @@ impl World {
     }
     pub(crate) fn remove_streamed_chunk(&mut self, key: &(i32, i32)) -> Option<Arc<Chunk>> {
         let previous = self.chunks.remove(key);
+        #[cfg(feature = "paired-packages")]
+        if previous.is_some()
+            && let Some(trial) = self
+                .world_slot_trial
+                .as_mut()
+                .filter(|t| t.watches_chunk(*key))
+        {
+            trial.unloaded();
+        }
         #[cfg(feature = "paired-packages")]
         if previous.is_some()
             && let Some(trial) = self
@@ -541,6 +567,10 @@ impl World {
         }
         let previous = Arc::make_mut(chunk).set(x & 15, y, z & 15, state.0);
         if previous != state.0 {
+            #[cfg(feature = "paired-packages")]
+            if let Some(trial) = &mut self.world_slot_trial {
+                trial.changed([x, y, z], state, self.game_time);
+            }
             #[cfg(feature = "paired-packages")]
             if let Some(trial) = &mut self.counter_trial {
                 trial.changed([x, y, z], state, self.game_time);
