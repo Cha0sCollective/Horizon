@@ -96,6 +96,19 @@ pub(super) struct Portals {
     /// Per-chunk portal palette masks, kept across ticks (portal_sections).
     pub(super) sections: horizon_client::portal_sections::PortalSections,
 }
+impl Portals {
+    fn save_arrivals_to(&mut self, path: &std::path::Path, remote: bool) -> Result<()> {
+        if !self.dirty || remote {
+            return Ok(());
+        }
+        let list = self.arrivals.iter().map(arrival_tag).collect();
+        let root = Tag::compound([("arrivals", Tag::List(list))]);
+        horizon_client::save::write_dat(path, root)
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+        self.dirty = false;
+        Ok(())
+    }
+}
 
 fn rotate_y(v: Vec3, degrees: f32) -> Vec3 {
     // Vec3.yRot((float)Math.toRadians(degrees))
@@ -1002,15 +1015,252 @@ impl Game<'_> {
             .extend(list.iter().filter_map(arrival_from_tag));
     }
     /// Write the waiting entities when they changed.
-    pub(super) fn save_portal_arrivals(&mut self) {
-        if !self.portals.dirty || self.remote.is_some() {
-            return;
+    pub(super) fn save_portal_arrivals(&mut self) -> Result<()> {
+        let path = self.arrivals_path();
+        self.portals.save_arrivals_to(&path, self.remote.is_some())
+    }
+}
+
+#[cfg(test)]
+mod metadata_tests {
+    use super::*;
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "horizon-arrival-save-{name}-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+    fn plans() -> [Plan; 2] {
+        [
+            Plan {
+                dim: Dim::Nether,
+                approximate: BlockPos::new(-16, 70, 32),
+                entry_x_axis: false,
+                offset: Vec3::new(0.25, 0.75, -0.5),
+                width: 0.75,
+                height: 1.25,
+                end: false,
+            },
+            Plan {
+                dim: Dim::End,
+                approximate: BlockPos::new(100, 50, 0),
+                entry_x_axis: true,
+                offset: Vec3::new(-1.25, 0.5, 0.25),
+                width: 1.5,
+                height: 2.0,
+                end: true,
+            },
+        ]
+    }
+    fn opaque_entity(index: i32) -> Tag {
+        let id = if index == 0 {
+            "minecraft:item"
+        } else {
+            "minecraft:chest_minecart"
+        };
+        Tag::compound([
+            ("id", Tag::String(id.into())),
+            ("UUID", Tag::IntArray(vec![1, 2, 3, index])),
+            ("test:sequence", Tag::Int(index)),
+            (
+                "Items",
+                Tag::List(vec![Tag::compound([
+                    ("Slot", Tag::Byte(0)),
+                    ("id", Tag::String("minecraft:stone".into())),
+                    ("count", Tag::Int(3)),
+                    (
+                        "components",
+                        Tag::compound([("test:opaque", Tag::ByteArray(vec![1, 7, 9]))]),
+                    ),
+                ])]),
+            ),
+            (
+                "Passengers",
+                Tag::List(vec![Tag::compound([
+                    ("id", Tag::String("minecraft:pig".into())),
+                    (
+                        "test:nested",
+                        Tag::compound([(
+                            "unknown",
+                            Tag::List(vec![Tag::Long(123), Tag::Long(-456)]),
+                        )]),
+                    ),
+                ])]),
+            ),
+            (
+                "test:custom",
+                Tag::compound([("name", Tag::String("preserve opaque payload".into()))]),
+            ),
+        ])
+    }
+    fn populated() -> Portals {
+        Portals {
+            player: PortalState {
+                cooldown: 17,
+                process: Some(horizon_client::nether_portal::Process {
+                    entry: BlockPos::new(1, 65, 2),
+                    time: 9,
+                    inside: true,
+                }),
+            },
+            travel: Some(plans()[0]),
+            client_inside: true,
+            entities: HashMap::from([(
+                99,
+                PortalState {
+                    cooldown: 11,
+                    process: None,
+                },
+            )]),
+            before: HashMap::from([(99, Vec3::new(1.0, 2.0, 3.0))]),
+            arrivals: plans()
+                .into_iter()
+                .enumerate()
+                .map(|(index, plan)| Arrival {
+                    plan,
+                    tag: opaque_entity(index as i32),
+                })
+                .collect(),
+            loaded: false,
+            dirty: true,
+            ..Portals::default()
         }
-        let list = self.portals.arrivals.iter().map(arrival_tag).collect();
-        let root = Tag::compound([("arrivals", Tag::List(list))]);
-        if horizon_client::save::write_dat(&self.arrivals_path(), root).is_ok() {
-            self.portals.dirty = false;
+    }
+    fn rows(portals: &Portals) -> Vec<Tag> {
+        portals.arrivals.iter().map(arrival_tag).collect()
+    }
+    fn assert_runtime(portals: &Portals, dirty: bool) {
+        assert_eq!(
+            (portals.loaded, portals.dirty, portals.client_inside),
+            (false, dirty, true)
+        );
+        assert_eq!(portals.player.cooldown, 17);
+        let process = portals.player.process.unwrap();
+        assert_eq!(
+            (process.entry, process.time, process.inside),
+            (BlockPos::new(1, 65, 2), 9, true)
+        );
+        let travel = portals.travel.unwrap();
+        assert_eq!(
+            (travel.dim, travel.approximate),
+            (Dim::Nether, BlockPos::new(-16, 70, 32))
+        );
+        assert_eq!(travel.offset, Vec3::new(0.25, 0.75, -0.5));
+        assert_eq!((travel.width, travel.height), (0.75, 1.25));
+        assert!(!travel.entry_x_axis && !travel.end);
+        assert_eq!(portals.entities.len(), 1);
+        assert_eq!(portals.entities[&99].cooldown, 11);
+        assert!(portals.entities[&99].process.is_none());
+        assert_eq!(
+            portals.before,
+            HashMap::from([(99, Vec3::new(1.0, 2.0, 3.0))])
+        );
+    }
+
+    #[test]
+    fn failed_arrival_save_retains_unloaded_dirty_plans_and_opaque_payloads_for_retry() {
+        let root = scratch("retry");
+        let path = root.join("horizon_portal_arrivals.dat");
+        let blocked = root.join("horizon_portal_arrivals.dat_new");
+        let mut portals = populated();
+        let before = rows(&portals);
+        std::fs::create_dir(&blocked).unwrap();
+        assert!(
+            portals
+                .save_arrivals_to(&path, false)
+                .unwrap_err()
+                .to_string()
+                .contains("horizon_portal_arrivals.dat")
+        );
+        assert!(!path.exists());
+        assert_eq!(rows(&portals), before);
+        assert_runtime(&portals, true);
+        std::fs::remove_dir(blocked).unwrap();
+        portals.save_arrivals_to(&path, false).unwrap();
+        assert_runtime(&portals, false);
+        assert_eq!(rows(&portals), before);
+        let written = horizon_client::save::read_dat(&path).unwrap();
+        assert_eq!(
+            written,
+            Tag::compound([("arrivals", Tag::List(before.clone()))])
+        );
+        let Some(Tag::List(list)) = written.get("arrivals") else {
+            panic!("saved arrivals")
+        };
+        let restored: Vec<_> = list
+            .iter()
+            .map(|row| arrival_tag(&arrival_from_tag(row).expect("arrival parser")))
+            .collect();
+        assert_eq!(restored, before);
+        for (index, row) in restored.iter().enumerate() {
+            assert_eq!(row.get("entity"), Some(&opaque_entity(index as i32)));
         }
+        assert!(written.get("data").is_none() && written.get("DataVersion").is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_last_arrival_deletion_retries_empty_existing_schema() {
+        let root = scratch("deletion");
+        let path = root.join("horizon_portal_arrivals.dat");
+        let mut portals = populated();
+        portals.arrivals.truncate(1);
+        portals.save_arrivals_to(&path, false).unwrap();
+        let old = std::fs::read(&path).unwrap();
+        portals.arrivals.clear();
+        portals.dirty = true;
+        let blocked = root.join("horizon_portal_arrivals.dat_new");
+        std::fs::create_dir(&blocked).unwrap();
+        assert!(portals.save_arrivals_to(&path, false).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), old);
+        assert!(portals.arrivals.is_empty());
+        assert_runtime(&portals, true);
+        std::fs::remove_dir(blocked).unwrap();
+        portals.save_arrivals_to(&path, false).unwrap();
+        assert!(portals.arrivals.is_empty());
+        assert_runtime(&portals, false);
+        assert_eq!(
+            horizon_client::save::read_dat(&path).unwrap(),
+            Tag::compound([("arrivals", Tag::List(Vec::new()))])
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn arrival_remote_and_clean_guards_preserve_state_but_dirty_empty_unloaded_saves() {
+        for (remote, dirty) in [(true, true), (false, false), (true, false)] {
+            let root = scratch("guard");
+            let mut portals = populated();
+            portals.dirty = dirty;
+            let before = rows(&portals);
+            portals
+                .save_arrivals_to(&root.join("data/horizon_portal_arrivals.dat"), remote)
+                .unwrap();
+            assert!(std::fs::read_dir(&root).unwrap().next().is_none());
+            assert_eq!(rows(&portals), before);
+            assert_runtime(&portals, dirty);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+        let root = scratch("fresh-empty");
+        let path = root.join("horizon_portal_arrivals.dat");
+        let mut portals = Portals {
+            dirty: true,
+            ..Portals::default()
+        };
+        portals.save_arrivals_to(&path, false).unwrap();
+        assert!(!portals.loaded && !portals.dirty && portals.arrivals.is_empty());
+        assert_eq!(
+            horizon_client::save::read_dat(&path).unwrap(),
+            Tag::compound([("arrivals", Tag::List(Vec::new()))])
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
 

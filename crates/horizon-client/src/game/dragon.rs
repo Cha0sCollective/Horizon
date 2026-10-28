@@ -55,6 +55,45 @@ pub(super) struct Fight {
     blast_by: Option<FightWho>,
     dirty: bool,
 }
+impl Fight {
+    fn save_to(&mut self, path: &std::path::Path) -> horizon_client::Result<()> {
+        if !self.loaded || !self.dirty {
+            return Ok(());
+        }
+        let b = |v: bool| Tag::Byte(i8::from(v));
+        let mut data = vec![
+            ("needs_state_scanning", b(self.needs_scan)),
+            ("dragon_killed", b(self.killed)),
+            ("previously_killed", b(self.previously_killed)),
+            ("respawn_time", Tag::Int(self.respawn.map_or(0, |r| r.1))),
+            ("gateways", Tag::IntArray(self.gateways.clone())),
+            ("horizon_crystals_placed", b(self.crystals_placed)),
+        ];
+        if let Some(p) = self.exit_portal {
+            data.push(("exit_portal_location", Tag::IntArray(p.to_vec())));
+        }
+        if let Some((stage, _)) = self.respawn {
+            data.push(("respawn_stage", Tag::String(stage.name().into())));
+            data.push((
+                "horizon_respawn_crystals",
+                Tag::IntArray(
+                    self.respawn_crystals
+                        .iter()
+                        .flat_map(|p| [p.x.floor() as i32, p.y.floor() as i32, p.z.floor() as i32])
+                        .collect(),
+                ),
+            ));
+        }
+        let tag = Tag::compound([
+            ("data", Tag::compound(data)),
+            ("DataVersion", Tag::Int(horizon_world::DATA_VERSION)),
+        ]);
+        horizon_client::save::write_dat(path, tag)
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+        self.dirty = false;
+        Ok(())
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Respawn {
     Start,
@@ -661,43 +700,9 @@ impl Game<'_> {
                 })
         })
     }
-    pub(super) fn save_fight(&mut self) {
-        if !self.fight.loaded || !self.fight.dirty {
-            return;
-        }
-
-        let f = &self.fight;
-        let b = |v: bool| Tag::Byte(i8::from(v));
-        let mut data = vec![
-            ("needs_state_scanning", b(f.needs_scan)),
-            ("dragon_killed", b(f.killed)),
-            ("previously_killed", b(f.previously_killed)),
-            ("respawn_time", Tag::Int(f.respawn.map_or(0, |r| r.1))),
-            ("gateways", Tag::IntArray(f.gateways.clone())),
-            ("horizon_crystals_placed", b(f.crystals_placed)),
-        ];
-        if let Some(p) = f.exit_portal {
-            data.push(("exit_portal_location", Tag::IntArray(p.to_vec())));
-        }
-        if let Some((stage, _)) = f.respawn {
-            data.push(("respawn_stage", Tag::String(stage.name().into())));
-            data.push((
-                "horizon_respawn_crystals",
-                Tag::IntArray(
-                    f.respawn_crystals
-                        .iter()
-                        .flat_map(|p| [p.x.floor() as i32, p.y.floor() as i32, p.z.floor() as i32])
-                        .collect(),
-                ),
-            ));
-        }
-        let tag = Tag::compound([
-            ("data", Tag::compound(data)),
-            ("DataVersion", Tag::Int(horizon_world::DATA_VERSION)),
-        ]);
-        if horizon_client::save::write_dat(&self.fight_path(), tag).is_ok() {
-            self.fight.dirty = false;
-        }
+    pub(super) fn save_fight(&mut self) -> horizon_client::Result<()> {
+        let path = self.fight_path();
+        self.fight.save_to(&path)
     }
     /// The island's centre chunks are lit (the arena is "loaded").
     fn arena_loaded(&self) -> bool {
@@ -2125,7 +2130,10 @@ impl Game<'_> {
         self.fight.previously_killed = true;
         self.fight.killed = true;
         self.fight.dirty = true;
-        self.save_fight();
+        if let Err(error) = self.save_fight() {
+            // The death's world changes have committed; ordinary saves retry this state.
+            log::warn!("the Ender Dragon fight was not written: {error}");
+        }
     }
     fn spawn_dragon_fireball(&mut self, at: Vec3, dir: Vec3) {
         let l = (dir.x * dir.x + dir.y * dir.y + dir.z * dir.z)
@@ -3555,6 +3563,148 @@ impl Game<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn metadata_scratch(name: &str) -> std::path::PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "horizon-fight-save-{name}-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+    fn saved_fight() -> Fight {
+        Fight {
+            loaded: true,
+            needs_scan: true,
+            killed: true,
+            previously_killed: true,
+            gateways: vec![19, 3, 7],
+            exit_portal: Some([-2, 64, 4]),
+            alive_crystals: 4,
+            crystal_scan: 13,
+            player_scan: 7,
+            players: true,
+            crystals_placed: true,
+            respawn: Some((Respawn::Pillars, 42)),
+            respawn_crystals: vec![Vec3::new(1.9, 64.8, -1.2), Vec3::new(-2.1, -65.9, 3.9)],
+            blast_by: Some(FightWho::Guest(9)),
+            dirty: true,
+        }
+    }
+    fn assert_fight_contents(fight: &Fight) {
+        assert!(
+            fight.needs_scan
+                && fight.killed
+                && fight.previously_killed
+                && fight.crystals_placed
+                && fight.players
+        );
+        assert_eq!(fight.gateways, [19, 3, 7]);
+        assert_eq!(fight.exit_portal, Some([-2, 64, 4]));
+        assert_eq!(
+            (fight.alive_crystals, fight.crystal_scan, fight.player_scan),
+            (4, 13, 7)
+        );
+        assert_eq!(fight.respawn, Some((Respawn::Pillars, 42)));
+        assert_eq!(
+            fight.respawn_crystals,
+            [Vec3::new(1.9, 64.8, -1.2), Vec3::new(-2.1, -65.9, 3.9)]
+        );
+        assert_eq!(fight.blast_by, Some(FightWho::Guest(9)));
+    }
+
+    #[test]
+    fn failed_committed_fight_save_retains_dirty_and_runtime_state_for_exact_retry() {
+        let root = metadata_scratch("retry");
+        let path = root.join("ender_dragon_fight.dat");
+        let blocked = root.join("ender_dragon_fight.dat_new");
+        let mut fight = saved_fight();
+        std::fs::create_dir(&blocked).unwrap();
+        assert!(
+            fight
+                .save_to(&path)
+                .unwrap_err()
+                .to_string()
+                .contains("ender_dragon_fight.dat")
+        );
+        assert!(fight.loaded && fight.dirty);
+        assert_fight_contents(&fight);
+        assert!(!path.exists());
+        std::fs::remove_dir(blocked).unwrap();
+        fight.save_to(&path).unwrap();
+        assert!(fight.loaded && !fight.dirty);
+        assert_fight_contents(&fight);
+        let written = horizon_client::save::read_dat(&path).unwrap();
+        assert_eq!(
+            written,
+            Tag::compound([
+                ("DataVersion", Tag::Int(horizon_world::DATA_VERSION)),
+                (
+                    "data",
+                    Tag::compound([
+                        ("needs_state_scanning", Tag::Byte(1)),
+                        ("dragon_killed", Tag::Byte(1)),
+                        ("previously_killed", Tag::Byte(1)),
+                        ("respawn_time", Tag::Int(42)),
+                        ("gateways", Tag::IntArray(vec![19, 3, 7])),
+                        ("horizon_crystals_placed", Tag::Byte(1)),
+                        ("exit_portal_location", Tag::IntArray(vec![-2, 64, 4])),
+                        ("respawn_stage", Tag::String("summoning_pillars".into())),
+                        (
+                            "horizon_respawn_crystals",
+                            Tag::IntArray(vec![1, 64, -2, -3, -66, 3])
+                        ),
+                    ])
+                ),
+            ])
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unloaded_or_clean_fight_save_writes_nothing_and_preserves_every_field() {
+        for (loaded, dirty) in [(false, true), (true, false), (false, false)] {
+            let root = metadata_scratch("guard");
+            let mut fight = saved_fight();
+            fight.loaded = loaded;
+            fight.dirty = dirty;
+            fight
+                .save_to(&root.join("data/minecraft/ender_dragon_fight.dat"))
+                .unwrap();
+            assert!(std::fs::read_dir(&root).unwrap().next().is_none());
+            assert_eq!((fight.loaded, fight.dirty), (loaded, dirty));
+            assert_fight_contents(&fight);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn fight_save_preserves_existing_optional_field_omission() {
+        let root = metadata_scratch("optional");
+        let path = root.join("ender_dragon_fight.dat");
+        let mut fight = saved_fight();
+        fight.exit_portal = None;
+        fight.respawn = None;
+        let crystals = fight.respawn_crystals.clone();
+        fight.save_to(&path).unwrap();
+        let written = horizon_client::save::read_dat(&path).unwrap();
+        let data = written.get("data").unwrap();
+        assert_eq!(data.get("respawn_time"), Some(&Tag::Int(0)));
+        for key in [
+            "exit_portal_location",
+            "respawn_stage",
+            "horizon_respawn_crystals",
+        ] {
+            assert!(data.get(key).is_none());
+        }
+        assert_eq!(fight.respawn_crystals, crystals);
+        assert!(fight.loaded && !fight.dirty && fight.killed && fight.previously_killed);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     fn dragon(phase: Phase) -> Dragon {
         let mut d = Dragon::new(Vec3::new(0.0, 70.0, 0.0), 0.0, 1);

@@ -34,6 +34,26 @@ impl Default for Spawner {
         }
     }
 }
+impl Spawner {
+    fn save_to(&mut self, path: &std::path::Path) -> horizon_client::Result<()> {
+        if !self.loaded || !self.dirty {
+            return Ok(());
+        }
+        let tag = Tag::compound([
+            (
+                "data",
+                Tag::compound([
+                    ("spawn_delay", Tag::Int(self.spawn_delay)),
+                    ("spawn_chance", Tag::Int(self.chance)),
+                ]),
+            ),
+            ("DataVersion", Tag::Int(horizon_world::DATA_VERSION)),
+        ]);
+        write_dat(path, tag).map_err(|error| format!("{}: {error}", path.display()))?;
+        self.dirty = false;
+        Ok(())
+    }
+}
 impl Creatures {
     /// A fresh spawner for a newly opened world.
     pub(super) fn reset_trader(&mut self) {
@@ -62,24 +82,9 @@ impl Game<'_> {
         t.chance = get("spawn_chance", MIN_CHANCE);
         t.loaded = true;
     }
-    pub(super) fn save_wandering_trader(&mut self) {
-        if !self.creatures.trader.loaded || !self.creatures.trader.dirty {
-            return;
-        }
-        let t = &self.creatures.trader;
-        let tag = Tag::compound([
-            (
-                "data",
-                Tag::compound([
-                    ("spawn_delay", Tag::Int(t.spawn_delay)),
-                    ("spawn_chance", Tag::Int(t.chance)),
-                ]),
-            ),
-            ("DataVersion", Tag::Int(horizon_world::DATA_VERSION)),
-        ]);
-        if write_dat(&self.trader_path(), tag).is_ok() {
-            self.creatures.trader.dirty = false;
-        }
+    pub(super) fn save_wandering_trader(&mut self) -> horizon_client::Result<()> {
+        let path = self.trader_path();
+        self.creatures.trader.save_to(&path)
     }
     /// `WanderingTraderSpawner.tick`.
     pub(super) fn tick_wandering_trader(&mut self) {
@@ -252,5 +257,94 @@ impl Game<'_> {
             }
         }
         best.map(|b| b.0)
+    }
+}
+
+#[cfg(test)]
+mod metadata_tests {
+    use super::*;
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "horizon-trader-save-{name}-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+    fn state(spawner: &Spawner) -> (i32, i32, i32, bool, bool) {
+        (
+            spawner.tick_delay,
+            spawner.spawn_delay,
+            spawner.chance,
+            spawner.loaded,
+            spawner.dirty,
+        )
+    }
+    fn populated() -> Spawner {
+        Spawner {
+            tick_delay: 17,
+            spawn_delay: 12000,
+            chance: 50,
+            loaded: true,
+            dirty: true,
+        }
+    }
+
+    #[test]
+    fn failed_trader_save_keeps_dirty_and_timers_for_exact_retry() {
+        let root = scratch("retry");
+        let path = root.join("wandering_trader.dat");
+        let blocked = root.join("wandering_trader.dat_new");
+        let mut spawner = populated();
+        let before = state(&spawner);
+        std::fs::create_dir(&blocked).unwrap();
+        assert!(
+            spawner
+                .save_to(&path)
+                .unwrap_err()
+                .to_string()
+                .contains("wandering_trader.dat")
+        );
+        assert_eq!(state(&spawner), before);
+        assert!(!path.exists());
+        std::fs::remove_dir(blocked).unwrap();
+        spawner.save_to(&path).unwrap();
+        assert_eq!(state(&spawner), (17, 12000, 50, true, false));
+        assert_eq!(
+            read_dat(&path).unwrap(),
+            Tag::compound([
+                (
+                    "data",
+                    Tag::compound([
+                        ("spawn_delay", Tag::Int(12000)),
+                        ("spawn_chance", Tag::Int(50))
+                    ])
+                ),
+                ("DataVersion", Tag::Int(horizon_world::DATA_VERSION)),
+            ])
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unloaded_or_clean_trader_save_writes_nothing_and_keeps_all_state() {
+        for (loaded, dirty) in [(false, true), (true, false), (false, false)] {
+            let root = scratch("guard");
+            let mut spawner = populated();
+            spawner.loaded = loaded;
+            spawner.dirty = dirty;
+            let before = state(&spawner);
+            spawner
+                .save_to(&root.join("data/minecraft/wandering_trader.dat"))
+                .unwrap();
+            assert!(std::fs::read_dir(&root).unwrap().next().is_none());
+            assert_eq!(state(&spawner), before);
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 }
