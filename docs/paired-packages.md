@@ -44,3 +44,42 @@ invalid records and unmarked existing-world migration are refused before upgrade
 chunk decoding or world writes. The check also runs in builds without this feature,
 so disabling it cannot silently open a paired world. This is admission metadata,
 not a machine save format, a migration tool or peer authentication.
+
+## Static state preview
+
+Captured paired block declarations may add `state-definition` alongside their
+ordinary `template`, `properties` and `item` fields. For example:
+
+```json
+{
+  "template": "minecraft:iron_block",
+  "state-definition": {
+    "format": 1,
+    "behavior": "static",
+    "properties": [
+      {"name": "axis", "values": ["x", "y", "z"], "default": "y"},
+      {"name": "enabled", "values": ["false", "true"], "default": "true"}
+    ]
+  }
+}
+```
+
+Only the single-state iron-block template is supported by this preview. Every
+tuple inherits its geometry and physics; properties are explicit state data, with
+no machinery, custom shape, orientation-aware placement or rotation behavior.
+Static structure rotations/mirrors preserve each tuple. Supply matching ordinary
+blockstate/model resources for all combinations. The example's default is its
+fourth canonical state (`axis=y,enabled=true`), not its first state.
+
+Names and values are bounded lowercase ASCII tokens. Property names/values sort
+lexicographically; the rightmost property varies fastest. Unknown fields, duplicate
+names/values, invalid defaults and unsupported formats reject. A declaration is
+at most 64 KiB, with 16 properties, 64 values per property and 4,096 combinations.
+Captured packages retain at most 65,536 expanded static states; the resource
+materializer separately enforces the total world state limit including vanilla.
+The combined vanilla/package property vocabulary is limited to 4,096 names, leaving
+headroom in the engine's key table. `waterlogged` is unsupported because the host
+assigns fluid semantics to it independently of this static template.
+
+Legacy folders/zips and feature-disabled builds refuse this new field. This is an
+experimental content format; it does not add a stable SDK API or machine save schema.

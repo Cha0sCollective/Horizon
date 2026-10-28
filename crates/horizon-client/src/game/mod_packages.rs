@@ -225,9 +225,10 @@ mod tests {
     }
     fn packages() -> Packages {
         Packages {
+            #[cfg(feature = "paired-packages")]
+            catalog: None,
             build: "test-executable".into(),
             identities: BTreeMap::from([("counter".into(), "test-package".into())]),
-            ..Packages::default()
         }
     }
     #[test]

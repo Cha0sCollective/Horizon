@@ -25,6 +25,10 @@ pub mod states;
 pub const MAX_FILES: usize = 65_536;
 pub const MAX_FILE: u64 = 16 << 20;
 pub const MAX_TOTAL: u64 = 512 << 20;
+/// Experimental expanded static states per captured package. Parsing may hold
+/// one additional bounded plan while checking this aggregate limit.
+#[cfg(feature = "paired-packages")]
+pub const MAX_STATIC_STATES: usize = 65_536;
 
 /// Checks a content path: `assets/` or `data/`, then `/`-separated parts of
 /// `[a-z0-9_.-]`, none of them `.` or `..` (vanilla's resource-location
@@ -88,6 +92,19 @@ struct BlockFile {
     properties: BlockProperties,
     #[serde(default = "yes")]
     item: bool,
+    #[cfg(feature = "paired-packages")]
+    #[serde(
+        default,
+        rename = "state-definition",
+        deserialize_with = "state_definition"
+    )]
+    state_definition: Option<Box<serde_json::value::RawValue>>,
+}
+#[cfg(feature = "paired-packages")]
+fn state_definition<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<Box<serde_json::value::RawValue>>, D::Error> {
+    Box::<serde_json::value::RawValue>::deserialize(d).map(Some)
 }
 fn yes() -> bool {
     true
@@ -104,6 +121,9 @@ pub struct Block {
     pub properties: BlockProperties,
     /// Also add a block item with the same id.
     pub item: bool,
+    /// Experimental static states, admitted only from a captured paired bundle.
+    #[cfg(feature = "paired-packages")]
+    pub state_plan: Option<states::StatePlan>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
@@ -378,10 +398,39 @@ impl Content {
             }
         }
         let mut ids = BTreeSet::new();
+        #[cfg(feature = "paired-packages")]
+        let mut static_states = 0usize;
         for (block, name) in blocks {
             let file: BlockFile =
                 serde_json::from_slice(&self.file(&name)?).map_err(|e| format!("{name}: {e}"))?;
             check_block(&file).map_err(|e| format!("{name}: {e}"))?;
+            #[cfg(feature = "paired-packages")]
+            let state_plan = match &file.state_definition {
+                Some(raw) => {
+                    if self.snapshot_identity().is_none() {
+                        return Err(format!(
+                            "{name}: state-definition requires captured paired content"
+                        ));
+                    }
+                    let plan =
+                        states::StatePlan::parse(raw.get()).map_err(|e| format!("{name}: {e}"))?;
+                    static_states = static_states.checked_add(plan.states().len())
+                        .filter(|&total| total <= MAX_STATIC_STATES)
+                        .ok_or_else(|| format!("{name}: more than {MAX_STATIC_STATES} expanded static states in one package"))?;
+                    if file.template != "minecraft:iron_block" {
+                        return Err(format!(
+                            "{name}: static state preview requires minecraft:iron_block"
+                        ));
+                    }
+                    if plan.properties().iter().any(|p| p.name() == "waterlogged") {
+                        return Err(format!(
+                            "{name}: static state preview cannot declare waterlogged"
+                        ));
+                    }
+                    Some(plan)
+                }
+                None => None,
+            };
             if file.item {
                 ids.insert(block.clone());
             }
@@ -390,6 +439,8 @@ impl Content {
                 template: file.template,
                 properties: file.properties,
                 item: file.item,
+                #[cfg(feature = "paired-packages")]
+                state_plan,
             });
         }
         for (item, name) in items {
@@ -497,6 +548,107 @@ capabilities = ["registries"]
         "properties": {"hardness": 4.0, "light": 3, "sounds": "minecraft:amethyst_block"}}"#;
     const ITEM: &[u8] = br#"{"template": "minecraft:diamond", "rarity": "uncommon"}"#;
 
+    #[cfg(not(feature = "paired-packages"))]
+    #[test]
+    fn state_definition_field_requires_the_experimental_feature() {
+        let error = serde_json::from_str::<BlockFile>(
+            r#"{"template":"minecraft:iron_block","state-definition":{}}"#,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unknown field `state-definition`")
+        );
+    }
+
+    #[cfg(feature = "paired-packages")]
+    #[test]
+    fn static_state_admission_requires_captured_safe_content_and_raw_validation() {
+        let manifest = Manifest::parse(MANIFEST_TEXT).unwrap();
+        let definition = r#"{"format":1,"behavior":"static","properties":[{"name":"axis","values":["z","x","y"],"default":"y"}]}"#;
+        let declaration = |template: &str, state: &str| {
+            format!(r#"{{"template":"{template}","state-definition":{state}}}"#).into_bytes()
+        };
+        let captured = |bytes: Vec<u8>| {
+            Content::captured(
+                PathBuf::from("unused"),
+                &manifest,
+                [("data/ruby/horizon/block/marker.json".into(), bytes)].into(),
+                [0; 32],
+            )
+        };
+        let content = captured(declaration("minecraft:iron_block", definition)).unwrap();
+        let plan = content.blocks[0].state_plan.as_ref().unwrap();
+        assert_eq!(plan.states().len(), 3);
+        assert_eq!(plan.default_index(), 1);
+        let legacy = declaration("minecraft:iron_block", definition);
+        assert!(
+            hmod(
+                "static-legacy",
+                MANIFEST_TEXT,
+                &[("data/ruby/horizon/block/marker.json", &legacy)]
+            )
+            .unwrap_err()
+            .contains("captured paired content")
+        );
+        for template in ["minecraft:oak_door", "minecraft:spawner"] {
+            assert!(captured(declaration(template, definition)).is_err());
+        }
+        for invalid in [
+            definition.replace("axis", "waterlogged"),
+            definition.replace("\"format\":1", "\"format\":2"),
+            definition.replace("\"format\":1", "\"format\":1,\"format\":1"),
+            definition.replace("\"name\":\"axis\"", "\"name\":\"axis\",\"name\":\"axis\""),
+            "null".into(),
+        ] {
+            assert!(
+                captured(declaration("minecraft:iron_block", &invalid)).is_err(),
+                "{invalid}"
+            );
+        }
+    }
+
+    #[cfg(feature = "paired-packages")]
+    #[test]
+    fn captured_static_states_have_an_aggregate_expansion_limit() {
+        let manifest = Manifest::parse(MANIFEST_TEXT).unwrap();
+        let values: Vec<_> = (0..16).map(|n| n.to_string()).collect();
+        let declaration = serde_json::to_vec(&serde_json::json!({
+            "template":"minecraft:iron_block", "state-definition": {
+                "format":1,"behavior":"static","properties":[
+                    {"name":"a","values":values,"default":"0"},
+                    {"name":"b","values":values,"default":"0"},
+                    {"name":"c","values":values,"default":"0"}]}}))
+        .unwrap();
+        let files = |count| {
+            (0..count)
+                .map(|i| {
+                    (
+                        format!("data/ruby/horizon/block/b{i}.json"),
+                        declaration.clone(),
+                    )
+                })
+                .collect()
+        };
+        let at_limit =
+            Content::captured(PathBuf::from("unused"), &manifest, files(16), [0; 32]).unwrap();
+        assert_eq!(
+            at_limit
+                .blocks
+                .iter()
+                .map(|b| b.state_plan.as_ref().unwrap().states().len())
+                .sum::<usize>(),
+            MAX_STATIC_STATES
+        );
+        drop(at_limit);
+        assert!(
+            Content::captured(PathBuf::from("unused"), &manifest, files(17), [0; 32])
+                .unwrap_err()
+                .contains("expanded static states in one package")
+        );
+    }
+
     fn scratch(name: &str) -> PathBuf {
         let dir =
             std::env::temp_dir().join(format!("horizon-content-{}-{name}", std::process::id()));
@@ -538,6 +690,8 @@ capabilities = ["registries"]
                     ..BlockProperties::default()
                 },
                 item: true,
+                #[cfg(feature = "paired-packages")]
+                state_plan: None,
             }]
         );
         assert_eq!(content.items[0].id, "ruby:ruby");

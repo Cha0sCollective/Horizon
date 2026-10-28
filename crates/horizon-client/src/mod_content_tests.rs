@@ -1,6 +1,270 @@
 use super::*;
 use crate::{assets::Assets, blocks::BlockFacts, items::Items};
 
+#[cfg(feature = "paired-packages")]
+#[test]
+fn static_property_vocabulary_counts_vanilla_and_all_packages() {
+    let names: Vec<_> = (0..MAX_STATIC_PROPERTY_KEYS)
+        .map(|i| format!("key_{i}"))
+        .collect();
+    let first: Vec<_> = names[..2048].iter().map(String::as_str).collect();
+    let second: Vec<_> = names[2048..].iter().map(String::as_str).collect();
+    check_property_vocabulary(
+        [],
+        [&first[..], &second[..]].map(|keys| keys.iter().copied()),
+    )
+    .unwrap();
+    check_property_vocabulary(["vanilla"], [first.iter().copied()]).unwrap();
+    check_property_vocabulary(["vanilla"], [second.iter().copied()]).unwrap();
+    assert!(
+        check_property_vocabulary(
+            ["vanilla"],
+            [&first[..], &second[..]].map(|keys| keys.iter().copied())
+        )
+        .is_err()
+    );
+    // A vanilla key already present in a package occupies one global slot.
+    check_property_vocabulary(
+        [names[0].as_str()],
+        [&first[..], &second[..]].map(|keys| keys.iter().copied()),
+    )
+    .unwrap();
+    // Count vanilla before accepting the final declaration's vocabulary.
+    check_property_vocabulary(
+        ["vanilla"],
+        [&first[..], &second[..second.len() - 1]].map(|keys| keys.iter().copied()),
+    )
+    .unwrap();
+}
+
+#[cfg(feature = "paired-packages")]
+fn static_state_mod(dir: &Path) -> ContentMod {
+    fs::create_dir_all(dir.join("data/state_demo/horizon/block")).unwrap();
+    fs::write(
+        dir.join("horizon-paired.toml"),
+        r#"
+format=1
+host-contract='paired-preview-1'
+[content]
+id='state_demo'
+name='Static states'
+version='0'
+api='0.2'
+side='both'
+capabilities=['registries']
+[client]
+entry='client.wasm'
+api='0.1'
+capabilities=[]
+[server]
+entry='server.wasm'
+api='0.3'
+capabilities=[]
+"#,
+    )
+    .unwrap();
+    // Content parsing is deliberately independent of executable ABI checking.
+    fs::write(dir.join("client.wasm"), b"not executed").unwrap();
+    fs::write(dir.join("server.wasm"), b"not executed").unwrap();
+    fs::write(
+        dir.join("data/state_demo/horizon/block/marker.json"),
+        r#"{
+      "template":"minecraft:iron_block", "state-definition": {
+        "format":1,"behavior":"static","properties":[
+          {"name":"enabled","values":["true","false"],"default":"true"},
+          {"name":"axis","values":["z","x","y"],"default":"y"}]}}
+    "#,
+    )
+    .unwrap();
+    let prepared = horizon_mods::paired::PreparedBundle::read_folder(dir).unwrap();
+    ContentMod {
+        id: "state_demo".into(),
+        content: prepared.content().clone(),
+    }
+}
+
+#[cfg(feature = "paired-packages")]
+#[test]
+#[ignore = "full owned content root: run explicitly for static state materialization"]
+fn static_states_materialize_all_tables_models_and_palette_roundtrip() {
+    use horizon_core::position::BlockPos;
+    use horizon_world::{
+        chunk::{BlockSection, BlockState},
+        registry::{BlockRegistry, BlockTableFile},
+    };
+    let base = prepared().expect("owned 26.3 prepared resources are required for this check");
+    let scratch =
+        std::env::temp_dir().join(format!("horizon-static-states-{}", std::process::id()));
+    fs::create_dir(&scratch).unwrap();
+    let m = static_state_mod(&scratch.join("package"));
+    let root = resource_root(&base, std::slice::from_ref(&m), &scratch.join("cache")).unwrap();
+    let registry = |root: &Path| {
+        BlockRegistry::from_facts_json(fs::File::open(root.join("facts.json")).unwrap()).unwrap()
+    };
+    let old = registry(&base);
+    let new: &'static BlockRegistry = Box::leak(Box::new(registry(&root)));
+    let n = old.len();
+    assert_eq!(new.len(), n + 6);
+    for i in 0..n {
+        let id = BlockStateId(i as u32);
+        assert_eq!(old.state(id), new.state(id));
+        let name = &old.state(id).unwrap().name;
+        assert_eq!(old.default_state(name), new.default_state(name));
+    }
+    assert_eq!(
+        new.default_state("state_demo:marker"),
+        Some(BlockStateId(n as u32 + 3))
+    );
+    let tuples = [
+        ("x", "false"),
+        ("x", "true"),
+        ("y", "false"),
+        ("y", "true"),
+        ("z", "false"),
+        ("z", "true"),
+    ];
+    for (i, (axis, enabled)) in tuples.iter().enumerate() {
+        let expected = BlockState {
+            name: "state_demo:marker".into(),
+            properties: [
+                ("axis".into(), (*axis).into()),
+                ("enabled".into(), (*enabled).into()),
+            ]
+            .into(),
+        };
+        let id = BlockStateId((n + i) as u32);
+        assert_eq!(new.state(id), Some(&expected));
+        assert_eq!(new.resolve(&expected).unwrap(), id);
+        assert_eq!(BlockState::from_nbt(&expected.to_nbt()).unwrap(), expected);
+    }
+    assert_eq!(
+        new.resolve(&BlockState {
+            name: "state_demo:marker".into(),
+            properties: BTreeMap::new()
+        })
+        .unwrap(),
+        BlockStateId(n as u32 + 3)
+    );
+    horizon_world::level::states::StateTable::new(new).unwrap();
+    let json = |root: &Path, name: &str| -> serde_json::Value {
+        serde_json::from_slice(&fs::read(root.join(name)).unwrap()).unwrap()
+    };
+    for (name, key) in [
+        ("facts.json", "states"),
+        ("gameplay-facts.json", "states"),
+        ("block-behaviours.json", "states"),
+        ("mob-data.json", "states"),
+        ("worldgen/block_flags.json", ""),
+    ] {
+        let (before, after) = (json(&base, name), json(&root, name));
+        let a = if key.is_empty() {
+            before.as_array().unwrap()
+        } else {
+            before[key].as_array().unwrap()
+        };
+        let b = if key.is_empty() {
+            after.as_array().unwrap()
+        } else {
+            after[key].as_array().unwrap()
+        };
+        assert_eq!(b.len(), n + 6, "{name}");
+        assert_eq!(&b[..n], a, "{name}");
+    }
+    let model = json(&root, "model-states.json");
+    assert_eq!(
+        model["state_demo:marker"]["schema"],
+        serde_json::json!({"axis":{"named":["x","y","z"]},"enabled":{"named":["false","true"]}})
+    );
+    let render = json(&root, "render-definitions.json");
+    assert_eq!(render["state_demo:marker"]["default"], n + 3);
+    assert_eq!(
+        render["state_demo:marker"]["states"],
+        serde_json::json!((n..n + 6).collect::<Vec<_>>())
+    );
+    let commands = json(&root, "command-registries.json");
+    assert_eq!(
+        commands["blocks"]["state_demo:marker"],
+        serde_json::json!([["axis", ["x", "y", "z"]], ["enabled", ["false", "true"]]])
+    );
+    let transforms = json(&root, "worldgen/blocks/structure-blocks.json");
+    let old_transforms = json(&base, "worldgen/blocks/structure-blocks.json");
+    assert_eq!(transforms["states"], n + 6);
+    for key in ["rotate", "mirror", "full_block"] {
+        assert_eq!(
+            &transforms[key].as_array().unwrap()[..n],
+            old_transforms[key].as_array().unwrap()
+        );
+    }
+    for i in n..n + 6 {
+        assert_eq!(transforms["rotate"][i], serde_json::json!([i, i, i]));
+        assert_eq!(transforms["mirror"][i], serde_json::json!([i, i]));
+    }
+    for name in NBT_TABLES {
+        let original_file = BlockTableFile::open(&base.join(name), &old).unwrap();
+        let original = original_file.table(name).unwrap();
+        let file = BlockTableFile::open(&root.join(name), new).unwrap();
+        let table = file.table(name).unwrap();
+        if name == "worldgen/blocks/block-properties.nbt" {
+            table.nested("occlusion", "nested occlusion").unwrap();
+        }
+        if let Some(Tag::IntArray(shapes)) = table.get("cached_shapes") {
+            let Some(Tag::IntArray(original_shapes)) = original.get("cached_shapes") else {
+                panic!("missing original shape indices");
+            };
+            assert_eq!(&shapes[..n], original_shapes, "{name}");
+            let source = old.default_state("minecraft:iron_block").unwrap().0 as usize;
+            assert_eq!(shapes.len(), n + 6);
+            assert!(shapes[n..].iter().all(|index| *index == shapes[source]));
+        }
+        if let Some(shapes) = original.get("shapes") {
+            assert_eq!(
+                table.get("shapes"),
+                Some(shapes),
+                "shared {name} geometry changed"
+            );
+        }
+    }
+    let assets = Assets::load(&root).unwrap();
+    let mut sprites = crate::sprites::Sprites::default();
+    let models = crate::models::StateModels::load(
+        &root,
+        assets.registry,
+        &["state_demo:marker"],
+        &mut sprites,
+    )
+    .unwrap();
+    for i in n..n + 6 {
+        let mut selected = Vec::new();
+        models
+            .models_at(
+                BlockStateId(i as u32),
+                BlockPos::new(0, 64, 0),
+                &mut selected,
+            )
+            .unwrap();
+        assert!(!selected.is_empty());
+    }
+    let facts = BlockFacts::load(&root, new).unwrap();
+    let items = Items::load(&root, new, &facts).unwrap();
+    assert_eq!(
+        items.items["state_demo:marker"].block,
+        Some(BlockStateId((n + 3) as u32))
+    );
+    crate::collisions::load(&root, new).unwrap();
+    crate::models::load_visibility(&root, new).unwrap();
+    crate::motion::MotionResources::load(&root, &assets).unwrap();
+    horizon_world::worldgen::generator::GeneratorData::load(&root.join("worldgen"), new).unwrap();
+    let mut section = BlockSection::uniform(BlockStateId((n + 3) as u32), new).unwrap();
+    section.set(0, BlockStateId(n as u32)).unwrap();
+    section.set(1, BlockStateId((n + 5) as u32)).unwrap();
+    let saved = section.to_nbt().unwrap();
+    let restored = BlockSection::from_nbt(&saved, new).unwrap();
+    assert_eq!(restored.get(0).unwrap(), BlockStateId(n as u32));
+    assert_eq!(restored.get(1).unwrap(), BlockStateId((n + 5) as u32));
+    assert_eq!(restored.get(2).unwrap(), BlockStateId((n + 3) as u32));
+    fs::remove_dir_all(scratch).unwrap();
+}
+
 #[test]
 fn renames_ids_keys_and_states() {
     let mut r = Rename::new("minecraft:iron_block", "ruby:ruby_block");
