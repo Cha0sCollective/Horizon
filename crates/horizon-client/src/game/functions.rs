@@ -37,6 +37,67 @@ pub(super) struct FnState {
     pub schedule: Vec<Scheduled>,
     next_seq: u64,
 }
+impl FnState {
+    fn load_schedule_from(&mut self, path: &std::path::Path) {
+        let Some(root) = save::read_dat(path) else {
+            return;
+        };
+        let Some(Tag::List(events)) = root.get("data").and_then(|d| d.get("events")) else {
+            return;
+        };
+        for e in events {
+            let (Some(Tag::Long(time)), Some(Tag::String(id)), Some(cb)) =
+                (e.get("trigger_time"), e.get("id"), e.get("callback"))
+            else {
+                continue;
+            };
+            let _ = cb;
+            self.next_seq += 1;
+            self.schedule.push(Scheduled {
+                id: id.to_string_lossy(),
+                time: *time,
+                seq: self.next_seq,
+            });
+        }
+    }
+    fn save_schedule_to(&self, path: &std::path::Path, remote: bool) -> horizon_client::Result<()> {
+        if !self.loaded || remote {
+            return Ok(());
+        }
+        if self.schedule.is_empty() && !path.try_exists()? {
+            return Ok(());
+        }
+        let mut events = self.schedule.clone();
+        events.sort_by_key(|e| (e.time, e.seq));
+        let list = events
+            .iter()
+            .map(|e| {
+                let (kind, name) = match e.id.strip_prefix('#') {
+                    Some(tag) => ("minecraft:function_tag", tag),
+                    None => ("minecraft:function", e.id.as_str()),
+                };
+                Tag::compound([
+                    ("trigger_time", Tag::Long(e.time)),
+                    ("id", Tag::String(e.id.as_str().into())),
+                    (
+                        "callback",
+                        Tag::compound([
+                            ("type", Tag::String(kind.into())),
+                            ("id", Tag::String(name.into())),
+                        ]),
+                    ),
+                ])
+            })
+            .collect();
+        save::write_dat(
+            path,
+            Tag::compound([
+                ("data", Tag::compound([("events", Tag::List(list))])),
+                ("DataVersion", Tag::Int(horizon_world::DATA_VERSION)),
+            ]),
+        )
+    }
+}
 /// What a function reported through `return`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Outcome {
@@ -149,63 +210,12 @@ impl Game<'_> {
         self.world_root.join("data/minecraft/scheduled_events.dat")
     }
     fn load_schedule(&mut self) {
-        let Some(root) = save::read_dat(&self.schedule_path()) else {
-            return;
-        };
-        let Some(Tag::List(events)) = root.get("data").and_then(|d| d.get("events")) else {
-            return;
-        };
-        for e in events {
-            let (Some(Tag::Long(time)), Some(Tag::String(id)), Some(cb)) =
-                (e.get("trigger_time"), e.get("id"), e.get("callback"))
-            else {
-                continue;
-            };
-            let _ = cb;
-            self.fns.next_seq += 1;
-            self.fns.schedule.push(Scheduled {
-                id: id.to_string_lossy(),
-                time: *time,
-                seq: self.fns.next_seq,
-            });
-        }
+        let path = self.schedule_path();
+        self.fns.load_schedule_from(&path);
     }
-    pub(super) fn save_schedule(&self) {
-        if !self.fns.loaded || self.remote.is_some() {
-            return;
-        }
-        let mut events = self.fns.schedule.clone();
-        events.sort_by_key(|e| (e.time, e.seq));
-        let list = events
-            .iter()
-            .map(|e| {
-                let (kind, name) = match e.id.strip_prefix('#') {
-                    Some(tag) => ("minecraft:function_tag", tag),
-                    None => ("minecraft:function", e.id.as_str()),
-                };
-                Tag::compound([
-                    ("trigger_time", Tag::Long(e.time)),
-                    ("id", Tag::String(e.id.as_str().into())),
-                    (
-                        "callback",
-                        Tag::compound([
-                            ("type", Tag::String(kind.into())),
-                            ("id", Tag::String(name.into())),
-                        ]),
-                    ),
-                ])
-            })
-            .collect();
-        if events.is_empty() && !self.schedule_path().exists() {
-            return;
-        }
-        let _ = save::write_dat(
-            &self.schedule_path(),
-            Tag::compound([
-                ("data", Tag::compound([("events", Tag::List(list))])),
-                ("DataVersion", Tag::Int(horizon_world::DATA_VERSION)),
-            ]),
-        );
+    pub(super) fn save_schedule(&self) -> horizon_client::Result<()> {
+        self.fns
+            .save_schedule_to(&self.schedule_path(), self.remote.is_some())
     }
 
     // ---- ticking -----------------------------------------------------------------
@@ -721,3 +731,197 @@ const FEATURE_PACKS: &[(&str, &str)] = &[
     ("redstone_experiments", "minecraft:redstone_experiments"),
     ("trade_rebalance", "minecraft:trade_rebalance"),
 ];
+
+#[cfg(test)]
+mod metadata_tests {
+    use super::*;
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "horizon-schedule-save-{name}-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn populated() -> FnState {
+        FnState {
+            loaded: true,
+            load_pending: true,
+            next_seq: 91,
+            schedule: vec![
+                Scheduled {
+                    id: "test:a".into(),
+                    time: 40,
+                    seq: 9,
+                },
+                Scheduled {
+                    id: "#test:early".into(),
+                    time: -5,
+                    seq: 2,
+                },
+                Scheduled {
+                    id: "test:z".into(),
+                    time: 40,
+                    seq: 3,
+                },
+            ],
+            ..FnState::default()
+        }
+    }
+
+    fn expected_event(id: &str, time: i64, kind: &str, name: &str) -> Tag {
+        Tag::compound([
+            ("id", Tag::String(id.into())),
+            ("trigger_time", Tag::Long(time)),
+            (
+                "callback",
+                Tag::compound([
+                    ("type", Tag::String(kind.into())),
+                    ("id", Tag::String(name.into())),
+                ]),
+            ),
+        ])
+    }
+
+    fn assert_live(state: &FnState, before: &[Scheduled]) {
+        assert_eq!(state.schedule, before);
+        assert_eq!(state.next_seq, 91);
+        assert!(state.loaded && state.load_pending);
+    }
+
+    #[test]
+    fn schedule_write_failure_retries_sorted_callbacks_without_changing_live_order() {
+        let root = scratch("retry");
+        let path = root.join("scheduled_events.dat");
+        let state = populated();
+        let before = state.schedule.clone();
+        let blocked = root.join("scheduled_events.dat_new");
+        std::fs::create_dir(&blocked).unwrap();
+        assert!(state.save_schedule_to(&path, false).is_err());
+        assert!(!path.exists());
+        assert_live(&state, &before);
+        std::fs::remove_dir(blocked).unwrap();
+        state.save_schedule_to(&path, false).unwrap();
+        let written = save::read_dat(&path).unwrap();
+        let expected = Tag::compound([
+            ("DataVersion", Tag::Int(horizon_world::DATA_VERSION)),
+            (
+                "data",
+                Tag::compound([(
+                    "events",
+                    Tag::List(vec![
+                        expected_event("#test:early", -5, "minecraft:function_tag", "test:early"),
+                        expected_event("test:z", 40, "minecraft:function", "test:z"),
+                        expected_event("test:a", 40, "minecraft:function", "test:a"),
+                    ]),
+                )]),
+            ),
+        ]);
+        assert_eq!(written, expected);
+        assert_live(&state, &before);
+        let retained = Scheduled {
+            id: "test:retained".into(),
+            time: -99,
+            seq: 50,
+        };
+        let mut reloaded = FnState {
+            loaded: true,
+            load_pending: true,
+            next_seq: 50,
+            schedule: vec![retained.clone()],
+            ..FnState::default()
+        };
+        // The real parser appends and reconstructs sequence numbers in saved order.
+        reloaded.load_schedule_from(&path);
+        assert_eq!(
+            reloaded.schedule,
+            vec![
+                retained,
+                Scheduled {
+                    id: "#test:early".into(),
+                    time: -5,
+                    seq: 51
+                },
+                Scheduled {
+                    id: "test:z".into(),
+                    time: 40,
+                    seq: 52
+                },
+                Scheduled {
+                    id: "test:a".into(),
+                    time: 40,
+                    seq: 53
+                },
+            ]
+        );
+        assert_eq!(reloaded.next_seq, 53);
+        assert!(reloaded.loaded && reloaded.load_pending);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_last_scheduled_event_removal_retries_empty_existing_file() {
+        let root = scratch("empty");
+        let path = root.join("scheduled_events.dat");
+        let mut state = populated();
+        state.schedule.truncate(1);
+        state.save_schedule_to(&path, false).unwrap();
+        let old = std::fs::read(&path).unwrap();
+        state.schedule.clear();
+        let blocked = root.join("scheduled_events.dat_new");
+        std::fs::create_dir(&blocked).unwrap();
+        assert!(state.save_schedule_to(&path, false).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), old);
+        assert_live(&state, &[]);
+        std::fs::remove_dir(blocked).unwrap();
+        state.save_schedule_to(&path, false).unwrap();
+        let written = save::read_dat(&path).unwrap();
+        assert_eq!(
+            written,
+            Tag::compound([
+                ("data", Tag::compound([("events", Tag::List(Vec::new()))])),
+                ("DataVersion", Tag::Int(horizon_world::DATA_VERSION)),
+            ])
+        );
+        let mut reloaded = FnState::default();
+        reloaded.load_schedule_from(&path);
+        assert!(reloaded.schedule.is_empty());
+        assert_eq!(reloaded.next_seq, 0);
+        assert_live(&state, &[]);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unloaded_remote_and_fresh_empty_schedules_write_nothing() {
+        for (loaded, remote) in [(false, false), (true, true)] {
+            let root = scratch(if loaded { "remote" } else { "unloaded" });
+            let path = root.join("data/minecraft/scheduled_events.dat");
+            let mut state = populated();
+            state.loaded = loaded;
+            let before = state.schedule.clone();
+            state.save_schedule_to(&path, remote).unwrap();
+            assert!(std::fs::read_dir(&root).unwrap().next().is_none());
+            assert_eq!(state.schedule, before);
+            assert_eq!(state.next_seq, 91);
+            assert_eq!(state.loaded, loaded);
+            assert!(state.load_pending);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+        let root = scratch("fresh");
+        let state = FnState {
+            loaded: true,
+            ..FnState::default()
+        };
+        state
+            .save_schedule_to(&root.join("data/minecraft/scheduled_events.dat"), false)
+            .unwrap();
+        assert!(std::fs::read_dir(&root).unwrap().next().is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}

@@ -11360,8 +11360,8 @@ impl Game<'_> {
         self.save_stats();
         self.save_advancements();
         self.save_scoreboard()?;
-        self.save_bossbars();
-        self.save_schedule();
+        self.save_bossbars()?;
+        self.save_schedule()?;
         self.save_warden_tracker();
         self.sync_level();
         self.store_owner();

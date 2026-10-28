@@ -25,6 +25,23 @@ pub(super) struct BossState {
     /// What each viewer was last sent, so a change becomes one packet.
     sent: HashMap<u128, HashMap<u128, Offer>>,
 }
+impl BossState {
+    fn save_to(&self, path: &std::path::Path, remote: bool) -> horizon_client::Result<()> {
+        if !self.loaded || remote {
+            return Ok(());
+        }
+        if self.bars.bars.is_empty() && !path.try_exists()? {
+            return Ok(());
+        }
+        save::write_dat(
+            path,
+            Tag::compound([
+                ("data", self.bars.pack()),
+                ("DataVersion", Tag::Int(horizon_world::DATA_VERSION)),
+            ]),
+        )
+    }
+}
 
 fn num(n: impl std::fmt::Display) -> Text {
     Text::literal(n.to_string())
@@ -47,22 +64,9 @@ impl Game<'_> {
         }
         self.ui.registries.bossbars = self.bosses.bars.ids();
     }
-    pub(super) fn save_bossbars(&self) {
-        if !self.bosses.loaded || self.remote.is_some() {
-            return;
-        }
-        if self.bosses.bars.bars.is_empty() && !self.bossbar_path().exists() {
-            return;
-        }
-        if let Err(e) = save::write_dat(
-            &self.bossbar_path(),
-            Tag::compound([
-                ("data", self.bosses.bars.pack()),
-                ("DataVersion", Tag::Int(horizon_world::DATA_VERSION)),
-            ]),
-        ) {
-            log::warn!("boss bars were not written: {e}");
-        }
+    pub(super) fn save_bossbars(&self) -> horizon_client::Result<()> {
+        self.bosses
+            .save_to(&self.bossbar_path(), self.remote.is_some())
     }
     pub(in crate::game) fn bossbar_exists(&self, id: &str) -> bool {
         self.bosses.bars.get(id).is_some()
@@ -676,4 +680,153 @@ struct Offer {
     music: bool,
     fog: bool,
     scope: Scope,
+}
+
+#[cfg(test)]
+mod metadata_tests {
+    use super::*;
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "horizon-boss-save-{name}-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn populated() -> BossState {
+        let mut state = BossState {
+            loaded: true,
+            ..BossState::default()
+        };
+        assert!(state.bars.add("test:boss", sb::literal("Saved boss")));
+        let bar = state.bars.get_mut("test:boss").unwrap();
+        bar.uuid = 99; // Runtime UUIDs deliberately differ from the load-time stable UUID.
+        bar.value = 27;
+        bar.max = 53;
+        bar.visible = false;
+        bar.color = "purple".into();
+        bar.style = "notched_12".into();
+        bar.darken = true;
+        bar.music = true;
+        bar.fog = true;
+        bar.players = vec![[1, 2, 3, 4], [-1, -2, -3, -4]];
+        state.sent.insert(
+            7,
+            HashMap::from([(
+                99,
+                Offer {
+                    id: 99,
+                    name: Tag::String("Previously sent".into()),
+                    progress: 0.5,
+                    color: 3,
+                    overlay: 2,
+                    darken: false,
+                    music: true,
+                    fog: false,
+                    scope: Scope::Level(Dim::Nether),
+                },
+            )]),
+        );
+        state
+    }
+
+    fn assert_live(state: &BossState, bars: &BossBars) {
+        assert!(state.loaded);
+        assert_eq!(&state.bars, bars);
+        assert_eq!(state.sent.len(), 1);
+        assert_eq!(state.sent[&7].len(), 1);
+        let sent = &state.sent[&7][&99];
+        assert_eq!(sent.id, 99);
+        assert_eq!(sent.name, Tag::String("Previously sent".into()));
+        assert_eq!((sent.progress, sent.color, sent.overlay), (0.5, 3, 2));
+        assert!(!sent.darken && sent.music && !sent.fog);
+        assert!(sent.scope == Scope::Level(Dim::Nether));
+    }
+
+    #[test]
+    fn bossbar_write_failure_retries_exact_data_without_changing_runtime_viewers() {
+        let root = scratch("retry");
+        let path = root.join("custom_boss_events.dat");
+        let blocked = root.join("custom_boss_events.dat_new");
+        let state = populated();
+        let before = state.bars.clone();
+        std::fs::create_dir(&blocked).unwrap();
+        assert!(state.save_to(&path, false).is_err());
+        assert!(!path.exists());
+        assert_live(&state, &before);
+        std::fs::remove_dir(blocked).unwrap();
+        state.save_to(&path, false).unwrap();
+        let tag = save::read_dat(&path).unwrap();
+        assert_eq!(
+            tag,
+            Tag::compound([
+                ("data", before.pack()),
+                ("DataVersion", Tag::Int(horizon_world::DATA_VERSION)),
+            ])
+        );
+        let reloaded = BossBars::unpack(tag.get("data").unwrap());
+        assert_eq!(reloaded.pack(), before.pack());
+        assert_eq!(
+            reloaded.get("test:boss").unwrap().uuid,
+            bossbar::stable_uuid("test:boss")
+        );
+        assert_live(&state, &before);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_last_bossbar_removal_retries_empty_existing_file() {
+        let root = scratch("empty");
+        let path = root.join("custom_boss_events.dat");
+        let mut state = populated();
+        state.save_to(&path, false).unwrap();
+        let old = std::fs::read(&path).unwrap();
+        state.bars.remove("test:boss");
+        let before = state.bars.clone();
+        let blocked = root.join("custom_boss_events.dat_new");
+        std::fs::create_dir(&blocked).unwrap();
+        assert!(state.save_to(&path, false).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), old);
+        assert_live(&state, &before);
+        std::fs::remove_dir(blocked).unwrap();
+        state.save_to(&path, false).unwrap();
+        let tag = save::read_dat(&path).unwrap();
+        assert_eq!(tag.get("data"), Some(&Tag::Compound(Default::default())));
+        assert!(BossBars::unpack(tag.get("data").unwrap()).bars.is_empty());
+        assert_live(&state, &before);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unloaded_remote_and_fresh_empty_bossbars_write_nothing() {
+        for (loaded, remote) in [(false, false), (true, true)] {
+            let root = scratch(if loaded { "remote" } else { "unloaded" });
+            let path = root.join("data/minecraft/custom_boss_events.dat");
+            let mut state = populated();
+            state.loaded = loaded;
+            let before = state.bars.clone();
+            state.save_to(&path, remote).unwrap();
+            assert!(std::fs::read_dir(&root).unwrap().next().is_none());
+            assert_eq!(state.loaded, loaded);
+            assert_eq!(state.bars, before);
+            assert_eq!(state.sent[&7][&99].id, 99);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+        let root = scratch("fresh");
+        let state = BossState {
+            loaded: true,
+            ..BossState::default()
+        };
+        state
+            .save_to(&root.join("data/minecraft/custom_boss_events.dat"), false)
+            .unwrap();
+        assert!(std::fs::read_dir(&root).unwrap().next().is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
