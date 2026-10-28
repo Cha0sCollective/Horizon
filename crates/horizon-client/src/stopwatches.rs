@@ -56,24 +56,27 @@ impl Stopwatches {
         }
         s
     }
-    pub fn save(&mut self, root: &Path) {
+    pub fn save(&mut self, root: &Path) -> crate::Result<()> {
         if !self.dirty && self.watches.is_empty() {
-            return;
+            return Ok(());
         }
-        self.dirty = false;
-        let now = current_time();
+        self.save_at(root, current_time())
+    }
+    fn save_at(&mut self, root: &Path, now: i64) -> crate::Result<()> {
         let map: Compound = self
             .watches
             .iter()
             .map(|(k, w)| (k.as_str().into(), Tag::Long(w.elapsed_ms(now))))
             .collect();
-        let _ = save::write_dat(
+        save::write_dat(
             &file(root),
             Tag::compound([
                 ("data", Tag::compound([("stopwatches", Tag::Compound(map))])),
                 ("DataVersion", Tag::Int(horizon_world::DATA_VERSION)),
             ]),
-        );
+        )?;
+        self.dirty = false;
+        Ok(())
     }
     pub fn ids(&self) -> Vec<String> {
         self.watches.keys().cloned().collect()
@@ -115,5 +118,102 @@ impl Stopwatches {
         self.watches
             .get(id)
             .map(|w| w.elapsed_ms(current_time()) as f64 / 1000.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "horizon-stopwatch-retry-{name}-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn saved_watches(root: &Path) -> Tag {
+        let tag = save::read_dat(&file(root)).unwrap();
+        assert_eq!(
+            tag.get("DataVersion"),
+            Some(&Tag::Int(horizon_world::DATA_VERSION))
+        );
+        tag.get("data").unwrap().get("stopwatches").unwrap().clone()
+    }
+
+    #[test]
+    fn failed_stopwatch_write_retries_elapsed_snapshot_without_mutating_live_watches() {
+        let root = scratch("elapsed");
+        let mut watches = Stopwatches::default();
+        watches.watches.insert(
+            "test:clock".into(),
+            Stopwatch {
+                creation_time: 100,
+                accumulated: 40,
+            },
+        );
+        watches.dirty = true;
+        let before = watches.watches.clone();
+        let blocked = file(&root).with_file_name("stopwatches.dat_new");
+        std::fs::create_dir_all(&blocked).unwrap();
+        assert!(watches.save_at(&root, 150).is_err());
+        assert!(watches.dirty);
+        assert_eq!(watches.watches, before);
+        std::fs::remove_dir(blocked).unwrap();
+        watches.save_at(&root, 160).unwrap();
+        assert!(!watches.dirty);
+        assert_eq!(watches.watches, before);
+        assert_eq!(
+            saved_watches(&root),
+            Tag::compound([("test:clock", Tag::Long(100))])
+        );
+        assert_eq!(
+            Stopwatches::load(&root).watches["test:clock"].accumulated,
+            100
+        );
+        // Clean nonempty watches keep saving current elapsed time, without resetting their origin.
+        watches.save_at(&root, 170).unwrap();
+        assert_eq!(
+            saved_watches(&root),
+            Tag::compound([("test:clock", Tag::Long(110))])
+        );
+        assert_eq!(watches.watches, before);
+        let fresh = root.join("clean-public-save");
+        watches.save(&fresh).unwrap();
+        assert!(saved_watches(&fresh).get("test:clock").is_some());
+        assert_eq!(watches.watches, before);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_last_stopwatch_removal_keeps_dirty_for_empty_retry() {
+        let root = scratch("removal");
+        let mut watches = Stopwatches::default();
+        assert!(watches.create("test:last"));
+        watches.save(&root).unwrap();
+        let path = file(&root);
+        let old = std::fs::read(&path).unwrap();
+        let blocked = path.with_file_name("stopwatches.dat_new");
+        std::fs::create_dir(&blocked).unwrap();
+        assert!(watches.remove("test:last"));
+        assert!(watches.save(&root).is_err());
+        assert!(watches.dirty && watches.watches.is_empty());
+        assert_eq!(std::fs::read(&path).unwrap(), old);
+        std::fs::remove_dir(blocked).unwrap();
+        watches.save(&root).unwrap();
+        assert!(!watches.dirty);
+        assert_eq!(saved_watches(&root), Tag::Compound(Compound::new()));
+        let mut reloaded = Stopwatches::load(&root);
+        assert!(reloaded.ids().is_empty());
+        let sparse = root.join("clean-empty");
+        reloaded.save(&sparse).unwrap();
+        assert!(!sparse.exists());
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

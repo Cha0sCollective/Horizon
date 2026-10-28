@@ -40,6 +40,44 @@ pub(super) struct ScoreState {
     loaded: bool,
     recorded: Recorded,
 }
+impl ScoreState {
+    fn save_to(
+        &mut self,
+        root: &std::path::Path,
+        border: &horizon_client::worldborder::WorldBorder,
+        remote: bool,
+    ) -> horizon_client::Result<()> {
+        if !self.loaded || remote {
+            return Ok(());
+        }
+        self.storage.save(root)?;
+        self.stopwatches.save(root)?;
+        let border_path = root.join("data/minecraft/world_border.dat");
+        // A reset must replace an old nondefault border, while fresh defaults stay sparse.
+        if border != &horizon_client::worldborder::WorldBorder::default()
+            || border_path.try_exists()?
+        {
+            save::write_dat(
+                &border_path,
+                Tag::compound([
+                    ("data", border.pack()),
+                    ("DataVersion", Tag::Int(horizon_world::DATA_VERSION)),
+                ]),
+            )?;
+        }
+        let path = root.join("data/minecraft/scoreboard.dat");
+        if self.board == Scoreboard::default() && !path.try_exists()? {
+            return Ok(());
+        }
+        save::write_dat(
+            &path,
+            Tag::compound([
+                ("data", self.board.pack()),
+                ("DataVersion", Tag::Int(horizon_world::DATA_VERSION)),
+            ]),
+        )
+    }
+}
 
 fn in_range(v: i32, (lo, hi): IntRange) -> bool {
     lo.is_none_or(|l| v >= l) && hi.is_none_or(|h| v <= h)
@@ -70,33 +108,9 @@ impl Game<'_> {
         self.score.stopwatches = horizon_client::stopwatches::Stopwatches::load(&self.world_root);
         self.sync_score_registries();
     }
-    pub(super) fn save_scoreboard(&mut self) {
-        if !self.score.loaded || self.remote.is_some() {
-            return;
-        }
-        self.score.storage.save(&self.world_root);
-        self.score.stopwatches.save(&self.world_root);
-        if self.border != horizon_client::worldborder::WorldBorder::default() {
-            let _ = save::write_dat(
-                &self.world_root.join("data/minecraft/world_border.dat"),
-                Tag::compound([
-                    ("data", self.border.pack()),
-                    ("DataVersion", Tag::Int(horizon_world::DATA_VERSION)),
-                ]),
-            );
-        }
-        let path = self.scoreboard_path();
-        let board = &self.score.board;
-        if board == &Scoreboard::default() && !path.exists() {
-            return;
-        }
-        let _ = save::write_dat(
-            &path,
-            Tag::compound([
-                ("data", board.pack()),
-                ("DataVersion", Tag::Int(horizon_world::DATA_VERSION)),
-            ]),
-        );
+    pub(super) fn save_scoreboard(&mut self) -> horizon_client::Result<()> {
+        self.score
+            .save_to(&self.world_root, &self.border, self.remote.is_some())
     }
     /// The names commands complete: objectives, teams and tracked holders.
     pub(super) fn sync_score_registries(&mut self) {
@@ -778,6 +792,193 @@ impl Env for GameEnv<'_, '_> {
     }
     fn feedback(&mut self, message: Text) {
         self.g.feedback(message);
+    }
+}
+
+#[cfg(test)]
+mod metadata_tests {
+    use super::*;
+    use horizon_client::worldborder::WorldBorder;
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "horizon-score-metadata-{name}-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn populated() -> (ScoreState, WorldBorder) {
+        let mut score = ScoreState {
+            loaded: true,
+            ..ScoreState::default()
+        };
+        score
+            .storage
+            .set("test:entry", Tag::compound([("value", Tag::Int(42))]));
+        assert!(score.stopwatches.create("test:clock"));
+        assert!(score.board.add_objective(
+            "points",
+            "dummy",
+            literal("Points"),
+            sb::RenderType::Integer,
+            false,
+            None
+        ));
+        score.board.set("Alice", "points", 17);
+        let mut border = WorldBorder::default();
+        border.set_center([12.0, -34.0]);
+        border.set_size(128.0);
+        border.warning_distance = 9;
+        (score, border)
+    }
+
+    fn saved_data(root: &std::path::Path, path: &str) -> Tag {
+        let tag = save::read_dat(&root.join(path)).unwrap();
+        assert_eq!(
+            tag.get("DataVersion"),
+            Some(&Tag::Int(horizon_world::DATA_VERSION))
+        );
+        tag.get("data").unwrap().clone()
+    }
+
+    #[test]
+    fn each_score_metadata_write_failure_propagates_before_later_files_and_retries() {
+        let paths = [
+            "data/test/command_storage.dat",
+            "data/minecraft/stopwatches.dat",
+            "data/minecraft/world_border.dat",
+            "data/minecraft/scoreboard.dat",
+        ];
+        for failed in 0..paths.len() {
+            let root = scratch(&format!("failure-{failed}"));
+            let (mut score, border) = populated();
+            let board_before = score.board.pack();
+            let border_before = border.pack();
+            let entry_before = score.storage.get("test:entry");
+            let watches_before = score.stopwatches.ids();
+            let blocked = root.join(format!("{}_new", paths[failed]));
+            std::fs::create_dir_all(&blocked).unwrap();
+            assert!(
+                score.save_to(&root, &border, false).is_err(),
+                "{}",
+                paths[failed]
+            );
+            for (index, path) in paths.iter().enumerate() {
+                assert_eq!(root.join(path).exists(), index < failed, "{path}");
+            }
+            assert_eq!(score.board.pack(), board_before);
+            assert_eq!(border.pack(), border_before);
+            assert_eq!(score.storage.get("test:entry"), entry_before);
+            assert_eq!(score.stopwatches.ids(), watches_before);
+            assert!(score.loaded);
+            std::fs::remove_dir(blocked).unwrap();
+            score.save_to(&root, &border, false).unwrap();
+            assert_eq!(saved_data(&root, paths[3]), board_before);
+            assert_eq!(saved_data(&root, paths[2]), border_before);
+            assert_eq!(
+                Scoreboard::unpack(&saved_data(&root, paths[3])),
+                score.board
+            );
+            assert_eq!(WorldBorder::unpack(&saved_data(&root, paths[2])), border);
+            assert_eq!(
+                horizon_client::command_storage::CommandStorage::load(&root).get("test:entry"),
+                entry_before
+            );
+            assert_eq!(
+                horizon_client::stopwatches::Stopwatches::load(&root).ids(),
+                watches_before
+            );
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn failed_default_border_reset_retries_and_overwrites_border_and_empty_scoreboard() {
+        let root = scratch("reset");
+        let (mut score, border) = populated();
+        score.stopwatches = Default::default();
+        score.save_to(&root, &border, false).unwrap();
+        let old_border = std::fs::read(root.join("data/minecraft/world_border.dat")).unwrap();
+        let old_board = std::fs::read(root.join("data/minecraft/scoreboard.dat")).unwrap();
+        score.board = Scoreboard::default();
+        let border = WorldBorder::default();
+        let blocked = root.join("data/minecraft/world_border.dat_new");
+        std::fs::create_dir(&blocked).unwrap();
+        assert!(score.save_to(&root, &border, false).is_err());
+        assert_eq!(score.board, Scoreboard::default());
+        assert_eq!(border, WorldBorder::default());
+        assert_eq!(
+            std::fs::read(root.join("data/minecraft/world_border.dat")).unwrap(),
+            old_border
+        );
+        assert_eq!(
+            std::fs::read(root.join("data/minecraft/scoreboard.dat")).unwrap(),
+            old_board
+        );
+        std::fs::remove_dir(blocked).unwrap();
+        score.save_to(&root, &border, false).unwrap();
+        let board = saved_data(&root, "data/minecraft/scoreboard.dat");
+        let saved_border = saved_data(&root, "data/minecraft/world_border.dat");
+        assert_eq!(board, Scoreboard::default().pack());
+        assert_eq!(saved_border, border.pack());
+        assert_eq!(Scoreboard::unpack(&board), Scoreboard::default());
+        assert_eq!(WorldBorder::unpack(&saved_border), WorldBorder::default());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unloaded_remote_and_fresh_default_score_metadata_stay_sparse() {
+        for (loaded, remote) in [(false, false), (true, true)] {
+            let root = scratch(if loaded { "remote" } else { "unloaded" });
+            let mut score = ScoreState {
+                loaded,
+                ..ScoreState::default()
+            };
+            score
+                .storage
+                .set("test:entry", Tag::compound([("value", Tag::Int(8))]));
+            assert!(score.stopwatches.create("test:removed"));
+            assert!(score.stopwatches.remove("test:removed"));
+            let storage_before = score.storage.clone();
+            score
+                .save_to(&root, &WorldBorder::default(), remote)
+                .unwrap();
+            assert!(std::fs::read_dir(&root).unwrap().next().is_none());
+            assert_eq!(score.storage, storage_before);
+            assert!(score.stopwatches.ids().is_empty());
+            assert_eq!(score.loaded, loaded);
+            // Neither no-op guard may lose the pending empty-watch deletion.
+            score.loaded = true;
+            score
+                .save_to(&root, &WorldBorder::default(), false)
+                .unwrap();
+            let watches = saved_data(&root, "data/minecraft/stopwatches.dat");
+            assert_eq!(
+                watches.get("stopwatches"),
+                Some(&Tag::Compound(Default::default()))
+            );
+            assert_eq!(
+                horizon_client::command_storage::CommandStorage::load(&root).get("test:entry"),
+                storage_before.get("test:entry")
+            );
+            std::fs::remove_dir_all(root).unwrap();
+        }
+        let root = scratch("fresh-defaults");
+        let mut score = ScoreState {
+            loaded: true,
+            ..ScoreState::default()
+        };
+        score
+            .save_to(&root, &WorldBorder::default(), false)
+            .unwrap();
+        assert!(std::fs::read_dir(&root).unwrap().next().is_none());
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
 

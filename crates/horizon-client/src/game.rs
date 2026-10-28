@@ -11359,7 +11359,7 @@ impl Game<'_> {
         self.save_portal_arrivals();
         self.save_stats();
         self.save_advancements();
-        self.save_scoreboard();
+        self.save_scoreboard()?;
         self.save_bossbars();
         self.save_schedule();
         self.save_warden_tracker();

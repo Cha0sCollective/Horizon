@@ -45,17 +45,16 @@ impl CommandStorage {
         }
         s
     }
-    pub fn save(&mut self, root: &Path) {
+    pub fn save(&mut self, root: &Path) -> crate::Result<()> {
         if !self.dirty {
-            return;
+            return Ok(());
         }
-        self.dirty = false;
         for (namespace, map) in &self.namespaces {
             let contents: Compound = map
                 .iter()
                 .map(|(k, v)| (k.as_str().into(), v.clone()))
                 .collect();
-            if let Err(e) = save::write_dat(
+            save::write_dat(
                 &file(root, namespace),
                 Tag::compound([
                     (
@@ -64,10 +63,11 @@ impl CommandStorage {
                     ),
                     ("DataVersion", Tag::Int(horizon_world::DATA_VERSION)),
                 ]),
-            ) {
-                log::warn!("command storage {namespace} was not written: {e}");
-            }
+            )?;
         }
+        // One global flag deliberately retries earlier namespaces after a later failure.
+        self.dirty = false;
+        Ok(())
     }
     /// `get`: an empty compound when unset.
     pub fn get(&self, id: &str) -> Tag {
@@ -104,6 +104,82 @@ mod tests {
     use super::*;
     use horizon_world::nbt::parse_snbt;
 
+    fn scratch(name: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "horizon-storage-retry-{name}-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn failed_namespace_keeps_global_dirty_and_all_contents_for_partial_retry() {
+        let root = scratch("namespaces");
+        let mut storage = CommandStorage::default();
+        for (namespace, value) in [("a", 1), ("b", 2), ("c", 3)] {
+            storage.set(
+                &format!("{namespace}:value"),
+                Tag::compound([("value", Tag::Int(value))]),
+            );
+        }
+        let before = storage.clone();
+        let blocked = file(&root, "b").with_file_name("command_storage.dat_new");
+        std::fs::create_dir_all(&blocked).unwrap();
+        assert!(storage.save(&root).is_err());
+        assert_eq!(storage, before);
+        assert!(storage.dirty);
+        assert_eq!(
+            CommandStorage::load(&root).get("a:value"),
+            storage.get("a:value")
+        );
+        assert!(!file(&root, "b").exists());
+        assert!(!file(&root, "c").exists());
+        std::fs::remove_dir(blocked).unwrap();
+        storage.save(&root).unwrap();
+        assert!(!storage.dirty);
+        assert_eq!(storage.namespaces, before.namespaces);
+        assert_eq!(CommandStorage::load(&root).namespaces, before.namespaces);
+        let written = save::read_dat(&file(&root, "c")).unwrap();
+        assert_eq!(
+            written.get("DataVersion"),
+            Some(&Tag::Int(horizon_world::DATA_VERSION))
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_last_storage_entry_removal_retries_empty_namespace() {
+        let root = scratch("deletion");
+        let mut storage = CommandStorage::default();
+        storage.set("test:last", Tag::compound([("value", Tag::Int(7))]));
+        storage.save(&root).unwrap();
+        let path = file(&root, "test");
+        let old = std::fs::read(&path).unwrap();
+        let blocked = path.with_file_name("command_storage.dat_new");
+        std::fs::create_dir(&blocked).unwrap();
+        storage.set("test:last", Tag::Compound(Compound::new()));
+        assert!(storage.save(&root).is_err());
+        assert!(storage.dirty && storage.keys().is_empty());
+        assert_eq!(std::fs::read(&path).unwrap(), old);
+        std::fs::remove_dir(blocked).unwrap();
+        storage.save(&root).unwrap();
+        assert!(!storage.dirty);
+        let reloaded = CommandStorage::load(&root);
+        assert!(reloaded.keys().is_empty());
+        assert_eq!(reloaded.namespaces, storage.namespaces);
+        let written = save::read_dat(&path).unwrap();
+        assert_eq!(
+            written.get("data").unwrap().get("contents"),
+            Some(&Tag::Compound(Compound::new()))
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn stores_per_namespace_and_persists() {
         let dir = std::env::temp_dir().join(format!("hz-storage-{}", std::process::id()));
@@ -112,7 +188,7 @@ mod tests {
         assert_eq!(s.get("minecraft:x"), Tag::Compound(Compound::new()));
         s.set("minecraft:x", parse_snbt("{a:1}").unwrap().0);
         s.set("my:pack/y", parse_snbt("{b:[1,2]}").unwrap().0);
-        s.save(&dir);
+        s.save(&dir).unwrap();
         let back = CommandStorage::load(&dir);
         assert_eq!(back.get("x"), parse_snbt("{a:1}").unwrap().0);
         assert_eq!(back.get("my:pack/y"), parse_snbt("{b:[1,2]}").unwrap().0);
