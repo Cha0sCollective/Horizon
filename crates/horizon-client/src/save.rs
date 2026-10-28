@@ -1182,6 +1182,11 @@ pub fn encode_with(
     let mut root = extras
         .map(|e| Tag::Compound(e.root.clone()))
         .unwrap_or_else(|| Tag::Compound(Compound::new()));
+    // Full chunks store entities in their separate region. Proto encoding
+    // explicitly adds its own entities after this shared column encoding.
+    if let Tag::Compound(values) = &mut root {
+        values.remove(&"entities".into());
+    }
     for (key, value) in [
         ("DataVersion", Tag::Int(DATA_VERSION)),
         ("xPos", Tag::Int(chunk.x)),
@@ -1767,6 +1772,8 @@ enum Record {
     /// A chunk's points of interest, made on the writer thread against the
     /// saved ones (`resolve_poi`).
     Poi(Arc<Chunk>, Arc<SaveTables>),
+    /// A finished column's immutable entity snapshot, encoded on demand.
+    FinishedEntities(Arc<Chunk>),
     Delete,
 }
 /// What encoding a chunk needs, captured when it is queued.
@@ -1788,9 +1795,22 @@ impl Record {
                 e.shape,
             ))),
             Record::Poi(c, t) => encode_poi(c, t).map(Arc::new),
+            Record::FinishedEntities(c) => {
+                entity_record(c.x, c.z, c.entities.clone()).map(Arc::new)
+            }
             Record::Delete => None,
         }
     }
+}
+fn entity_record(x: i32, z: i32, entities: Vec<Tag>) -> Option<NamedTag> {
+    (!entities.is_empty()).then(|| NamedTag {
+        name: "".into(),
+        tag: Tag::compound([
+            ("DataVersion", Tag::Int(DATA_VERSION)),
+            ("Position", Tag::IntArray(vec![x, z])),
+            ("Entities", Tag::List(entities)),
+        ]),
+    })
 }
 /// A queued POI record as it is written: claims kept from the saved one, and
 /// a chunk that lost its last POI gets an empty one, as vanilla trusts a
@@ -2236,18 +2256,20 @@ impl SaveDir {
     pub fn save_entities_later(&self, chunks: Vec<((i32, i32), Vec<Tag>)>) -> Result<()> {
         self.write_entities(chunks, false)
     }
+    /// Keep the original finished-column snapshot through entity enqueue and
+    /// pending reads. Success is enqueue acceptance, not disk completion.
+    pub(crate) fn save_finished_entities_later(&self, chunk: &Arc<Chunk>) -> Result<()> {
+        self.queue(
+            Folder::Entities,
+            vec![((chunk.x, chunk.z), Record::FinishedEntities(chunk.clone()))],
+            false,
+        )
+    }
     fn write_entities(&self, chunks: Vec<((i32, i32), Vec<Tag>)>, wait: bool) -> Result<()> {
         let records = chunks
             .into_iter()
             .map(|((x, z), entities)| {
-                let tag = (!entities.is_empty()).then(|| NamedTag {
-                    name: "".into(),
-                    tag: Tag::compound([
-                        ("DataVersion", Tag::Int(DATA_VERSION)),
-                        ("Position", Tag::IntArray(vec![x, z])),
-                        ("Entities", Tag::List(entities)),
-                    ]),
-                });
+                let tag = entity_record(x, z, entities);
                 ((x, z), tag)
             })
             .collect();
@@ -3753,19 +3775,18 @@ impl<G: ChunkGenerator> ChunkGenerator for Persistent<G> {
             .save_protos(&saved, self.registry.registry, &self.biomes)
             .map_err(|e| format!("failed to save proto chunks: {e}"))
     }
-    fn save_finished(&self, mut chunk: Chunk) {
+    fn save_finished(&self, chunk: &Arc<Chunk>) -> std::result::Result<(), String> {
         self.save
             .tables
             .get_or_init(|| Arc::new(SaveTables::new(&self.registry)));
-        let key = (chunk.x, chunk.z);
-        let entities = std::mem::take(&mut chunk.entities);
-        let saved = self
-            .save
-            .save_later(&[Arc::new(chunk)], self.registry.registry, &self.biomes)
-            .and_then(|_| self.save.save_entities_later(vec![(key, entities)]));
-        if let Err(e) = saved {
-            log::warn!("Horizon: failed to save chunk {} {}: {e}", key.0, key.1);
-        }
+        self.save
+            .save_later(
+                std::slice::from_ref(chunk),
+                self.registry.registry,
+                &self.biomes,
+            )
+            .and_then(|_| self.save.save_finished_entities_later(chunk))
+            .map_err(|e| format!("failed to save finished chunk {} {}: {e}", chunk.x, chunk.z))
     }
     fn decorates(&self) -> bool {
         self.inner.decorates()
@@ -4436,6 +4457,113 @@ mod tests {
         assert!(save.flush().is_err());
         drop(save);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn finished_entities_fixture(label: &str) -> (std::path::PathBuf, Arc<Chunk>) {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "horizon-finished-entities-{}-{label}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let mut chunk = Chunk::empty(1, 2);
+        chunk
+            .entities
+            .push(Tag::compound([("version", Tag::Int(3))]));
+        (dir, Arc::new(chunk))
+    }
+    #[test]
+    fn finished_entities_pending_arc_and_empty_delete_keep_existing_format() {
+        let (dir, chunk) = finished_entities_fixture("pending");
+        let save = super::SaveDir::new(dir.clone());
+        let path = save.region_path("entities", 0, 0);
+        let region = super::cached_region(&save.entity_regions, (0, 0), &path, true)
+            .unwrap()
+            .unwrap();
+        let blocked = region.lock().unwrap();
+        save.save_finished_entities_later(&chunk).unwrap();
+        assert!(!save.writes_finished().unwrap());
+        {
+            let pending = save.pending.lock().unwrap();
+            let (_, super::Record::FinishedEntities(held)) =
+                &pending[&(super::Folder::Entities, 1, 2)]
+            else {
+                panic!("finished snapshot not retained")
+            };
+            assert!(Arc::ptr_eq(held, &chunk));
+        }
+        assert_eq!(save.load_entities(1, 2), chunk.entities);
+        let tag = save.read_record("entities", 1, 2).unwrap();
+        assert_eq!(tag.tag.get("Position"), Some(&Tag::IntArray(vec![1, 2])));
+        assert_eq!(
+            tag.tag.get("DataVersion"),
+            Some(&Tag::Int(super::DATA_VERSION))
+        );
+        let empty = Arc::new(Chunk::empty(1, 2));
+        save.save_finished_entities_later(&empty).unwrap();
+        assert!(save.load_entities(1, 2).is_empty());
+        drop(blocked);
+        save.flush().unwrap();
+        assert!(
+            super::SaveDir::new(dir.clone())
+                .load_entities(1, 2)
+                .is_empty()
+        );
+        assert_eq!(chunk.entities.len(), 1);
+        drop(save);
+        drop(region);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn finished_entities_writer_failure_keeps_original_arc_readable() {
+        let (dir, chunk) = finished_entities_fixture("writer-error");
+        std::fs::write(dir.join("entities"), b"blocked").unwrap();
+        let save = super::SaveDir::new(dir.clone());
+        save.save_finished_entities_later(&chunk).unwrap();
+        assert!(save.flush().is_err());
+        assert!(save.writes_finished().is_err());
+        assert_eq!(save.load_entities(1, 2), chunk.entities);
+        {
+            let pending = save.pending.lock().unwrap();
+            let (_, super::Record::FinishedEntities(held)) =
+                &pending[&(super::Folder::Entities, 1, 2)]
+            else {
+                panic!("failed snapshot lost")
+            };
+            assert!(Arc::ptr_eq(held, &chunk));
+        }
+        assert!(save.flush().is_err());
+        drop(save);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn finished_entities_queue_failure_keeps_pending_arc_and_reports_error() {
+        let (dir, chunk) = finished_entities_fixture("queue-error");
+        let save = super::SaveDir::new(dir.clone());
+        let (send, receive) = std::sync::mpsc::channel();
+        drop(receive);
+        *save.writer.lock().unwrap() = Some(super::Writer {
+            send,
+            thread: std::thread::spawn(|| {}),
+        });
+        assert!(save.save_finished_entities_later(&chunk).is_err());
+        assert!(save.flush().is_err());
+        assert!(save.writes_finished().is_err());
+        assert_eq!(save.load_entities(1, 2), chunk.entities);
+        {
+            let pending = save.pending.lock().unwrap();
+            let (_, super::Record::FinishedEntities(held)) =
+                &pending[&(super::Folder::Entities, 1, 2)]
+            else {
+                panic!("unqueued snapshot lost")
+            };
+            assert!(Arc::ptr_eq(held, &chunk));
+        }
+        drop(save);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

@@ -87,7 +87,9 @@ pub trait ChunkGenerator: Send + Sync + 'static {
     }
     /// Save a column that finished after the player moved away: its
     /// neighbours' decoration is done, so it can't be generated again.
-    fn save_finished(&self, _chunk: Chunk) {}
+    fn save_finished(&self, _chunk: &Arc<Chunk>) -> Result<(), String> {
+        Ok(())
+    }
 }
 pub type LodDetail = ((i32, i32), Arc<[crate::lod::Column; 256]>);
 
@@ -142,14 +144,14 @@ impl<G: ChunkGenerator> LodSource for G {
 /// The generator's saving, for the streamer (which doesn't know its type).
 trait Saves: LodSource {
     fn save_protos(&self, protos: &[&Proto]) -> Result<(), String>;
-    fn save_finished(&self, chunk: Chunk);
+    fn save_finished(&self, chunk: &Arc<Chunk>) -> Result<(), String>;
 }
 impl<G: ChunkGenerator> Saves for G {
     fn save_protos(&self, protos: &[&Proto]) -> Result<(), String> {
         ChunkGenerator::save_protos(self, protos)
     }
-    fn save_finished(&self, chunk: Chunk) {
-        ChunkGenerator::save_finished(self, chunk);
+    fn save_finished(&self, chunk: &Arc<Chunk>) -> Result<(), String> {
+        ChunkGenerator::save_finished(self, chunk)
     }
 }
 /// Per-job mesher inputs that change with the dimension or the options.
@@ -231,9 +233,12 @@ pub struct Streaming {
     decorating: usize,
     /// Save jobs in flight.
     saving: usize,
-    /// First failed proto enqueue. Terrain production halts for this streamer's
+    /// First failed generation-storage enqueue. Terrain production halts for this streamer's
     /// lifetime; existing results, lighting and meshes still reconcile normally.
-    proto_save_error: Option<String>,
+    generation_save_error: Option<String>,
+    /// Complete out-of-range fresh snapshots whose handoff did not complete.
+    /// No retry/reset or absolute retention quota; only pre-existing jobs drain.
+    failed_finished: Vec<Arc<Chunk>>,
     /// Vanilla's decoration order around the player, and the centre and
     /// radius it was last ranked for.
     decoration_order: DecorationOrder,
@@ -566,7 +571,8 @@ impl Streaming {
             decorated: Default::default(),
             decorating: 0,
             saving: 0,
-            proto_save_error: None,
+            generation_save_error: None,
+            failed_finished: Vec::new(),
             decoration_order: DecorationOrder::default(),
             order_area: None,
             queue_basis: Default::default(),
@@ -729,29 +735,29 @@ impl Streaming {
             }
         }
         if let Err(error) = outcome {
-            self.fail_proto_save(error);
+            self.fail_generation_save(error);
         }
     }
-    fn fail_proto_save(&mut self, error: String) {
-        if self.proto_save_error.is_none() {
-            log::error!("Horizon: proto save failed; terrain streaming halted: {error}");
-            self.proto_save_error = Some(error);
+    fn fail_generation_save(&mut self, error: String) {
+        if self.generation_save_error.is_none() {
+            log::error!("Horizon: generation save failed; terrain streaming halted: {error}");
+            self.generation_save_error = Some(error);
         }
     }
     /// No reset/retry policy: terrain production stays halted for this lifetime.
     /// Retained ownership needs explicit failure handling, not a full save claim.
-    pub fn proto_save_error(&self) -> Option<&str> {
-        self.proto_save_error.as_deref()
+    pub fn generation_save_error(&self) -> Option<&str> {
+        self.generation_save_error.as_deref()
     }
-    fn proto_save_result(&self) -> crate::Result<()> {
-        match &self.proto_save_error {
+    fn generation_save_result(&self) -> crate::Result<()> {
+        match &self.generation_save_error {
             Some(error) => Err(error.clone().into()),
             None => Ok(()),
         }
     }
     /// Check out the proto chunks at `keys` and save them on a worker.
     fn save_checked_out(&mut self, keys: impl IntoIterator<Item = (i32, i32)>) {
-        if self.proto_save_error.is_some() {
+        if self.generation_save_error.is_some() {
             return;
         }
         let protos: Vec<((i32, i32), Proto)> = keys
@@ -771,15 +777,20 @@ impl Streaming {
         self.generating.remove(&key);
         self.finishing.remove(&key);
         self.decorated.insert(key);
-        // A column that finished after the player moved away is dropped
-        // whole: its block entities and saved entities too, or they would
-        // stay in the world (and the entities spawn again, duplicated, when
-        // the column loads later). A generated one is saved first: its
-        // neighbours were decorated around it, so generating it again would
-        // not give it back.
+        // A column that finished after the player moved away stays outside
+        // World, including its block entities and saved entities. A fresh one
+        // is handed to storage intact: decoration cannot be regenerated safely.
+        // Failed handoffs (and subsequent old results after fault) stay retained
+        // as complete snapshots, without activating entities or faking residency.
         if !self.ranges().chunk_kept(key.0, key.1, self.decorates) {
             if chunk.fresh {
-                self.saves.save_finished(chunk);
+                let chunk = Arc::new(chunk);
+                if self.generation_save_error.is_some() {
+                    self.failed_finished.push(chunk);
+                } else if let Err(error) = self.saves.save_finished(&chunk) {
+                    self.failed_finished.push(chunk);
+                    self.fail_generation_save(error);
+                }
             }
             return;
         }
@@ -1141,7 +1152,7 @@ impl Streaming {
     // A proto failure halts new producers before any failed snapshot can be
     // evicted, checked out, finalized or borrowed by neighboring decoration.
     fn produce_terrain(&mut self, world: &World) {
-        if self.proto_save_error.is_some() {
+        if self.generation_save_error.is_some() {
             return;
         }
         // Drop far proto chunks that are not checked out.
@@ -1316,7 +1327,7 @@ impl Streaming {
         self.schedule_generation(world, workers);
     }
     fn schedule_generation(&mut self, world: &World, workers: usize) {
-        if self.proto_save_error.is_some() {
+        if self.generation_save_error.is_some() {
             return;
         }
         let input = GenerationInputs {
@@ -1439,7 +1450,7 @@ impl Streaming {
     pub fn save(&mut self, world: &mut World, wait: bool) -> crate::Result<()> {
         if !wait {
             self.reconcile_ready_save_results(world);
-            self.proto_save_result()?;
+            self.generation_save_result()?;
             let written: Vec<(i32, i32)> = self.written.drain().collect();
             self.save_checked_out(written);
             return Ok(());
@@ -1448,10 +1459,10 @@ impl Streaming {
         self.save_until(world, deadline)
     }
     // The deadline bounds waiting for the tracked decoration/finish/save jobs.
-    // Plain generation and non-proto generator save callbacks are separate.
+    // Plain generation and non-generation storage owners are separate.
     fn save_until(&mut self, world: &mut World, deadline: std::time::Instant) -> crate::Result<()> {
         self.reconcile_ready_save_results(world);
-        self.proto_save_result()?;
+        self.generation_save_result()?;
         while self.save_in_flight() {
             let left = deadline.saturating_duration_since(std::time::Instant::now());
             match self.results.recv_timeout(left) {
@@ -1469,7 +1480,7 @@ impl Streaming {
                     );
                 }
             }
-            self.proto_save_result()?;
+            self.generation_save_result()?;
             if self.save_in_flight() && std::time::Instant::now() >= deadline {
                 return Err(
                     "chunk generation did not finish before saving: deadline exceeded".into(),
@@ -1488,8 +1499,8 @@ impl Streaming {
         };
         drop(protos);
         if let Err(error) = outcome {
-            self.fail_proto_save(error);
-            return self.proto_save_result();
+            self.fail_generation_save(error);
+            return self.generation_save_result();
         }
         self.written.clear();
         Ok(())
@@ -1538,7 +1549,7 @@ impl Streaming {
             // Scanning that existing prefix is linear, not a strict time bound.
             if self.receive_save_result(done, world) && started.elapsed() >= budget {
                 self.deferred.extend(deferred);
-                self.proto_save_result()?;
+                self.generation_save_result()?;
                 return Ok(false);
             }
         }
@@ -1547,7 +1558,7 @@ impl Streaming {
                 Ok(done) => {
                     self.receive_save_result(done, world);
                     if started.elapsed() >= budget {
-                        self.proto_save_result()?;
+                        self.generation_save_result()?;
                         return Ok(false);
                     }
                 }
@@ -1555,7 +1566,7 @@ impl Streaming {
                 Err(mpsc::TryRecvError::Disconnected) => break true,
             }
         };
-        self.proto_save_result()?;
+        self.generation_save_result()?;
         if disconnected
             && (self.save_in_flight()
                 || self
@@ -2047,6 +2058,107 @@ mod tests {
     fn save_world() -> World {
         World::new(horizon_world::registry::BlockStateId(0), 0)
     }
+    struct FinishedProbe {
+        context: Arc<WorkerContext>,
+        save: Option<Arc<crate::save::SaveDir>>,
+        failure: Mutex<Option<String>>,
+        seen: Mutex<Vec<std::sync::Weak<Chunk>>>,
+    }
+    impl ChunkGenerator for FinishedProbe {
+        type Worker = ();
+        fn worker(&self) {}
+        fn proto(&self, _: &mut (), _: i32, _: i32) -> Proto {
+            unreachable!()
+        }
+        fn finish(&self, _: Proto) -> Chunk {
+            unreachable!()
+        }
+        fn save_finished(&self, chunk: &Arc<Chunk>) -> Result<(), String> {
+            self.seen.lock().unwrap().push(Arc::downgrade(chunk));
+            if let Some(save) = &self.save {
+                save.save_later(
+                    std::slice::from_ref(chunk),
+                    self.context.assets.registry,
+                    &self.context.biomes,
+                )
+                .map_err(|e| e.to_string())?;
+            }
+            // With save set, inject failure after real region/POI acceptance
+            // but before the separate entity enqueue owns anything.
+            if let Some(error) = &*self.failure.lock().unwrap() {
+                return Err(error.clone());
+            }
+            if let Some(save) = &self.save {
+                save.save_finished_entities_later(chunk)
+                    .map_err(|e| e.to_string())?;
+            }
+            Ok(())
+        }
+    }
+    fn finished_chunk(context: &WorkerContext, key: (i32, i32)) -> Chunk {
+        use horizon_world::nbt::Tag;
+        let mut chunk = Chunk::empty(key.0, key.1);
+        chunk.fresh = true;
+        let chest = context
+            .assets
+            .registry
+            .default_state("minecraft:chest")
+            .unwrap()
+            .0;
+        chunk.set(1, 70, 1, chest);
+        let mut slots = vec![None; 27];
+        slots[0] = Some(crate::items::ItemStack {
+            item: "minecraft:stone".into(),
+            count: 3,
+            damage: 0,
+            extra: None,
+        });
+        chunk.block_entities.push((
+            (key.0 * 16 + 1, 70, key.1 * 16 + 1),
+            crate::containers::BlockEntity::Chest(slots),
+        ));
+        chunk.block_names.push((
+            (key.0 * 16 + 1, 70, key.1 * 16 + 1),
+            "Retained chest".into(),
+        ));
+        chunk.entities.push(Tag::compound([
+            ("id", Tag::String("minecraft:pig".into())),
+            ("Sentinel", Tag::Int(99)),
+        ]));
+        let mut extras = crate::chunk::ChunkExtras::default();
+        extras.root.insert("diagnostic_extra".into(), Tag::Int(123));
+        extras
+            .root
+            .insert("entities".into(), Tag::List(chunk.entities.clone()));
+        chunk.saved = Some(Arc::new(extras));
+        chunk.postprocess.push([key.0 * 16 + 1, 70, key.1 * 16 + 1]);
+        chunk
+    }
+    fn finished_scratch(label: &str) -> std::path::PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "horizon-finished-{}-{label}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        dir
+    }
+    fn persistent_finished(
+        save: Arc<crate::save::SaveDir>,
+        context: &Arc<WorkerContext>,
+    ) -> crate::save::Persistent<crate::testgen::TestTerrain> {
+        crate::save::Persistent {
+            inner: Arc::new(
+                crate::testgen::TestTerrain::new(context.assets.registry, &context.biomes).unwrap(),
+            ),
+            save,
+            registry: context.assets.clone(),
+            biomes: context.biomes.clone(),
+        }
+    }
     fn finish_polling(streaming: &mut Streaming, world: &mut World) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while !streaming.poll_save(world).unwrap() {
@@ -2226,7 +2338,7 @@ mod tests {
         *probe.failure.lock().unwrap() = Some("direct proto failure".into());
         let error = streaming.save(&mut world, true).unwrap_err().to_string();
         assert_eq!(error, "direct proto failure");
-        assert_eq!(streaming.proto_save_error(), Some(error.as_str()));
+        assert_eq!(streaming.generation_save_error(), Some(error.as_str()));
         assert!(streaming.written.contains(&(0, 0)));
         assert_eq!(
             *streaming.protos[&(0, 0)]
@@ -2305,7 +2417,7 @@ mod tests {
         assert!(!streaming.written.contains(&(1, 0)));
         streaming.saving = 1;
         streaming.receive_saved(vec![((2, 0), Box::new(23u64))], Err("later failure".into()));
-        assert_eq!(streaming.proto_save_error(), Some("first failure"));
+        assert_eq!(streaming.generation_save_error(), Some("first failure"));
         assert!(streaming.written.contains(&(2, 0)));
     }
 
@@ -2431,6 +2543,186 @@ mod tests {
             streaming.save(&mut world, false).unwrap_err().to_string(),
             "worker proto failure"
         );
+    }
+
+    #[test]
+    #[ignore = "owned prepared resources: immutable failed finished handoff"]
+    fn finished_save_failure_retains_exact_payload_before_or_after_partial_enqueue() {
+        for partial in [false, true] {
+            let (mut streaming, _, _, _) = save_probe(false);
+            let context = streaming.shared.context.read().unwrap().clone();
+            let dir = finished_scratch(if partial { "partial" } else { "before" });
+            let save = Arc::new(crate::save::SaveDir::new(dir.clone()));
+            // Initialize the existing POI tables without enqueueing any data.
+            ChunkGenerator::save_protos(&persistent_finished(save.clone(), &context), &[]).unwrap();
+            let probe = Arc::new(FinishedProbe {
+                context: context.clone(),
+                save: partial.then(|| save.clone()),
+                failure: Mutex::new(Some("finished enqueue failed".into())),
+                seen: Mutex::new(Vec::new()),
+            });
+            streaming.saves = probe.clone();
+            streaming.mesh = false;
+            let mut world = save_world();
+            let key = (40, 40);
+            #[cfg(feature = "paired-packages")]
+            world
+                .enable_residency_observer(
+                    crate::mutation_observer::AuthorityScope::new(7, "minecraft:overworld")
+                        .unwrap(),
+                    [key, (41, 40)],
+                    8,
+                )
+                .unwrap();
+            let chunk = finished_chunk(&context, key);
+            let extras = chunk.saved.as_ref().unwrap().clone();
+            let chest_id = chunk.get(1, 70, 1);
+            streaming.receive_generated(chunk, &mut world);
+            assert_eq!(streaming.failed_finished.len(), 1);
+            let held = &streaming.failed_finished[0];
+            assert!(std::sync::Weak::ptr_eq(
+                &probe.seen.lock().unwrap()[0],
+                &Arc::downgrade(held)
+            ));
+            assert_eq!(held.get(1, 70, 1), chest_id);
+            assert_eq!(held.entities.len(), 1);
+            assert_eq!(held.block_names[0].1, "Retained chest");
+            let crate::containers::BlockEntity::Chest(slots) = &held.block_entities[0].1 else {
+                panic!("native chest was lost")
+            };
+            assert_eq!(slots[0].as_ref().unwrap().count, 3);
+            assert!(Arc::ptr_eq(held.saved.as_ref().unwrap(), &extras));
+            assert_eq!(held.postprocess, [[641, 70, 641]]);
+            assert!(world.chunks.is_empty());
+            assert!(world.loaded_entities.is_empty());
+            assert_eq!(world.block_entities.iter_mut().count(), 0);
+            save.flush().unwrap();
+            assert_eq!(
+                save.load(key.0, key.1, context.assets.registry, &context.biomes)
+                    .is_some(),
+                partial
+            );
+            assert!(save.load_entities(key.0, key.1).is_empty());
+            *probe.failure.lock().unwrap() = None;
+            streaming.finishing.insert((41, 40));
+            streaming.saving = 1;
+            streaming.protos.insert((3, 3), None);
+            streaming.deferred.extend([
+                Done::Generated(finished_chunk(&context, (41, 40))),
+                Done::Saved(
+                    vec![((3, 3), Box::new(22u64))],
+                    Err("later proto failure".into()),
+                ),
+            ]);
+            streaming.update(&mut world);
+            assert_eq!(probe.seen.lock().unwrap().len(), 1);
+            assert_eq!(streaming.failed_finished.len(), 2);
+            assert_eq!(streaming.saving, 0);
+            assert!(streaming.finishing.is_empty());
+            assert!(streaming.protos[&(3, 3)].is_some());
+            assert!(streaming.written.contains(&(3, 3)));
+            assert!(streaming.generating.is_empty());
+            assert_eq!(streaming.decorating, 0);
+            assert!(world.chunks.is_empty());
+            assert_eq!(
+                streaming.generation_save_error(),
+                Some("finished enqueue failed")
+            );
+            assert!(streaming.save(&mut world, true).is_err());
+            assert!(streaming.save(&mut world, false).is_err());
+            assert!(streaming.poll_save(&mut world).is_err());
+            #[cfg(feature = "paired-packages")]
+            assert!(world.drain_residency().unwrap().unwrap().is_empty());
+            drop(streaming);
+            drop(probe);
+            drop(save);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    #[ignore = "owned prepared resources: prior generation fault keeps finished snapshots"]
+    fn finished_save_prior_fault_skips_callback_without_changing_first_error() {
+        let (mut streaming, _, _, _) = save_probe(false);
+        let context = streaming.shared.context.read().unwrap().clone();
+        let probe = Arc::new(FinishedProbe {
+            context: context.clone(),
+            save: None,
+            failure: Mutex::new(None),
+            seen: Mutex::new(Vec::new()),
+        });
+        streaming.saves = probe.clone();
+        streaming.fail_generation_save("prior proto failure".into());
+        let mut world = save_world();
+        streaming.receive_generated(finished_chunk(&context, (40, 40)), &mut world);
+        assert_eq!(streaming.failed_finished.len(), 1);
+        assert!(probe.seen.lock().unwrap().is_empty());
+        assert!(world.chunks.is_empty());
+        assert_eq!(
+            streaming.generation_save_error(),
+            Some("prior proto failure")
+        );
+    }
+
+    #[test]
+    #[ignore = "owned prepared resources: finished Persistent handoff"]
+    fn finished_save_success_preserves_entities_and_extras_in_existing_formats() {
+        let (mut streaming, _, _, _) = save_probe(false);
+        let context = streaming.shared.context.read().unwrap().clone();
+        let dir = finished_scratch("success");
+        let save = Arc::new(crate::save::SaveDir::new(dir.clone()));
+        streaming.saves = Arc::new(persistent_finished(save.clone(), &context));
+        let mut world = save_world();
+        let key = (40, 40);
+        let chunk = finished_chunk(&context, key);
+        let entities = chunk.entities.clone();
+        streaming.receive_generated(chunk, &mut world);
+        assert!(streaming.failed_finished.is_empty());
+        assert!(streaming.generation_save_error().is_none());
+        assert!(world.chunks.is_empty());
+        assert_eq!(save.load_entities(key.0, key.1), entities);
+        save.flush().unwrap();
+        let reopened = crate::save::SaveDir::new(dir.clone());
+        assert_eq!(reopened.load_entities(key.0, key.1), entities);
+        // Check the actual record: decoding a Chunk filters legacy keys and
+        // cannot establish that duplicate entity data was absent on disk.
+        let raw = {
+            let path = dir
+                .join("region")
+                .join(format!("r.{}.{}.mca", key.0 >> 5, key.1 >> 5));
+            let mut file = horizon_world::region::RegionFile::open(path).unwrap();
+            file.read(horizon_core::position::ChunkPos::new(key.0, key.1))
+                .unwrap()
+                .unwrap()
+                .nbt(horizon_world::nbt::Limits::default())
+                .unwrap()
+        };
+        assert!(
+            raw.tag.get("entities").is_none(),
+            "legacy entities were duplicated into the raw region record"
+        );
+        assert_eq!(
+            raw.tag.get("diagnostic_extra"),
+            Some(&horizon_world::nbt::Tag::Int(123))
+        );
+        let region = reopened
+            .load(key.0, key.1, context.assets.registry, &context.biomes)
+            .unwrap();
+        assert_eq!(
+            region
+                .saved
+                .as_ref()
+                .unwrap()
+                .root
+                .get(&"diagnostic_extra".into()),
+            Some(&horizon_world::nbt::Tag::Int(123))
+        );
+        assert_eq!(region.block_entities.len(), 1);
+        drop(region);
+        drop(reopened);
+        drop(streaming);
+        drop(save);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[cfg(feature = "paired-packages")]

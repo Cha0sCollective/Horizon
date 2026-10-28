@@ -109,8 +109,9 @@ impl ChunkGenerator for Recorder {
         }
         Ok(())
     }
-    fn save_finished(&self, chunk: Chunk) {
-        self.save_chunk(&chunk);
+    fn save_finished(&self, chunk: &Arc<Chunk>) -> Result<(), String> {
+        self.save_chunk(chunk);
+        Ok(())
     }
 }
 
