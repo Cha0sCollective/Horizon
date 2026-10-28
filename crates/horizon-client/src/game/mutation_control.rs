@@ -1,5 +1,5 @@
-//! Explicit local diagnostic fixture for passive resident mutation observations.
-//! No observer is enabled by normal startup, or by a remote player/guest.
+//! Local host-fixture routing and passive resident mutation observations.
+//! Normal startup and remote players never enable these diagnostics.
 use super::{Dim, Game};
 use horizon_client::{Result, mutation_observer::AuthorityScope};
 use horizon_world::registry::BlockStateId;
@@ -25,11 +25,12 @@ fn next_instance(counter: &AtomicU64) -> Result<u64> {
 impl Game<'_> {
     pub(super) fn observation_control(&mut self, words: &[&str]) -> Result<Value> {
         if words.get(1) == Some(&"local-status") && words.len() == 2 {
-            return Ok(if words.first() == Some(&"mutations") {
-                self.mutation_status()
-            } else {
-                self.residency_status()
-            });
+            return match words.first() {
+                Some(&"mutations") => Ok(self.mutation_status()),
+                Some(&"residency") => Ok(self.residency_status()),
+                Some(&"counter-trial") => Ok(self.counter_trial_status()),
+                _ => Err("unknown host diagnostic".into()),
+            };
         }
         if let Some(server) = &self.integrated {
             let owned: Vec<String> = words.iter().map(|word| (*word).to_owned()).collect();
@@ -79,6 +80,7 @@ impl Game<'_> {
         match words.first() {
             Some(&"mutations") => self.mutation_local(words),
             Some(&"residency") => self.residency_local(words),
+            Some(&"counter-trial") => self.counter_trial_control(words),
             _ => Err("unknown observation command".into()),
         }
     }

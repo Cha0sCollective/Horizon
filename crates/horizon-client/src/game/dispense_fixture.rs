@@ -118,6 +118,8 @@ impl Game<'_> {
     }
 
     fn fixture_reset(&mut self, seed: i64) {
+        #[cfg(feature = "paired-packages")]
+        self.retire_counter_trial("dispenser-fixture-reset");
         self.world = World::new(self.res.facts().air, seed);
         // The oracle level is plains everywhere (bone meal's flowers, freezing).
         let plains = u32::from(self.res.biomes().id("minecraft:plains"));

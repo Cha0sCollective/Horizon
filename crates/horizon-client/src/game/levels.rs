@@ -129,6 +129,15 @@ impl Levels {
 }
 
 impl Game<'_> {
+    /// End every owned trial without swapping levels or changing save results.
+    #[cfg(feature = "paired-packages")]
+    pub(super) fn retire_all_counter_trials(&mut self, boundary: &str) {
+        self.retire_counter_trial(boundary);
+        for parked in self.levels.parked.values_mut() {
+            super::counter_control::retire_world_counter(&mut parked.world, boundary);
+        }
+    }
+
     /// A new level for `dim`, opened from the save (`MinecraftServer.createLevels`).
     fn open_level(&self, dim: Dim) -> Result<Parked> {
         let (streaming, save, locator) = super::world_loading::make_streaming(
@@ -473,6 +482,10 @@ impl Game<'_> {
             self.enter_level(None, dim)?;
             self.save_level(true)?;
             self.enter_level(None, back)?;
+            #[cfg(feature = "paired-packages")]
+            if let Some(parked) = self.levels.parked.get_mut(&dim) {
+                super::counter_control::retire_world_counter(&mut parked.world, "idle-level-close");
+            }
             self.levels.parked.remove(&dim);
         }
         Ok(())

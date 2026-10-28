@@ -307,6 +307,8 @@ impl Game<'_> {
     }
 
     fn sculk_fixture_reset(&mut self, s: &Scenario) -> Result<()> {
+        #[cfg(feature = "paired-packages")]
+        self.retire_counter_trial("sculk-fixture-reset");
         self.world = World::new(self.res.facts().air, 0);
         let plains = u32::from(self.res.biomes().id("minecraft:plains"));
         let layers = [

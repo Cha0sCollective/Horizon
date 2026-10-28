@@ -36,6 +36,8 @@ mod composter;
 mod consume;
 mod control;
 mod copper_golems;
+#[cfg(feature = "paired-packages")]
+mod counter_control;
 mod creaking;
 mod creative_hotbar;
 mod creatures;
@@ -5432,6 +5434,8 @@ impl Game<'_> {
             self.use_with_hand()?;
             self.use_delay = 4;
         }
+        #[cfg(feature = "paired-packages")]
+        self.tick_counter_trial(running);
         Ok(())
     }
     /// Keep the held-key state of toggled sneak and sprint in step with their mapping.
@@ -8941,6 +8945,8 @@ impl Game<'_> {
         self.pitch = pitch;
         self.selected = level.selected_slot.clamp(0, 8) as usize;
         self.streaming = streaming;
+        #[cfg(feature = "paired-packages")]
+        self.retire_counter_trial("world-open");
         self.world = world;
         self.inventory = inventory;
         self.save = save;
@@ -9073,6 +9079,8 @@ impl Game<'_> {
         // The sculk tables' watched blocks are built once per game.
         world.watched = std::mem::take(&mut self.world.watched);
         self.streaming = streaming;
+        #[cfg(feature = "paired-packages")]
+        self.retire_counter_trial("dimension-switch");
         self.world = world;
         self.save = save;
         self.dim = target;
@@ -9234,6 +9242,19 @@ impl Game<'_> {
     }
 
     pub(super) fn save_for_exit(&mut self) -> Result<()> {
+        #[cfg(feature = "paired-packages")]
+        {
+            let result = self.save_for_exit_attempt();
+            self.retire_all_counter_trials("application-exit");
+            result
+        }
+        #[cfg(not(feature = "paired-packages"))]
+        {
+            self.save_for_exit_attempt()
+        }
+    }
+
+    fn save_for_exit_attempt(&mut self) -> Result<()> {
         // Native application termination can bypass CloseRequested. Finish any
         // save screen synchronously here, before the process can go away.
         while self.pending_save.is_some() {
@@ -9284,6 +9305,8 @@ impl Game<'_> {
         self.boss_overlay.reset();
         self.bosses = Default::default();
         self.streaming.paused = true;
+        #[cfg(feature = "paired-packages")]
+        self.retire_counter_trial("world-close");
         self.world = World::new(self.res.facts().air, 0);
         self.player = None;
         self.sleeping = None;
@@ -14737,7 +14760,10 @@ fn start_game<'a>(
         return Ok(None);
     }
     if game.options.execution_role == execution_role::ExecutionRole::DedicatedServer {
-        game.run_dedicated()?;
+        let result = game.run_dedicated();
+        #[cfg(feature = "paired-packages")]
+        game.retire_all_counter_trials("dedicated-exit");
+        result?;
         return Ok(None);
     }
     match game.options.world.clone() {

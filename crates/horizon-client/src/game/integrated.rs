@@ -738,7 +738,16 @@ fn serve(
     ready: &Sender<Ready>,
 ) -> Result<()> {
     let mut server = server_game(res, pack, options, settings)?;
-    server.run_integrated(launch, flags, tasks, ready)
+    #[cfg(feature = "paired-packages")]
+    {
+        let result = server.run_integrated(launch, flags, tasks, ready);
+        server.retire_all_counter_trials("integrated-exit");
+        result
+    }
+    #[cfg(not(feature = "paired-packages"))]
+    {
+        server.run_integrated(launch, flags, tasks, ready)
+    }
 }
 
 /// Component oracles supply their own synthetic levels and entity phases.
@@ -760,9 +769,21 @@ impl Game<'_> {
             .spawn(move || {
                 let run = || -> Result<()> {
                     let mut server = server_game(&res, pack, options, settings)?;
-                    match fixture {
-                        ComponentHarness::Dispenser(spec) => server.dispense_fixture(&spec),
-                        ComponentHarness::Sculk(spec) => server.sculk_fixture(&spec),
+                    #[cfg(feature = "paired-packages")]
+                    {
+                        let result = match fixture {
+                            ComponentHarness::Dispenser(spec) => server.dispense_fixture(&spec),
+                            ComponentHarness::Sculk(spec) => server.sculk_fixture(&spec),
+                        };
+                        server.retire_all_counter_trials("component-harness-exit");
+                        result
+                    }
+                    #[cfg(not(feature = "paired-packages"))]
+                    {
+                        match fixture {
+                            ComponentHarness::Dispenser(spec) => server.dispense_fixture(&spec),
+                            ComponentHarness::Sculk(spec) => server.sculk_fixture(&spec),
+                        }
                     }
                 };
                 run().map_err(|e| e.to_string())

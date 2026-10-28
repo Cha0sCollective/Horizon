@@ -242,7 +242,7 @@ impl Game<'_> {
             "sculk" => Ok(Some(self.sculk_command(&words)?)),
             "status" => Ok(Some(self.control_status())),
             #[cfg(feature = "paired-packages")]
-            "mutations" | "residency" => {
+            "mutations" | "residency" | "counter-trial" => {
                 self.require_world()?;
                 Ok(Some(self.observation_control(&words)?))
             }
