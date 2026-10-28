@@ -216,6 +216,7 @@ pub(super) fn spawn_loader(
     let settings = settings.clone();
     let vanilla_root = vanilla_root.to_path_buf();
     let dev_mods = options.dev_mods.clone();
+    let mod_packages = options.mod_packages.clone();
     let progress = progress.clone();
     let handle = std::thread::Builder::new()
         .name("resource-loader".into())
@@ -226,23 +227,26 @@ pub(super) fn spawn_loader(
                     pack_error = Some(error.to_string());
                     vanilla_root.clone()
                 });
-            let root = mods::content_root(&root, &settings.mods.enabled, &dev_mods);
-            let result = load_resources(
-                root,
-                &vanilla_root,
-                &settings,
-                started,
-                true,
-                &progress,
-                &mut |gui, root| {
-                    let _ = sender.send(LoaderMsg::Ui(gui, root.to_path_buf()));
-                },
-            )
-            .map(|mut loaded| {
-                loaded.pack_error = loaded.pack_error.or(pack_error);
-                loaded
-            })
-            .map_err(|error| error.to_string());
+            let result =
+                mods::content_root(&root, &settings.mods.enabled, &dev_mods, &mod_packages)
+                    .and_then(|root| {
+                        load_resources(
+                            root,
+                            &vanilla_root,
+                            &settings,
+                            started,
+                            true,
+                            &progress,
+                            &mut |gui, root| {
+                                let _ = sender.send(LoaderMsg::Ui(gui, root.to_path_buf()));
+                            },
+                        )
+                    })
+                    .map(|mut loaded| {
+                        loaded.pack_error = loaded.pack_error.or(pack_error);
+                        loaded
+                    })
+                    .map_err(|error| error.to_string());
             let _ = sender.send(LoaderMsg::Done(result));
         })?;
     Ok((receiver, handle))

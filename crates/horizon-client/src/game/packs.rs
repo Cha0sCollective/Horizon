@@ -160,6 +160,7 @@ impl Game<'_> {
             &self.server_packs.active,
             &self.settings.mods.enabled,
             &self.options.dev_mods,
+            &self.options.mod_packages,
             &self.pack.assets,
             &self.res,
             &self.pack.context,
@@ -267,6 +268,7 @@ pub(super) fn stage_pack(
     server: &[Pack],
     mods_enabled: &BTreeSet<String>,
     dev_mods: &[PathBuf],
+    mod_packages: &super::mod_packages::Packages,
     assets: &Arc<Assets>,
     res: &Resources,
     context: &WorkerContext,
@@ -275,7 +277,7 @@ pub(super) fn stage_pack(
     progress: &super::Progress,
 ) -> horizon_client::Result<StagedPack> {
     let root = startup_root(vanilla_root, selected, server)?;
-    let root = super::mods::content_root(&root, mods_enabled, dev_mods);
+    let root = super::mods::content_root(&root, mods_enabled, dev_mods, mod_packages)?;
     progress.set(1);
     let render = Arc::new(assets.reload(&root)?);
     let mut atlas = HudAtlas::build_over(&root, vanilla_root)?;

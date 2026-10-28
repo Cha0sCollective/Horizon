@@ -1073,6 +1073,7 @@ impl Game<'_> {
     }
     /// IntegratedServer.publishServer without the screen's announcement.
     pub(super) fn lan_start(&mut self, settings: LanSettings) -> Result<()> {
+        self.options.mod_packages.external_network()?;
         if self.lan.is_some() || self.remote.is_some() || self.title.is_some() {
             return Err("already open".into());
         }
@@ -1113,6 +1114,9 @@ impl Game<'_> {
         config: HubConfig,
         host: Option<u128>,
     ) -> Result<()> {
+        if net.listen {
+            self.options.mod_packages.external_network()?;
+        }
         let sync = sync_data(&self.options.resources)?;
         let biome_names: Vec<String> = self
             .res

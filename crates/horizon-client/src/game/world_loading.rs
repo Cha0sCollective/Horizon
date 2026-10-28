@@ -46,6 +46,7 @@ impl WorldRequest {
         options: &Options,
         settings: &Settings,
     ) -> Result<PreparedWorld> {
+        options.mod_packages.check_world(&self.save_root)?;
         // Before any chunk is read: a loaded container with a loot table is rolled as its chunk
         // is decoded (`save::roll_loaded_loot`), and the spawn chunks are read while the world
         // opens. Every world opens here: in-frame, on the server thread, on a dedicated server.
@@ -63,6 +64,7 @@ impl WorldRequest {
         horizon_client::save::upgrade_older_world(&save_root)?;
         horizon_client::save::migrate_legacy(&save_root)?;
         let session_lock = horizon_client::save::SessionLock::acquire(&save_root)?;
+        options.mod_packages.record_world(&save_root)?;
         // RandomSequences: the world's data/minecraft/random_sequences.dat.
         let rand_sequences =
             horizon_client::save::read_dat(&save_root.join("data/minecraft/random_sequences.dat"))

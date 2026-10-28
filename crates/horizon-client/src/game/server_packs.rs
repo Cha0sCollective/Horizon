@@ -436,14 +436,25 @@ impl Game<'_> {
             self.pack.context.clone(),
         );
         let (unicode, japanese) = (self.settings.force_unicode, self.settings.japanese_glyphs);
+        let mod_packages = self.options.mod_packages.clone();
         let progress = Progress::with(&RELOAD_LINES);
         let worker = progress.clone();
         let handle = std::thread::Builder::new()
             .name("server-pack-reload".into())
             .spawn(move || {
                 super::packs::stage_pack(
-                    &vanilla, &selected, &server, &mods, &dev_mods, &assets, &res, &context,
-                    unicode, japanese, &worker,
+                    &vanilla,
+                    &selected,
+                    &server,
+                    &mods,
+                    &dev_mods,
+                    &mod_packages,
+                    &assets,
+                    &res,
+                    &context,
+                    unicode,
+                    japanese,
+                    &worker,
                 )
                 .map_err(|e| e.to_string())
             });

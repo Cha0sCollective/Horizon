@@ -295,6 +295,13 @@ impl Game<'_> {
         tasks: Receiver<Task>,
         ready: &Sender<Ready>,
     ) -> Result<()> {
+        // Required package activation must succeed before any editable world is loaded.
+        if self.options.mod_packages.has_pairs() {
+            self.mods.dev = self.options.dev_mods.clone();
+            self.start_mods();
+        }
+        #[cfg(feature = "mods")]
+        self.options.mod_packages.check_running(&self.mods.mods)?;
         self.load_world(WorldRequest::new(
             &launch.folder,
             launch.name.as_deref(),
@@ -304,8 +311,10 @@ impl Game<'_> {
         )?)?;
         let saved = Box::new(self.level.clone());
         // IntegratedServer runs the server mods; the window the client mods.
-        self.mods.dev = self.options.dev_mods.clone();
-        self.start_mods();
+        if !self.options.mod_packages.has_pairs() {
+            self.mods.dev = self.options.dev_mods.clone();
+            self.start_mods();
+        }
         // Math.max(2, options.renderDistance): past vanilla's 32 when the
         // window's render distance is (Horizon's options go to 64).
         let view_distance = self.settings.render_distance.max(2);
@@ -561,6 +570,10 @@ impl Game<'_> {
     /// one) and announce the world. The socket is bound at once so a busy
     /// port fails here; the hub starts listening once it is at hand.
     pub(super) fn publish(&mut self, settings: LanSettings) -> std::result::Result<u16, String> {
+        self.options
+            .mod_packages
+            .external_network()
+            .map_err(|e| e.to_string())?;
         let Some(s) = self.serving.as_mut() else {
             return Err("not an integrated server".into());
         };

@@ -198,9 +198,30 @@ pub(super) fn content_root(
     root: &std::path::Path,
     enabled: &std::collections::BTreeSet<String>,
     dev: &[std::path::PathBuf],
-) -> std::path::PathBuf {
+    packages: &super::mod_packages::Packages,
+) -> horizon_client::Result<std::path::PathBuf> {
     use horizon_client::mod_content::{self, ContentMod};
     use horizon_mods::{Capability, Content, Package};
+    #[cfg(feature = "paired-packages")]
+    if let Some(catalog) = packages.catalog() {
+        let mods: Vec<ContentMod> = catalog
+            .entries()
+            .iter()
+            .filter_map(|entry| {
+                Some(ContentMod {
+                    id: entry.manifest.as_ref()?.id.clone(),
+                    content: entry.content.as_ref()?.clone(),
+                })
+            })
+            .collect();
+        return mod_content::resource_root(
+            root,
+            &mods,
+            &std::env::current_dir()?.join(".horizon-cache"),
+        );
+    }
+    #[cfg(not(feature = "paired-packages"))]
+    let _ = packages;
     let here = std::env::current_dir().unwrap_or_default();
     let mut paths = horizon_mods::find(&here.join(mod_list::DIR));
     paths.retain(|p| !dev.contains(p));
@@ -237,22 +258,24 @@ pub(super) fn content_root(
             Err(e) => log::warn!("Horizon: mod {} content not loaded: {e}", m.id),
         }
     }
-    match mod_content::resource_root(root, &mods, &here.join(".horizon-cache")) {
-        Ok(out) => {
-            if out != root {
-                log::info!(
-                    "Horizon: content from {} mod(s) in {}",
-                    mods.len(),
-                    out.display()
-                );
+    Ok(
+        match mod_content::resource_root(root, &mods, &here.join(".horizon-cache")) {
+            Ok(out) => {
+                if out != root {
+                    log::info!(
+                        "Horizon: content from {} mod(s) in {}",
+                        mods.len(),
+                        out.display()
+                    );
+                }
+                out
             }
-            out
-        }
-        Err(e) => {
-            log::warn!("Horizon: content mods not loaded: {e}");
-            root.to_owned()
-        }
-    }
+            Err(e) => {
+                log::warn!("Horizon: content mods not loaded: {e}");
+                root.to_owned()
+            }
+        },
+    )
 }
 
 /// A build without the `mods` feature: no mod runs.
@@ -304,6 +327,26 @@ impl Game<'_> {
             .collect();
         let enabled = &self.settings.mods.enabled;
         let on = |id: &str| enabled.contains(id) || dev_ids.iter().any(|d| d == id);
+        #[cfg(feature = "paired-packages")]
+        let mods = if let Some(catalog) = self.options.mod_packages.catalog() {
+            let paths: Vec<_> = catalog.entries().iter().map(|e| e.path.clone()).collect();
+            let on = |id: &str| {
+                catalog
+                    .entries()
+                    .iter()
+                    .any(|e| e.enabled && e.manifest.as_ref().is_some_and(|m| m.id == id))
+            };
+            Mods::load_for_with_prepared(
+                self.mod_runs(),
+                &paths,
+                catalog.prepared(),
+                on,
+                vanilla_command,
+            )
+        } else {
+            Mods::load_for(self.mod_runs(), &paths, on, vanilla_command)
+        };
+        #[cfg(not(feature = "paired-packages"))]
         let mods = Mods::load_for(self.mod_runs(), &paths, on, vanilla_command);
         self.mods.mods = mods;
         let chosen = &self.settings.mods;
@@ -352,11 +395,17 @@ impl Game<'_> {
                     };
                 };
                 // What it may do first: the row cuts long descriptions.
-                let may: Vec<&str> = m.capabilities.iter().map(|c| c.describe()).collect();
+                let may: Vec<&str> = e.capabilities().iter().map(|c| c.describe()).collect();
                 let may = if may.is_empty() {
                     "Asks for nothing.".to_owned()
                 } else {
                     format!("May {}.", may.join(", "))
+                };
+                #[cfg(feature = "paired-packages")]
+                let may = if self.options.mod_packages.catalog().is_some() {
+                    format!("Restart to apply package selection changes. {may}")
+                } else {
+                    may
                 };
                 Installed {
                     id: m.id.clone(),
@@ -396,6 +445,12 @@ impl Game<'_> {
     /// After the options changed: restart the mods if the list of the ones
     /// turned on did.
     pub(super) fn sync_mods(&mut self) {
+        #[cfg(feature = "paired-packages")]
+        if self.options.mod_packages.catalog().is_some() {
+            // Settings retain the requested selection for the next process.
+            // This process and its server keep the startup registry owners.
+            return;
+        }
         let running: Vec<&str> = self
             .mods
             .mods

@@ -112,6 +112,7 @@ mod mod_browser;
 #[cfg(feature = "mods")]
 mod mod_browser_recipes;
 mod mod_input;
+mod mod_packages;
 #[cfg(feature = "mods")]
 mod mod_recipes;
 mod mod_render;
@@ -322,6 +323,7 @@ struct Options {
     benchmark: Option<String>,
     /// `--dev-mod PATH` (repeatable): mods always on and reloaded when rebuilt.
     dev_mods: Vec<PathBuf>,
+    mod_packages: mod_packages::Packages,
     /// Single player runs on an integrated server thread (game/integrated.rs),
     /// as vanilla's does: the default. `--in-frame` (or `--no-server-thread`,
     /// or `HORIZON_SERVER_THREAD=0`) runs the world in the frame instead.
@@ -380,6 +382,7 @@ impl Options {
             dedicated: None,
             benchmark: None,
             dev_mods: Vec::new(),
+            mod_packages: mod_packages::Packages::default(),
             server_thread: std::env::var("HORIZON_SERVER_THREAD").map_or(true, |v| v != "0"),
             execution_role: execution_role::ExecutionRole::Client,
         };
@@ -8803,6 +8806,8 @@ impl Game<'_> {
         create: Option<&horizon_client::title::WorldOptions>,
     ) -> Result<()> {
         world_loading::world_data_used();
+        #[cfg(feature = "mods")]
+        self.options.mod_packages.check_running(&self.mods.mods)?;
         if self.defer_world_entry(PendingWorldEntry::Local {
             folder: folder.to_owned(),
             name: name.map(str::to_owned),
@@ -14692,6 +14697,8 @@ fn start_game<'a>(
         game.mods.dev = game.options.dev_mods.clone();
         game.start_moved_extras();
         game.start_mods();
+        #[cfg(feature = "mods")]
+        game.options.mod_packages.check_running(&game.mods.mods)?;
     }
     game.start_agent_control()?;
     if let Some(scenario) = game.options.benchmark.clone() {
@@ -15210,6 +15217,16 @@ pub fn run() -> Result<()> {
     horizon_client::spans::enable(options.spikes.is_some());
     let vanilla_root = options.resources.clone();
     let early_settings = Settings::load(&std::env::current_dir()?.join("options.txt"));
+    options.mod_packages =
+        mod_packages::Packages::read(&early_settings.mods.enabled, &options.dev_mods)?;
+    if options.benchmark.is_some() && options.mod_packages.has_pairs() {
+        return Err(
+            "paired packages are excluded from the unmodified-engine benchmark path".into(),
+        );
+    }
+    if options.server.is_some() || options.dedicated.is_some() {
+        options.mod_packages.external_network()?;
+    }
     // "Playing Horizon" on Discord: never for a server; an automated run only talks to a test's fake Discord.
     if options.dedicated.is_none() {
         let automated = options.benchmark.is_some()
@@ -15235,7 +15252,8 @@ pub fn run() -> Result<()> {
         &options.resources,
         &early_settings.mods.enabled,
         &options.dev_mods,
-    );
+        &options.mod_packages,
+    )?;
     let loaded = load_resources(
         options.resources.clone(),
         &vanilla_root,
