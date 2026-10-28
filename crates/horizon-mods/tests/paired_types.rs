@@ -102,7 +102,7 @@ fn both_worlds_typecheck_without_calling_unreachable_dummy_functions() {
 #[test]
 fn matching_export_names_with_wrong_function_types_are_refused() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../horizon-mod-sdk/wit/horizon.wit");
-    let wit = fs::read_to_string(path).unwrap();
+    let wit = fs::read_to_string(path).unwrap().replace("\r\n", "\n");
     let client = dummy("horizon-mod", false);
     let server = dummy("horizon-server-mod", false);
     let mut mods = Mods::default();
@@ -185,4 +185,23 @@ fn wrong_worlds_undeclared_imports_and_newer_functions_are_refused() {
     );
     assert!(mods.entries().is_empty());
     assert!(mods.drain().is_empty());
+}
+
+#[test]
+fn optional_ui_callbacks_are_checked_before_any_instance_exists() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../horizon-mod-sdk/wit/horizon.wit");
+    let wit = fs::read_to_string(path).unwrap();
+    let server = dummy("horizon-server-mod", false);
+    for (name, old) in [
+        ("select", "select: func(id: u32, row: u32);"),
+        ("closed", "closed: func();"),
+        ("settings-opened", "settings-opened: func();"),
+    ] {
+        let wrong = wit.replace(old, &format!("{name}: func(unexpected: f64) -> u32;"));
+        let (_dir, pair) = prepared(&encode_dummy("horizon-ui-mod", &wrong), &server, DESCR);
+        let mut mods = Mods::default();
+        assert!(matches!(mods.preflight_pair(&pair), Err(e) if e.contains(name)));
+        assert!(mods.entries().is_empty());
+        assert!(mods.drain().is_empty());
+    }
 }

@@ -77,6 +77,9 @@ fn checked_component(
     }
     let pre = linker.instantiate_pre(&component).map_err(|e| reason(&e))?;
     check_callback_types(&component, &pre, manifest.side)?;
+    if manifest.side == Side::Client {
+        check_optional_callback_types(&component, &pre)?;
+    }
     if manifest.side == Side::Server {
         server_bindings::HorizonServerModPre::new(pre).map_err(|e| reason(&e))?;
     } else {
@@ -141,6 +144,41 @@ fn check_callback_types(
         );
         check!("chat", (String,), ());
     }
+    Ok(())
+}
+
+/// Optional callback interfaces are optional as a whole, never optional types.
+/// `browser` is import-only; its requests are checked by `instantiate_pre`.
+#[cfg(feature = "paired-packages")]
+fn check_optional_callback_types(
+    component: &Component,
+    pre: &wasmtime::component::InstancePre<State>,
+) -> Result<(), String> {
+    use wasmtime::component::types::ComponentItem;
+    const UI: &str = "horizon:mods/ui-events@0.1.0";
+    let Some(index) = component.get_export_index(None, UI) else {
+        return Ok(());
+    };
+    let context = pre.instance_type();
+    macro_rules! check {
+        ($name:literal, $params:ty) => {{
+            let Some((ComponentItem::ComponentFunc(function), _)) =
+                component.get_export(Some(&index), $name)
+            else {
+                return Err(format!("{UI}.{} is not an exported function", $name));
+            };
+            if function.async_() {
+                return Err(format!("{UI}.{} must be synchronous", $name));
+            }
+            function
+                .typecheck::<$params, ()>(&context)
+                .map_err(|e| format!("{UI}.{}: {e:#}", $name))?;
+        }};
+    }
+    check!("select", (u32, u32));
+    check!("closed", ());
+    check!("settings-opened", ());
+    ui_bindings::UiHostPre::new(pre.clone()).map_err(|e| reason(&e))?;
     Ok(())
 }
 /// Capability `ui`'s world beyond `horizon-mod` (docs/mods.md): a second
@@ -404,9 +442,40 @@ pub struct Entry {
     /// The mod's average time per call of its busiest hook.
     pub cost: Duration,
     run: Option<Running>,
+    /// A paired package's server Store. The primary Store remains its client.
+    /// Legacy server mods keep their original primary Store.
+    paired_server: Option<Running>,
+    #[cfg(feature = "paired-packages")]
+    paired: Option<Arc<crate::paired::PreparedBundle>>,
+    #[cfg(feature = "paired-packages")]
+    paired_capabilities: Vec<crate::Capability>,
     modified: Option<SystemTime>,
 }
 impl Entry {
+    fn runs(&self) -> impl Iterator<Item = &Running> {
+        self.run.iter().chain(self.paired_server.iter())
+    }
+    fn side_run(&self, server: bool) -> Option<&Running> {
+        self.runs().find(|r| r.hooks.server().is_some() == server)
+    }
+    fn side_run_mut(&mut self, server: bool) -> Option<&mut Running> {
+        self.run
+            .iter_mut()
+            .chain(self.paired_server.iter_mut())
+            .find(|r| r.hooks.server().is_some() == server)
+    }
+    /// Every permission this package requests, including both paired sides.
+    pub fn capabilities(&self) -> Vec<crate::Capability> {
+        let mut capabilities = self
+            .manifest
+            .as_ref()
+            .map_or_else(Vec::new, |m| m.capabilities.clone());
+        #[cfg(feature = "paired-packages")]
+        capabilities.extend(&self.paired_capabilities);
+        capabilities.sort_unstable();
+        capabilities.dedup();
+        capabilities
+    }
     /// The running mod has a settings page (capability `ui` set widgets
     /// with `ui.set-settings`, or `input` registered keys the player may
     /// bind there): its row in Options > Mods gains a button.
@@ -428,6 +497,7 @@ struct Running {
     raycasts: bool,
     /// It imports capability `recipes`.
     reads_recipes: bool,
+    world: bool,
 }
 
 /// A running mod's exports and the hooks its `init` asked for.
@@ -592,12 +662,7 @@ impl Mods {
     /// Whether a running mod may use capability `world`: only then is a
     /// view worth lending.
     pub fn wants_world(&self) -> bool {
-        self.entries.iter().any(|e| {
-            e.status == Status::Running
-                && e.manifest
-                    .as_ref()
-                    .is_some_and(|m| m.capabilities.contains(&crate::Capability::World))
-        })
+        self.entries.iter().any(|e| e.runs().any(|r| r.world))
     }
     /// Lends the game's world to capability `world` for the calls until
     /// [`Mods::take_world`]; with none lent, `get-block` finds nothing and
@@ -639,6 +704,11 @@ impl Mods {
                 status: Status::Off,
                 cost: Duration::ZERO,
                 run: None,
+                paired_server: None,
+                #[cfg(feature = "paired-packages")]
+                paired: None,
+                #[cfg(feature = "paired-packages")]
+                paired_capabilities: Vec::new(),
                 modified,
             };
             match Package::read(path) {
@@ -669,6 +739,145 @@ impl Mods {
             mods.entries.push(entry);
         }
         mods
+    }
+
+    /// Starts paired code from the exact snapshots used for content registration.
+    /// Missing snapshots never fall back to reading executable bytes from disk.
+    /// Callers validate the selected catalog before registering any content.
+    #[cfg(feature = "paired-packages")]
+    pub fn load_for_with_prepared(
+        runs: Runs,
+        paths: &[PathBuf],
+        prepared: &std::collections::BTreeMap<PathBuf, Arc<crate::paired::PreparedBundle>>,
+        enabled: impl Fn(&str) -> bool,
+        reserved: impl Fn(&str) -> bool,
+    ) -> Mods {
+        let mut mods = Mods::default();
+        // Reject duplicate selected identities before starting any component.
+        let mut seen = std::collections::BTreeSet::new();
+        let duplicate = paths.iter().find_map(|path| {
+            let id = prepared
+                .get(path)
+                .map(|p| p.bundle().content_owner().id.clone())
+                .or_else(|| Package::read(path).ok().map(|p| p.manifest.id));
+            id.filter(|id| enabled(id) && !seen.insert(id.clone()))
+        });
+        for path in paths {
+            let mut entry = Entry {
+                path: path.clone(),
+                manifest: None,
+                status: Status::Off,
+                cost: Duration::ZERO,
+                run: None,
+                paired_server: None,
+                paired: prepared.get(path).cloned(),
+                modified: modified(path),
+                paired_capabilities: Vec::new(),
+            };
+            if let Some(pair) = entry.paired.clone() {
+                entry.manifest = Some(pair.bundle().content_owner().clone());
+                entry.paired_capabilities = pair_capabilities(pair.bundle());
+                if enabled(&pair.bundle().content_owner().id) {
+                    entry.status = if let Some(id) = &duplicate {
+                        Status::Failed(format!("duplicate selected package id {id}"))
+                    } else {
+                        match mods.start_pair(path, &pair, runs, &reserved) {
+                            Ok((client, server)) => {
+                                entry.run = client;
+                                entry.paired_server = server;
+                                Status::Running
+                            }
+                            Err(e) => Status::Failed(e),
+                        }
+                    };
+                }
+            } else if path.join(crate::paired::DESCRIPTOR).exists() {
+                // A disabled package can be listed from its bounded header. A
+                // selected one must already have an admitted immutable snapshot.
+                match crate::paired::Bundle::read_folder(path) {
+                    Ok(bundle) => {
+                        let on = enabled(&bundle.content_owner().id);
+                        entry.paired_capabilities = pair_capabilities(&bundle);
+                        entry.manifest = Some(bundle.content_owner().clone());
+                        if on {
+                            entry.status = Status::Failed(
+                                "paired snapshot unavailable; restart after validating the package catalog".into());
+                        }
+                    }
+                    Err(e) => entry.status = Status::Failed(e),
+                }
+            } else {
+                match Package::read(path) {
+                    Err(e) => entry.status = Status::Failed(e),
+                    Ok(package) => {
+                        entry.manifest = Some(package.manifest.clone());
+                        if enabled(&package.manifest.id) {
+                            entry.status = if let Some(id) = &duplicate {
+                                Status::Failed(format!("duplicate selected package id {id}"))
+                            } else if !runs.starts(package.manifest.side) {
+                                Status::Elsewhere
+                            } else {
+                                match crate::Content::read(path, &package.manifest)
+                                    .and_then(|_| mods.start(path, &package, &reserved))
+                                {
+                                    Ok(run) => {
+                                        entry.run = run;
+                                        Status::Running
+                                    }
+                                    Err(e) => Status::Failed(e),
+                                }
+                            };
+                        }
+                    }
+                }
+            }
+            mods.entries.push(entry);
+        }
+        mods
+    }
+
+    #[cfg(feature = "paired-packages")]
+    fn start_pair(
+        &mut self,
+        path: &Path,
+        pair: &crate::paired::PreparedBundle,
+        runs: Runs,
+        reserved: &dyn Fn(&str) -> bool,
+    ) -> Result<(Option<Running>, Option<Running>), String> {
+        // Both sides are checked before either Store, start function or init.
+        let checked = self.preflight_pair(pair)?;
+        let client_component = checked.component(Side::Client)?.clone();
+        let server_component = checked.component(Side::Server)?.clone();
+        let plan = pair.bundle().plan(crate::paired::Role::InFrame);
+        let mut client = None;
+        let mut server = None;
+        if runs != Runs::Server {
+            client = Some(self.start_component(
+                path,
+                plan.executables[0].manifest(),
+                &client_component,
+                pair.code(Side::Client)?,
+                Some("client"),
+                reserved,
+            )?);
+        }
+        if runs != Runs::Client {
+            server = Some(self.start_component(
+                path,
+                plan.executables[1].manifest(),
+                &server_component,
+                pair.code(Side::Server)?,
+                Some("server"),
+                reserved,
+            )?);
+        }
+        // Init output stays private until every selected side starts. Storage
+        // is the existing nontransactional settings API, not world persistence.
+        for run in client.iter_mut().chain(server.iter_mut()) {
+            self.out.append(&mut run.store.data_mut().out);
+        }
+        self.generation += 1;
+        Ok((client, server))
     }
 
     fn engine(&mut self) -> Result<&(Engine, Linker<State>), String> {
@@ -710,25 +919,12 @@ impl Mods {
         };
         // Two running mods with the same id would share one `data_dir`
         // (capability `storage`): the first loaded keeps the id.
-        if self
-            .entries
-            .iter()
-            .any(|e| e.run.is_some() && e.manifest.as_ref().is_some_and(|other| other.id == m.id))
-        {
+        if self.entries.iter().any(|e| {
+            e.runs().next().is_some() && e.manifest.as_ref().is_some_and(|other| other.id == m.id)
+        }) {
             return Err(format!("another running mod already uses id {}", m.id));
         }
-        let server = m.side == Side::Server;
-        let taken: Vec<String> = self
-            .entries
-            .iter()
-            .filter_map(|e| e.run.as_ref())
-            .filter(|r| r.hooks.server().is_some() == server)
-            .flat_map(|r| r.hooks.commands())
-            .map(str::to_owned)
-            .collect();
-        let snapshot = self.snapshot.clone();
-        let world = self.world.clone();
-        let (engine, linker) = self.engine()?;
+        let (engine, _) = self.engine()?;
         let component =
             Component::new(engine, wasm).map_err(|e| format!("not a component: {e}"))?;
         let ty = component.component_type();
@@ -743,11 +939,42 @@ impl Mods {
         if let Some(why) = crate::api_level::too_new(level, function) {
             return Err(why);
         }
-        let data_dir = path
+        let mut run = self.start_component(path, m, &component, wasm, None, reserved)?;
+        self.generation += 1;
+        self.out.append(&mut run.store.data_mut().out);
+        Ok(Some(run))
+    }
+
+    fn start_component(
+        &mut self,
+        path: &Path,
+        m: &Manifest,
+        component: &Component,
+        wasm: &[u8],
+        storage_side: Option<&str>,
+        reserved: &dyn Fn(&str) -> bool,
+    ) -> Result<Running, String> {
+        let server = m.side == Side::Server;
+        let taken: Vec<String> = self
+            .entries
+            .iter()
+            .flat_map(Entry::runs)
+            .filter(|r| r.hooks.server().is_some() == server)
+            .flat_map(|r| r.hooks.commands())
+            .map(str::to_owned)
+            .collect();
+        let functions = crate::api_level::imports(wasm)?;
+        let snapshot = self.snapshot.clone();
+        let world = self.world.clone();
+        let (engine, linker) = self.engine()?;
+        let mut data_dir = path
             .parent()
             .unwrap_or(Path::new("."))
             .join(crate::manifest::STORAGE_DIR)
             .join(&m.id);
+        if let Some(side) = storage_side {
+            data_dir.push(side);
+        }
         let state = State {
             name: m.name.clone(),
             id: m.id.clone(),
@@ -774,7 +1001,7 @@ impl Mods {
         store.limiter(|s| &mut s.limits);
         store.set_fuel(FUEL_INIT).map_err(|e| e.to_string())?;
         let instance = linker
-            .instantiate(&mut store, &component)
+            .instantiate(&mut store, component)
             .map_err(|e| reason(&e))?;
         let (mut hooks, ui) = if server {
             let exports = HorizonServerMod::new(&mut store, &instance).map_err(|e| reason(&e))?;
@@ -817,26 +1044,23 @@ impl Mods {
                 }
             }
         }
-        self.generation += 1;
-        self.out.append(&mut store.data_mut().out);
-        Ok(Some(Running {
+        Ok(Running {
             store,
             ui,
             hooks,
             raycasts: functions.iter().any(|f| f == "game.raycast"),
             reads_recipes: functions.iter().any(|f| f.starts_with("recipes.")),
-        }))
+            world: m.capabilities.contains(&crate::Capability::World),
+        })
     }
 
     /// True when at least one mod runs: the game skips its mod work otherwise.
     pub fn is_running(&self) -> bool {
-        self.entries.iter().any(|e| e.run.is_some())
+        self.entries.iter().any(|e| e.runs().next().is_some())
     }
     /// True when a server mod runs: the server skips its mod work otherwise.
     pub fn runs_server(&self) -> bool {
-        self.entries
-            .iter()
-            .any(|e| e.run.as_ref().is_some_and(|r| r.hooks.server().is_some()))
+        self.entries.iter().any(|e| e.side_run(true).is_some())
     }
     pub fn entries(&self) -> &[Entry] {
         &self.entries
@@ -854,12 +1078,13 @@ impl Mods {
         mut f: impl FnMut(&mut Running) -> wasmtime::Result<()>,
     ) {
         for i in 0..self.entries.len() {
-            if self.entries[i]
-                .run
-                .as_ref()
-                .is_some_and(|r| wants(&r.hooks))
-            {
-                self.call(i, fuel, &mut f);
+            for server in [false, true] {
+                if self.entries[i]
+                    .side_run(server)
+                    .is_some_and(|r| wants(&r.hooks))
+                {
+                    self.call_side(i, server, fuel, &mut f);
+                }
             }
         }
     }
@@ -903,38 +1128,63 @@ impl Mods {
         fuel: u64,
         f: impl FnOnce(&mut Running) -> wasmtime::Result<R>,
     ) -> Option<R> {
+        self.call_side(i, false, fuel, f)
+    }
+    fn call_side<R>(
+        &mut self,
+        i: usize,
+        server: bool,
+        fuel: u64,
+        f: impl FnOnce(&mut Running) -> wasmtime::Result<R>,
+    ) -> Option<R> {
         let entry = &mut self.entries[i];
-        let run = entry.run.as_mut()?;
+        #[cfg(feature = "paired-packages")]
+        let paired = entry.paired.is_some();
+        #[cfg(not(feature = "paired-packages"))]
+        let paired = false;
+        let run = entry.side_run_mut(server)?;
         run.store.data_mut().snapshot = self.snapshot.clone();
         run.store.data_mut().storage_budget = STORAGE_WRITE_BUDGET;
         let started = Instant::now();
         let result = run.store.set_fuel(fuel).and_then(|()| f(run));
         // An average over about the last 64 calls.
-        entry.cost = (entry.cost * 63 + started.elapsed()) / 64;
+        let elapsed = started.elapsed();
         let data = run.store.data_mut();
         let (open, close) = (
             std::mem::take(&mut data.ui.open),
             std::mem::take(&mut data.ui.close),
         );
-        self.out.append(&mut data.out);
-        if open {
-            self.out.push(Output::OpenScreen { owner: i });
+        if result.is_ok() || !paired {
+            self.out.append(&mut data.out);
+            if open {
+                self.out.push(Output::OpenScreen { owner: i });
+            }
+            if close {
+                self.out.push(Output::CloseScreen { owner: i });
+            }
+        } else {
+            data.out.clear();
         }
-        if close {
-            self.out.push(Output::CloseScreen { owner: i });
-        }
+        let stopped = result.as_ref().err().map(|e| {
+            (
+                reason(e),
+                run.store.data().name.clone(),
+                run.store.data().id.clone(),
+            )
+        });
+        entry.cost = (entry.cost * 63 + elapsed) / 64;
         match result {
             Ok(r) => Some(r),
-            Err(e) => {
-                let reason = reason(&e);
-                log::warn!("Horizon: mod {} stopped: {reason}", run.store.data().id);
-                let name = run.store.data().name.clone();
+            Err(_) => {
+                let (reason, name, id) = stopped.expect("failed result");
+                log::warn!("Horizon: mod {id} stopped: {reason}");
                 self.out.push(Output::Stopped {
                     name,
                     reason: reason.clone(),
                 });
                 entry.status = Status::Failed(reason);
                 entry.run = None;
+                entry.paired_server = None;
                 self.generation += 1;
                 None
             }
@@ -959,9 +1209,8 @@ impl Mods {
     }
     fn command_owner(&self, server: bool, name: &str) -> Option<usize> {
         self.entries.iter().position(|e| {
-            e.run.as_ref().is_some_and(|r| {
-                r.hooks.server().is_some() == server && r.hooks.commands().contains(&name)
-            })
+            e.side_run(server)
+                .is_some_and(|r| r.hooks.commands().contains(&name))
         })
     }
     /// Runs `line` (without its slash) if a client mod owns its command;
@@ -991,7 +1240,7 @@ impl Mods {
     fn owned_commands(&self, server: bool) -> impl Iterator<Item = &str> {
         self.entries
             .iter()
-            .filter_map(|e| e.run.as_ref())
+            .flat_map(Entry::runs)
             .filter(move |r| r.hooks.server().is_some() == server)
             .flat_map(|r| r.hooks.commands())
     }
@@ -1041,7 +1290,7 @@ impl Mods {
     pub fn server_commands(&self) -> impl Iterator<Item = &ServerCommand> {
         self.entries
             .iter()
-            .filter_map(|e| e.run.as_ref()?.hooks.server())
+            .filter_map(|e| e.side_run(true)?.hooks.server())
             .flat_map(|r| r.commands.iter())
     }
     /// Runs `line` (without its slash), typed by `player`, if a server mod
@@ -1058,8 +1307,7 @@ impl Mods {
             error,
         };
         let arguments = self.entries[i]
-            .run
-            .as_ref()
+            .side_run(true)
             .and_then(|r| r.hooks.server())
             .and_then(|r| r.commands.iter().find(|c| c.name == name))
             .map(|c| c.arguments.as_slice())
@@ -1071,7 +1319,7 @@ impl Mods {
                 return true;
             }
         };
-        let result = self.call(i, FUEL_EVENT, |run| match &run.hooks {
+        let result = self.call_side(i, true, FUEL_EVENT, |run| match &run.hooks {
             Hooks::Server(m, _) => m.horizon_mods_server_events().call_command(
                 &mut run.store,
                 player,
@@ -1406,6 +1654,12 @@ impl Mods {
         let mut any = false;
         for i in 0..self.entries.len() {
             let entry = &self.entries[i];
+            #[cfg(feature = "paired-packages")]
+            if entry.paired.is_some() || entry.path.join(crate::paired::DESCRIPTOR).exists() {
+                // Content and both components belong to one captured identity.
+                // A package catalog restart is required to admit a replacement.
+                continue;
+            }
             let now = modified(&entry.path);
             let was_on = !matches!(entry.status, Status::Off | Status::Elsewhere);
             if now == entry.modified || !was_on {
@@ -1415,6 +1669,7 @@ impl Mods {
             self.generation += 1;
             self.entries[i].modified = now;
             self.entries[i].run = None;
+            self.entries[i].paired_server = None;
             let path = self.entries[i].path.clone();
             let started = Package::read(&path).and_then(|p| {
                 self.entries[i].manifest = Some(p.manifest.clone());
@@ -1436,6 +1691,16 @@ impl Mods {
         }
         any
     }
+}
+
+#[cfg(feature = "paired-packages")]
+fn pair_capabilities(bundle: &crate::paired::Bundle) -> Vec<crate::Capability> {
+    bundle
+        .plan(crate::paired::Role::InFrame)
+        .executables
+        .iter()
+        .flat_map(|e| e.manifest().capabilities.iter().copied())
+        .collect()
 }
 
 /// A command's arguments are well formed: names given and distinct,

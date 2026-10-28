@@ -11,11 +11,25 @@ struct Guest {
 
 impl Mod for Guest {
     fn init() -> Result<(Self, Registration), String> {
-        let hooks = ["spin", "panic", "grow", "hello", "save", "load", "save_key"]
-            .into_iter()
-            .fold(Registration::new(), Registration::command)
-            .on_tick()
-            .on_frame();
+        // Opt-in probe for paired activation ordering and buffered init output.
+        if storage::get("init_probe").is_some() {
+            storage::set("init_seen", b"client initialized")?;
+            chat::show("client initialized");
+        }
+        let hooks = [
+            "spin",
+            "panic",
+            "panic_after_output",
+            "grow",
+            "hello",
+            "save",
+            "load",
+            "save_key",
+        ]
+        .into_iter()
+        .fold(Registration::new(), Registration::command)
+        .on_tick()
+        .on_frame();
         Ok((Guest { ticks: 0 }, hooks))
     }
     fn tick(&mut self, _tick: u64) {
@@ -31,6 +45,10 @@ impl Mod for Guest {
                 Ok(None)
             }
             "panic" => panic!("asked to"),
+            "panic_after_output" => {
+                chat::show("discard this failed callback output");
+                panic!("asked to after output");
+            }
             "grow" => {
                 let big = std::hint::black_box(vec![1u8; 1 << 30]);
                 Ok(Some(format!("{}", big.len())))
