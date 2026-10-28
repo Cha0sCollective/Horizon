@@ -16,6 +16,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// Experimental finite-state planning only. Resource admission still accepts
+/// legacy template declarations; custom state materialization is separate.
+#[cfg(feature = "paired-packages")]
+pub mod states;
+
 /// Content files per mod, bytes per file and bytes per mod.
 pub const MAX_FILES: usize = 65_536;
 pub const MAX_FILE: u64 = 16 << 20;
