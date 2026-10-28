@@ -2362,6 +2362,132 @@ pub fn read_dat(path: &Path) -> Option<Tag> {
     };
     Some(nbt::read_named(&raw, Limits::default()).ok()?.0.tag)
 }
+/// Optional overworld controls for the concrete world-clock save handoff.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ClockControls {
+    pub partial: f32,
+    pub rate: f32,
+    pub paused: bool,
+}
+
+fn decode_world_clocks(bytes: &[u8]) -> Result<Tag> {
+    let compression = if bytes.starts_with(&[0x1f, 0x8b]) {
+        Compression::Gzip
+    } else {
+        Compression::None
+    };
+    let raw = compression.decode(bytes, 64 << 20)?;
+    let (root, consumed) = nbt::read_named(&raw, Limits::default())?;
+    if consumed != raw.len() {
+        return Err("trailing world-clock NBT bytes".into());
+    }
+    if !matches!(root.tag, Tag::Compound(_)) {
+        return Err("world-clock root must be a compound".into());
+    }
+    match root.tag.get("DataVersion") {
+        None => {}
+        Some(Tag::Int(version)) if *version <= DATA_VERSION => {}
+        Some(Tag::Int(_)) => return Err("unsupported newer world-clock DataVersion".into()),
+        Some(_) => return Err("world-clock DataVersion must be an Int".into()),
+    }
+    if let Some(data) = root.tag.get("data") {
+        if !matches!(data, Tag::Compound(_)) {
+            return Err("world-clock data must be a compound".into());
+        }
+        if let Some(clock) = data.get("minecraft:overworld") {
+            if !matches!(clock, Tag::Compound(_)) {
+                return Err("world-clock overworld must be a compound".into());
+            }
+            for (name, id) in [
+                ("total_ticks", 4),
+                ("rate", 5),
+                ("partial_tick", 5),
+                ("paused", 1),
+            ] {
+                if let Some(value) = clock.get(name)
+                    && value.id() != id
+                {
+                    return Err(format!("world-clock {name} has the wrong NBT type").into());
+                }
+            }
+        }
+    }
+    Ok(root.tag)
+}
+
+/// Read this saved-data file with strict merge semantics. Other saved-data loads
+/// retain their own policies. Only a genuinely missing clock file is absent.
+pub fn read_world_clocks(world: &Path) -> Result<Option<Tag>> {
+    let path = saved_data_path(world, "world_clocks");
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("{}: {error}", path.display()).into()),
+    };
+    decode_world_clocks(&bytes)
+        .map(Some)
+        .map_err(|error| format!("{}: {error}", path.display()).into())
+}
+
+/// Merge the owned overworld fields while preserving other clocks and unknown
+/// fields. Level saves omit controls and initialize only an absent End clock;
+/// Game saves supply controls, using their ordinary default-removal comparisons.
+/// This concrete internal Rust handoff does not make metadata writes atomic.
+pub fn write_world_clocks(
+    world: &Path,
+    overworld_ticks: i64,
+    missing_end_ticks: Option<i64>,
+    controls: Option<ClockControls>,
+) -> Result<()> {
+    let mut root = read_world_clocks(world)?.unwrap_or_else(|| Tag::Compound(Compound::new()));
+    let mut data = root
+        .get("data")
+        .cloned()
+        .unwrap_or_else(|| Tag::Compound(Compound::new()));
+    let mut clock = data
+        .get("minecraft:overworld")
+        .cloned()
+        .unwrap_or_else(|| Tag::Compound(Compound::new()));
+    put(&mut clock, "total_ticks", Tag::Long(overworld_ticks));
+    if let Some(controls) = controls
+        && let Tag::Compound(map) = &mut clock
+    {
+        for (key, value, default) in [
+            (
+                "partial_tick",
+                Tag::Float(controls.partial.to_bits()),
+                controls.partial == 0.0,
+            ),
+            (
+                "rate",
+                Tag::Float(controls.rate.to_bits()),
+                controls.rate == 1.0,
+            ),
+            (
+                "paused",
+                Tag::Byte(i8::from(controls.paused)),
+                !controls.paused,
+            ),
+        ] {
+            if default {
+                map.remove(&key.into());
+            } else {
+                map.insert(key.into(), value);
+            }
+        }
+    }
+    put(&mut data, "minecraft:overworld", clock);
+    if let Some(ticks) = missing_end_ticks
+        && let Tag::Compound(map) = &mut data
+    {
+        map.entry("minecraft:the_end".into())
+            .or_insert_with(|| Tag::compound([("total_ticks", Tag::Long(ticks))]));
+    }
+    put(&mut root, "data", data);
+    put(&mut root, "DataVersion", Tag::Int(DATA_VERSION));
+    let path = saved_data_path(world, "world_clocks");
+    write_dat(&path, root).map_err(|error| format!("{}: {error}", path.display()).into())
+}
 /// Write a gzip NBT file the way vanilla does (`<name>_new`, keep `_old`).
 pub fn write_dat(path: &Path, tag: Tag) -> Result<()> {
     if let Some(dir) = path.parent() {
@@ -3397,15 +3523,7 @@ impl Level {
                 ("thundering", Tag::Byte(i8::from(self.weather.thundering))),
             ]),
         )?;
-        let mut clocks = compound_or_empty(read_saved_data(dir, "world_clocks"));
-        let mut overworld = compound_or_empty(clocks.get("minecraft:overworld").cloned());
-        put(&mut overworld, "total_ticks", Tag::Long(self.day_time));
-        put(&mut clocks, "minecraft:overworld", overworld);
-        if let Tag::Compound(map) = &mut clocks {
-            map.entry("minecraft:the_end".into())
-                .or_insert_with(|| Tag::compound([("total_ticks", Tag::Long(self.time))]));
-        }
-        write_saved_data(dir, "world_clocks", clocks)?;
+        write_world_clocks(dir, self.day_time, Some(self.time), None)?;
         if legacy || !saved_data_path(dir, "world_gen_settings").exists() {
             write_world_gen_settings(dir, self.seed, WorldGen::default())?;
         }
@@ -3868,6 +3986,425 @@ impl<G: ChunkGenerator> ChunkGenerator for Persistent<G> {
 
 #[cfg(test)]
 mod tests {
+    mod world_clocks {
+        use super::*;
+
+        fn scratch(name: &str) -> PathBuf {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let world = std::env::temp_dir().join(format!(
+                "horizon-clock-save-{name}-{}-{nonce}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&world).unwrap();
+            world
+        }
+        fn raw(tag: Tag) -> Vec<u8> {
+            nbt::write_named(
+                &NamedTag {
+                    name: "".into(),
+                    tag,
+                },
+                Limits::default(),
+            )
+            .unwrap()
+        }
+        fn seed(world: &Path, bytes: &[u8]) {
+            let path = saved_data_path(world, "world_clocks");
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, bytes).unwrap();
+        }
+        fn clock(root: &Tag) -> &Tag {
+            root.get("data")
+                .unwrap()
+                .get("minecraft:overworld")
+                .unwrap()
+        }
+        fn with_clock(clock: Tag) -> Tag {
+            Tag::compound([("data", Tag::compound([("minecraft:overworld", clock)]))])
+        }
+        fn controls() -> ClockControls {
+            ClockControls {
+                partial: 0.25,
+                rate: 2.5,
+                paused: true,
+            }
+        }
+        fn sentinel_root() -> Tag {
+            Tag::compound([
+                ("root_sentinel", string("preserve root")),
+                ("DataVersion", Tag::Int(DATA_VERSION - 1)),
+                (
+                    "data",
+                    Tag::compound([
+                        (
+                            "minecraft:overworld",
+                            Tag::compound([
+                                ("total_ticks", Tag::Long(1)),
+                                ("rate", Tag::Float(2.5f32.to_bits())),
+                                ("partial_tick", Tag::Float(0.25f32.to_bits())),
+                                ("paused", Tag::Byte(1)),
+                                ("clock_sentinel", string("preserve overworld")),
+                            ]),
+                        ),
+                        (
+                            "test:other",
+                            Tag::compound([("opaque", Tag::IntArray(vec![1, 2, 3]))]),
+                        ),
+                        (
+                            "minecraft:the_end",
+                            Tag::compound([
+                                ("total_ticks", Tag::Long(77)),
+                                ("end_sentinel", string("preserve End")),
+                            ]),
+                        ),
+                    ]),
+                ),
+            ])
+        }
+        fn assert_sentinels(root: &Tag) {
+            assert_eq!(root.get("root_sentinel"), Some(&string("preserve root")));
+            assert_eq!(
+                clock(root).get("clock_sentinel"),
+                Some(&string("preserve overworld"))
+            );
+            assert_eq!(
+                root.get("data").unwrap().get("test:other"),
+                sentinel_root().get("data").unwrap().get("test:other")
+            );
+            assert_eq!(
+                root.get("data").unwrap().get("minecraft:the_end"),
+                sentinel_root()
+                    .get("data")
+                    .unwrap()
+                    .get("minecraft:the_end")
+            );
+        }
+        #[test]
+        fn actual_level_then_game_clock_modes_preserve_sentinels_and_remove_only_default_controls()
+        {
+            let world = scratch("writers");
+            seed(&world, &raw(sentinel_root()));
+            let mut level = Level {
+                time: 123,
+                day_time: 456,
+                ..Level::default()
+            };
+            level.write(&world).unwrap();
+            let level_saved = read_world_clocks(&world).unwrap().unwrap();
+            assert_sentinels(&level_saved);
+            assert_eq!(
+                level_saved.get("DataVersion"),
+                Some(&Tag::Int(DATA_VERSION))
+            );
+            assert_eq!(
+                clock(&level_saved).get("total_ticks"),
+                Some(&Tag::Long(456))
+            );
+            for key in ["rate", "partial_tick", "paused"] {
+                assert_eq!(
+                    clock(&level_saved).get(key),
+                    clock(&sentinel_root()).get(key)
+                );
+            }
+            write_world_clocks(&world, 789, None, Some(controls())).unwrap();
+            let game_saved = read_world_clocks(&world).unwrap().unwrap();
+            assert_sentinels(&game_saved);
+            assert_eq!(clock(&game_saved).get("total_ticks"), Some(&Tag::Long(789)));
+            assert_eq!(
+                clock(&game_saved).get("rate"),
+                Some(&Tag::Float(2.5f32.to_bits()))
+            );
+            write_world_clocks(
+                &world,
+                -321,
+                None,
+                Some(ClockControls {
+                    partial: -0.0,
+                    rate: 1.0,
+                    paused: false,
+                }),
+            )
+            .unwrap();
+            let defaults = read_world_clocks(&world).unwrap().unwrap();
+            assert_sentinels(&defaults);
+            assert_eq!(clock(&defaults).get("total_ticks"), Some(&Tag::Long(-321)));
+            for key in ["rate", "partial_tick", "paused"] {
+                assert!(clock(&defaults).get(key).is_none());
+            }
+            assert!(
+                fs::read(saved_data_path(&world, "world_clocks"))
+                    .unwrap()
+                    .starts_with(&[0x1f, 0x8b])
+            );
+            fs::remove_dir_all(world).unwrap();
+        }
+
+        #[test]
+        fn clock_merge_initializes_missing_containers_and_only_missing_end_clock() {
+            for tag in [
+                Tag::Compound(Compound::new()),
+                Tag::compound([("data", Tag::Compound(Compound::new()))]),
+                Tag::compound([("data", Tag::compound([("minecraft:the_end", Tag::Int(77))]))]),
+            ] {
+                let world = scratch("missing-containers");
+                let expected_end = tag
+                    .get("data")
+                    .and_then(|data| data.get("minecraft:the_end"))
+                    .cloned()
+                    .unwrap_or_else(|| Tag::compound([("total_ticks", Tag::Long(22))]));
+                seed(&world, &raw(tag));
+                write_world_clocks(&world, 11, Some(22), None).unwrap();
+                let saved = read_world_clocks(&world).unwrap().unwrap();
+                assert_eq!(clock(&saved).get("total_ticks"), Some(&Tag::Long(11)));
+                assert_eq!(
+                    saved.get("data").unwrap().get("minecraft:the_end"),
+                    Some(&expected_end)
+                );
+                fs::remove_dir_all(world).unwrap();
+            }
+            let world = scratch("missing-file");
+            assert!(read_world_clocks(&world).unwrap().is_none());
+            let mut level = Level {
+                time: 90,
+                day_time: 45,
+                ..Level::default()
+            };
+            level.write(&world).unwrap();
+            write_world_clocks(&world, 46, None, Some(controls())).unwrap();
+            let saved = read_world_clocks(&world).unwrap().unwrap();
+            assert_eq!(
+                saved
+                    .get("data")
+                    .unwrap()
+                    .get("minecraft:the_end")
+                    .unwrap()
+                    .get("total_ticks"),
+                Some(&Tag::Long(90))
+            );
+            fs::remove_dir_all(world).unwrap();
+            let world = scratch("game-no-end");
+            write_world_clocks(&world, 1, None, Some(controls())).unwrap();
+            assert!(
+                read_world_clocks(&world)
+                    .unwrap()
+                    .unwrap()
+                    .get("data")
+                    .unwrap()
+                    .get("minecraft:the_end")
+                    .is_none()
+            );
+            fs::remove_dir_all(world).unwrap();
+        }
+
+        #[test]
+        fn clock_merge_rejects_reported_codec_schema_and_version_errors_without_overwrite() {
+            let valid_raw = raw(sentinel_root());
+            let mut trailing = valid_raw.clone();
+            trailing.push(0);
+            let mut bad_gzip = Compression::Gzip.encode(&valid_raw).unwrap();
+            let last = bad_gzip.len() - 1;
+            bad_gzip[last] ^= 0xff;
+            let mut cases = vec![
+                vec![255],
+                vec![0x1f, 0x8b, 8, 0],
+                bad_gzip,
+                trailing.clone(),
+                Compression::Gzip.encode(&trailing).unwrap(),
+            ];
+            for tag in [
+                Tag::Int(1),
+                Tag::compound([("data", Tag::Int(1))]),
+                with_clock(Tag::Int(1)),
+                Tag::compound([("DataVersion", Tag::Long(i64::from(DATA_VERSION)))]),
+                Tag::compound([("DataVersion", Tag::Int(DATA_VERSION + 1))]),
+            ] {
+                cases.push(raw(tag));
+            }
+            for (field, value) in [
+                ("total_ticks", Tag::Int(1)),
+                ("rate", Tag::Double(1f64.to_bits())),
+                ("partial_tick", Tag::Int(0)),
+                ("paused", Tag::Int(1)),
+            ] {
+                cases.push(raw(with_clock(Tag::compound([(field, value)]))));
+            }
+            for (index, bytes) in cases.into_iter().enumerate() {
+                let world = scratch(&format!("invalid-{index}"));
+                seed(&world, &bytes);
+                assert!(
+                    read_world_clocks(&world)
+                        .unwrap_err()
+                        .to_string()
+                        .contains("world_clocks.dat")
+                );
+                assert!(
+                    write_world_clocks(&world, 100, Some(200), Some(controls()))
+                        .unwrap_err()
+                        .to_string()
+                        .contains("world_clocks.dat")
+                );
+                assert_eq!(
+                    fs::read(saved_data_path(&world, "world_clocks")).unwrap(),
+                    bytes
+                );
+                assert!(
+                    !saved_data_path(&world, "world_clocks")
+                        .with_file_name("world_clocks.dat_new")
+                        .exists()
+                );
+                fs::remove_dir_all(world).unwrap();
+            }
+            let world = scratch("read-obstruction");
+            let path = saved_data_path(&world, "world_clocks");
+            fs::create_dir_all(&path).unwrap();
+            assert!(read_world_clocks(&world).is_err());
+            assert!(
+                write_world_clocks(&world, 1, None, None)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("world_clocks.dat")
+            );
+            assert!(path.is_dir());
+            fs::remove_dir_all(world).unwrap();
+        }
+
+        #[test]
+        fn level_clock_guard_and_repaired_input_or_blocked_new_retry_preserve_clock_bytes() {
+            let world = scratch("level-rejection");
+            seed(&world, &[255]);
+            let mut level = Level {
+                time: 20,
+                day_time: 30,
+                ..Level::default()
+            };
+            assert!(
+                level
+                    .write(&world)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("world_clocks.dat")
+            );
+            assert_eq!(
+                fs::read(saved_data_path(&world, "world_clocks")).unwrap(),
+                [255]
+            );
+            seed(&world, &raw(sentinel_root()));
+            level.write(&world).unwrap();
+            assert_sentinels(&read_world_clocks(&world).unwrap().unwrap());
+            fs::remove_dir_all(world).unwrap();
+            let world = scratch("write-retry");
+            seed(&world, &[255]);
+            let live = controls();
+            assert!(write_world_clocks(&world, 700, None, Some(live)).is_err());
+            let original = raw(sentinel_root());
+            seed(&world, &original);
+            let blocked =
+                saved_data_path(&world, "world_clocks").with_file_name("world_clocks.dat_new");
+            fs::create_dir(&blocked).unwrap();
+            assert!(
+                write_world_clocks(&world, 700, None, Some(live))
+                    .unwrap_err()
+                    .to_string()
+                    .contains("world_clocks.dat")
+            );
+            assert_eq!(
+                fs::read(saved_data_path(&world, "world_clocks")).unwrap(),
+                original
+            );
+            assert_eq!(live, controls());
+            fs::remove_dir(blocked).unwrap();
+            write_world_clocks(&world, 700, None, Some(live)).unwrap();
+            let saved = read_world_clocks(&world).unwrap().unwrap();
+            assert_sentinels(&saved);
+            assert_eq!(clock(&saved).get("total_ticks"), Some(&Tag::Long(700)));
+            assert_eq!(live, controls());
+            fs::remove_dir_all(world).unwrap();
+        }
+
+        #[test]
+        fn clock_raw_gzip_large_payload_and_existing_float_codec_semantics_remain_supported() {
+            let mut root = sentinel_root();
+            put(
+                &mut root,
+                "large_sentinel",
+                Tag::ByteArray(vec![37; (1 << 20) + 128]),
+            );
+            let bytes = raw(root.clone());
+            assert!(bytes.len() > 1 << 20);
+            for bytes in [bytes.clone(), Compression::Gzip.encode(&bytes).unwrap()] {
+                let world = scratch("large-codec");
+                seed(&world, &bytes);
+                assert_eq!(read_world_clocks(&world).unwrap().unwrap(), root);
+                write_world_clocks(&world, 100, None, Some(controls())).unwrap();
+                assert_eq!(
+                    read_world_clocks(&world)
+                        .unwrap()
+                        .unwrap()
+                        .get("large_sentinel"),
+                    root.get("large_sentinel")
+                );
+                fs::remove_dir_all(world).unwrap();
+            }
+            let world = scratch("float-codec");
+            seed(
+                &world,
+                &raw(with_clock(Tag::compound([
+                    ("rate", Tag::Float((-0.0f32).to_bits())),
+                    ("partial_tick", Tag::Float((-0.0f32).to_bits())),
+                ]))),
+            );
+            let normalized = read_world_clocks(&world).unwrap().unwrap();
+            assert_eq!(clock(&normalized).get("rate"), Some(&Tag::Float(0)));
+            assert_eq!(clock(&normalized).get("partial_tick"), Some(&Tag::Float(0)));
+            write_world_clocks(
+                &world,
+                1,
+                None,
+                Some(ClockControls {
+                    rate: f32::from_bits(0x7fa1_2345),
+                    partial: f32::from_bits(0xffc1_2345),
+                    paused: true,
+                }),
+            )
+            .unwrap();
+            let canonical = read_world_clocks(&world).unwrap().unwrap();
+            assert_eq!(
+                clock(&canonical).get("rate"),
+                Some(&Tag::Float(f32::NAN.to_bits()))
+            );
+            assert_eq!(
+                clock(&canonical).get("partial_tick"),
+                Some(&Tag::Float(f32::NAN.to_bits()))
+            );
+            fs::remove_dir_all(world).unwrap();
+            let world = scratch("nonfinite");
+            write_world_clocks(
+                &world,
+                -10,
+                None,
+                Some(ClockControls {
+                    rate: f32::INFINITY,
+                    partial: f32::NEG_INFINITY,
+                    paused: true,
+                }),
+            )
+            .unwrap();
+            let saved = read_world_clocks(&world).unwrap().unwrap();
+            assert_eq!(
+                clock(&saved).get("rate"),
+                Some(&Tag::Float(f32::INFINITY.to_bits()))
+            );
+            assert_eq!(
+                clock(&saved).get("partial_tick"),
+                Some(&Tag::Float(f32::NEG_INFINITY.to_bits()))
+            );
+            fs::remove_dir_all(world).unwrap();
+        }
+    }
+
     mod dirty_handoff {
         use super::*;
 

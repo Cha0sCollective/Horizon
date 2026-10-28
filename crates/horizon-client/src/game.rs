@@ -11366,7 +11366,7 @@ impl Game<'_> {
         self.sync_level();
         self.store_owner();
         self.level.write(&self.world_root)?;
-        self.save_world_state();
+        self.save_world_state()?;
         self.message = Some(("Saved the game".into(), Instant::now()));
         Ok(())
     }

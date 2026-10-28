@@ -50,6 +50,45 @@ impl Default for WorldClock {
         }
     }
 }
+impl WorldClock {
+    fn load_from(&mut self, world: &std::path::Path) {
+        *self = Self::default();
+        let Ok(Some(root)) = horizon_client::save::read_world_clocks(world) else {
+            return;
+        };
+        let Some(clock) = root
+            .get("data")
+            .and_then(|data| data.get("minecraft:overworld"))
+        else {
+            return;
+        };
+        use horizon_world::nbt::Tag;
+        if let Some(Tag::Float(rate)) = clock.get("rate") {
+            self.rate = f32::from_bits(*rate);
+        }
+        if let Some(Tag::Float(partial)) = clock.get("partial_tick") {
+            self.partial = f32::from_bits(*partial);
+        }
+        if let Some(Tag::Byte(paused)) = clock.get("paused") {
+            self.paused = *paused != 0;
+        }
+    }
+    fn save_to(&self, world: &std::path::Path, ticks: i64) -> horizon_client::Result<()> {
+        if world.as_os_str().is_empty() {
+            return Ok(());
+        }
+        horizon_client::save::write_world_clocks(
+            world,
+            ticks,
+            None,
+            Some(horizon_client::save::ClockControls {
+                partial: self.partial,
+                rate: self.rate,
+                paused: self.paused,
+            }),
+        )
+    }
+}
 /// A clock time marker from the timelines (ClockTimeMarker).
 #[derive(Clone, Copy, Debug)]
 pub struct TimeMarker {
@@ -1014,32 +1053,12 @@ impl Game<'_> {
     /// Load per-world command state when a world opens.
     pub(super) fn load_world_state(&mut self) {
         self.ui.rules = GameRules::load(&self.world_root);
-        self.ui.clock = WorldClock::default();
         // PrimaryLevelData: the difficulty comes back from level.dat's difficulty_settings.
         self.ui.difficulty = horizon_client::title::DIFFICULTIES
             .iter()
             .position(|d| *d == self.level.difficulty)
             .map_or(2, |i| i as u8);
-        if let Ok(bytes) = std::fs::read(self.world_root.join("data/minecraft/world_clocks.dat"))
-            && let Ok(raw) = horizon_world::compression::Compression::Gzip.decode(&bytes, 1 << 20)
-            && let Ok((root, _)) =
-                horizon_world::nbt::read_named(&raw, horizon_world::nbt::Limits::default())
-            && let Some(c) = root
-                .tag
-                .get("data")
-                .and_then(|d| d.get("minecraft:overworld"))
-        {
-            use horizon_world::nbt::Tag;
-            if let Some(Tag::Float(r)) = c.get("rate") {
-                self.ui.clock.rate = f32::from_bits(*r);
-            }
-            if let Some(Tag::Float(p)) = c.get("partial_tick") {
-                self.ui.clock.partial = f32::from_bits(*p);
-            }
-            if let Some(Tag::Byte(p)) = c.get("paused") {
-                self.ui.clock.paused = *p != 0;
-            }
-        }
+        self.ui.clock.load_from(&self.world_root);
         self.ui.chat.clear();
         self.build_registries();
         self.sync_rules();
@@ -1047,53 +1066,8 @@ impl Game<'_> {
     /// Save the clock beside level.dat (Level.write saves the game rules: a
     /// second writer of game_rules.dat could leave it with the rules loaded
     /// when the world opened).
-    pub(super) fn save_world_state(&mut self) {
-        if self.world_root.as_os_str().is_empty() {
-            return;
-        }
-        use horizon_world::nbt::Tag;
-        let c = self.ui.clock;
-        // The other clocks stay as saved; the overworld one keeps the fields Horizon
-        // does not model, and (like vanilla's codec) omits rate, partial tick and
-        // pause while they have their defaults.
-        let path = self.world_root.join("data/minecraft/world_clocks.dat");
-        let existing = horizon_client::save::read_dat(&path);
-        let mut data = match existing.as_ref().and_then(|r| r.get("data")) {
-            Some(d @ Tag::Compound(_)) => d.clone(),
-            _ => Tag::Compound(Default::default()),
-        };
-        let mut clock = match data.get("minecraft:overworld") {
-            Some(c @ Tag::Compound(_)) => c.clone(),
-            _ => Tag::Compound(Default::default()),
-        };
-        if let Tag::Compound(map) = &mut clock {
-            map.insert("total_ticks".into(), Tag::Long(self.world.day_time));
-            for (key, value, default) in [
-                (
-                    "partial_tick",
-                    Tag::Float(c.partial.to_bits()),
-                    c.partial == 0.0,
-                ),
-                ("rate", Tag::Float(c.rate.to_bits()), c.rate == 1.0),
-                ("paused", Tag::Byte(i8::from(c.paused)), !c.paused),
-            ] {
-                if default {
-                    map.remove(&key.into());
-                } else {
-                    map.insert(key.into(), value);
-                }
-            }
-        }
-        if let Tag::Compound(map) = &mut data {
-            map.insert("minecraft:overworld".into(), clock);
-        }
-        let root = Tag::compound([
-            ("data", data),
-            ("DataVersion", Tag::Int(horizon_world::DATA_VERSION)),
-        ]);
-        if let Err(e) = horizon_client::save::write_dat(&path, root) {
-            log::warn!("the world clocks were not written: {e}");
-        }
+    pub(super) fn save_world_state(&mut self) -> horizon_client::Result<()> {
+        self.ui.clock.save_to(&self.world_root, self.world.day_time)
     }
     /// Death message in chat (CombatTracker.getDeathMessage, as far as the
     /// cause is known to the client).
@@ -1209,4 +1183,162 @@ pub fn screenshot_name(dir: &std::path::Path) -> String {
 /// commands are allowed, else `ALL` (0).
 fn owner_permission(allow_commands: bool) -> u8 {
     if allow_commands { 4 } else { 0 }
+}
+
+#[cfg(test)]
+mod clock_metadata_tests {
+    use super::*;
+    use horizon_client::save;
+    use horizon_world::{
+        compression::Compression,
+        nbt::{self, Limits, NamedTag, Tag},
+    };
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let world = std::env::temp_dir().join(format!(
+            "horizon-game-clock-{name}-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&world).unwrap();
+        world
+    }
+    fn path(world: &std::path::Path) -> std::path::PathBuf {
+        world.join("data/minecraft/world_clocks.dat")
+    }
+    fn raw(tag: Tag) -> Vec<u8> {
+        nbt::write_named(
+            &NamedTag {
+                name: "".into(),
+                tag,
+            },
+            Limits::default(),
+        )
+        .unwrap()
+    }
+    fn seed(world: &std::path::Path, bytes: &[u8]) {
+        let path = path(world);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+    fn assert_clock(clock: &WorldClock, rate: f32, partial: f32, paused: bool) {
+        assert_eq!(clock.rate.to_bits(), rate.to_bits());
+        assert_eq!(clock.partial.to_bits(), partial.to_bits());
+        assert_eq!(clock.paused, paused);
+    }
+    fn controlled_root() -> Tag {
+        with_clock(Tag::compound([
+            ("total_ticks", Tag::Long(100)),
+            ("rate", Tag::Float(3.5f32.to_bits())),
+            ("partial_tick", Tag::Float(0.75f32.to_bits())),
+            ("paused", Tag::Byte(-1)),
+        ]))
+    }
+    fn with_clock(clock: Tag) -> Tag {
+        Tag::compound([("data", Tag::compound([("minecraft:overworld", clock)]))])
+    }
+
+    #[test]
+    fn clock_controls_load_raw_gzip_and_payload_above_old_one_mib_limit() {
+        let mut root = controlled_root();
+        if let Tag::Compound(fields) = &mut root {
+            fields.insert(
+                "large_sentinel".into(),
+                Tag::ByteArray(vec![41; (1 << 20) + 128]),
+            );
+        }
+        let bytes = raw(root);
+        assert!(bytes.len() > 1 << 20);
+        for bytes in [bytes.clone(), Compression::Gzip.encode(&bytes).unwrap()] {
+            let world = scratch("codec");
+            seed(&world, &bytes);
+            let mut clock = WorldClock::default();
+            clock.load_from(&world);
+            assert_clock(&clock, 3.5, 0.75, true);
+            std::fs::remove_dir_all(world).unwrap();
+        }
+    }
+
+    #[test]
+    fn clock_controls_reset_before_loading_missing_default_or_invalid_next_world() {
+        let source = scratch("source");
+        seed(&source, &raw(controlled_root()));
+        let mut cases = vec![
+            None,
+            Some(raw(Tag::compound([(
+                "data",
+                Tag::Compound(Default::default()),
+            )]))),
+            Some(raw(with_clock(Tag::Compound(Default::default())))),
+            Some(vec![0x1f, 0x8b, 8, 0]),
+            Some(raw(Tag::compound([(
+                "DataVersion",
+                Tag::Int(horizon_world::DATA_VERSION + 1),
+            )]))),
+            Some(raw(with_clock(Tag::compound([("rate", Tag::Int(7))])))),
+        ];
+        let mut trailing = raw(controlled_root());
+        trailing.push(0);
+        cases.push(Some(trailing));
+        let mut clock = WorldClock::default();
+        for bytes in cases {
+            clock.load_from(&source);
+            assert_clock(&clock, 3.5, 0.75, true);
+            let next = scratch("next");
+            if let Some(bytes) = bytes {
+                seed(&next, &bytes);
+            }
+            clock.load_from(&next);
+            assert_clock(&clock, 1.0, 0.0, false);
+            std::fs::remove_dir_all(next).unwrap();
+        }
+        clock.load_from(&source);
+        let obstructed = scratch("read-obstruction");
+        std::fs::create_dir_all(path(&obstructed)).unwrap();
+        clock.load_from(&obstructed);
+        assert_clock(&clock, 1.0, 0.0, false);
+        std::fs::remove_dir_all(obstructed).unwrap();
+        std::fs::remove_dir_all(source).unwrap();
+    }
+
+    #[test]
+    fn game_clock_blocked_write_reports_path_and_same_live_controls_retry_after_repair() {
+        let world = scratch("retry");
+        seed(&world, &raw(controlled_root()));
+        let clock = WorldClock {
+            rate: 5.25,
+            partial: 0.5,
+            paused: true,
+        };
+        let old = std::fs::read(path(&world)).unwrap();
+        let blocked = path(&world).with_file_name("world_clocks.dat_new");
+        std::fs::create_dir(&blocked).unwrap();
+        let error = clock.save_to(&world, 222).unwrap_err();
+        assert!(error.to_string().contains("world_clocks.dat"));
+        assert_eq!(std::fs::read(path(&world)).unwrap(), old);
+        assert_clock(&clock, 5.25, 0.5, true);
+        std::fs::remove_dir(blocked).unwrap();
+        clock.save_to(&world, 222).unwrap();
+        let mut loaded = WorldClock::default();
+        loaded.load_from(&world);
+        assert_clock(&loaded, 5.25, 0.5, true);
+        assert_clock(&clock, 5.25, 0.5, true);
+        let saved = save::read_world_clocks(&world).unwrap().unwrap();
+        assert_eq!(
+            saved
+                .get("data")
+                .unwrap()
+                .get("minecraft:overworld")
+                .unwrap()
+                .get("total_ticks"),
+            Some(&Tag::Long(222))
+        );
+        // A Game with no world retains its existing no-op, even with nondefault controls.
+        clock.save_to(std::path::Path::new(""), 999).unwrap();
+        assert_clock(&clock, 5.25, 0.5, true);
+        std::fs::remove_dir_all(world).unwrap();
+    }
 }
