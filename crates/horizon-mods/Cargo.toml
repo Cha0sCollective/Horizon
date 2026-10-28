@@ -29,6 +29,7 @@ minisign-verify = { version = "0.3", optional = true }
 horizon-shader-api = { path = "../horizon-shader-api", optional = true }
 
 [dev-dependencies]
+wat = "=1.254.2"
 # A component made for a newer Horizon, from the WIT alone (tests/sandbox.rs).
 wit-component = { version = "0.254", features = ["dummy-module"] }
 wit-parser = "0.254"

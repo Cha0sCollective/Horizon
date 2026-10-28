@@ -15,6 +15,11 @@ use wasmtime::{
     component::{Component, HasSelf, Linker},
 };
 
+#[cfg(feature = "paired-packages")]
+mod counter_trial;
+#[cfg(feature = "paired-packages")]
+pub use counter_trial::{CounterEvaluator, CounterProposal, CounterRequest};
+
 mod bindings {
     wasmtime::component::bindgen!({
         path: "../horizon-mod-sdk/wit",
