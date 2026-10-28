@@ -333,12 +333,77 @@ impl World {
     ) -> Option<Result<bool, crate::counter_trial::Fault>> {
         let trial = self.counter_trial.as_mut()?;
         let configuration = trial.configuration();
+        if !matches!(
+            configuration.backend(),
+            crate::counter_trial::Backend::Native
+        ) {
+            return Some(Err(crate::counter_trial::Fault::DispatchMismatch));
+        }
         let [x, y, z] = configuration.position();
         let current = self
             .chunks
             .get(&configuration.chunk())
             .map(|c| c.block(x & 15, y, z & 15));
         Some(trial.advance(running, eligible, current, self.game_time))
+    }
+    #[cfg(feature = "paired-packages")]
+    fn guest_counter_current(&self) -> Option<BlockStateId> {
+        let configuration = self.counter_trial.as_ref()?.configuration();
+        let [x, y, z] = configuration.position();
+        self.chunks
+            .get(&configuration.chunk())
+            .map(|c| c.block(x & 15, y, z & 15))
+    }
+    /// The caller supplies current authoritative running/ticket eligibility.
+    #[cfg(feature = "paired-packages")]
+    pub fn prepare_guest_counter_phase(
+        &mut self,
+        running: bool,
+        eligible: bool,
+    ) -> Result<Option<crate::counter_trial::PhaseToken>, crate::counter_trial::PhaseError> {
+        let current = self.guest_counter_current();
+        match &mut self.counter_trial {
+            Some(trial) => trial.prepare_guest(running, eligible, current, self.game_time),
+            None => Ok(None),
+        }
+    }
+    #[cfg(feature = "paired-packages")]
+    fn complete_guest_counter_phase(
+        &mut self,
+        token: crate::counter_trial::PhaseToken,
+        result: Result<crate::counter_trial::Proposal, crate::counter_trial::GuestFailure>,
+        running: bool,
+        eligible: bool,
+    ) -> Result<crate::counter_trial::Completion, crate::counter_trial::PhaseError> {
+        let current = self.guest_counter_current();
+        match &mut self.counter_trial {
+            Some(trial) => {
+                trial.complete_guest(token, result, running, eligible, current, self.game_time)
+            }
+            None => Ok(crate::counter_trial::Completion::Stale),
+        }
+    }
+    /// Rechecks the token and fresh authority/storage before publishing both fields.
+    #[cfg(feature = "paired-packages")]
+    pub fn commit_guest_counter_phase(
+        &mut self,
+        token: crate::counter_trial::PhaseToken,
+        proposal: crate::counter_trial::Proposal,
+        running: bool,
+        eligible: bool,
+    ) -> Result<crate::counter_trial::Completion, crate::counter_trial::PhaseError> {
+        self.complete_guest_counter_phase(token, Ok(proposal), running, eligible)
+    }
+    /// A stale failure cannot fault a different/replaced trial.
+    #[cfg(feature = "paired-packages")]
+    pub fn fail_guest_counter_phase(
+        &mut self,
+        token: crate::counter_trial::PhaseToken,
+        failure: crate::counter_trial::GuestFailure,
+        running: bool,
+        eligible: bool,
+    ) -> Result<crate::counter_trial::Completion, crate::counter_trial::PhaseError> {
+        self.complete_guest_counter_phase(token, Err(failure), running, eligible)
     }
     /// Explicit lifetime retirement before the owning World is discarded.
     #[cfg(feature = "paired-packages")]

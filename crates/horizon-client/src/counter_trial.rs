@@ -1,4 +1,5 @@
-//! Opt-in diagnostic native counter, without persistence or a guest API.
+//! Opt-in transient counter with native and staged guest host phases.
+//! No persistence or Game callback binding is established here.
 //! Host configuration/phase authority is required; this is not machine activity
 //! discovery, a saved generation, or a stable behavior interface.
 use crate::{
@@ -30,10 +31,17 @@ impl fmt::Display for ConfigError {
 impl std::error::Error for ConfigError {}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Fault {
+    /// Dispatch refusal only; the native wrapper does not latch this fault.
+    DispatchMismatch,
+    GuestFailure(GuestFailure),
     InstanceExhausted,
     CounterExhausted,
-    ReloadMismatch { actual: BlockStateId },
-    ResidentMismatch { actual: BlockStateId },
+    ReloadMismatch {
+        actual: BlockStateId,
+    },
+    ResidentMismatch {
+        actual: BlockStateId,
+    },
 }
 impl fmt::Display for Fault {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -41,6 +49,40 @@ impl fmt::Display for Fault {
     }
 }
 impl std::error::Error for Fault {}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GuestFailure {
+    Trap,
+    Fuel,
+    Memory,
+    Rejected,
+    InvalidReply,
+    Unavailable,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PhaseError {
+    DispatchMismatch,
+    Fault(Fault),
+}
+impl fmt::Display for PhaseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "counter guest phase: {self:?}")
+    }
+}
+impl std::error::Error for PhaseError {}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Completion {
+    Committed,
+    Skipped,
+    Stale,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Backend {
+    Native,
+    Guest {
+        primary_owner: String,
+        package_identity: [u8; 32],
+    },
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReadError {
     Disabled,
@@ -62,6 +104,7 @@ pub struct Configuration {
     state: BlockState,
     state_id: BlockStateId,
     position: [i32; 3],
+    backend: Backend,
 }
 impl Configuration {
     pub fn new(
@@ -92,7 +135,39 @@ impl Configuration {
             state,
             state_id,
             position,
+            backend: Backend::Native,
         })
+    }
+    /// Captured metadata binding only; runtime purity/activation is a caller prerequisite.
+    pub fn with_guest_package(
+        mut self,
+        prepared: &horizon_mods::paired::PreparedBundle,
+    ) -> Result<Self, ConfigError> {
+        let owner = &prepared.bundle().content_owner().id;
+        let content = prepared.content();
+        let mut blocks = content
+            .blocks
+            .iter()
+            .filter(|b| b.machine_type() == Some(self.machine_type.id()));
+        let block = blocks.next().ok_or(ConfigError::InvalidMetadata)?;
+        if self.backend != Backend::Native
+            || self.machine_type.id().split_once(':').map(|(id, _)| id) != Some(owner.as_str())
+            || content.machine_types().get(self.machine_type.id()) != Some(&self.machine_type)
+            || blocks.next().is_some()
+            || block.id != self.state.name
+            || block.template != "minecraft:iron_block"
+            || block.state_plan.is_some()
+        {
+            return Err(ConfigError::InvalidMetadata);
+        }
+        self.backend = Backend::Guest {
+            primary_owner: owner.clone(),
+            package_identity: *prepared.identity(),
+        };
+        Ok(self)
+    }
+    pub fn backend(&self) -> &Backend {
+        &self.backend
     }
     pub fn scope(&self) -> &AuthorityScope {
         &self.scope
@@ -134,6 +209,33 @@ impl Record {
     pub fn resident(&self) -> bool {
         self.resident
     }
+}
+/// An invocation-local read token. No public construction, cloning or mutation.
+#[derive(Debug)]
+pub struct PhaseToken {
+    configuration: Arc<Configuration>,
+    record: Record,
+    game_time: i64,
+}
+impl PhaseToken {
+    pub fn configuration(&self) -> &Configuration {
+        &self.configuration
+    }
+    pub fn record(&self) -> Record {
+        self.record
+    }
+    pub fn game_time(&self) -> i64 {
+        self.game_time
+    }
+}
+/// Untrusted scalar output; constructing this does not authorize any mutation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Proposal {
+    pub world_instance: u64,
+    pub instance: u64,
+    pub game_time: i64,
+    pub expected_counter: u64,
+    pub next_counter: u64,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RetirementReason {
@@ -286,6 +388,100 @@ impl Trial {
             record.resident = false;
         }
     }
+    fn guest_ready(
+        &mut self,
+        running: bool,
+        eligible: bool,
+        current: Option<BlockStateId>,
+        game_time: i64,
+    ) -> Result<bool, PhaseError> {
+        if !matches!(self.configuration.backend(), Backend::Guest { .. }) {
+            return Err(PhaseError::DispatchMismatch);
+        }
+        if let Some(fault) = self.fault {
+            return Err(PhaseError::Fault(fault));
+        }
+        let Some(record) = self.record else {
+            return Ok(false);
+        };
+        if !running || !eligible || !record.resident {
+            return Ok(false);
+        }
+        let Some(current) = current else {
+            return Ok(false);
+        };
+        let fault = if current != self.configuration.state_id {
+            Some(Fault::ResidentMismatch { actual: current })
+        } else if record.last_advanced == Some(game_time) {
+            return Ok(false);
+        } else if record.counter.checked_add(1).is_none() {
+            Some(Fault::CounterExhausted)
+        } else {
+            None
+        };
+        if let Some(fault) = fault {
+            self.fault = Some(fault);
+            return Err(PhaseError::Fault(fault));
+        }
+        Ok(true)
+    }
+    pub(crate) fn prepare_guest(
+        &mut self,
+        running: bool,
+        eligible: bool,
+        current: Option<BlockStateId>,
+        game_time: i64,
+    ) -> Result<Option<PhaseToken>, PhaseError> {
+        if !self.guest_ready(running, eligible, current, game_time)? {
+            return Ok(None);
+        }
+        Ok(self.record.map(|record| PhaseToken {
+            configuration: self.configuration.clone(),
+            record,
+            game_time,
+        }))
+    }
+    pub(crate) fn complete_guest(
+        &mut self,
+        token: PhaseToken,
+        result: Result<Proposal, GuestFailure>,
+        running: bool,
+        eligible: bool,
+        current: Option<BlockStateId>,
+        game_time: i64,
+    ) -> Result<Completion, PhaseError> {
+        if self.configuration != token.configuration
+            || self.record != Some(token.record)
+            || game_time != token.game_time
+        {
+            return Ok(Completion::Stale);
+        }
+        if !self.guest_ready(running, eligible, current, game_time)? {
+            return Ok(Completion::Skipped);
+        }
+        let valid = |p: &Proposal| {
+            p.world_instance == token.configuration.scope.world_instance()
+                && p.instance == token.record.instance
+                && p.game_time == token.game_time
+                && p.expected_counter == token.record.counter
+                && token.record.counter.checked_add(1) == Some(p.next_counter)
+        };
+        match result {
+            Ok(proposal) if valid(&proposal) => {
+                let Some(record) = &mut self.record else {
+                    return Ok(Completion::Stale);
+                };
+                record.counter = proposal.next_counter;
+                record.last_advanced = Some(game_time);
+                Ok(Completion::Committed)
+            }
+            other => {
+                let fault = Fault::GuestFailure(other.err().unwrap_or(GuestFailure::InvalidReply));
+                self.fault = Some(fault);
+                Err(PhaseError::Fault(fault))
+            }
+        }
+    }
     pub(crate) fn advance(
         &mut self,
         running: bool,
@@ -332,22 +528,46 @@ mod tests {
     fn metadata() -> &'static MachineType {
         static TYPE: OnceLock<MachineType> = OnceLock::new();
         TYPE.get_or_init(|| {
-            let unique=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-            let dir=std::env::temp_dir().join(format!("horizon-counter-metadata-{}-{unique}",std::process::id()));
-            fs::create_dir(&dir).unwrap();
-            let descriptor="format=1\nhost-contract='paired-preview-1'\n[content]\nid='counter_demo'\nname='Counter'\nversion='0'\napi='0.2'\nside='both'\ncapabilities=['registries']\n[client]\nentry='client.wasm'\napi='0.1'\ncapabilities=[]\n[server]\nentry='server.wasm'\napi='0.3'\ncapabilities=[]\n";
-            for (name,bytes) in [
-                ("horizon-paired.toml",descriptor.as_bytes()),("client.wasm",b"not executed"),("server.wasm",b"not executed"),
-                ("data/counter_demo/horizon/machine/counter_type.json",br#"{"format":1,"save-schema":1}"#),
-                ("data/counter_demo/horizon/block/counter.json",br#"{"template":"minecraft:iron_block","machine-type":"counter_demo:counter_type"}"#),
-            ] {
-                let path=dir.join(name);
-                fs::create_dir_all(path.parent().unwrap()).unwrap(); fs::write(path,bytes).unwrap();
-            }
-            let bundle=horizon_mods::paired::PreparedBundle::read_folder(&dir).unwrap();
-            let result=bundle.content().machine_types().get("counter_demo:counter_type").unwrap().clone();
-            fs::remove_dir_all(dir).unwrap(); result
+            captured(b"not executed", "counter_demo", "counter")
+                .content()
+                .machine_types()
+                .get("counter_demo:counter_type")
+                .unwrap()
+                .clone()
         })
+    }
+    fn captured(server: &[u8], owner: &str, block: &str) -> horizon_mods::paired::PreparedBundle {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "horizon-counter-metadata-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir(&dir).unwrap();
+        let descriptor = format!(
+            "format=1\nhost-contract='paired-preview-1'\n[content]\nid='{owner}'\nname='Counter'\nversion='0'\napi='0.2'\nside='both'\ncapabilities=['registries']\n[client]\nentry='client.wasm'\napi='0.1'\ncapabilities=[]\n[server]\nentry='server.wasm'\napi='0.3'\ncapabilities=[]\n"
+        );
+        let machine_path = format!("data/{owner}/horizon/machine/counter_type.json");
+        let block_path = format!("data/{owner}/horizon/block/{block}.json");
+        let binding = format!(
+            "{{\"template\":\"minecraft:iron_block\",\"machine-type\":\"{owner}:counter_type\"}}"
+        );
+        for (name, bytes) in [
+            ("horizon-paired.toml", descriptor.as_bytes()),
+            ("client.wasm", b"not executed"),
+            ("server.wasm", server),
+            (machine_path.as_str(), br#"{"format":1,"save-schema":1}"#),
+            (block_path.as_str(), binding.as_bytes()),
+        ] {
+            let path = dir.join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, bytes).unwrap();
+        }
+        let bundle = horizon_mods::paired::PreparedBundle::read_folder(&dir).unwrap();
+        fs::remove_dir_all(dir).unwrap();
+        bundle
     }
     fn configuration(dimension: &str) -> Configuration {
         Configuration::new(
@@ -636,5 +856,382 @@ mod tests {
             trial.advance(true, true, Some(BlockStateId(1)), 2),
             Err(Fault::InstanceExhausted)
         );
+    }
+    fn guest_configuration() -> Configuration {
+        configuration("minecraft:overworld")
+            .with_guest_package(&captured(b"guest one", "counter_demo", "counter"))
+            .unwrap()
+    }
+    fn guest_world() -> World {
+        let mut w = world(1, "minecraft:overworld");
+        w.take_counter_trial().unwrap();
+        w.enable_counter_trial(guest_configuration()).unwrap();
+        w
+    }
+    fn phase(w: &mut World) -> PhaseToken {
+        w.prepare_guest_counter_phase(true, true).unwrap().unwrap()
+    }
+    fn proposal(token: &PhaseToken) -> Proposal {
+        Proposal {
+            world_instance: token.configuration().scope().world_instance(),
+            instance: token.record().instance(),
+            game_time: token.game_time(),
+            expected_counter: token.record().counter(),
+            next_counter: token.record().counter() + 1,
+        }
+    }
+    #[test]
+    fn guest_binding_uses_captured_owner_type_block_and_identity() {
+        let config = configuration("minecraft:overworld");
+        let first = config
+            .clone()
+            .with_guest_package(&captured(b"one", "counter_demo", "counter"))
+            .unwrap();
+        let second = config
+            .clone()
+            .with_guest_package(&captured(b"two", "counter_demo", "counter"))
+            .unwrap();
+        assert_ne!(first, second);
+        assert!(
+            matches!(first.backend(), Backend::Guest { primary_owner, .. } if primary_owner == "counter_demo")
+        );
+        assert_eq!(
+            first
+                .clone()
+                .with_guest_package(&captured(b"one", "counter_demo", "counter")),
+            Err(ConfigError::InvalidMetadata)
+        );
+        for (owner, block) in [("other", "counter"), ("counter_demo", "other")] {
+            assert_eq!(
+                config
+                    .clone()
+                    .with_guest_package(&captured(b"one", owner, block)),
+                Err(ConfigError::InvalidMetadata)
+            );
+        }
+        let mut different_type = config.clone();
+        different_type.machine_type = captured(b"one", "other", "counter")
+            .content()
+            .machine_types()
+            .get("other:counter_type")
+            .unwrap()
+            .clone();
+        assert_eq!(
+            different_type.with_guest_package(&captured(b"one", "counter_demo", "counter")),
+            Err(ConfigError::InvalidMetadata)
+        );
+        assert_eq!(config.backend(), &Backend::Native);
+    }
+    #[test]
+    fn guest_phase_commits_once_without_native_fallback_and_preserves_rewind() {
+        let mut w = guest_world();
+        let before = w.counter_trial_snapshot();
+        assert_eq!(
+            w.advance_counter_trial(true, true),
+            Some(Err(Fault::DispatchMismatch))
+        );
+        assert_eq!(w.counter_trial_snapshot(), before);
+        let first = phase(&mut w);
+        let duplicate = phase(&mut w);
+        let reply = proposal(&first);
+        assert_eq!(w.counter_trial_snapshot(), before);
+        assert_eq!(
+            w.commit_guest_counter_phase(first, reply, true, true),
+            Ok(Completion::Committed)
+        );
+        let committed = w.counter_trial_snapshot();
+        assert_eq!(
+            w.commit_guest_counter_phase(duplicate, reply, true, true),
+            Ok(Completion::Stale)
+        );
+        assert_eq!(w.counter_trial_snapshot(), committed);
+        assert!(w.prepare_guest_counter_phase(true, true).unwrap().is_none());
+        w.game_time = -1;
+        let token = phase(&mut w);
+        let reply = proposal(&token);
+        assert_eq!(
+            w.commit_guest_counter_phase(token, reply, true, true),
+            Ok(Completion::Committed)
+        );
+        assert_eq!(record(&w).counter(), 2);
+        assert_eq!(record(&w).last_advanced(), Some(-1));
+    }
+    #[test]
+    fn guest_prepare_and_completion_respect_fresh_authority_and_storage() {
+        let mut w = guest_world();
+        for (running, eligible) in [(false, true), (true, false)] {
+            let before = w.counter_trial_snapshot();
+            assert!(
+                w.prepare_guest_counter_phase(running, eligible)
+                    .unwrap()
+                    .is_none()
+            );
+            let token = phase(&mut w);
+            let reply = proposal(&token);
+            assert_eq!(
+                w.commit_guest_counter_phase(token, reply, running, eligible),
+                Ok(Completion::Skipped)
+            );
+            let token = phase(&mut w);
+            assert_eq!(
+                w.fail_guest_counter_phase(token, GuestFailure::Trap, running, eligible),
+                Ok(Completion::Skipped)
+            );
+            assert_eq!(w.counter_trial_snapshot(), before);
+        }
+        let token = phase(&mut w);
+        let reply = proposal(&token);
+        let lent = std::mem::take(&mut w.chunks);
+        assert!(w.prepare_guest_counter_phase(true, true).unwrap().is_none());
+        assert_eq!(
+            w.commit_guest_counter_phase(token, reply, true, true),
+            Ok(Completion::Skipped)
+        );
+        w.chunks = lent;
+        let token = phase(&mut w);
+        w.remove_streamed_chunk(&(0, 0)).unwrap();
+        let before = w.counter_trial_snapshot();
+        assert_eq!(
+            w.fail_guest_counter_phase(token, GuestFailure::Trap, true, true),
+            Ok(Completion::Stale)
+        );
+        assert_eq!(w.counter_trial_snapshot(), before);
+        assert!(w.prepare_guest_counter_phase(true, true).unwrap().is_none());
+        let mut absent = world(0, "minecraft:overworld");
+        absent.take_counter_trial().unwrap();
+        assert!(
+            absent
+                .prepare_guest_counter_phase(true, true)
+                .unwrap()
+                .is_none()
+        );
+        absent.enable_counter_trial(guest_configuration()).unwrap();
+        assert!(
+            absent
+                .prepare_guest_counter_phase(true, true)
+                .unwrap()
+                .is_none()
+        );
+        let mut native = world(1, "minecraft:overworld");
+        assert!(matches!(
+            native.prepare_guest_counter_phase(true, true),
+            Err(PhaseError::DispatchMismatch)
+        ));
+    }
+    #[test]
+    fn guest_invalid_replies_and_failures_latch_without_losing_committed_fields() {
+        for invalid in 0..7 {
+            let mut w = guest_world();
+            let token = phase(&mut w);
+            let mut reply = proposal(&token);
+            match invalid {
+                0 => reply.world_instance += 1,
+                1 => reply.instance += 1,
+                2 => reply.game_time += 1,
+                3 => reply.expected_counter += 1,
+                4 => reply.next_counter = 0,
+                5 => reply.next_counter = 2,
+                _ => reply.next_counter = u64::MAX,
+            }
+            let before = record(&w);
+            let fault = Fault::GuestFailure(GuestFailure::InvalidReply);
+            assert_eq!(
+                w.commit_guest_counter_phase(token, reply, true, true),
+                Err(PhaseError::Fault(fault))
+            );
+            assert_eq!(record(&w), before);
+            assert!(
+                matches!(w.prepare_guest_counter_phase(false, false), Err(PhaseError::Fault(f)) if f == fault)
+            );
+        }
+        for failure in [
+            GuestFailure::Trap,
+            GuestFailure::Fuel,
+            GuestFailure::Memory,
+            GuestFailure::Rejected,
+            GuestFailure::Unavailable,
+        ] {
+            let mut w = guest_world();
+            let token = phase(&mut w);
+            let reply = proposal(&token);
+            w.commit_guest_counter_phase(token, reply, true, true)
+                .unwrap();
+            w.game_time += 1;
+            let token = phase(&mut w);
+            let another = phase(&mut w);
+            let before = record(&w);
+            let fault = Fault::GuestFailure(failure);
+            assert_eq!(
+                w.fail_guest_counter_phase(token, failure, true, true),
+                Err(PhaseError::Fault(fault))
+            );
+            assert_eq!(
+                w.fail_guest_counter_phase(another, GuestFailure::InvalidReply, true, true),
+                Err(PhaseError::Fault(fault))
+            );
+            assert_eq!(record(&w), before);
+            write(&mut w, 0);
+            write(&mut w, 1);
+            assert!(w.counter_trial_snapshot().unwrap().record().is_none());
+            assert_eq!(
+                w.block(POSITION[0], POSITION[1], POSITION[2]),
+                BlockStateId(1)
+            );
+        }
+    }
+    #[test]
+    fn guest_stale_results_cannot_commit_or_fault_another_record_or_configuration() {
+        for failure in [false, true] {
+            for replacement in 0..5 {
+                let mut w = guest_world();
+                let token = phase(&mut w);
+                let reply = proposal(&token);
+                match replacement {
+                    0 => {
+                        write(&mut w, 0);
+                        write(&mut w, 1);
+                    }
+                    1 => {
+                        w.take_counter_trial().unwrap();
+                        w.enable_counter_trial(guest_configuration()).unwrap();
+                    }
+                    2 => {
+                        w.take_counter_trial().unwrap();
+                        w.enable_counter_trial(configuration("minecraft:overworld"))
+                            .unwrap();
+                    }
+                    3 => w.game_time += 1,
+                    _ => {
+                        w.take_counter_trial().unwrap();
+                    }
+                }
+                let before = w.counter_trial_snapshot();
+                let result = if failure {
+                    w.fail_guest_counter_phase(token, GuestFailure::Trap, true, true)
+                } else {
+                    w.commit_guest_counter_phase(token, reply, true, true)
+                };
+                assert_eq!(result, Ok(Completion::Stale));
+                assert_eq!(w.counter_trial_snapshot(), before);
+            }
+        }
+        for change in 0..10 {
+            let mut trial = Trial::new(guest_configuration(), Some(BlockStateId(1)));
+            let token = trial
+                .prepare_guest(true, true, Some(BlockStateId(1)), 1)
+                .unwrap()
+                .unwrap();
+            let reply = proposal(&token);
+            let config = Arc::make_mut(&mut trial.configuration);
+            match change {
+                0 => config.scope = AuthorityScope::new(8, "minecraft:overworld").unwrap(),
+                1 => config.scope = AuthorityScope::new(7, "minecraft:the_nether").unwrap(),
+                2 => config.position[0] += 1,
+                3 => config.state.name = "counter_demo:other".into(),
+                4 => config.state_id = BlockStateId(2),
+                5 => {
+                    config.backend = configuration("minecraft:overworld")
+                        .with_guest_package(&captured(b"different", "counter_demo", "counter"))
+                        .unwrap()
+                        .backend
+                }
+                6 => trial.record.as_mut().unwrap().counter += 1,
+                7 => trial.record.as_mut().unwrap().last_advanced = Some(0),
+                8 => {
+                    config.machine_type = captured(b"one", "other", "counter")
+                        .content()
+                        .machine_types()
+                        .get("other:counter_type")
+                        .unwrap()
+                        .clone()
+                }
+                _ => {
+                    config.state.properties.insert("axis".into(), "x".into());
+                }
+            }
+            let before = trial.snapshot();
+            assert_eq!(
+                trial.complete_guest(token, Ok(reply), true, true, Some(BlockStateId(1)), 1),
+                Ok(Completion::Stale)
+            );
+            assert_eq!(trial.snapshot(), before);
+        }
+    }
+    #[test]
+    fn guest_rechecks_actual_block_during_prepare_and_completion() {
+        for prepared in [false, true] {
+            let mut w = guest_world();
+            let token = prepared.then(|| phase(&mut w));
+            let before = record(&w);
+            Arc::make_mut(w.chunks.get_mut(&(0, 0)).unwrap()).set(
+                POSITION[0],
+                POSITION[1],
+                POSITION[2],
+                2,
+            );
+            let fault = Fault::ResidentMismatch {
+                actual: BlockStateId(2),
+            };
+            if let Some(token) = token {
+                let reply = proposal(&token);
+                assert_eq!(
+                    w.commit_guest_counter_phase(token, reply, true, true),
+                    Err(PhaseError::Fault(fault))
+                );
+            } else {
+                assert!(
+                    matches!(w.prepare_guest_counter_phase(true, true), Err(PhaseError::Fault(f)) if f == fault)
+                );
+            }
+            assert_eq!(record(&w), before);
+            assert_eq!(w.counter_trial_snapshot().unwrap().fault(), Some(fault));
+        }
+    }
+    #[test]
+    fn guest_and_native_precedence_preserve_duplicate_mismatch_and_overflow() {
+        for guest in [false, true] {
+            let config = if guest {
+                guest_configuration()
+            } else {
+                configuration("minecraft:overworld")
+            };
+            let mut trial = Trial::new(config, Some(BlockStateId(1)));
+            trial.record.as_mut().unwrap().last_advanced = Some(10);
+            trial.record.as_mut().unwrap().counter = u64::MAX;
+            if guest {
+                assert!(
+                    trial
+                        .prepare_guest(true, true, Some(BlockStateId(1)), 10)
+                        .unwrap()
+                        .is_none()
+                );
+            } else {
+                assert_eq!(
+                    trial.advance(true, true, Some(BlockStateId(1)), 10),
+                    Ok(false)
+                );
+            }
+            let expected = Fault::ResidentMismatch {
+                actual: BlockStateId(2),
+            };
+            if guest {
+                assert!(
+                    matches!(trial.prepare_guest(true, true, Some(BlockStateId(2)), 10), Err(PhaseError::Fault(f)) if f == expected)
+                );
+            } else {
+                assert_eq!(
+                    trial.advance(true, true, Some(BlockStateId(2)), 10),
+                    Err(expected)
+                );
+            }
+            assert_eq!(trial.record.unwrap().counter(), u64::MAX);
+        }
+        let mut trial = Trial::new(guest_configuration(), Some(BlockStateId(1)));
+        trial.record.as_mut().unwrap().counter = u64::MAX;
+        assert!(matches!(
+            trial.prepare_guest(true, true, Some(BlockStateId(1)), 1),
+            Err(PhaseError::Fault(Fault::CounterExhausted))
+        ));
+        assert_eq!(trial.record.unwrap().last_advanced(), None);
     }
 }
