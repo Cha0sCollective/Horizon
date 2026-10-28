@@ -57,6 +57,7 @@ pub enum GuestFailure {
     Rejected,
     InvalidReply,
     Unavailable,
+    Evaluation,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PhaseError {
@@ -1050,6 +1051,7 @@ mod tests {
             GuestFailure::Memory,
             GuestFailure::Rejected,
             GuestFailure::Unavailable,
+            GuestFailure::Evaluation,
         ] {
             let mut w = guest_world();
             let token = phase(&mut w);

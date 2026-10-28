@@ -454,6 +454,9 @@ pub struct Entry {
     paired: Option<Arc<crate::paired::PreparedBundle>>,
     #[cfg(feature = "paired-packages")]
     paired_capabilities: Vec<crate::Capability>,
+    /// Compiled diagnostic metadata only; calls always create fresh isolated Stores.
+    #[cfg(feature = "paired-packages")]
+    counter_evaluator: Option<CounterEvaluator>,
     modified: Option<SystemTime>,
 }
 impl Entry {
@@ -660,6 +663,70 @@ impl Mods {
             server,
         })
     }
+    #[cfg(feature = "paired-packages")]
+    fn counter_entry_index(&self, owner: &str, identity: &[u8; 32]) -> Result<usize, String> {
+        let mut matching = self.entries.iter().enumerate().filter(|(_, entry)| {
+            entry
+                .paired
+                .as_ref()
+                .is_some_and(|pair| pair.bundle().content_owner().id == owner)
+        });
+        let (index, entry) = matching
+            .next()
+            .ok_or("counter guest has no captured paired entry")?;
+        if matching.next().is_some() {
+            return Err("counter guest has ambiguous paired entries".into());
+        }
+        let pair = entry
+            .paired
+            .as_ref()
+            .ok_or("counter guest capture is unavailable")?;
+        if entry.manifest.as_ref().map(|m| m.id.as_str()) != Some(owner)
+            || pair.identity() != identity
+        {
+            return Err("counter guest captured owner/identity does not match".into());
+        }
+        if entry.status != Status::Running || entry.side_run(true).is_none() {
+            return Err("counter guest paired server is not running".into());
+        }
+        Ok(index)
+    }
+    /// Warm one immutable diagnostic cache from the exact live captured server.
+    #[cfg(feature = "paired-packages")]
+    pub fn prepare_counter_evaluator(
+        &mut self,
+        owner: &str,
+        identity: &[u8; 32],
+    ) -> Result<(), String> {
+        let index = self.counter_entry_index(owner, identity)?;
+        if self.entries[index].counter_evaluator.is_none() {
+            let pair = self.entries[index]
+                .paired
+                .clone()
+                .ok_or("counter guest capture is unavailable")?;
+            let checked = self.preflight_pair(&pair)?;
+            let evaluator = CounterEvaluator::from_pair(&checked)?;
+            self.entries[index].counter_evaluator = Some(evaluator);
+        }
+        self.counter_evaluator(owner, identity).map(|_| ())
+    }
+    /// Every invocation rechecks activation and captured identity, even with cached code.
+    #[cfg(feature = "paired-packages")]
+    pub fn counter_evaluator(
+        &self,
+        owner: &str,
+        identity: &[u8; 32],
+    ) -> Result<&CounterEvaluator, String> {
+        let index = self.counter_entry_index(owner, identity)?;
+        let evaluator = self.entries[index]
+            .counter_evaluator
+            .as_ref()
+            .ok_or("counter guest evaluator is not prepared")?;
+        if evaluator.identity() != identity {
+            return Err("counter guest evaluator identity does not match".into());
+        }
+        Ok(evaluator)
+    }
     /// Changes whenever the running mods (so their commands) change.
     pub fn generation(&self) -> u64 {
         self.generation
@@ -714,6 +781,8 @@ impl Mods {
                 paired: None,
                 #[cfg(feature = "paired-packages")]
                 paired_capabilities: Vec::new(),
+                #[cfg(feature = "paired-packages")]
+                counter_evaluator: None,
                 modified,
             };
             match Package::read(path) {
@@ -778,6 +847,7 @@ impl Mods {
                 paired: prepared.get(path).cloned(),
                 modified: modified(path),
                 paired_capabilities: Vec::new(),
+                counter_evaluator: None,
             };
             if let Some(pair) = entry.paired.clone() {
                 entry.manifest = Some(pair.bundle().content_owner().clone());
@@ -1190,6 +1260,10 @@ impl Mods {
                 entry.status = Status::Failed(reason);
                 entry.run = None;
                 entry.paired_server = None;
+                #[cfg(feature = "paired-packages")]
+                {
+                    entry.counter_evaluator = None;
+                }
                 self.generation += 1;
                 None
             }
@@ -1675,6 +1749,10 @@ impl Mods {
             self.entries[i].modified = now;
             self.entries[i].run = None;
             self.entries[i].paired_server = None;
+            #[cfg(feature = "paired-packages")]
+            {
+                self.entries[i].counter_evaluator = None;
+            }
             let path = self.entries[i].path.clone();
             let started = Package::read(&path).and_then(|p| {
                 self.entries[i].manifest = Some(p.manifest.clone());

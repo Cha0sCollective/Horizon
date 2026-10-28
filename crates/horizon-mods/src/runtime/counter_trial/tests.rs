@@ -424,3 +424,92 @@ fn request_byte_caps_refuse_before_start_and_bound_returned_diagnostics() {
     let message = diagnostic("test", wasmtime::Error::msg("é".repeat(600)));
     assert_eq!(message.chars().count(), 512);
 }
+
+#[test]
+#[ignore = "requires HORIZON_COUNTER_PAIR_FIXTURE"]
+fn captured_rust_pair_selector_requires_matching_live_server_and_cache_identity() {
+    use crate::{Mods, Runs, Status, paired::PreparedBundle};
+    use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
+
+    let path = PathBuf::from(
+        std::env::var_os("HORIZON_COUNTER_PAIR_FIXTURE")
+            .expect("HORIZON_COUNTER_PAIR_FIXTURE must name the owned prepared Rust pair"),
+    );
+    let prepared =
+        Arc::new(PreparedBundle::read_folder(&path).expect("valid captured Rust fixture"));
+    let owner = prepared.bundle().content_owner().id.clone();
+    let identity = *prepared.identity();
+    let snapshots = BTreeMap::from([(path.clone(), prepared)]);
+    let mut mods = Mods::load_for_with_prepared(
+        Runs::Both,
+        std::slice::from_ref(&path),
+        &snapshots,
+        |_| true,
+        |_| false,
+    );
+    assert_eq!(mods.entries().len(), 1);
+    assert_eq!(mods.entries()[0].status, Status::Running);
+    assert!(mods.runs_server());
+    assert!(mods.drain().is_empty());
+    assert!(mods.counter_evaluator(&owner, &identity).is_err());
+    mods.prepare_counter_evaluator(&owner, &identity)
+        .expect("actual server diagnostic preflight");
+    let evaluator = mods.counter_evaluator(&owner, &identity).unwrap();
+    assert_eq!(evaluator.identity(), &identity);
+    assert_eq!(
+        evaluator.evaluate(&request()).unwrap(),
+        CounterProposal {
+            world_instance: 17,
+            instance: 23,
+            game_time: -22,
+            expected_counter: 9,
+            next_counter: 10,
+        }
+    );
+    let mut wrong_identity = identity;
+    wrong_identity[0] ^= 1;
+    for (selected_owner, selected_identity) in [
+        ("no-such-owner", identity),
+        (owner.as_str(), wrong_identity),
+    ] {
+        assert!(
+            mods.counter_evaluator(selected_owner, &selected_identity)
+                .is_err()
+        );
+        assert!(
+            mods.prepare_counter_evaluator(selected_owner, &selected_identity)
+                .is_err()
+        );
+    }
+    // The immutable compiled cache still exists after private server removal.
+    let server = mods.entries[0]
+        .paired_server
+        .take()
+        .expect("actual running server Store");
+    assert!(mods.entries[0].counter_evaluator.is_some());
+    assert!(mods.counter_evaluator(&owner, &identity).is_err());
+    assert!(mods.prepare_counter_evaluator(&owner, &identity).is_err());
+    mods.entries[0].paired_server = Some(server);
+    for status in [
+        Status::Off,
+        Status::Elsewhere,
+        Status::Failed("controlled status failure".into()),
+    ] {
+        mods.entries[0].status = status;
+        assert!(mods.counter_evaluator(&owner, &identity).is_err());
+        assert!(mods.prepare_counter_evaluator(&owner, &identity).is_err());
+    }
+    mods.entries[0].status = Status::Running;
+    assert!(mods.counter_evaluator(&owner, &identity).is_ok());
+    mods.entries[0].counter_evaluator.as_mut().unwrap().identity[0] ^= 1;
+    assert!(mods.counter_evaluator(&owner, &identity).is_err());
+    assert!(mods.prepare_counter_evaluator(&owner, &identity).is_err());
+
+    let mut client =
+        Mods::load_for_with_prepared(Runs::Client, &[path], &snapshots, |_| true, |_| false);
+    assert_eq!(client.entries().len(), 1);
+    assert_eq!(client.entries()[0].status, Status::Running);
+    assert!(!client.runs_server());
+    assert!(client.prepare_counter_evaluator(&owner, &identity).is_err());
+    assert!(client.counter_evaluator(&owner, &identity).is_err());
+}
