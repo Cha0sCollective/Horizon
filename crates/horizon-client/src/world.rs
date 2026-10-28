@@ -78,6 +78,9 @@ pub struct World {
     pub watched: Vec<bool>,
     /// Writes of watched states: position, previous and new state.
     pub watched_writes: Vec<((i32, i32, i32), u32, u32)>,
+    /// Separate passive host observation; never enabled for a default world.
+    #[cfg(feature = "paired-packages")]
+    mutation_observer: Option<Box<crate::mutation_observer::Observer>>,
     /// `ChunkAccess.inhabitedTime` of resident chunks: ticks a player spent
     /// within spawning range (local difficulty).
     pub inhabited: HashMap<(i32, i32), i64>,
@@ -183,6 +186,8 @@ impl World {
             block_names: HashMap::new(),
             watched: Vec::new(),
             watched_writes: Vec::new(),
+            #[cfg(feature = "paired-packages")]
+            mutation_observer: None,
             inhabited: HashMap::new(),
             game_time: 0,
             day_time: 1000,
@@ -193,6 +198,43 @@ impl World {
             moving_pistons: Vec::new(),
             pois: Default::default(),
         }
+    }
+    /// Opt in after the host establishes authority, dimension and registry IDs.
+    /// This does not infer authority from a World or expose it to a guest.
+    #[cfg(feature = "paired-packages")]
+    pub fn enable_mutation_observer(
+        &mut self,
+        scope: crate::mutation_observer::AuthorityScope,
+        watched: impl IntoIterator<Item = BlockStateId>,
+        capacity: usize,
+    ) -> Result<(), crate::mutation_observer::ConfigError> {
+        if self.mutation_observer.is_some() {
+            return Err(crate::mutation_observer::ConfigError::AlreadyEnabled);
+        }
+        self.mutation_observer = Some(Box::new(crate::mutation_observer::Observer::new(
+            scope, watched, capacity,
+        )?));
+        Ok(())
+    }
+    #[cfg(feature = "paired-packages")]
+    pub fn mutation_observer(&self) -> Option<&crate::mutation_observer::Observer> {
+        self.mutation_observer.as_deref()
+    }
+    /// Disabled is distinct from an enabled empty batch or a sticky fault.
+    #[cfg(feature = "paired-packages")]
+    pub fn drain_mutations(
+        &mut self,
+    ) -> Option<
+        Result<Vec<crate::mutation_observer::Mutation>, crate::mutation_observer::ObserverFault>,
+    > {
+        self.mutation_observer
+            .as_mut()
+            .map(|observer| observer.drain())
+    }
+    /// Explicit teardown returns the observer, including its pending/fault state.
+    #[cfg(feature = "paired-packages")]
+    pub fn take_mutation_observer(&mut self) -> Option<crate::mutation_observer::Observer> {
+        self.mutation_observer.take().map(|observer| *observer)
     }
     /// A controlled blockstate scene for the native scene probes: material
     /// layers, a stepped pyramid and the model gallery. Not generated terrain.
@@ -268,6 +310,10 @@ impl World {
             let watches = |id: u32| self.watched.get(id as usize).copied().unwrap_or(false);
             if watches(previous) || watches(state.0) {
                 self.watched_writes.push(((x, y, z), previous, state.0));
+            }
+            #[cfg(feature = "paired-packages")]
+            if let Some(observer) = &mut self.mutation_observer {
+                observer.record([x, y, z], BlockStateId(previous), state, self.game_time);
             }
             self.revision = self.revision.wrapping_add(1);
             if let Some(log) = &mut self.block_log {
@@ -429,5 +475,188 @@ mod tests {
         // Past the top, and the palette of air below it.
         assert!(!world.may_hold([0, 400, 0], [0, 401, 0], nine));
         assert!(world.may_hold([0, 400, 0], [0, 401, 0], |s| s.0 == 0));
+    }
+}
+
+#[cfg(all(test, feature = "paired-packages"))]
+mod mutation_tests {
+    use super::*;
+    use crate::mutation_observer::{AuthorityScope, Cause, ConfigError, ObserverFault};
+
+    fn resident() -> World {
+        let mut world = World::new(BlockStateId(0), 0);
+        world.chunks.insert((0, 0), Arc::new(Chunk::empty(0, 0)));
+        world
+    }
+    fn enable(world: &mut World, dimension: &str, capacity: usize) {
+        world
+            .enable_mutation_observer(
+                AuthorityScope::new(7, dimension).unwrap(),
+                [BlockStateId(1), BlockStateId(2)],
+                capacity,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn committed_transitions_stay_ordered_without_coalescing_or_clock_invention() {
+        let mut world = resident();
+        enable(&mut world, "minecraft:overworld", 8);
+        world.game_time = 42;
+        world.set(2, 70, 2, BlockStateId(9)).unwrap(); // Both states unobserved.
+        for state in [1, 2, 0] {
+            world.set(2, 70, 2, BlockStateId(state)).unwrap();
+        }
+        let batch = world.drain_mutations().unwrap().unwrap();
+        let observed: Vec<_> = batch
+            .iter()
+            .map(|event| {
+                (
+                    event.position(),
+                    event.previous().0,
+                    event.current().0,
+                    event.game_time(),
+                    event.sequence(),
+                    event.cause(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            observed,
+            [
+                ([2, 70, 2], 9, 1, 42, 1, Cause::Unclassified),
+                ([2, 70, 2], 1, 2, 42, 2, Cause::Unclassified),
+                ([2, 70, 2], 2, 0, 42, 3, Cause::Unclassified),
+            ]
+        );
+        assert_eq!(batch[0].scope().world_instance(), 7);
+        assert_eq!(batch[0].scope().dimension(), "minecraft:overworld");
+        world.game_time = 43;
+        world.set(3, 70, 3, BlockStateId(1)).unwrap();
+        let next = world.drain_mutations().unwrap().unwrap();
+        assert_eq!((next[0].game_time(), next[0].sequence()), (43, 4));
+        assert!(world.drain_mutations().unwrap().unwrap().is_empty());
+    }
+
+    #[test]
+    fn failed_or_same_state_writes_produce_no_observations() {
+        let mut world = resident();
+        enable(&mut world, "minecraft:overworld", 8);
+        world.set(2, 70, 2, BlockStateId(1)).unwrap();
+        world.drain_mutations().unwrap().unwrap();
+        let revision = world.revision;
+        world.set(2, 70, 2, BlockStateId(1)).unwrap();
+        assert!(world.set(16, 70, 0, BlockStateId(1)).is_err());
+        assert!(world.set(2, MIN_Y - 1, 2, BlockStateId(1)).is_err());
+        assert!(
+            world
+                .set(2, MIN_Y + SECTIONS as i32 * 16, 2, BlockStateId(1))
+                .is_err()
+        );
+        assert_eq!(world.revision, revision);
+        assert!(world.drain_mutations().unwrap().unwrap().is_empty());
+        world.set(2, 70, 2, BlockStateId(0)).unwrap();
+        assert_eq!(world.drain_mutations().unwrap().unwrap()[0].sequence(), 2);
+    }
+
+    #[test]
+    fn existing_watch_and_network_logs_remain_independent() {
+        let mut world = resident();
+        world.watched = vec![false, true];
+        world.watched_writes.push(((-1, 0, 0), 5, 6));
+        world.block_log = Some(vec![(-1, 0, 0)]);
+        enable(&mut world, "minecraft:overworld", 8);
+        world.set(2, 70, 2, BlockStateId(1)).unwrap();
+        assert_eq!(
+            world.watched_writes,
+            [((-1, 0, 0), 5, 6), ((2, 70, 2), 0, 1)]
+        );
+        assert_eq!(world.block_log.as_ref().unwrap(), &[(-1, 0, 0), (2, 70, 2)]);
+        assert_eq!(world.drain_mutations().unwrap().unwrap().len(), 1);
+        assert_eq!(world.watched_writes.len(), 2);
+        assert_eq!(world.block_log.as_ref().unwrap().len(), 2);
+        world.watched_writes.clear();
+        world.block_log.as_mut().unwrap().clear();
+        world.set(2, 70, 2, BlockStateId(0)).unwrap();
+        assert_eq!(world.drain_mutations().unwrap().unwrap().len(), 1);
+        assert_eq!(world.watched_writes, [((2, 70, 2), 1, 0)]);
+    }
+
+    #[test]
+    fn overflow_faults_the_batch_but_does_not_reject_committed_world_writes() {
+        let mut world = resident();
+        enable(&mut world, "minecraft:overworld", 1);
+        world.set(2, 70, 2, BlockStateId(1)).unwrap();
+        world.set(2, 70, 2, BlockStateId(2)).unwrap();
+        let expected = ObserverFault::Overflow {
+            capacity: 1,
+            sequence: 2,
+        };
+        assert_eq!(world.block(2, 70, 2), BlockStateId(2));
+        assert_eq!(world.drain_mutations(), Some(Err(expected)));
+        world.set(2, 70, 2, BlockStateId(0)).unwrap();
+        assert_eq!(world.block(2, 70, 2), BlockStateId(0));
+        assert_eq!(world.drain_mutations(), Some(Err(expected)));
+        let observer = world.mutation_observer().unwrap();
+        assert_eq!(observer.pending_len(), 1);
+        assert_eq!(observer.fault(), Some(expected));
+    }
+
+    #[test]
+    fn dimension_scope_and_pending_history_travel_with_world_swaps() {
+        let mut overworld = resident();
+        let mut nether = resident();
+        enable(&mut overworld, "minecraft:overworld", 8);
+        enable(&mut nether, "minecraft:the_nether", 8);
+        overworld.game_time = 10;
+        nether.game_time = 20;
+        overworld.set(2, 70, 2, BlockStateId(1)).unwrap();
+        nether.set(2, 70, 2, BlockStateId(1)).unwrap();
+        std::mem::swap(&mut overworld, &mut nether);
+        overworld.set(2, 70, 2, BlockStateId(0)).unwrap();
+        let moved = overworld.drain_mutations().unwrap().unwrap();
+        assert_eq!(moved.len(), 2);
+        for event in &moved {
+            assert_eq!(event.scope().world_instance(), 7);
+            assert_eq!(event.scope().dimension(), "minecraft:the_nether");
+            assert_eq!(event.game_time(), 20);
+        }
+        assert_eq!((moved[0].sequence(), moved[1].sequence()), (1, 2));
+        let parked = nether.drain_mutations().unwrap().unwrap();
+        assert_eq!(parked[0].scope().dimension(), "minecraft:overworld");
+        assert_eq!(parked[0].game_time(), 10);
+        assert_eq!(parked[0].sequence(), 1);
+    }
+
+    #[test]
+    fn default_is_disabled_and_replacement_requires_explicit_teardown() {
+        let mut world = resident();
+        world.set(2, 70, 2, BlockStateId(1)).unwrap();
+        assert!(world.mutation_observer().is_none());
+        assert!(world.drain_mutations().is_none());
+        assert_eq!(
+            world.enable_mutation_observer(
+                AuthorityScope::new(7, "minecraft:overworld").unwrap(),
+                [],
+                2,
+            ),
+            Err(ConfigError::EmptyWatchedStates)
+        );
+        assert!(world.mutation_observer().is_none());
+        enable(&mut world, "minecraft:overworld", 8);
+        world.set(2, 70, 2, BlockStateId(2)).unwrap();
+        assert_eq!(
+            world.enable_mutation_observer(
+                AuthorityScope::new(8, "minecraft:the_end").unwrap(),
+                [BlockStateId(1)],
+                2,
+            ),
+            Err(ConfigError::AlreadyEnabled)
+        );
+        let mut retained = world.take_mutation_observer().unwrap();
+        assert_eq!(retained.scope().world_instance(), 7);
+        assert_eq!(retained.drain().unwrap().len(), 1);
+        world.set(2, 70, 2, BlockStateId(0)).unwrap();
+        assert!(world.drain_mutations().is_none());
     }
 }

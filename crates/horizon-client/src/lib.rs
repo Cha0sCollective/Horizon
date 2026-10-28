@@ -120,6 +120,8 @@ pub mod mouse;
 pub mod moved_extras;
 pub mod multiplayer;
 pub mod music;
+#[cfg(feature = "paired-packages")]
+pub mod mutation_observer;
 pub mod net;
 pub mod nether_portal;
 pub mod offline_name;
