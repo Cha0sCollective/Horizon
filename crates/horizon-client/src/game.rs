@@ -11374,10 +11374,18 @@ impl Game<'_> {
     fn save_level(&mut self, wait: bool) -> Result<()> {
         self.save.save_forced_chunks(&self.streaming.forced)?;
         self.streaming.save(&mut self.world, wait)?;
-        let keys: Vec<_> = self.world.modified.drain().collect();
-        let chunks = self.with_entities(keys.iter().filter_map(|k| self.world.chunks.get(k)));
-        self.save
-            .save_later(&chunks, self.pack.assets.registry, self.res.biomes())?;
+        let chunks = self.with_entities(
+            self.world
+                .modified
+                .iter()
+                .filter_map(|k| self.world.chunks.get(k)),
+        );
+        self.save.save_modified_later(
+            &mut self.world.modified,
+            &chunks,
+            self.pack.assets.registry,
+            self.res.biomes(),
+        )?;
         // Prepare entities while the chunk writer runs, then use one barrier.
         self.save_entities(false)?;
         self.save_raids();

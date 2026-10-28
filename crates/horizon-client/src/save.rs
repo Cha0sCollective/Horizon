@@ -2299,6 +2299,22 @@ impl SaveDir {
         self.save_poi(chunks, false)?;
         Ok(chunks.len())
     }
+    /// Queue snapshots before releasing their dirty coordinates. Any enqueue error,
+    /// including partial acceptance, leaves every marker available to the owner.
+    /// This internal Rust handoff is not durability: use the normal writer barrier.
+    pub fn save_modified_later(
+        &self,
+        modified: &mut HashSet<(i32, i32)>,
+        chunks: &[Arc<Chunk>],
+        registry: &'static BlockRegistry,
+        biomes: &Arc<Biomes>,
+    ) -> Result<usize> {
+        let accepted = self.save_later(chunks, registry, biomes)?;
+        for chunk in chunks {
+            modified.remove(&(chunk.x, chunk.z));
+        }
+        Ok(accepted)
+    }
     /// Write the entity chunks (`EntityStorage`): an empty list deletes it.
     pub fn save_entities(&self, chunks: Vec<((i32, i32), Vec<Tag>)>) -> Result<()> {
         self.write_entities(chunks, true)
@@ -3852,6 +3868,338 @@ impl<G: ChunkGenerator> ChunkGenerator for Persistent<G> {
 
 #[cfg(test)]
 mod tests {
+    mod dirty_handoff {
+        use super::*;
+
+        struct Resources {
+            registry: &'static BlockRegistry,
+            biomes: Arc<Biomes>,
+            tables: Arc<SaveTables>,
+            bell: u32,
+        }
+
+        fn resources() -> &'static Resources {
+            static RESOURCES: OnceLock<Resources> = OnceLock::new();
+            RESOURCES.get_or_init(|| {
+                let root = PathBuf::from(
+                    std::env::var_os("HORIZON_TEST_RESOURCES")
+                        .expect("HORIZON_TEST_RESOURCES must name the pinned resource root"),
+                );
+                assert!(root.is_dir(), "missing resource root: {}", root.display());
+                let assets = crate::assets::Assets::load(&root).expect("pinned assets");
+                Resources {
+                    registry: assets.registry,
+                    biomes: Arc::new(Biomes::load(&root).expect("pinned biomes")),
+                    tables: Arc::new(SaveTables::new(&assets)),
+                    bell: assets
+                        .registry
+                        .default_state("minecraft:bell")
+                        .expect("bell state")
+                        .0,
+                }
+            })
+        }
+
+        fn fixture(name: &str) -> (PathBuf, SaveDir, Arc<Chunk>) {
+            let resources = resources();
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let root = std::env::temp_dir().join(format!(
+                "horizon-dirty-handoff-{name}-{}-{nonce}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&root).unwrap();
+            let save = SaveDir::new(root.clone());
+            assert!(save.tables.set(resources.tables.clone()).is_ok());
+            let mut chunk = Chunk::empty(1, 2);
+            chunk.set(5, 71, 5, resources.bell);
+            assert!(encode_poi(&chunk, &resources.tables).is_some());
+            (root, save, Arc::new(chunk))
+        }
+
+        fn markers() -> HashSet<(i32, i32)> {
+            HashSet::from([(1, 2), (7, 8), (20, 30)])
+        }
+
+        fn retained_region(save: &SaveDir, snapshot: &Arc<Chunk>) {
+            // Poisoned-lock fixtures inspect the retained owner directly; normal loads cannot.
+            let pending = save
+                .pending
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (_, Record::Chunk(held, _)) = pending
+                .get(&(Folder::Region, 1, 2))
+                .expect("region snapshot retained")
+            else {
+                panic!("expected the original queued chunk");
+            };
+            assert!(Arc::ptr_eq(held, snapshot));
+            assert_eq!(held.get(5, 71, 5), resources().bell);
+        }
+
+        fn poison_pending_on_thread(save: &SaveDir) -> std::thread::JoinHandle<()> {
+            let pending = save.pending.clone();
+            std::thread::spawn(move || {
+                let _held = pending.lock().unwrap();
+                panic!("intentional pending-lock failure");
+            })
+        }
+
+        fn wait_count(save: &SaveDir, expected: usize) -> bool {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                if *save.outstanding.count.lock().unwrap() == expected {
+                    return true;
+                }
+                if std::time::Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::yield_now();
+            }
+        }
+
+        #[test]
+        #[ignore = "requires pinned HORIZON_TEST_RESOURCES"]
+        fn dirty_handoff_acceptance_clears_only_submitted_keys_and_round_trips_snapshot() {
+            let resources = resources();
+            let (root, save, snapshot) = fixture("accepted");
+            let mut world = crate::world::World::new(
+                resources.registry.default_state("minecraft:air").unwrap(),
+                0,
+            );
+            world.chunks.insert((1, 2), snapshot.clone());
+            world.chunks.insert((7, 8), Arc::new(Chunk::empty(7, 8)));
+            world.modified = markers();
+            assert!(!world.chunks.contains_key(&(20, 30)));
+            let before = world.modified.clone();
+            assert_eq!(
+                save.save_modified_later(
+                    &mut world.modified,
+                    &[],
+                    resources.registry,
+                    &resources.biomes
+                )
+                .unwrap(),
+                0
+            );
+            assert_eq!(world.modified, before);
+            assert_eq!(
+                save.save_modified_later(
+                    &mut world.modified,
+                    std::slice::from_ref(&snapshot),
+                    resources.registry,
+                    &resources.biomes
+                )
+                .unwrap(),
+                1
+            );
+            assert_eq!(world.modified, HashSet::from([(7, 8), (20, 30)]));
+            assert!(Arc::ptr_eq(world.chunks.get(&(1, 2)).unwrap(), &snapshot));
+            save.flush().unwrap();
+            let reopened = SaveDir::new(root.clone());
+            assert!(reopened.tables.set(resources.tables.clone()).is_ok());
+            let written = reopened
+                .read_record("region", 1, 2)
+                .expect("fresh disk read");
+            let expected = encode_with(
+                &snapshot,
+                resources.registry,
+                &resources.biomes,
+                Some(&resources.tables),
+                save.shape,
+            );
+            assert_eq!(written.tag, expected.tag);
+            let poi = reopened
+                .read_record("poi", 1, 2)
+                .expect("fresh POI disk read");
+            assert_eq!(
+                poi.tag,
+                encode_poi(&snapshot, &resources.tables).unwrap().tag
+            );
+            assert_eq!(
+                reopened
+                    .load(1, 2, resources.registry, &resources.biomes)
+                    .unwrap()
+                    .get(5, 71, 5),
+                resources.bell
+            );
+            assert!(reopened.read_record("region", 7, 8).is_none());
+            assert_eq!(snapshot.get(5, 71, 5), resources.bell);
+            drop((reopened, save, world));
+            fs::remove_dir_all(root).unwrap();
+        }
+
+        #[test]
+        #[ignore = "requires pinned HORIZON_TEST_RESOURCES"]
+        fn dirty_handoff_disconnected_send_keeps_markers_original_arc_and_sticky_error() {
+            let resources = resources();
+            let (root, save, snapshot) = fixture("disconnected");
+            let (send, receive) = mpsc::channel();
+            drop(receive);
+            *save.writer.lock().unwrap() = Some(Writer {
+                send,
+                thread: std::thread::spawn(|| {}),
+            });
+            let mut modified = markers();
+            let before = modified.clone();
+            let error = save
+                .save_modified_later(
+                    &mut modified,
+                    std::slice::from_ref(&snapshot),
+                    resources.registry,
+                    &resources.biomes,
+                )
+                .unwrap_err();
+            assert!(error.to_string().contains("region writer stopped"));
+            assert_eq!(modified, before);
+            retained_region(&save, &snapshot);
+            assert_eq!(*save.outstanding.count.lock().unwrap(), 0);
+            assert!(save.flush().is_err());
+            assert!(save.writes_finished().is_err());
+            assert!(save.flush().is_err());
+            drop(save);
+            fs::remove_dir_all(root).unwrap();
+        }
+
+        #[test]
+        #[ignore = "requires pinned HORIZON_TEST_RESOURCES"]
+        fn dirty_handoff_poison_before_acceptance_keeps_all_markers_without_writer_fault() {
+            let resources = resources();
+            let (root, save, snapshot) = fixture("before-acceptance");
+            assert!(poison_pending_on_thread(&save).join().is_err());
+            let mut modified = markers();
+            let before = modified.clone();
+            let error = save
+                .save_modified_later(
+                    &mut modified,
+                    std::slice::from_ref(&snapshot),
+                    resources.registry,
+                    &resources.biomes,
+                )
+                .unwrap_err();
+            assert!(error.to_string().contains("pending writes poisoned"));
+            assert_eq!(modified, before);
+            assert_eq!(snapshot.get(5, 71, 5), resources.bell);
+            assert!(
+                save.pending
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .is_empty()
+            );
+            assert!(save.writer.lock().unwrap().is_none());
+            assert_eq!(*save.outstanding.count.lock().unwrap(), 0);
+            assert!(save.outstanding.error.lock().unwrap().is_none());
+            save.flush().unwrap();
+            assert!(save.writes_finished().unwrap());
+            drop(save);
+            fs::remove_dir_all(root).unwrap();
+        }
+
+        #[test]
+        #[ignore = "requires pinned HORIZON_TEST_RESOURCES"]
+        fn dirty_handoff_partial_region_acceptance_then_poi_error_keeps_all_markers() {
+            let resources = resources();
+            let (root, save, snapshot) = fixture("partial-acceptance");
+            let save = Arc::new(save);
+            *save.writer.lock().unwrap() = Some(save.start_writer());
+            let blocked = save.writer.lock().unwrap();
+            let worker_save = save.clone();
+            let worker_snapshot = snapshot.clone();
+            let worker = std::thread::spawn(move || {
+                let mut modified = markers();
+                let result = worker_save
+                    .save_modified_later(
+                        &mut modified,
+                        std::slice::from_ref(&worker_snapshot),
+                        resources.registry,
+                        &resources.biomes,
+                    )
+                    .map_err(|error| error.to_string());
+                (result, modified)
+            });
+            // The Region batch owns its snapshot and is waiting on the writer mutex.
+            let reached = wait_count(&save, 1);
+            let poisoner = reached.then(|| poison_pending_on_thread(&save));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while reached && !save.pending.is_poisoned() && std::time::Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            let poisoned = save.pending.is_poisoned();
+            // Release the interlock before any assertion or join, including timeout paths.
+            drop(blocked);
+            let poison_joined = poisoner.map(|thread| thread.join());
+            let joined = worker.join();
+            assert!(reached, "helper did not reach the Region enqueue interlock");
+            assert!(poisoned, "pending lock was not poisoned");
+            assert!(poison_joined.is_some_and(|result| result.is_err()));
+            let (result, modified) = joined.expect("handoff thread");
+            assert!(result.unwrap_err().contains("pending writes poisoned"));
+            assert_eq!(modified, markers());
+            assert!(
+                wait_count(&save, 0),
+                "accepted Region work did not complete"
+            );
+            retained_region(&save, &snapshot);
+            assert!(save.pending.is_poisoned());
+            {
+                let pending = save
+                    .pending
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                assert_eq!(pending.len(), 1);
+                assert!(!pending.contains_key(&(Folder::Poi, 1, 2)));
+            }
+            // Pending-lock poison itself is not a sticky disk-writer error.
+            assert!(save.outstanding.error.lock().unwrap().is_none());
+            save.flush().unwrap();
+            assert!(save.writes_finished().unwrap());
+            let reopened = SaveDir::new(root.clone());
+            assert!(reopened.tables.set(resources.tables.clone()).is_ok());
+            assert_eq!(
+                reopened
+                    .load(1, 2, resources.registry, &resources.biomes)
+                    .unwrap()
+                    .get(5, 71, 5),
+                resources.bell
+            );
+            drop((reopened, save));
+            fs::remove_dir_all(root).unwrap();
+        }
+
+        #[test]
+        #[ignore = "requires pinned HORIZON_TEST_RESOURCES"]
+        fn dirty_handoff_async_disk_failure_follows_acceptance_and_retains_pending_owner() {
+            let resources = resources();
+            let (root, save, snapshot) = fixture("async-failure");
+            fs::write(root.join("region"), b"blocked directory").unwrap();
+            let mut modified = markers();
+            assert_eq!(
+                save.save_modified_later(
+                    &mut modified,
+                    std::slice::from_ref(&snapshot),
+                    resources.registry,
+                    &resources.biomes
+                )
+                .unwrap(),
+                1
+            );
+            assert_eq!(modified, HashSet::from([(7, 8), (20, 30)]));
+            assert!(
+                wait_count(&save, 0),
+                "writer did not finish the accepted batches"
+            );
+            assert!(save.flush().is_err());
+            assert!(save.writes_finished().is_err());
+            retained_region(&save, &snapshot);
+            assert!(save.flush().is_err());
+            assert_eq!(snapshot.get(5, 71, 5), resources.bell);
+            drop(save);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
     mod strict_poi_writer {
         use super::*;
 
