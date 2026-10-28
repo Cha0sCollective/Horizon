@@ -11352,8 +11352,8 @@ impl Game<'_> {
         self.save_game_metadata()
     }
     fn save_game_metadata(&mut self) -> Result<()> {
-        self.save_maps();
-        self.save_random_sequences();
+        self.save_maps()?;
+        self.save_random_sequences()?;
         self.save_fight();
         self.save_wandering_trader();
         self.save_portal_arrivals();

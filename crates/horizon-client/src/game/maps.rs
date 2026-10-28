@@ -281,6 +281,31 @@ pub(super) struct Maps {
     slots: Vec<(i32, usize)>,
     missing: std::collections::HashSet<i32>,
 }
+impl Maps {
+    fn save_to(&mut self, root: &std::path::Path, remote: bool) -> horizon_client::Result<()> {
+        if remote {
+            return Ok(());
+        }
+        let directory = root.join("data/minecraft/maps");
+        for (id, map) in &mut self.data {
+            if map.dirty {
+                horizon_client::save::write_dat(
+                    &directory.join(format!("{id}.dat")),
+                    map.to_nbt(),
+                )?;
+                map.dirty = false;
+            }
+        }
+        if let Some(last) = self.last_id {
+            let tag = Tag::compound([
+                ("data", Tag::compound([("map", Tag::Int(last))])),
+                ("DataVersion", Tag::Int(horizon_world::DATA_VERSION)),
+            ]);
+            horizon_client::save::write_dat(&directory.join("last_id.dat"), tag)?;
+        }
+        Ok(())
+    }
+}
 /// `MapColor.getColorFromPackedId` as RGBA bytes (NONE is transparent).
 fn packed_rgba(packed: u8) -> [u8; 4] {
     let id = usize::from(packed >> 2);
@@ -1141,28 +1166,8 @@ impl Game<'_> {
         }
     }
     /// Writes changed maps and the id counter (`MapItemSavedData`, `MapIndex`).
-    pub(super) fn save_maps(&mut self) {
-        for (id, m) in &mut self.maps.data {
-            if m.dirty {
-                let path = self
-                    .world_root
-                    .join("data/minecraft/maps")
-                    .join(format!("{id}.dat"));
-                if horizon_client::save::write_dat(&path, m.to_nbt()).is_ok() {
-                    m.dirty = false;
-                }
-            }
-        }
-        if let Some(last) = self.maps.last_id {
-            let tag = Tag::compound([
-                ("data", Tag::compound([("map", Tag::Int(last))])),
-                ("DataVersion", Tag::Int(horizon_world::DATA_VERSION)),
-            ]);
-            let _ = horizon_client::save::write_dat(
-                &self.world_root.join("data/minecraft/maps/last_id.dat"),
-                tag,
-            );
-        }
+    pub(super) fn save_maps(&mut self) -> horizon_client::Result<()> {
+        self.maps.save_to(&self.world_root, self.remote.is_some())
     }
     /// The atlas slot showing map `id`, its texture uploaded when it changed.
     pub(super) fn map_texture(&mut self, id: i32) -> Option<Rect> {
@@ -1370,6 +1375,113 @@ impl Game<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn metadata_scratch(name: &str) -> std::path::PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "horizon-map-metadata-{name}-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn failed_map_write_keeps_failed_and_unvisited_maps_dirty_for_exact_retry() {
+        let root = metadata_scratch("maps");
+        let directory = root.join("data/minecraft/maps");
+        let mut maps = Maps {
+            last_id: Some(9),
+            ..Maps::default()
+        };
+        for id in [3, 9] {
+            let mut map = MapData::fresh(123.0, -456.0, 2, "minecraft:the_nether");
+            map.locked = true;
+            map.unlimited = true;
+            map.update_color(id, 7, (id * 4) as u8);
+            maps.data.insert(id, map);
+            // Every dirty map is blocked, so HashMap order cannot hide an unvisited flag.
+            std::fs::create_dir_all(directory.join(format!("{id}.dat_new"))).unwrap();
+        }
+        let expected: HashMap<_, _> = maps
+            .data
+            .iter()
+            .map(|(id, map)| (*id, map.to_nbt()))
+            .collect();
+        assert!(maps.save_to(&root, false).is_err());
+        assert!(maps.data.values().all(|map| map.dirty && map.texture_dirty));
+        assert_eq!(maps.last_id, Some(9));
+        assert!(!directory.join("last_id.dat").exists());
+        for id in [3, 9] {
+            std::fs::remove_dir(directory.join(format!("{id}.dat_new"))).unwrap();
+        }
+        maps.save_to(&root, false).unwrap();
+        for (id, tag) in expected {
+            let written =
+                horizon_client::save::read_dat(&directory.join(format!("{id}.dat"))).unwrap();
+            assert_eq!(written, tag);
+            assert_eq!(MapData::from_nbt(&written).unwrap().to_nbt(), tag);
+            assert!(!maps.data[&id].dirty);
+            assert!(maps.data[&id].texture_dirty);
+        }
+        let index = horizon_client::save::read_dat(&directory.join("last_id.dat")).unwrap();
+        assert_eq!(index.get("data").unwrap().get("map"), Some(&Tag::Int(9)));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_map_index_keeps_last_id_and_successful_maps_clean_for_retry() {
+        let root = metadata_scratch("index");
+        let directory = root.join("data/minecraft/maps");
+        std::fs::create_dir_all(directory.join("last_id.dat_new")).unwrap();
+        let mut maps = Maps {
+            last_id: Some(4),
+            ..Maps::default()
+        };
+        let map = MapData::fresh(16.0, 32.0, 1, "minecraft:overworld");
+        let expected = map.to_nbt();
+        maps.data.insert(4, map);
+        assert!(maps.save_to(&root, false).is_err());
+        assert!(!maps.data[&4].dirty);
+        assert_eq!(maps.last_id, Some(4));
+        assert_eq!(
+            horizon_client::save::read_dat(&directory.join("4.dat")).unwrap(),
+            expected
+        );
+        let bytes = std::fs::read(directory.join("4.dat")).unwrap();
+        std::fs::remove_dir(directory.join("last_id.dat_new")).unwrap();
+        maps.save_to(&root, false).unwrap();
+        assert_eq!(std::fs::read(directory.join("4.dat")).unwrap(), bytes);
+        assert_eq!(maps.last_id, Some(4));
+        let index = horizon_client::save::read_dat(&directory.join("last_id.dat")).unwrap();
+        assert_eq!(index.get("data").unwrap().get("map"), Some(&Tag::Int(4)));
+        assert_eq!(
+            index.get("DataVersion"),
+            Some(&Tag::Int(horizon_world::DATA_VERSION))
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn remote_map_save_writes_nothing_and_preserves_dirty_and_index_state() {
+        let root = metadata_scratch("remote");
+        let mut maps = Maps {
+            last_id: Some(6),
+            ..Maps::default()
+        };
+        maps.data
+            .insert(6, MapData::fresh(0.0, 0.0, 0, "minecraft:overworld"));
+        let before = maps.data[&6].to_nbt();
+        maps.save_to(&root, true).unwrap();
+        assert!(std::fs::read_dir(&root).unwrap().next().is_none());
+        assert_eq!(maps.data[&6].to_nbt(), before);
+        assert!(maps.data[&6].dirty && maps.data[&6].texture_dirty);
+        assert_eq!(maps.last_id, Some(6));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn every_target_decoration_type_has_its_sprite() {

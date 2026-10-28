@@ -121,23 +121,79 @@ impl merchant::MapMaker for GameMaps<'_> {
     }
 }
 
+/// Build a save copy, leaving streams lent to open merchant menus in place.
+/// Conflicting owners cannot be represented by RandomSequences' single value per id.
+fn random_sequence_snapshot<'a>(
+    world: &horizon_client::random_sequences::RandomSequences,
+    sessions: impl IntoIterator<Item = &'a merchant::Session>,
+) -> horizon_client::Result<horizon_client::random_sequences::RandomSequences> {
+    let mut snapshot = world.clone();
+    let mut present: std::collections::HashSet<String> = snapshot.ids().into_iter().collect();
+    for session in sessions {
+        for (id, random) in &session.sequences {
+            if present.contains(id) {
+                // The id already exists in this clone: get cannot create a stream
+                // or use the seed, and state_words does not advance it.
+                if snapshot.get(id, 0).state_words() != random.state_words() {
+                    return Err(format!(
+                        "cannot save random sequence {id}: conflicting live merchant/world states"
+                    )
+                    .into());
+                }
+            } else {
+                present.insert(id.clone());
+                snapshot.give_back(id.clone(), random.clone());
+            }
+        }
+    }
+    Ok(snapshot)
+}
+
+fn save_random_sequences_to<'a>(
+    path: &std::path::Path,
+    world: &horizon_client::random_sequences::RandomSequences,
+    local: Option<&'a merchant::Session>,
+    guests: impl IntoIterator<Item = &'a merchant::Session>,
+    remote: bool,
+) -> horizon_client::Result<()> {
+    if remote {
+        return Ok(());
+    }
+    let snapshot = random_sequence_snapshot(world, local.into_iter().chain(guests))?;
+    let tag = horizon_world::nbt::Tag::compound([
+        ("data", snapshot.to_nbt()),
+        (
+            "DataVersion",
+            horizon_world::nbt::Tag::Int(horizon_world::DATA_VERSION),
+        ),
+    ]);
+    horizon_client::save::write_dat(path, tag)
+}
+
 impl Game<'_> {
     pub(super) fn random_sequences_path(&self) -> std::path::PathBuf {
         self.world_root.join("data/minecraft/random_sequences.dat")
     }
     /// `RandomSequences` as `random_sequences.dat` (not on a server's guest).
-    pub(super) fn save_random_sequences(&mut self) {
-        if self.remote.is_some() || self.rand_sequences.ids().is_empty() {
-            return;
-        }
-        let tag = horizon_world::nbt::Tag::compound([
-            ("data", self.rand_sequences.to_nbt()),
-            (
-                "DataVersion",
-                horizon_world::nbt::Tag::Int(horizon_world::DATA_VERSION),
-            ),
-        ]);
-        let _ = horizon_client::save::write_dat(&self.random_sequences_path(), tag);
+    pub(super) fn save_random_sequences(&self) -> horizon_client::Result<()> {
+        let local = self
+            .station
+            .as_ref()
+            .and_then(|station| station.merchant.as_ref())
+            .map(|merchant| merchant.session.as_ref());
+        let guests = self
+            .lan
+            .iter()
+            .flat_map(|host| host.play.values())
+            .filter_map(|player| player.merchant.as_ref())
+            .map(|merchant| merchant.merchant.session.as_ref());
+        save_random_sequences_to(
+            &self.random_sequences_path(),
+            &self.rand_sequences,
+            local,
+            guests,
+            self.remote.is_some(),
+        )
     }
     /// `AbstractVillager.addOffersFromTradeSet` with the world's random
     /// sequence of the set, at the merchant's position.
@@ -824,5 +880,181 @@ impl Game<'_> {
             self.draw_stack_tooltip(batch, &stack, self.cursor.0, self.cursor.1);
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod metadata_tests {
+    use super::*;
+    use horizon_client::random_sequences::RandomSequences;
+    use horizon_core::random::RandomSource;
+    use horizon_world::nbt::Tag;
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "horizon-random-metadata-{name}-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn loan(world: &mut RandomSequences, id: &str) -> merchant::Session {
+        let mut session = merchant::Session::new(Vec::new(), true);
+        let mut random = world.lend(id, 42);
+        random.next_long();
+        session.sequences.insert(id.into(), random);
+        session
+    }
+
+    fn words(session: &merchant::Session) -> std::collections::BTreeMap<String, (u64, u64)> {
+        session
+            .sequences
+            .iter()
+            .map(|(id, random)| (id.clone(), random.state_words()))
+            .collect()
+    }
+
+    fn wrapped(world: &RandomSequences) -> Tag {
+        Tag::compound([
+            ("data", world.to_nbt()),
+            ("DataVersion", Tag::Int(horizon_world::DATA_VERSION)),
+        ])
+    }
+
+    #[test]
+    fn random_write_failure_and_repair_preserve_world_local_and_all_guest_loans() {
+        let root = scratch("retry");
+        let path = root.join("random_sequences.dat");
+        let mut world = RandomSequences::default();
+        world.set_defaults(17, false, true);
+        world.get("minecraft:world", 42).next_long();
+        let local = loan(&mut world, "minecraft:local");
+        let guests = [
+            loan(&mut world, "minecraft:guest_a"),
+            loan(&mut world, "minecraft:guest_b"),
+        ];
+        let before = world.to_nbt();
+        let local_before = words(&local);
+        let guest_before: Vec<_> = guests.iter().map(words).collect();
+        let mut expected = world.clone();
+        for session in std::iter::once(&local).chain(guests.iter()) {
+            for (id, random) in &session.sequences {
+                expected.give_back(id.clone(), random.clone());
+            }
+        }
+        horizon_client::save::write_dat(&path, Tag::compound([("old", Tag::Int(1))])).unwrap();
+        let old_bytes = std::fs::read(&path).unwrap();
+        let blocked = root.join("random_sequences.dat_new");
+        std::fs::create_dir(&blocked).unwrap();
+        assert!(
+            save_random_sequences_to(&path, &world, Some(&local), guests.iter(), false).is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), old_bytes);
+        assert_eq!(world.to_nbt(), before);
+        assert_eq!(words(&local), local_before);
+        assert_eq!(guests.iter().map(words).collect::<Vec<_>>(), guest_before);
+        std::fs::remove_dir(blocked).unwrap();
+        save_random_sequences_to(&path, &world, Some(&local), guests.iter(), false).unwrap();
+        let saved = horizon_client::save::read_dat(&path).unwrap();
+        assert_eq!(saved, wrapped(&expected));
+        let restored = RandomSequences::from_nbt(saved.get("data").unwrap());
+        assert_eq!(restored.to_nbt(), expected.to_nbt());
+        assert_eq!(world.to_nbt(), before);
+        assert_eq!(words(&local), local_before);
+        assert_eq!(guests.iter().map(words).collect::<Vec<_>>(), guest_before);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn identical_random_owners_save_once_and_conflicts_leave_old_file_unchanged() {
+        let root = scratch("duplicates");
+        let path = root.join("random_sequences.dat");
+        let mut world = RandomSequences::default();
+        let local = loan(&mut world, "minecraft:shared");
+        let mut guest = merchant::Session::new(Vec::new(), true);
+        guest.sequences = local.sequences.clone();
+        // A world with only loans must still serialize them, and equal owners agree.
+        let snapshot = random_sequence_snapshot(&world, [&local, &guest]).unwrap();
+        assert_eq!(snapshot.ids(), ["minecraft:shared"]);
+        world.give_back(
+            "minecraft:shared".into(),
+            local.sequences["minecraft:shared"].clone(),
+        );
+        save_random_sequences_to(&path, &world, Some(&local), [&guest], false).unwrap();
+        assert_eq!(
+            horizon_client::save::read_dat(&path).unwrap(),
+            wrapped(&snapshot)
+        );
+        let bytes = std::fs::read(&path).unwrap();
+        guest
+            .sequences
+            .get_mut("minecraft:shared")
+            .unwrap()
+            .next_long();
+        let world_before = world.to_nbt();
+        let local_before = words(&local);
+        let guest_before = words(&guest);
+        let error =
+            save_random_sequences_to(&path, &world, Some(&local), [&guest], false).unwrap_err();
+        assert!(error.to_string().contains("minecraft:shared"));
+        assert!(error.to_string().contains("conflicting live"));
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(world.to_nbt(), world_before);
+        assert_eq!(words(&local), local_before);
+        assert_eq!(words(&guest), guest_before);
+        // Conflicts among two loans also refuse without a world-owned copy.
+        assert!(random_sequence_snapshot(&RandomSequences::default(), [&guest, &local]).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn clearing_random_sequences_persists_empty_state_and_changed_defaults() {
+        for configured in [false, true] {
+            let root = scratch(if configured {
+                "defaults-reset"
+            } else {
+                "reset"
+            });
+            let path = root.join("random_sequences.dat");
+            let mut world = RandomSequences::default();
+            world.get("minecraft:old", 42).next_long();
+            save_random_sequences_to(&path, &world, None, [], false).unwrap();
+            if configured {
+                world.set_defaults(23, false, false);
+            }
+            assert_eq!(world.clear(), 1);
+            let before = world.to_nbt();
+            save_random_sequences_to(&path, &world, None, [], false).unwrap();
+            let saved = horizon_client::save::read_dat(&path).unwrap();
+            assert_eq!(saved, wrapped(&world));
+            let restored = RandomSequences::from_nbt(saved.get("data").unwrap());
+            assert!(restored.ids().is_empty());
+            assert_eq!(restored.to_nbt(), before);
+            assert_eq!(world.to_nbt(), before);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn remote_random_save_writes_nothing_even_with_conflicting_loans() {
+        let root = scratch("remote");
+        let path = root.join("data/minecraft/random_sequences.dat");
+        let mut world = RandomSequences::default();
+        let local = loan(&mut world, "minecraft:shared");
+        world.get("minecraft:shared", 42).next_long();
+        world.get("minecraft:shared", 42).next_long();
+        assert!(random_sequence_snapshot(&world, [&local]).is_err());
+        let before = world.to_nbt();
+        let local_before = words(&local);
+        save_random_sequences_to(&path, &world, Some(&local), [], true).unwrap();
+        assert!(std::fs::read_dir(&root).unwrap().next().is_none());
+        assert_eq!(world.to_nbt(), before);
+        assert_eq!(words(&local), local_before);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
