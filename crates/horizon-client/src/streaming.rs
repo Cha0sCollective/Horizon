@@ -82,7 +82,9 @@ pub trait ChunkGenerator: Send + Sync + 'static {
     fn restore_proto(&self, _proto: &mut Proto, _saved: crate::chunk::SavedProto) {}
     /// Save proto chunks decoration wrote to, so that they come back as they
     /// were: generating them again would lose those writes.
-    fn save_protos(&self, _protos: &[&Proto]) {}
+    fn save_protos(&self, _protos: &[&Proto]) -> Result<(), String> {
+        Ok(())
+    }
     /// Save a column that finished after the player moved away: its
     /// neighbours' decoration is done, so it can't be generated again.
     fn save_finished(&self, _chunk: Chunk) {}
@@ -139,12 +141,12 @@ impl<G: ChunkGenerator> LodSource for G {
 }
 /// The generator's saving, for the streamer (which doesn't know its type).
 trait Saves: LodSource {
-    fn save_protos(&self, protos: &[&Proto]);
+    fn save_protos(&self, protos: &[&Proto]) -> Result<(), String>;
     fn save_finished(&self, chunk: Chunk);
 }
 impl<G: ChunkGenerator> Saves for G {
-    fn save_protos(&self, protos: &[&Proto]) {
-        ChunkGenerator::save_protos(self, protos);
+    fn save_protos(&self, protos: &[&Proto]) -> Result<(), String> {
+        ChunkGenerator::save_protos(self, protos)
     }
     fn save_finished(&self, chunk: Chunk) {
         ChunkGenerator::save_finished(self, chunk);
@@ -176,7 +178,7 @@ pub enum Done {
     Decorated(i32, i32, Box<[Proto; 9]>),
     Lit(i32, i32, Vec<crate::chunk::Light>, u64),
     Meshed(i32, i32, i32, SectionMesh, u64),
-    Saved(Vec<((i32, i32), Proto)>),
+    Saved(Vec<((i32, i32), Proto)>, Result<(), String>),
 }
 struct Queued {
     priority: i64,
@@ -229,6 +231,9 @@ pub struct Streaming {
     decorating: usize,
     /// Save jobs in flight.
     saving: usize,
+    /// First failed proto enqueue. Terrain production halts for this streamer's
+    /// lifetime; existing results, lighting and meshes still reconcile normally.
+    proto_save_error: Option<String>,
     /// Vanilla's decoration order around the player, and the centre and
     /// radius it was last ranked for.
     decoration_order: DecorationOrder,
@@ -503,8 +508,8 @@ impl Streaming {
                                 Job::Finish(proto) => Done::Generated(generator.finish(proto)),
                                 Job::Save(protos) => {
                                     let refs: Vec<&Proto> = protos.iter().map(|(_, p)| p).collect();
-                                    generator.save_protos(&refs);
-                                    Done::Saved(protos)
+                                    let outcome = generator.save_protos(&refs);
+                                    Done::Saved(protos, outcome)
                                 }
                                 Job::Light(x, z, region, seq, sky) => {
                                     Done::Lit(x, z, light_chunk(&borrow(&region), &light, sky), seq)
@@ -561,6 +566,7 @@ impl Streaming {
             decorated: Default::default(),
             decorating: 0,
             saving: 0,
+            proto_save_error: None,
             decoration_order: DecorationOrder::default(),
             order_area: None,
             queue_basis: Default::default(),
@@ -713,15 +719,41 @@ impl Streaming {
     }
     /// Saved proto chunks come back; those now out of range are dropped by
     /// the next `update`.
-    fn receive_saved(&mut self, protos: Vec<((i32, i32), Proto)>) {
+    fn receive_saved(&mut self, protos: Vec<((i32, i32), Proto)>, outcome: Result<(), String>) {
         self.generation_scan.exhausted = false;
         self.saving -= 1;
         for (key, proto) in protos {
             self.protos.insert(key, Some(proto));
+            if outcome.is_err() {
+                self.written.insert(key);
+            }
+        }
+        if let Err(error) = outcome {
+            self.fail_proto_save(error);
+        }
+    }
+    fn fail_proto_save(&mut self, error: String) {
+        if self.proto_save_error.is_none() {
+            log::error!("Horizon: proto save failed; terrain streaming halted: {error}");
+            self.proto_save_error = Some(error);
+        }
+    }
+    /// No reset/retry policy: terrain production stays halted for this lifetime.
+    /// Retained ownership needs explicit failure handling, not a full save claim.
+    pub fn proto_save_error(&self) -> Option<&str> {
+        self.proto_save_error.as_deref()
+    }
+    fn proto_save_result(&self) -> crate::Result<()> {
+        match &self.proto_save_error {
+            Some(error) => Err(error.clone().into()),
+            None => Ok(()),
         }
     }
     /// Check out the proto chunks at `keys` and save them on a worker.
     fn save_checked_out(&mut self, keys: impl IntoIterator<Item = (i32, i32)>) {
+        if self.proto_save_error.is_some() {
+            return;
+        }
         let protos: Vec<((i32, i32), Proto)> = keys
             .into_iter()
             .filter_map(|k| Some((k, self.protos.get_mut(&k)?.take()?)))
@@ -911,7 +943,7 @@ impl Streaming {
                 }
                 Done::Decorated(x, z, region) => self.receive_decorated(x, z, *region),
                 Done::Generated(chunk) => self.receive_generated(chunk, world),
-                Done::Saved(protos) => self.receive_saved(protos),
+                Done::Saved(protos, outcome) => self.receive_saved(protos, outcome),
                 Done::Lit(x, z, sections, seq) => {
                     if self.lighting.get(&(x, z)) != Some(&seq) {
                         continue;
@@ -994,6 +1026,123 @@ impl Streaming {
             world
                 .dirty_sections
                 .retain_columns(|x, z| !far.contains(&(x, z)));
+        }
+        self.produce_terrain(world);
+        // Lighting once all neighbours exist.
+        let light: Vec<_> = world.dirty_light.iter().copied().collect();
+        for (x, z) in light {
+            if !world.chunks.contains_key(&(x, z)) {
+                world.dirty_light.remove(&(x, z));
+                continue;
+            }
+            let Some(region) = self.light_region(world, x, z) else {
+                continue;
+            };
+            world.dirty_light.remove(&(x, z));
+            self.sequence += 1;
+            self.lighting.insert((x, z), self.sequence);
+            self.light_snapshots
+                .insert((x, z), self.light_edit_sequence);
+            self.submit(
+                Some((x, z)),
+                1,
+                Job::Light(x, z, region, self.sequence, self.sky_light),
+            );
+        }
+        // A server draws nothing: its sections are never meshed.
+        if !self.mesh {
+            world.dirty_sections.clear();
+            return (uploads, removed);
+        }
+        // Meshing once the column and its neighbours are lit, and the column
+        // is within the render distance (`in_view_distance`, the columns
+        // vanilla draws). Sections set aside past it come back
+        // when the player moves: a column that loads with its light gets no
+        // other request (#228).
+        let area = (self.center, self.radius, self.forced.len());
+        if self.waiting_area != area {
+            self.waiting_area = area;
+            let ranges = Ranges {
+                center: self.center,
+                radius: self.radius,
+                extra: &self.extra,
+                forced: &self.forced,
+                cover: ExtraCover::matching(&self.cover, &self.extra),
+                band: self.band.as_ref(),
+            };
+            self.waiting.retain(|&(x, sy, z)| {
+                let back = ranges.in_view(x, z);
+                if back {
+                    world.dirty_sections.insert((x, sy, z));
+                }
+                !back
+            });
+        }
+        // Column by column: the checks below hold for all of a column's
+        // sections, and columns waiting for light cost one look per frame.
+        let columns: Vec<_> = world.dirty_sections.columns().collect();
+        for ((x, z), sections) in columns {
+            if !world.chunks.contains_key(&(x, z)) {
+                world.dirty_sections.take_column(x, z);
+                continue;
+            }
+            if !self.ranges().in_view(x, z) {
+                world.dirty_sections.take_column(x, z);
+                for sy in section_indexes(sections) {
+                    self.waiting.insert((x, sy, z));
+                }
+                continue;
+            }
+            // A neighbour being lit dirties this column again when its light
+            // job finishes (new chunks relight their eight neighbours), so
+            // wait for it rather than mesh once per neighbour. Columns still
+            // in `dirty_light` here can't be lit yet (a neighbour of theirs is
+            // missing): waiting for them could last until the player comes
+            // back.
+            let ready = (-1..=1).all(|dz| {
+                (-1..=1).all(|dx| {
+                    let n = (x + dx, z + dz);
+                    self.lit.contains(&n) && !self.lighting.contains_key(&n)
+                })
+            });
+            if !ready {
+                continue;
+            }
+            let Some(region) = Self::region(world, x, z) else {
+                continue;
+            };
+            world.dirty_sections.take_column(x, z);
+            for sy in section_indexes(sections) {
+                let first = self.meshed.insert((x, z));
+                self.sequence += 1;
+                self.meshing.insert((x, sy, z), self.sequence);
+                self.submit(
+                    Some((x, z)),
+                    if first { 2 } else { 0 },
+                    Job::Mesh(
+                        x,
+                        sy,
+                        z,
+                        region.clone(),
+                        self.sequence,
+                        MeshSettings {
+                            nether: self.nether_shading,
+                            zoom: self.biome_zoom,
+                            blend_radius: self.biome_blend,
+                            smooth_lighting: self.smooth_lighting,
+                            cutout_leaves: self.cutout_leaves,
+                        },
+                    ),
+                );
+            }
+        }
+        (uploads, removed)
+    }
+    // A proto failure halts new producers before any failed snapshot can be
+    // evicted, checked out, finalized or borrowed by neighboring decoration.
+    fn produce_terrain(&mut self, world: &World) {
+        if self.proto_save_error.is_some() {
+            return;
         }
         // Drop far proto chunks that are not checked out.
         let (center, r4) = (self.center, i64::from(self.radius + 4));
@@ -1165,117 +1314,11 @@ impl Streaming {
             }
         }
         self.schedule_generation(world, workers);
-        // Lighting once all neighbours exist.
-        let light: Vec<_> = world.dirty_light.iter().copied().collect();
-        for (x, z) in light {
-            if !world.chunks.contains_key(&(x, z)) {
-                world.dirty_light.remove(&(x, z));
-                continue;
-            }
-            let Some(region) = self.light_region(world, x, z) else {
-                continue;
-            };
-            world.dirty_light.remove(&(x, z));
-            self.sequence += 1;
-            self.lighting.insert((x, z), self.sequence);
-            self.light_snapshots
-                .insert((x, z), self.light_edit_sequence);
-            self.submit(
-                Some((x, z)),
-                1,
-                Job::Light(x, z, region, self.sequence, self.sky_light),
-            );
-        }
-        // A server draws nothing: its sections are never meshed.
-        if !self.mesh {
-            world.dirty_sections.clear();
-            return (uploads, removed);
-        }
-        // Meshing once the column and its neighbours are lit, and the column
-        // is within the render distance (`in_view_distance`, the columns
-        // vanilla draws). Sections set aside past it come back
-        // when the player moves: a column that loads with its light gets no
-        // other request (#228).
-        let area = (self.center, self.radius, self.forced.len());
-        if self.waiting_area != area {
-            self.waiting_area = area;
-            let ranges = Ranges {
-                center: self.center,
-                radius: self.radius,
-                extra: &self.extra,
-                forced: &self.forced,
-                cover: ExtraCover::matching(&self.cover, &self.extra),
-                band: self.band.as_ref(),
-            };
-            self.waiting.retain(|&(x, sy, z)| {
-                let back = ranges.in_view(x, z);
-                if back {
-                    world.dirty_sections.insert((x, sy, z));
-                }
-                !back
-            });
-        }
-        // Column by column: the checks below hold for all of a column's
-        // sections, and columns waiting for light cost one look per frame.
-        let columns: Vec<_> = world.dirty_sections.columns().collect();
-        for ((x, z), sections) in columns {
-            if !world.chunks.contains_key(&(x, z)) {
-                world.dirty_sections.take_column(x, z);
-                continue;
-            }
-            if !self.ranges().in_view(x, z) {
-                world.dirty_sections.take_column(x, z);
-                for sy in section_indexes(sections) {
-                    self.waiting.insert((x, sy, z));
-                }
-                continue;
-            }
-            // A neighbour being lit dirties this column again when its light
-            // job finishes (new chunks relight their eight neighbours), so
-            // wait for it rather than mesh once per neighbour. Columns still
-            // in `dirty_light` here can't be lit yet (a neighbour of theirs is
-            // missing): waiting for them could last until the player comes
-            // back.
-            let ready = (-1..=1).all(|dz| {
-                (-1..=1).all(|dx| {
-                    let n = (x + dx, z + dz);
-                    self.lit.contains(&n) && !self.lighting.contains_key(&n)
-                })
-            });
-            if !ready {
-                continue;
-            }
-            let Some(region) = Self::region(world, x, z) else {
-                continue;
-            };
-            world.dirty_sections.take_column(x, z);
-            for sy in section_indexes(sections) {
-                let first = self.meshed.insert((x, z));
-                self.sequence += 1;
-                self.meshing.insert((x, sy, z), self.sequence);
-                self.submit(
-                    Some((x, z)),
-                    if first { 2 } else { 0 },
-                    Job::Mesh(
-                        x,
-                        sy,
-                        z,
-                        region.clone(),
-                        self.sequence,
-                        MeshSettings {
-                            nether: self.nether_shading,
-                            zoom: self.biome_zoom,
-                            blend_radius: self.biome_blend,
-                            smooth_lighting: self.smooth_lighting,
-                            cutout_leaves: self.cutout_leaves,
-                        },
-                    ),
-                );
-            }
-        }
-        (uploads, removed)
     }
     fn schedule_generation(&mut self, world: &World, workers: usize) {
+        if self.proto_save_error.is_some() {
+            return;
+        }
         let input = GenerationInputs {
             ranges: Ranges {
                 center: self.center,
@@ -1395,6 +1438,8 @@ impl Streaming {
     /// unload or at the next save.
     pub fn save(&mut self, world: &mut World, wait: bool) -> crate::Result<()> {
         if !wait {
+            self.reconcile_ready_save_results(world);
+            self.proto_save_result()?;
             let written: Vec<(i32, i32)> = self.written.drain().collect();
             self.save_checked_out(written);
             return Ok(());
@@ -1403,11 +1448,10 @@ impl Streaming {
         self.save_until(world, deadline)
     }
     // The deadline bounds waiting for the tracked decoration/finish/save jobs.
-    // Plain generation and errors inside generator save callbacks are separate.
+    // Plain generation and non-proto generator save callbacks are separate.
     fn save_until(&mut self, world: &mut World, deadline: std::time::Instant) -> crate::Result<()> {
-        for done in std::mem::take(&mut self.deferred) {
-            self.receive_save_result(done, world);
-        }
+        self.reconcile_ready_save_results(world);
+        self.proto_save_result()?;
         while self.save_in_flight() {
             let left = deadline.saturating_duration_since(std::time::Instant::now());
             match self.results.recv_timeout(left) {
@@ -1425,6 +1469,7 @@ impl Streaming {
                     );
                 }
             }
+            self.proto_save_result()?;
             if self.save_in_flight() && std::time::Instant::now() >= deadline {
                 return Err(
                     "chunk generation did not finish before saving: deadline exceeded".into(),
@@ -1436,8 +1481,15 @@ impl Streaming {
             .iter()
             .filter_map(|k| self.protos.get(k)?.as_ref())
             .collect();
-        if !protos.is_empty() {
-            self.saves.save_protos(&protos);
+        let outcome = if protos.is_empty() {
+            Ok(())
+        } else {
+            self.saves.save_protos(&protos)
+        };
+        drop(protos);
+        if let Err(error) = outcome {
+            self.fail_proto_save(error);
+            return self.proto_save_result();
         }
         self.written.clear();
         Ok(())
@@ -1445,13 +1497,20 @@ impl Streaming {
     fn save_in_flight(&self) -> bool {
         self.decorating > 0 || !self.finishing.is_empty() || self.saving > 0
     }
+    fn reconcile_ready_save_results(&mut self, world: &mut World) {
+        let deferred = std::mem::take(&mut self.deferred);
+        let ready: Vec<_> = self.results.try_iter().collect();
+        for done in deferred.into_iter().chain(ready) {
+            self.receive_save_result(done, world);
+        }
+    }
     // Returns whether the result was reconciled, leaving every unrelated result
     // in arrival order for normal update. `wait` may already have deferred it.
     fn receive_save_result(&mut self, done: Done, world: &mut World) -> bool {
         match done {
             Done::Decorated(x, z, region) => self.receive_decorated(x, z, *region),
             Done::Generated(chunk) => self.receive_generated(chunk, world),
-            Done::Saved(protos) => self.receive_saved(protos),
+            Done::Saved(protos, outcome) => self.receive_saved(protos, outcome),
             other => {
                 self.deferred.push(other);
                 return false;
@@ -1464,8 +1523,14 @@ impl Streaming {
     /// Proto snapshots are checked out to workers before chunk writes, just as
     /// in `save(true)`, so older generation cannot overwrite the final chunks.
     pub fn poll_save(&mut self, world: &mut World) -> crate::Result<bool> {
+        self.poll_save_budget(world, std::time::Duration::from_millis(2))
+    }
+    fn poll_save_budget(
+        &mut self,
+        world: &mut World,
+        budget: std::time::Duration,
+    ) -> crate::Result<bool> {
         let started = std::time::Instant::now();
-        let budget = std::time::Duration::from_millis(2);
         let mut deferred = std::mem::take(&mut self.deferred).into_iter();
         while let Some(done) = deferred.next() {
             // Skip unrelated results until a completion makes progress; an
@@ -1473,6 +1538,7 @@ impl Streaming {
             // Scanning that existing prefix is linear, not a strict time bound.
             if self.receive_save_result(done, world) && started.elapsed() >= budget {
                 self.deferred.extend(deferred);
+                self.proto_save_result()?;
                 return Ok(false);
             }
         }
@@ -1481,6 +1547,7 @@ impl Streaming {
                 Ok(done) => {
                     self.receive_save_result(done, world);
                     if started.elapsed() >= budget {
+                        self.proto_save_result()?;
                         return Ok(false);
                     }
                 }
@@ -1488,6 +1555,7 @@ impl Streaming {
                 Err(mpsc::TryRecvError::Disconnected) => break true,
             }
         };
+        self.proto_save_result()?;
         if disconnected
             && (self.save_in_flight()
                 || self
@@ -1853,7 +1921,7 @@ impl Drop for Streaming {
         while self.saving > 0 {
             let left = deadline.saturating_duration_since(std::time::Instant::now());
             match self.results.recv_timeout(left) {
-                Ok(Done::Saved(_)) => self.saving -= 1,
+                Ok(Done::Saved(protos, outcome)) => self.receive_saved(protos, outcome),
                 Ok(_) => {}
                 Err(_) => break,
             }
@@ -1897,6 +1965,7 @@ mod tests {
         gate: Mutex<Option<mpsc::Receiver<()>>>,
         started: mpsc::Sender<()>,
         writes: Mutex<Vec<u64>>,
+        failure: Mutex<Option<String>>,
     }
     impl ChunkGenerator for SaveProbe {
         type Worker = ();
@@ -1907,7 +1976,7 @@ mod tests {
         fn finish(&self, _: Proto) -> Chunk {
             unreachable!()
         }
-        fn save_protos(&self, protos: &[&Proto]) {
+        fn save_protos(&self, protos: &[&Proto]) -> Result<(), String> {
             if let Some(gate) = self.gate.lock().unwrap().take() {
                 self.started.send(()).unwrap();
                 gate.recv_timeout(std::time::Duration::from_secs(5))
@@ -1917,6 +1986,10 @@ mod tests {
                 .lock()
                 .unwrap()
                 .extend(protos.iter().map(|p| *p.downcast_ref::<u64>().unwrap()));
+            match &*self.failure.lock().unwrap() {
+                Some(error) => Err(error.clone()),
+                None => Ok(()),
+            }
         }
     }
     fn save_probe(
@@ -1962,6 +2035,7 @@ mod tests {
             gate: Mutex::new(gated.then_some(gate)),
             started,
             writes: Mutex::new(Vec::new()),
+            failure: Mutex::new(None),
         });
         (
             Streaming::new(probe.clone(), context, 1),
@@ -2017,7 +2091,10 @@ mod tests {
         assert!(probe.writes.lock().unwrap().is_empty());
         release.send(()).unwrap();
         streaming.wait(std::time::Duration::from_secs(5));
-        assert!(matches!(streaming.deferred.as_slice(), [Done::Saved(_)]));
+        assert!(matches!(
+            streaming.deferred.as_slice(),
+            [Done::Saved(_, Ok(()))]
+        ));
         assert_eq!(streaming.saving, 1); // Deferred result still owns the proto.
         streaming
             .save_until(&mut world, std::time::Instant::now())
@@ -2136,6 +2213,224 @@ mod tests {
         assert_eq!(*probe.writes.lock().unwrap(), [9]);
         assert!(streaming.written.is_empty());
         assert_eq!(world.modified, HashSet::from([(3, 4)]));
+    }
+
+    #[test]
+    #[ignore = "owned prepared resources: direct proto callback failure"]
+    fn proto_save_direct_failure_retains_dirty_keys_and_refuses_retry() {
+        let (mut streaming, probe, _, _) = save_probe(false);
+        let mut world = save_world();
+        world.modified.insert((3, 4));
+        streaming.protos.insert((0, 0), Some(Box::new(17u64)));
+        streaming.written.insert((0, 0));
+        *probe.failure.lock().unwrap() = Some("direct proto failure".into());
+        let error = streaming.save(&mut world, true).unwrap_err().to_string();
+        assert_eq!(error, "direct proto failure");
+        assert_eq!(streaming.proto_save_error(), Some(error.as_str()));
+        assert!(streaming.written.contains(&(0, 0)));
+        assert_eq!(
+            *streaming.protos[&(0, 0)]
+                .as_ref()
+                .unwrap()
+                .downcast_ref::<u64>()
+                .unwrap(),
+            17
+        );
+        *probe.failure.lock().unwrap() = None;
+        for wait in [false, true] {
+            assert_eq!(
+                streaming.save(&mut world, wait).unwrap_err().to_string(),
+                error
+            );
+        }
+        assert_eq!(
+            streaming.poll_save(&mut world).unwrap_err().to_string(),
+            error
+        );
+        streaming.save_checked_out([(0, 0)]);
+        assert!(streaming.protos[&(0, 0)].is_some());
+        assert!(streaming.written.contains(&(0, 0)));
+        assert_eq!(*probe.writes.lock().unwrap(), [17]);
+        assert_eq!(world.modified, HashSet::from([(3, 4)]));
+    }
+
+    #[test]
+    #[ignore = "owned prepared resources: failed Saved batch tail ownership"]
+    fn proto_save_fault_wins_poll_budget_without_losing_deferred_tail() {
+        let (mut streaming, _, _, _) = save_probe(false);
+        let mut world = save_world();
+        streaming.saving = 2;
+        streaming.protos.insert((0, 0), None);
+        streaming.protos.insert((1, 0), None);
+        streaming.deferred.extend([
+            Done::Saved(vec![((0, 0), Box::new(21u64))], Err("first failure".into())),
+            Done::Proto(7, 0, Box::new(7u64), false),
+            Done::Saved(vec![((1, 0), Box::new(22u64))], Ok(())),
+            Done::Proto(8, 0, Box::new(8u64), false),
+        ]);
+        let error = streaming
+            .poll_save_budget(&mut world, std::time::Duration::ZERO)
+            .unwrap_err();
+        assert_eq!(error.to_string(), "first failure");
+        assert_eq!(streaming.saving, 1);
+        assert!(streaming.written.contains(&(0, 0)));
+        assert!(streaming.protos[&(0, 0)].is_some());
+        assert!(streaming.protos[&(1, 0)].is_none());
+        assert!(matches!(
+            streaming.deferred.as_slice(),
+            [
+                Done::Proto(7, ..),
+                Done::Saved(_, Ok(())),
+                Done::Proto(8, ..)
+            ]
+        ));
+        // Reconciliation still runs before the existing sticky fault guard.
+        assert_eq!(
+            streaming.save(&mut world, false).unwrap_err().to_string(),
+            "first failure"
+        );
+        assert_eq!(streaming.saving, 0);
+        assert_eq!(
+            *streaming.protos[&(1, 0)]
+                .as_ref()
+                .unwrap()
+                .downcast_ref::<u64>()
+                .unwrap(),
+            22
+        );
+        assert!(matches!(
+            streaming.deferred.as_slice(),
+            [Done::Proto(7, ..), Done::Proto(8, ..)]
+        ));
+        assert!(!streaming.written.contains(&(1, 0)));
+        streaming.saving = 1;
+        streaming.receive_saved(vec![((2, 0), Box::new(23u64))], Err("later failure".into()));
+        assert_eq!(streaming.proto_save_error(), Some("first failure"));
+        assert!(streaming.written.contains(&(2, 0)));
+    }
+
+    #[test]
+    #[ignore = "owned prepared resources: failed proto ownership during normal updates"]
+    fn proto_save_worker_failure_halts_producers_but_reconciles_existing_work() {
+        let (mut streaming, probe, started, release) = save_probe(true);
+        let mut world = save_world();
+        *probe.failure.lock().unwrap() = Some("worker proto failure".into());
+        let payload = Box::new(42u64);
+        let address = (&*payload as *const u64) as usize;
+        streaming.protos.insert((0, 0), Some(payload));
+        streaming.written.insert((0, 0));
+        streaming.save(&mut world, false).unwrap();
+        started
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(streaming.protos[&(0, 0)].is_none());
+        release.send(()).unwrap();
+        streaming.wait(std::time::Duration::from_secs(5));
+        assert!(matches!(
+            streaming.deferred.as_slice(),
+            [Done::Saved(_, Err(_))]
+        ));
+        assert_eq!(
+            streaming.poll_save(&mut world).unwrap_err().to_string(),
+            "worker proto failure"
+        );
+        assert_eq!(streaming.saving, 0);
+        assert_eq!(
+            (streaming.protos[&(0, 0)]
+                .as_ref()
+                .unwrap()
+                .downcast_ref::<u64>()
+                .unwrap() as *const u64) as usize,
+            address
+        );
+        assert!(streaming.written.contains(&(0, 0)));
+        *probe.failure.lock().unwrap() = None;
+        streaming.mesh = false;
+        // These neighbors would make the failed proto eligible for Finish.
+        for z in -1..=1 {
+            for x in -1..=1 {
+                streaming.decorated.insert((x, z));
+                if (x, z) != (0, 0) {
+                    streaming.protos.insert((x, z), Some(Box::new(0u64)));
+                }
+            }
+        }
+        // Already-submitted results must drain even after production halts.
+        streaming.generating.insert((5, 0));
+        streaming.decorating = 1;
+        streaming.finishing.insert((6, 0));
+        streaming.lighting.insert((6, 0), 77);
+        streaming.meshing.insert((6, 0, 0), 88);
+        streaming.deferred.extend([
+            Done::Proto(5, 0, Box::new(50u64), false),
+            Done::Decorated(
+                10,
+                0,
+                Box::new(std::array::from_fn(|i| Box::new(100 + i as u64) as Proto)),
+            ),
+            Done::Generated(Chunk::empty(6, 0)),
+            Done::Lit(6, 0, Vec::new(), 77),
+            Done::Meshed(6, 0, 0, SectionMesh::default(), 88),
+        ]);
+        world
+            .chunks
+            .insert((1000, 1000), Arc::new(Chunk::empty(1000, 1000)));
+        let (uploads, removed) = streaming.update(&mut world);
+        assert_eq!(uploads.len(), 1);
+        assert_eq!(removed.len(), 1);
+        assert!(world.chunks[&(6, 0)].lit);
+        assert!(streaming.lighting.is_empty());
+        assert!(streaming.meshing.is_empty());
+        assert_eq!(streaming.decorating, 0);
+        assert!(streaming.finishing.is_empty());
+        assert!(streaming.generating.is_empty());
+        // A neighboring decoration would borrow the failed key as part of its
+        // 3x3, even if finalization of that key itself were blocked.
+        streaming.decorates = true;
+        streaming.decorated.remove(&(1, 0));
+        for z in -1..=1 {
+            streaming.protos.insert((2, z), Some(Box::new(0u64)));
+        }
+        streaming.update(&mut world);
+        assert!(streaming.protos[&(0, 0)].is_some());
+        assert_eq!(streaming.decorating, 0);
+        for center in [(100, 100), (0, 0), (-100, -100)] {
+            streaming.center = center;
+            streaming.decorates = !streaming.decorates;
+            streaming.update(&mut world);
+            assert_eq!(
+                (streaming.protos[&(0, 0)]
+                    .as_ref()
+                    .unwrap()
+                    .downcast_ref::<u64>()
+                    .unwrap() as *const u64) as usize,
+                address
+            );
+            assert!(streaming.written.contains(&(0, 0)));
+            assert!(streaming.protos[&(10, 0)].is_some());
+            assert!(streaming.written.contains(&(10, 0)));
+            assert!(streaming.generating.is_empty());
+            assert!(streaming.finishing.is_empty());
+            assert_eq!(streaming.decorating, 0);
+            assert_eq!(streaming.saving, 0);
+            assert!(
+                !streaming
+                    .shared
+                    .queue
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|q| matches!(
+                        &q.job,
+                        Job::Generate(..) | Job::Decorate(..) | Job::Finish(..) | Job::Save(..)
+                    ))
+            );
+        }
+        assert_eq!(*probe.writes.lock().unwrap(), [42]);
+        assert_eq!(
+            streaming.save(&mut world, false).unwrap_err().to_string(),
+            "worker proto failure"
+        );
     }
 
     #[cfg(feature = "paired-packages")]

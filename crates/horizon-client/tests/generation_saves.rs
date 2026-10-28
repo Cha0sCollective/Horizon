@@ -101,12 +101,13 @@ impl ChunkGenerator for Recorder {
     fn is_decorated(&self, proto: &Proto) -> bool {
         proto.downcast_ref::<Recorded>().unwrap().decorated
     }
-    fn save_protos(&self, protos: &[&Proto]) {
+    fn save_protos(&self, protos: &[&Proto]) -> Result<(), String> {
         let mut saved = self.protos.lock().unwrap();
         for proto in protos {
             let proto = proto.downcast_ref::<Recorded>().unwrap();
             saved.insert((proto.x, proto.z), proto.clone());
         }
+        Ok(())
     }
     fn save_finished(&self, chunk: Chunk) {
         self.save_chunk(&chunk);
@@ -274,7 +275,9 @@ fn saved_proto_chunks_restore_exactly() {
         std::array::from_fn(|i| generator.proto(&mut worker, keys[i].0, keys[i].1));
     generator.decorate(&mut worker, &mut region);
     assert!(generator.is_decorated(&region[4]));
-    generator.save_protos(&region.iter().collect::<Vec<_>>());
+    generator
+        .save_protos(&region.iter().collect::<Vec<_>>())
+        .unwrap();
     save.flush().unwrap();
     let restored: Vec<Proto> = keys
         .iter()
@@ -355,7 +358,9 @@ fn saved_proto_block_entities_keep_their_id() {
     let mut region: [Proto; 9] =
         std::array::from_fn(|i| generator.proto(&mut worker, keys[i].0, keys[i].1));
     generator.decorate(&mut worker, &mut region);
-    generator.save_protos(&region.iter().collect::<Vec<_>>());
+    generator
+        .save_protos(&region.iter().collect::<Vec<_>>())
+        .unwrap();
     save.flush().unwrap();
     let mut file = RegionFile::open(dir.join("region/r.1.0.mca")).unwrap();
     let mut suspicious = 0;

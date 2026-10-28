@@ -3741,7 +3741,7 @@ impl<G: ChunkGenerator> ChunkGenerator for Persistent<G> {
     fn light_view(&self, proto: &crate::streaming::Proto) -> Option<Chunk> {
         self.inner.light_view(proto)
     }
-    fn save_protos(&self, protos: &[&crate::streaming::Proto]) {
+    fn save_protos(&self, protos: &[&crate::streaming::Proto]) -> std::result::Result<(), String> {
         self.save
             .tables
             .get_or_init(|| Arc::new(SaveTables::new(&self.registry)));
@@ -3749,12 +3749,9 @@ impl<G: ChunkGenerator> ChunkGenerator for Persistent<G> {
             .iter()
             .filter_map(|p| self.inner.saved_proto(p))
             .collect();
-        if let Err(e) = self
-            .save
+        self.save
             .save_protos(&saved, self.registry.registry, &self.biomes)
-        {
-            log::warn!("Horizon: failed to save proto chunks: {e}");
-        }
+            .map_err(|e| format!("failed to save proto chunks: {e}"))
     }
     fn save_finished(&self, mut chunk: Chunk) {
         self.save
