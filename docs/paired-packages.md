@@ -83,3 +83,31 @@ assigns fluid semantics to it independently of this static template.
 
 Legacy folders/zips and feature-disabled builds refuse this new field. This is an
 experimental content format; it does not add a stable SDK API or machine save schema.
+
+## Passive resident-write diagnostic
+
+Feature-enabled builds expose an explicit local control fixture:
+
+```sh
+horizon-ctl mutations on example:block 64
+horizon-ctl mutations status
+horizon-ctl mutations drain
+horizon-ctl mutations local-status
+horizon-ctl mutations off
+```
+
+Normal startup never enables it. `on` watches every registered state of one exact
+block name; capacity defaults to 4,096 and must be 1..=4,096. Turning it on again
+requires explicit `off`. Integrated singleplayer routes authority operations to
+the server in the placed owner's level; another server's client refuses them.
+`local-status` only reads the caller's own World, allowing a window's replica to
+be inspected separately.
+
+Successful resident changes record ordered previous/current canonical states,
+position, actual world time and immutable transient instance/dimension scope.
+Same-state and failed writes emit nothing. Cause remains `unclassified`. Overflow
+or sequence exhaustion makes drain fail persistently, without rejecting vanilla
+world writes. This passive diagnostic is not a transaction journal, machine
+lifecycle, persistent identity or guest API. LAN/sculk queues remain independent.
+Observers belong to World and travel with parked server levels. In-frame dimension
+replacement constructs a new World with observation disabled. No history is saved.

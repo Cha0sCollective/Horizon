@@ -122,6 +122,8 @@ mod mounts;
 mod moved_extras;
 mod moving_pistons;
 mod music;
+#[cfg(feature = "paired-packages")]
+mod mutation_control;
 mod names;
 mod native_shaders;
 mod natural_spawning;
