@@ -158,6 +158,8 @@ pub mod screen_draw;
 pub mod screen_effects;
 pub mod screen_layout;
 pub mod sculk;
+#[cfg(feature = "paired-packages")]
+pub mod slot_transfer;
 pub use horizon_server_files as server;
 pub mod server_packs;
 pub mod settings;
