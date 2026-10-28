@@ -242,9 +242,9 @@ impl Game<'_> {
             "sculk" => Ok(Some(self.sculk_command(&words)?)),
             "status" => Ok(Some(self.control_status())),
             #[cfg(feature = "paired-packages")]
-            "mutations" => {
+            "mutations" | "residency" => {
                 self.require_world()?;
-                Ok(Some(self.mutation_control(&words)?))
+                Ok(Some(self.observation_control(&words)?))
             }
             "stall" => {
                 let millis: u64 = arg(1)?.parse()?;

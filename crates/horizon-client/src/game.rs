@@ -162,6 +162,8 @@ mod remote_stations;
 mod remote_vehicles;
 mod render_control;
 mod render_tick;
+#[cfg(feature = "paired-packages")]
+mod residency_control;
 mod respawn_anchor;
 mod saves_control;
 mod saving;

@@ -134,3 +134,24 @@ world writes. This passive diagnostic is not a transaction journal, machine
 lifecycle, persistent identity or guest API. LAN/sculk queues remain independent.
 Observers belong to World and travel with parked server levels. In-frame dimension
 replacement constructs a new World with observation disabled. No history is saved.
+
+## Passive residency diagnostic
+
+The same feature also provides `residency on CAPACITY CX CZ [CX CZ ...]`,
+`residency status`, `residency local-status`, `residency drain` and `residency off`
+through horizon-ctl. It uses the same strict local-authority routing, while its
+queue is independent of block writes. At most 64 supplied chunk coordinates and
+4,096 events are accepted. Nothing loads or forces a chunk merely to observe it.
+
+Enable returns a sorted current-membership snapshot separately from transition
+history. Status reads a new snapshot without draining events, including after a
+sticky queue fault. Authoritative streaming admission/removal records loaded,
+replaced and unloaded coordinates with captured scope/time/sequence. Same-key
+replacement is visible; missing removal is a no-op. Replica writes and temporary
+SDK map lending remain separate.
+
+This diagnostic retains no Chunk contents. Coordinate history cannot reconstruct
+a machine which loads and unloads before consumption. It provides no activation,
+world-lifetime retirement, machine record, generation or persistence contract.
+World destruction ends observation; there is no Drop callback or fabricated
+per-chunk teardown history. Normal startup leaves both observers disabled.

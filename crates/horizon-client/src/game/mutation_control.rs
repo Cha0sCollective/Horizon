@@ -23,27 +23,31 @@ fn next_instance(counter: &AtomicU64) -> Result<u64> {
 }
 
 impl Game<'_> {
-    pub(super) fn mutation_control(&mut self, words: &[&str]) -> Result<Value> {
+    pub(super) fn observation_control(&mut self, words: &[&str]) -> Result<Value> {
         if words.get(1) == Some(&"local-status") && words.len() == 2 {
-            return Ok(self.mutation_status());
+            return Ok(if words.first() == Some(&"mutations") {
+                self.mutation_status()
+            } else {
+                self.residency_status()
+            });
         }
         if let Some(server) = &self.integrated {
             let owned: Vec<String> = words.iter().map(|word| (*word).to_owned()).collect();
             return server
                 .call(move |game| {
                     let words: Vec<&str> = owned.iter().map(String::as_str).collect();
-                    game.mutation_owner(&words).map_err(|e| e.to_string())
+                    game.observation_owner(&words).map_err(|e| e.to_string())
                 })
                 .ok_or("the integrated server stopped")?
                 .map_err(Into::into);
         }
         if self.remote.is_some() {
-            return Err("mutation observation requires a local authoritative world".into());
+            return Err("observation requires a local authoritative world".into());
         }
-        self.mutation_local(words)
+        self.observation_local(words)
     }
 
-    fn mutation_owner(&mut self, words: &[&str]) -> Result<Value> {
+    fn observation_owner(&mut self, words: &[&str]) -> Result<Value> {
         let owner = self
             .serving
             .as_ref()
@@ -63,12 +67,27 @@ impl Game<'_> {
         if self.dim != dimension {
             return Err("the owner's authoritative level is unavailable".into());
         }
-        let result = self.mutation_local(words);
+        let result = self.observation_local(words);
         self.enter_command_level(back);
         if self.dim != back {
-            return Err("could not restore the server's level after mutation observation".into());
+            return Err("could not restore the server's level after observation".into());
         }
         result
+    }
+
+    fn observation_local(&mut self, words: &[&str]) -> Result<Value> {
+        match words.first() {
+            Some(&"mutations") => self.mutation_local(words),
+            Some(&"residency") => self.residency_local(words),
+            _ => Err("unknown observation command".into()),
+        }
+    }
+
+    pub(super) fn observation_scope(&self) -> Result<AuthorityScope> {
+        Ok(AuthorityScope::new(
+            next_instance(&NEXT_INSTANCE)?,
+            self.dim.id(),
+        )?)
     }
 
     fn mutation_status(&self) -> Value {
@@ -111,12 +130,9 @@ impl Game<'_> {
                 let states = (0..registry.len())
                     .map(|id| BlockStateId(id as u32))
                     .filter(|id| registry.state(*id).is_some_and(|state| state.name == name));
-                let instance = next_instance(&NEXT_INSTANCE)?;
-                self.world.enable_mutation_observer(
-                    AuthorityScope::new(instance, self.dim.id())?,
-                    states,
-                    capacity,
-                )?;
+                let scope = self.observation_scope()?;
+                self.world
+                    .enable_mutation_observer(scope, states, capacity)?;
                 Ok(self.mutation_status())
             }
             Some("drain") if words.len() == 2 => {
