@@ -1814,20 +1814,19 @@ fn entity_record(x: i32, z: i32, entities: Vec<Tag>) -> Option<NamedTag> {
 }
 /// A queued POI record as it is written: claims kept from the saved one, and
 /// a chunk that lost its last POI gets an empty one, as vanilla trusts a
-/// saved section. None when the chunk never had any.
+/// saved section. None when the chunk never had any. An unreadable old record
+/// fails resolution so the writer cannot discard claims as if it were absent.
 fn resolve_poi(
     root: &Path,
     cache: &RegionCache,
     (x, z): (i32, i32),
     record: &Record,
-) -> Option<Record> {
+) -> Result<Option<Record>> {
     let Record::Poi(chunk, tables) = record else {
-        return Some(record.clone());
+        return Ok(Some(record.clone()));
     };
-    let old = read_region_record(root, cache, "poi", x, z).unwrap_or_else(|e| {
-        log::warn!("Horizon: could not read the poi record of chunk {x} {z}: {e}");
-        None
-    });
+    let old = read_old_poi_strict(root, cache, x, z)
+        .map_err(|e| format!("could not read the old poi record of chunk {x} {z}: {e}"))?;
     let tag = match (encode_poi(chunk, tables), old) {
         (Some(mut tag), Some(old)) => {
             keep_claims(&mut tag, &old);
@@ -1835,9 +1834,50 @@ fn resolve_poi(
         }
         (Some(tag), None) => tag,
         (None, Some(_)) => poi_root(Compound::new()),
-        (None, None) => return None,
+        (None, None) => return Ok(None),
     };
-    Some(Record::Tag(Arc::new(tag)))
+    Ok(Some(Record::Tag(Arc::new(tag))))
+}
+/// Only the writer uses this path. Tolerant loads may cache None after an open
+/// error, so negative entries must be reprobed before treating old POI as absent.
+fn read_old_poi_strict(
+    root: &Path,
+    cache: &RegionCache,
+    x: i32,
+    z: i32,
+) -> Result<Option<NamedTag>> {
+    let key = (x >> 5, z >> 5);
+    let path = region_path(root, "poi", key.0, key.1);
+    let region = {
+        let mut regions = cache.lock().map_err(|_| "region cache poisoned")?;
+        if let Some(Some(region)) = regions.get(&key) {
+            Some(region.clone())
+        } else {
+            match RegionFile::open_writable(&path, false) {
+                Ok(file) => {
+                    let region = Arc::new(Mutex::new(file));
+                    regions.insert(key, Some(region.clone()));
+                    Some(region)
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    regions.insert(key, None);
+                    None
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    };
+    let Some(region) = region else {
+        return Ok(None);
+    };
+    let record = region
+        .lock()
+        .map_err(|_| "region file poisoned")?
+        .read(ChunkPos::new(x, z))?;
+    Ok(match record {
+        Some(record) => Some(record.nbt(Limits::default())?),
+        None => None,
+    })
 }
 fn read_region_record(
     root: &Path,
@@ -2126,13 +2166,24 @@ impl SaveDir {
                             p.get(&(kind, k.0, k.1)).is_none_or(|p| p.0 <= seq)
                         })
                     };
-                    let resolved: Vec<_> = batch
-                        .iter()
-                        .filter(|(k, _, seq)| newest(k, *seq))
-                        .filter_map(|(k, r, _)| Some((*k, resolve_poi(&root, cache, *k, r)?)))
-                        .collect();
-                    let records: Vec<_> = resolved.iter().map(|(k, r)| (*k, r)).collect();
-                    let result = write_region_records(&root, cache, folder, &records);
+                    // Resolve every selected old-POI read before writing any
+                    // record. Errors still pass through the common completion
+                    // tail so pending snapshots and waiter notifications survive.
+                    let result = (|| -> Result<()> {
+                        let mut resolved = Vec::new();
+                        for (key, record, seq) in &batch {
+                            if newest(key, *seq)
+                                && let Some(record) = resolve_poi(&root, cache, *key, record)?
+                            {
+                                resolved.push((*key, record));
+                            }
+                        }
+                        let records: Vec<_> = resolved
+                            .iter()
+                            .map(|(key, record)| (*key, record))
+                            .collect();
+                        write_region_records(&root, cache, folder, &records)
+                    })();
                     if let Err(e) = &result {
                         let message = format!("failed to write {folder} files: {e}");
                         log::warn!("Horizon: {message}");
@@ -3801,6 +3852,329 @@ impl<G: ChunkGenerator> ChunkGenerator for Persistent<G> {
 
 #[cfg(test)]
 mod tests {
+    mod strict_poi_writer {
+        use super::*;
+
+        fn scratch(name: &str) -> PathBuf {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let root = std::env::temp_dir().join(format!(
+                "horizon-strict-poi-{name}-{}-{nonce}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&root).unwrap();
+            root
+        }
+
+        fn tables() -> (Arc<SaveTables>, u32) {
+            static TABLES: OnceLock<(Arc<SaveTables>, u32)> = OnceLock::new();
+            TABLES
+                .get_or_init(|| {
+                    let root = PathBuf::from(
+                        std::env::var_os("HORIZON_TEST_RESOURCES")
+                            .expect("HORIZON_TEST_RESOURCES must name the pinned resource root"),
+                    );
+                    assert!(root.is_dir(), "missing resource root: {}", root.display());
+                    let assets = crate::assets::Assets::load(&root).expect("pinned assets");
+                    let bell = assets.registry.default_state("minecraft:bell").unwrap().0;
+                    (Arc::new(SaveTables::new(&assets)), bell)
+                })
+                .clone()
+        }
+
+        fn bell_chunk(x: i32, bell: u32) -> Arc<Chunk> {
+            let mut chunk = Chunk::empty(x, 0);
+            chunk.set(5, 71, 5, bell);
+            Arc::new(chunk)
+        }
+
+        fn claimed() -> NamedTag {
+            let mut sections = Compound::new();
+            sections.insert(
+                "4".into(),
+                Tag::compound([
+                    ("Valid", Tag::Byte(1)),
+                    (
+                        "Records",
+                        Tag::List(vec![Tag::compound([
+                            ("pos", Tag::IntArray(vec![5, 71, 5])),
+                            ("type", string("minecraft:meeting")),
+                            ("free_tickets", Tag::Int(30)),
+                        ])]),
+                    ),
+                ]),
+            );
+            poi_root(sections)
+        }
+
+        fn tickets(tag: &NamedTag) -> i64 {
+            let Some(Tag::List(records)) = tag
+                .tag
+                .get("Sections")
+                .and_then(|s| s.get("4"))
+                .and_then(|s| s.get("Records"))
+            else {
+                panic!("expected POI records");
+            };
+            number(records[0].get("free_tickets")).unwrap()
+        }
+
+        fn seed_bad_nbt(root: &Path, x: i32) -> PathBuf {
+            let path = region_path(root, "poi", x >> 5, 0);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let mut region = RegionFile::open_writable(&path, true).unwrap();
+            region
+                .write(
+                    ChunkPos::new(x, 0),
+                    &ChunkRecord {
+                        compression: Compression::None,
+                        compressed: vec![255], // Actual invalid NBT, with a valid MCA allocation.
+                        timestamp: 1,
+                    },
+                )
+                .unwrap();
+            region.sync().unwrap();
+            let record = region.read(ChunkPos::new(x, 0)).unwrap().unwrap();
+            assert!(record.nbt(Limits::default()).is_err());
+            path
+        }
+
+        fn drained(save: &SaveDir) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while *save.outstanding.count.lock().unwrap() != 0 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "writer did not notify completion"
+                );
+                std::thread::yield_now();
+            }
+        }
+
+        fn retained(save: &SaveDir, x: i32, expected: &Arc<Chunk>) {
+            let pending = save.pending.lock().unwrap();
+            let (_, Record::Poi(chunk, _)) =
+                pending.get(&(Folder::Poi, x, 0)).expect("retained POI")
+            else {
+                panic!("expected original POI snapshot");
+            };
+            assert!(Arc::ptr_eq(chunk, expected));
+        }
+
+        #[test]
+        fn strict_poi_reads_reprobe_negative_cache_and_report_open_read_decode_errors() {
+            let root = scratch("errors");
+            let path = region_path(&root, "poi", 0, 0);
+            fs::create_dir_all(&path).unwrap(); // A file open must report a real non-NotFound error.
+            let error = RegionFile::open_writable(&path, false)
+                .err()
+                .expect("directory is not an MCA file");
+            assert_ne!(error.kind(), std::io::ErrorKind::NotFound);
+            let cache = RegionCache::default();
+            assert!(
+                read_region_record(&root, &cache, "poi", 0, 0)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(matches!(cache.lock().unwrap().get(&(0, 0)), Some(None)));
+            assert!(read_old_poi_strict(&root, &cache, 0, 0).is_err());
+            assert!(
+                read_region_record(&root, &cache, "poi", 0, 0)
+                    .unwrap()
+                    .is_none()
+            );
+            fs::remove_dir(&path).unwrap();
+            assert!(read_old_poi_strict(&root, &cache, 0, 0).unwrap().is_none());
+            seed_bad_nbt(&root, 0);
+            let bytes = fs::read(&path).unwrap();
+            assert!(read_old_poi_strict(&root, &cache, 0, 0).is_err());
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+            assert!(read_old_poi_strict(&root, &cache, 1, 0).unwrap().is_none());
+            drop(cache);
+
+            // Keep the valid MCA slot, but force a RegionFile::read error before NBT decoding.
+            let mut bytes = bytes;
+            let sector =
+                ((bytes[0] as usize) << 16) | ((bytes[1] as usize) << 8) | bytes[2] as usize;
+            bytes[sector * 4096 + 4] = 255; // Unknown compression identifier.
+            fs::write(&path, &bytes).unwrap();
+            let cache = RegionCache::default();
+            let mut region = RegionFile::open_writable(&path, false).unwrap();
+            assert!(region.read(ChunkPos::new(0, 0)).is_err());
+            drop(region);
+            assert!(read_old_poi_strict(&root, &cache, 0, 0).is_err());
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+            drop(cache);
+            fs::remove_dir_all(root).unwrap();
+        }
+
+        #[test]
+        #[ignore = "requires pinned HORIZON_TEST_RESOURCES"]
+        fn strict_poi_batch_failure_keeps_all_original_snapshots_and_old_bytes() {
+            let (tables, bell) = tables();
+            let root = scratch("batch");
+            let path = seed_bad_nbt(&root, 1);
+            let save = SaveDir::new(root.clone());
+            save.write_records("poi", vec![((0, 0), Some(claimed()))], true)
+                .unwrap();
+            let bytes = fs::read(&path).unwrap();
+            let mut first = Chunk::empty(0, 0);
+            first.set(5, 71, 5, bell);
+            first.set(6, 71, 5, bell); // The valid prefix would add a second POI if written.
+            let first = Arc::new(first);
+            let bad = bell_chunk(1, bell);
+            save.queue(
+                Folder::Poi,
+                vec![
+                    ((0, 0), Record::Poi(first.clone(), tables.clone())),
+                    ((1, 0), Record::Poi(bad.clone(), tables)),
+                ],
+                false,
+            )
+            .unwrap();
+            drained(&save);
+            for _ in 0..2 {
+                assert!(
+                    save.flush()
+                        .unwrap_err()
+                        .to_string()
+                        .contains("old poi record of chunk 1 0")
+                );
+                assert!(save.writes_finished().is_err());
+                retained(&save, 0, &first);
+                retained(&save, 1, &bad);
+            }
+            assert_eq!(
+                fs::read(&path).unwrap(),
+                bytes,
+                "valid prefix must not be written before a later resolution fails"
+            );
+            // Pending reads retain their existing tolerant snapshot semantics.
+            assert_eq!(tickets(&save.read_record("poi", 0, 0).unwrap()), 32);
+            drop(save);
+            fs::remove_dir_all(root).unwrap();
+        }
+
+        #[test]
+        #[ignore = "requires pinned HORIZON_TEST_RESOURCES"]
+        fn strict_poi_success_preserves_claims_missing_records_and_empty_sections() {
+            let (tables, bell) = tables();
+            let root = scratch("success");
+            let save = SaveDir::new(root.clone());
+            assert!(
+                read_old_poi_strict(&root, &save.poi_regions, 0, 0)
+                    .unwrap()
+                    .is_none()
+            );
+            save.queue(
+                Folder::Poi,
+                vec![((0, 0), Record::Poi(bell_chunk(0, bell), tables.clone()))],
+                true,
+            )
+            .unwrap();
+            assert_eq!(tickets(&save.read_record("poi", 0, 0).unwrap()), 32);
+            save.write_records("poi", vec![((0, 0), Some(claimed()))], true)
+                .unwrap();
+            save.queue(
+                Folder::Poi,
+                vec![
+                    ((0, 0), Record::Poi(bell_chunk(0, bell), tables.clone())),
+                    ((1, 0), Record::Poi(bell_chunk(1, bell), tables.clone())),
+                    (
+                        (2, 0),
+                        Record::Poi(Arc::new(Chunk::empty(2, 0)), tables.clone()),
+                    ),
+                ],
+                true,
+            )
+            .unwrap();
+            assert_eq!(tickets(&save.read_record("poi", 0, 0).unwrap()), 30);
+            assert_eq!(tickets(&save.read_record("poi", 1, 0).unwrap()), 32);
+            assert!(save.read_record("poi", 2, 0).is_none());
+            save.queue(
+                Folder::Poi,
+                vec![((0, 0), Record::Poi(Arc::new(Chunk::empty(0, 0)), tables))],
+                true,
+            )
+            .unwrap();
+            let empty = save.read_record("poi", 0, 0).unwrap();
+            assert_eq!(
+                empty.tag.get("Sections"),
+                Some(&Tag::Compound(Compound::new()))
+            );
+            // Explicit deletion still uses the existing record path.
+            save.write_records("poi", vec![((1, 0), None)], true)
+                .unwrap();
+            assert!(save.read_record("poi", 1, 0).is_none());
+            assert!(save.writes_finished().unwrap());
+            drop(save);
+            fs::remove_dir_all(root).unwrap();
+        }
+
+        #[test]
+        #[ignore = "requires pinned HORIZON_TEST_RESOURCES"]
+        fn strict_poi_failed_older_batch_keeps_newer_sequence_and_writer_drains() {
+            let (tables, bell) = tables();
+            let root = scratch("newer");
+            let path = seed_bad_nbt(&root, 0);
+            let bytes = fs::read(&path).unwrap();
+            let save = SaveDir::new(root.clone());
+            let region = cached_region(&save.poi_regions, (0, 0), &path, false)
+                .unwrap()
+                .unwrap();
+            let blocked = region.lock().unwrap();
+            save.queue(
+                Folder::Poi,
+                vec![((0, 0), Record::Poi(bell_chunk(0, bell), tables.clone()))],
+                false,
+            )
+            .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            // Cache + this local handle + writer's strict-read handle: the old
+            // batch has passed the sequence filter and is waiting on our lock.
+            while Arc::strong_count(&region) < 3 {
+                if std::time::Instant::now() >= deadline {
+                    drop(blocked); // Never leave the writer blocked if this assertion fails.
+                    panic!("writer did not reach strict read");
+                }
+                std::thread::yield_now();
+            }
+            let newer = bell_chunk(0, bell);
+            save.queue(
+                Folder::Poi,
+                vec![((0, 0), Record::Poi(newer.clone(), tables))],
+                false,
+            )
+            .unwrap();
+            drop(blocked);
+            // An unrelated queued write still completes after the POI failure.
+            save.write_records(
+                "poi",
+                vec![((64, 0), Some(poi_root(Compound::new())))],
+                false,
+            )
+            .unwrap();
+            drained(&save);
+            assert!(save.flush().is_err());
+            assert!(save.flush().is_err());
+            assert!(save.writes_finished().is_err());
+            retained(&save, 0, &newer);
+            assert!(
+                !save
+                    .pending
+                    .lock()
+                    .unwrap()
+                    .contains_key(&(Folder::Poi, 64, 0))
+            );
+            assert!(save.read_record("poi", 64, 0).is_some());
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+            drop(region);
+            drop(save);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
     #[test]
     fn points_of_interest_save_as_poi_sections() {
         let Some(root) = std::env::var_os("HORIZON_TEST_RESOURCES") else {
