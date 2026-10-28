@@ -6,6 +6,7 @@ use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, path::Path};
 
 mod capture;
+pub mod catalog;
 
 pub const DESCRIPTOR: &str = "horizon-paired.toml";
 pub const CONTRACT: &str = "paired-preview-1";
@@ -36,12 +37,14 @@ struct ComponentSpec {
 }
 
 /// Validated declarations. Fields are private so plans cannot bypass validation.
+#[derive(Clone)]
 pub struct Bundle {
     owner: Manifest,
     client: Executable,
     server: Executable,
 }
 
+#[derive(Clone)]
 pub struct Executable {
     entry: String,
     manifest: Manifest,
@@ -101,6 +104,16 @@ fn executable(owner: &Manifest, spec: ComponentSpec, side: Side) -> Result<Execu
 }
 
 impl Bundle {
+    /// Read declarations without capturing executable or resource payloads.
+    /// The same no-symlink, regular-file and descriptor-size fences apply.
+    pub fn read_folder(path: &Path) -> Result<Self, String> {
+        let folder = capture::Folder::open(path)?;
+        let descriptor = folder.file(DESCRIPTOR, MAX_DESCRIPTOR)?;
+        let text =
+            std::str::from_utf8(&descriptor).map_err(|_| format!("{DESCRIPTOR}: not UTF-8"))?;
+        Self::parse(text)
+    }
+
     pub fn parse(text: &str) -> Result<Self, String> {
         let descriptor: Descriptor =
             toml::from_str(text).map_err(|e| format!("{DESCRIPTOR}: {e}"))?;
@@ -179,7 +192,7 @@ pub struct PreparedBundle {
 }
 impl PreparedBundle {
     /// Requires both halves even when only one side will execute.
-    /// This folder-only prototype is intentionally absent from `manifest::find`.
+    /// Folder-only; the experimental catalog supplies game discovery.
     pub fn read_folder(path: &Path) -> Result<Self, String> {
         let folder = capture::Folder::open(path)?;
         let descriptor = folder.file(DESCRIPTOR, MAX_DESCRIPTOR)?;
