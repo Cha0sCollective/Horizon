@@ -41,6 +41,8 @@ pub mod confirm_screen;
 pub mod container_screen;
 pub mod containers;
 pub mod control;
+#[cfg(feature = "paired-packages")]
+pub mod counter_trial;
 pub mod crafting;
 pub mod crash;
 pub mod creative;

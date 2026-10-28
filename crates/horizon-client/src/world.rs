@@ -83,6 +83,8 @@ pub struct World {
     mutation_observer: Option<Box<crate::mutation_observer::Observer>>,
     #[cfg(feature = "paired-packages")]
     residency_observer: Option<Box<crate::residency_observer::Observer>>,
+    #[cfg(feature = "paired-packages")]
+    counter_trial: Option<Box<crate::counter_trial::Trial>>,
     /// `ChunkAccess.inhabitedTime` of resident chunks: ticks a player spent
     /// within spawning range (local difficulty).
     pub inhabited: HashMap<(i32, i32), i64>,
@@ -192,6 +194,8 @@ impl World {
             mutation_observer: None,
             #[cfg(feature = "paired-packages")]
             residency_observer: None,
+            #[cfg(feature = "paired-packages")]
+            counter_trial: None,
             inhabited: HashMap::new(),
             game_time: 0,
             day_time: 1000,
@@ -281,11 +285,90 @@ impl World {
     pub fn take_residency_observer(&mut self) -> Option<crate::residency_observer::Observer> {
         self.residency_observer.take().map(|o| *o)
     }
+    #[cfg(feature = "paired-packages")]
+    pub fn enable_counter_trial(
+        &mut self,
+        configuration: crate::counter_trial::Configuration,
+    ) -> Result<crate::counter_trial::Snapshot, crate::counter_trial::ConfigError> {
+        use crate::counter_trial::{ConfigError, Trial};
+        if self.counter_trial.is_some() {
+            return Err(ConfigError::AlreadyEnabled);
+        }
+        if configuration.state_id() == self.air {
+            return Err(ConfigError::InvalidMetadata);
+        }
+        let [x, y, z] = configuration.position();
+        let current = self
+            .chunks
+            .get(&configuration.chunk())
+            .map(|c| c.block(x & 15, y, z & 15))
+            .ok_or(ConfigError::NotResident)?;
+        let trial = Trial::new(configuration, Some(current));
+        let snapshot = trial.snapshot();
+        self.counter_trial = Some(Box::new(trial));
+        Ok(snapshot)
+    }
+    #[cfg(feature = "paired-packages")]
+    pub fn counter_trial_snapshot(&self) -> Option<crate::counter_trial::Snapshot> {
+        self.counter_trial.as_ref().map(|t| t.snapshot())
+    }
+    #[cfg(feature = "paired-packages")]
+    pub fn read_counter_trial(
+        &self,
+        scope: &crate::mutation_observer::AuthorityScope,
+        instance: u64,
+    ) -> Result<crate::counter_trial::Record, crate::counter_trial::ReadError> {
+        self.counter_trial
+            .as_ref()
+            .ok_or(crate::counter_trial::ReadError::Disabled)?
+            .read(scope, instance)
+    }
+    /// The authoritative phase supplies running and current block-tick eligibility;
+    /// the trial still rechecks resident storage/state, not unloaded-as-air.
+    #[cfg(feature = "paired-packages")]
+    pub fn advance_counter_trial(
+        &mut self,
+        running: bool,
+        eligible: bool,
+    ) -> Option<Result<bool, crate::counter_trial::Fault>> {
+        let trial = self.counter_trial.as_mut()?;
+        let configuration = trial.configuration();
+        let [x, y, z] = configuration.position();
+        let current = self
+            .chunks
+            .get(&configuration.chunk())
+            .map(|c| c.block(x & 15, y, z & 15));
+        Some(trial.advance(running, eligible, current, self.game_time))
+    }
+    /// Explicit lifetime retirement before the owning World is discarded.
+    #[cfg(feature = "paired-packages")]
+    pub fn take_counter_trial(&mut self) -> Option<crate::counter_trial::Snapshot> {
+        self.counter_trial.take().map(|mut t| {
+            t.retire(
+                crate::counter_trial::RetirementReason::Explicit,
+                self.game_time,
+            );
+            t.snapshot()
+        })
+    }
     /// Ordinary authoritative streaming admission, distinct from replica writes
     /// and temporary lending of the map to the SDK.
     pub(crate) fn insert_streamed_chunk(&mut self, chunk: Chunk) -> Option<Arc<Chunk>> {
         let key = (chunk.x, chunk.z);
+        #[cfg(feature = "paired-packages")]
+        let counter_state = self
+            .counter_trial
+            .as_ref()
+            .filter(|t| t.configuration().chunk() == key)
+            .map(|t| {
+                let [x, y, z] = t.configuration().position();
+                chunk.block(x & 15, y, z & 15)
+            });
         let previous = self.chunks.insert(key, Arc::new(chunk));
+        #[cfg(feature = "paired-packages")]
+        if let (Some(trial), Some(state)) = (&mut self.counter_trial, counter_state) {
+            trial.inserted(previous.is_some(), state, self.game_time);
+        }
         #[cfg(feature = "paired-packages")]
         if let Some(observer) = &mut self.residency_observer {
             use crate::residency_observer::Kind;
@@ -303,6 +386,15 @@ impl World {
     }
     pub(crate) fn remove_streamed_chunk(&mut self, key: &(i32, i32)) -> Option<Arc<Chunk>> {
         let previous = self.chunks.remove(key);
+        #[cfg(feature = "paired-packages")]
+        if previous.is_some()
+            && let Some(trial) = self
+                .counter_trial
+                .as_mut()
+                .filter(|t| t.configuration().chunk() == *key)
+        {
+            trial.unloaded();
+        }
         #[cfg(feature = "paired-packages")]
         if previous.is_some()
             && let Some(observer) = &mut self.residency_observer
@@ -384,6 +476,10 @@ impl World {
         }
         let previous = Arc::make_mut(chunk).set(x & 15, y, z & 15, state.0);
         if previous != state.0 {
+            #[cfg(feature = "paired-packages")]
+            if let Some(trial) = &mut self.counter_trial {
+                trial.changed([x, y, z], state, self.game_time);
+            }
             self.block_entities
                 .state_changed((x, y, z), previous, state.0);
             let watches = |id: u32| self.watched.get(id as usize).copied().unwrap_or(false);
