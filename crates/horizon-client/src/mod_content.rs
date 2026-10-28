@@ -1294,6 +1294,10 @@ fn stamp(base: &Path, mods: &[ContentMod]) -> Result<String> {
     }
     for m in mods {
         parts.push(m.id.clone());
+        if let Some(identity) = m.content.snapshot_identity() {
+            parts.push(format!("captured {identity:02x?}"));
+            continue;
+        }
         let source = m.content.source();
         if source.is_dir() {
             for file in &m.content.files {

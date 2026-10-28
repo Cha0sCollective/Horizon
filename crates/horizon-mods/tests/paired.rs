@@ -243,3 +243,177 @@ fn executable_symlinks_are_not_plain_package_files() {
     std::os::unix::fs::symlink("server.wasm", scratch.0.join("client.wasm")).unwrap();
     assert!(PreparedBundle::read_folder(&scratch.0).is_err());
 }
+
+#[test]
+fn captured_bytes_and_declarations_survive_edits_and_source_removal() {
+    let scratch = Scratch::new();
+    scratch.files();
+    let declaration = "data/counter_demo/horizon/block/counter.json";
+    let resource = "assets/counter_demo/lang/en_us.json";
+    for (name, bytes) in [
+        (declaration, br#"{"template":"minecraft:stone"}"#.as_slice()),
+        (resource, b"original"),
+    ] {
+        let path = scratch.0.join(name);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, bytes).unwrap();
+    }
+    let prepared = PreparedBundle::read_folder(&scratch.0).unwrap();
+    let identity = *prepared.identity();
+    assert_eq!(prepared.content().snapshot_identity(), Some(&identity));
+    fs::write(
+        scratch.0.join(declaration),
+        br#"{"template":"minecraft:dirt"}"#,
+    )
+    .unwrap();
+    fs::write(scratch.0.join(resource), b"changed").unwrap();
+    fs::remove_dir_all(scratch.0.join("assets")).unwrap();
+    fs::remove_dir_all(scratch.0.join("data")).unwrap();
+    fs::remove_file(scratch.0.join(DESCRIPTOR)).unwrap();
+    fs::remove_file(scratch.0.join("client.wasm")).unwrap();
+    fs::remove_file(scratch.0.join("server.wasm")).unwrap();
+    assert_eq!(prepared.content().file(resource).unwrap(), b"original");
+    assert_eq!(prepared.content().blocks[0].template, "minecraft:stone");
+    assert_eq!(
+        prepared.content().file(declaration).unwrap(),
+        br#"{"template":"minecraft:stone"}"#
+    );
+    assert!(
+        prepared
+            .content()
+            .file("assets/counter_demo/missing")
+            .is_err()
+    );
+    assert_eq!(prepared.descriptor(), EXAMPLE.as_bytes());
+    assert_eq!(prepared.code(Side::Client).unwrap(), b"client bytes");
+    assert_eq!(prepared.code(Side::Server).unwrap(), b"server bytes");
+    assert_eq!(*prepared.identity(), identity);
+}
+
+#[test]
+fn identity_framing_matches_independent_sha256_vector() {
+    let scratch = Scratch::new();
+    scratch.files();
+    let prepared = PreparedBundle::read_folder(&scratch.0).unwrap();
+    let hex: String = prepared
+        .identity()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    // Python hashlib/struct, explicit scheme/count and the three fixed files;
+    // the expected value does not call the Rust digest implementation.
+    assert_eq!(
+        hex,
+        "d35af60c0e5babd95a8bb3f10fa8ec03a4bb60c1c19d0c78488791f36f5d9bdd"
+    );
+}
+
+#[test]
+fn identity_covers_descriptor_both_halves_declarations_and_resource_paths() {
+    let scratch = Scratch::new();
+    scratch.files();
+    let declaration = "data/counter_demo/horizon/block/counter.json";
+    let resource = "assets/counter_demo/lang/en_us.json";
+    let originals: [(&str, &[u8]); 5] = [
+        (DESCRIPTOR, EXAMPLE.as_bytes()),
+        ("client.wasm", b"client bytes"),
+        ("server.wasm", b"server bytes"),
+        (declaration, br#"{"template":"minecraft:stone"}"#),
+        (resource, b"abc"),
+    ];
+    for (name, bytes) in originals {
+        let path = scratch.0.join(name);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, bytes).unwrap();
+    }
+    let original = *PreparedBundle::read_folder(&scratch.0).unwrap().identity();
+    for (name, bytes) in [
+        (
+            DESCRIPTOR,
+            format!("{EXAMPLE}\n# descriptor bytes matter\n").into_bytes(),
+        ),
+        ("client.wasm", b"other client".to_vec()),
+        ("server.wasm", b"other server".to_vec()),
+        (declaration, br#"{"template":"minecraft:dirt"}"#.to_vec()),
+        (resource, b"xyz".to_vec()),
+    ] {
+        fs::write(scratch.0.join(name), bytes).unwrap();
+        assert_ne!(
+            *PreparedBundle::read_folder(&scratch.0).unwrap().identity(),
+            original,
+            "{name}"
+        );
+        fs::write(
+            scratch.0.join(name),
+            originals.iter().find(|(n, _)| *n == name).unwrap().1,
+        )
+        .unwrap();
+    }
+    fs::rename(
+        scratch.0.join(resource),
+        scratch.0.join("assets/counter_demo/lang/other.json"),
+    )
+    .unwrap();
+    assert_ne!(
+        *PreparedBundle::read_folder(&scratch.0).unwrap().identity(),
+        original
+    );
+    let other = Scratch::new();
+    for (name, bytes) in originals.into_iter().rev() {
+        let path = other.0.join(name);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, bytes).unwrap();
+    }
+    assert_eq!(
+        *PreparedBundle::read_folder(&other.0).unwrap().identity(),
+        original
+    );
+}
+
+#[test]
+fn captured_content_reuses_fences_declaration_validation_and_file_limits() {
+    for (name, bytes) in [
+        ("assets/foreign/lang/en_us.json", b"{}".as_slice()),
+        ("assets/counter_demo/INVALID/bad", b"{}"),
+        ("data/counter_demo/horizon/block/counter.json", b"not json"),
+    ] {
+        let scratch = Scratch::new();
+        scratch.files();
+        let path = scratch.0.join(name);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, bytes).unwrap();
+        assert!(PreparedBundle::read_folder(&scratch.0).is_err());
+    }
+    let scratch = Scratch::new();
+    scratch.files();
+    let path = scratch.0.join("assets/counter_demo/large");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::File::create(path)
+        .unwrap()
+        .set_len(horizon_mods::content::MAX_FILE + 1)
+        .unwrap();
+    assert!(PreparedBundle::read_folder(&scratch.0).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn captured_content_refuses_file_directory_and_package_symlinks() {
+    use std::os::unix::fs::symlink;
+    let scratch = Scratch::new();
+    scratch.files();
+    let outside = Scratch::new();
+    fs::write(outside.0.join("payload"), b"secret").unwrap();
+    let assets = scratch.0.join("assets/counter_demo");
+    fs::create_dir_all(&assets).unwrap();
+    symlink(outside.0.join("payload"), assets.join("link")).unwrap();
+    assert!(PreparedBundle::read_folder(&scratch.0).is_err());
+    fs::remove_file(assets.join("link")).unwrap();
+    symlink(&outside.0, assets.join("directory")).unwrap();
+    assert!(PreparedBundle::read_folder(&scratch.0).is_err());
+    fs::remove_file(assets.join("directory")).unwrap();
+    fs::remove_dir_all(scratch.0.join("assets")).unwrap();
+    symlink(&outside.0, scratch.0.join("assets")).unwrap();
+    assert!(PreparedBundle::read_folder(&scratch.0).is_err());
+    symlink(&scratch.0, outside.0.join("package")).unwrap();
+    assert!(PreparedBundle::read_folder(&outside.0.join("package")).is_err());
+}

@@ -80,11 +80,15 @@ fn encode_dummy(world: &str, wit: &str) -> Vec<u8> {
 
 #[test]
 fn both_worlds_typecheck_without_calling_unreachable_dummy_functions() {
-    let (_dir, bundle) = prepared(
+    let (dir, bundle) = prepared(
         &dummy("horizon-mod", false),
         &dummy("horizon-server-mod", false),
         DESCR,
     );
+    // Type-check the captured code even after every original root file changes.
+    for name in [DESCRIPTOR, "client.wasm", "server.wasm"] {
+        fs::write(dir.0.join(name), b"replaced after capture").unwrap();
+    }
     let mut mods = Mods::default();
     let checked = mods.preflight_pair(&bundle).unwrap();
     assert!(std::ptr::eq(checked.prepared(), &bundle));

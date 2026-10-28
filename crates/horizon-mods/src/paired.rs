@@ -2,10 +2,14 @@
 //! Each bundle has one content owner and two separately planned executables.
 use crate::{Capability, Content, Manifest, Side};
 use serde::Deserialize;
-use std::{collections::BTreeMap, io::Read, path::Path};
+use sha2::{Digest, Sha256};
+use std::{collections::BTreeMap, path::Path};
+
+mod capture;
 
 pub const DESCRIPTOR: &str = "horizon-paired.toml";
 pub const CONTRACT: &str = "paired-preview-1";
+pub const IDENTITY_SCHEME: &str = "paired-folder-sha256-1";
 const MAX_DESCRIPTOR: u64 = 64 << 10;
 const MAX_COMPONENT: u64 = 32 << 20;
 
@@ -163,55 +167,64 @@ pub fn check_owners<'a>(owners: impl IntoIterator<Item = &'a Manifest>) -> Resul
     Ok(())
 }
 
-fn read_bounded(path: &Path, max: u64) -> Result<Vec<u8>, String> {
-    let metadata = path
-        .symlink_metadata()
-        .map_err(|e| format!("{}: {e}", path.display()))?;
-    if !metadata.file_type().is_file() || metadata.len() > max {
-        return Err(format!(
-            "{} must be a regular file of at most {max} bytes",
-            path.display()
-        ));
-    }
-    let mut bytes = Vec::new();
-    std::fs::File::open(path)
-        .map_err(|e| e.to_string())?
-        .take(max + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|e| e.to_string())?;
-    if bytes.is_empty() || bytes.len() as u64 > max {
-        return Err(format!(
-            "{} is empty or over its byte limit",
-            path.display()
-        ));
-    }
-    Ok(bytes)
-}
-
-/// Bounded package bytes and one parsed content source. Wasm code is unvalidated:
-/// callers must type/link/import/digest-check both halves before runtime admission.
+/// Immutable captured code/content and parsed declarations. Code remains
+/// unvalidated until typed preflight; identity is not runtime or peer admission.
 pub struct PreparedBundle {
     bundle: Bundle,
     content: Content,
     client: Vec<u8>,
     server: Vec<u8>,
+    descriptor: Vec<u8>,
+    identity: [u8; 32],
 }
 impl PreparedBundle {
     /// Requires both halves even when only one side will execute.
     /// This folder-only prototype is intentionally absent from `manifest::find`.
     pub fn read_folder(path: &Path) -> Result<Self, String> {
-        let text = String::from_utf8(read_bounded(&path.join(DESCRIPTOR), MAX_DESCRIPTOR)?)
-            .map_err(|_| format!("{DESCRIPTOR}: not UTF-8"))?;
-        let bundle = Bundle::parse(&text)?;
-        let client = read_bounded(&path.join("client.wasm"), MAX_COMPONENT)?;
-        let server = read_bounded(&path.join("server.wasm"), MAX_COMPONENT)?;
-        let content = Content::read(path, bundle.content_owner())?;
+        let folder = capture::Folder::open(path)?;
+        let descriptor = folder.file(DESCRIPTOR, MAX_DESCRIPTOR)?;
+        let text =
+            std::str::from_utf8(&descriptor).map_err(|_| format!("{DESCRIPTOR}: not UTF-8"))?;
+        let bundle = Bundle::parse(text)?;
+        let client = folder.file("client.wasm", MAX_COMPONENT)?;
+        let server = folder.file("server.wasm", MAX_COMPONENT)?;
+        let files = folder.content()?;
+        let mut digest = Sha256::new();
+        digest.update(IDENTITY_SCHEME.as_bytes());
+        digest.update([0]);
+        digest.update((files.len() as u64 + 3).to_le_bytes());
+        for (name, bytes) in [
+            (DESCRIPTOR, descriptor.as_slice()),
+            ("client.wasm", &client),
+            ("server.wasm", &server),
+        ]
+        .into_iter()
+        .chain(
+            files
+                .iter()
+                .map(|(name, bytes)| (name.as_str(), bytes.as_slice())),
+        ) {
+            digest.update((name.len() as u64).to_le_bytes());
+            digest.update(name.as_bytes());
+            digest.update((bytes.len() as u64).to_le_bytes());
+            digest.update(bytes);
+        }
+        let identity = digest.finalize().into();
+        let content = Content::captured(path.to_owned(), bundle.content_owner(), files, identity)?;
         Ok(Self {
             bundle,
             content,
             client,
             server,
+            descriptor,
+            identity,
         })
+    }
+    pub fn identity(&self) -> &[u8; 32] {
+        &self.identity
+    }
+    pub fn descriptor(&self) -> &[u8] {
+        &self.descriptor
     }
     pub fn bundle(&self) -> &Bundle {
         &self.bundle

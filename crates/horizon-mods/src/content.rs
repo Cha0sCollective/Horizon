@@ -129,14 +129,20 @@ pub struct Item {
     pub rarity: Option<Rarity>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 enum Source {
     Dir(PathBuf),
     Zip(PathBuf),
+    #[cfg(feature = "paired-packages")]
+    Captured {
+        origin: PathBuf,
+        files: std::sync::Arc<std::collections::BTreeMap<String, Vec<u8>>>,
+        identity: [u8; 32],
+    },
 }
 
 /// A mod's content: its files and declarations.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Content {
     source: Source,
     /// Every content file (`assets/...`, `data/...`), sorted.
@@ -151,16 +157,27 @@ pub struct Content {
 pub enum FileReader<'a> {
     Dir(&'a Path),
     Zip(Box<zip::ZipArchive<std::fs::File>>),
+    #[cfg(feature = "paired-packages")]
+    Captured(&'a std::collections::BTreeMap<String, Vec<u8>>),
 }
 impl FileReader<'_> {
     /// One content file's bytes.
     pub fn read(&mut self, name: &str) -> Result<Vec<u8>, String> {
         check_path(name)?;
+        #[cfg(feature = "paired-packages")]
+        if let Self::Captured(files) = self {
+            return files
+                .get(name)
+                .cloned()
+                .ok_or_else(|| format!("{name}: not in captured content"));
+        }
         let reader: Box<dyn Read + '_> = match self {
             Self::Dir(root) => {
                 Box::new(std::fs::File::open(root.join(name)).map_err(|e| format!("{name}: {e}"))?)
             }
             Self::Zip(zip) => Box::new(zip.by_name(name).map_err(|e| format!("{name}: {e}"))?),
+            #[cfg(feature = "paired-packages")]
+            Self::Captured(_) => unreachable!("captured reader returned above"),
         };
         let mut out = Vec::new();
         reader
@@ -186,6 +203,39 @@ pub fn clash(a: (&str, &[String]), b: (&str, &[String])) -> Option<String> {
 }
 
 impl Content {
+    /// Reuse the ordinary namespace/declaration validator on captured bytes.
+    #[cfg(feature = "paired-packages")]
+    pub(crate) fn captured(
+        origin: PathBuf,
+        manifest: &Manifest,
+        files: std::collections::BTreeMap<String, Vec<u8>>,
+        identity: [u8; 32],
+    ) -> Result<Self, String> {
+        let mut content = Self {
+            files: files.keys().cloned().collect(),
+            source: Source::Captured {
+                origin,
+                files: std::sync::Arc::new(files),
+                identity,
+            },
+            blocks: Vec::new(),
+            items: Vec::new(),
+            namespaces: manifest.owned_namespaces().map(str::to_owned).collect(),
+        };
+        content.check(manifest)?;
+        Ok(content)
+    }
+
+    /// Immutable package identity for captured content. Cache users must use it
+    /// instead of querying the original path's mutable metadata.
+    pub fn snapshot_identity(&self) -> Option<&[u8; 32]> {
+        match &self.source {
+            #[cfg(feature = "paired-packages")]
+            Source::Captured { identity, .. } => Some(identity),
+            _ => None,
+        }
+    }
+
     /// The content of the mod at `path` (a `.hmod` or a mod folder).
     pub fn read(path: &Path, manifest: &Manifest) -> Result<Content, String> {
         let (source, sized) = if path.is_dir() {
@@ -235,10 +285,13 @@ impl Content {
         Ok(content)
     }
 
-    /// Where the files are read from: the mod's folder or its `.hmod`.
+    /// Origin label: for captured content this path is informational only.
+    /// Use `reader` for bytes and `snapshot_identity` for its cache identity.
     pub fn source(&self) -> &Path {
         match &self.source {
             Source::Dir(path) | Source::Zip(path) => path,
+            #[cfg(feature = "paired-packages")]
+            Source::Captured { origin, .. } => origin,
         }
     }
 
@@ -258,6 +311,8 @@ impl Content {
         Ok(match &self.source {
             Source::Dir(root) => FileReader::Dir(root),
             Source::Zip(path) => FileReader::Zip(Box::new(open_zip(path)?)),
+            #[cfg(feature = "paired-packages")]
+            Source::Captured { files, .. } => FileReader::Captured(files),
         })
     }
 

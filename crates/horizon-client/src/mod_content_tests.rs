@@ -571,6 +571,60 @@ fn content_root_is_reused_until_a_mod_changes() {
     let _ = fs::remove_dir_all(&scratch);
 }
 
+#[cfg(feature = "paired-packages")]
+#[test]
+#[ignore = "full content root: run with paired-packages and prepared resources"]
+fn captured_content_root_survives_source_removal_and_rebuilds_for_new_identity() {
+    let base = prepared().expect("prepared resources required for paired cache regression");
+    let scratch =
+        std::env::temp_dir().join(format!("horizon-captured-content-{}", std::process::id()));
+    fs::create_dir(&scratch).unwrap();
+    let source = scratch.join("ruby");
+    let legacy = ruby_mod(&source);
+    let descriptor = "format=1\nhost-contract='paired-preview-1'\n[content]\nid='ruby'\nname='Ruby'\nversion='0'\napi='0.2'\nside='both'\ncapabilities=['registries']\n[client]\nentry='client.wasm'\napi='0.1'\ncapabilities=[]\n[server]\nentry='server.wasm'\napi='0.3'\ncapabilities=[]\n";
+    fs::write(source.join("horizon-paired.toml"), descriptor).unwrap();
+    fs::write(source.join("client.wasm"), b"client").unwrap();
+    fs::write(source.join("server.wasm"), b"server").unwrap();
+    let first = horizon_mods::paired::PreparedBundle::read_folder(&source).unwrap();
+    fs::write(
+        source.join("assets/ruby/lang/en_us.json"),
+        br#"{"block.ruby.ruby_block":"New frozen name"}"#,
+    )
+    .unwrap();
+    let second = horizon_mods::paired::PreparedBundle::read_folder(&source).unwrap();
+    assert_ne!(first.identity(), second.identity());
+    let first_mod = ContentMod {
+        id: "ruby".into(),
+        content: first.content().clone(),
+    };
+    let second_mod = ContentMod {
+        id: "ruby".into(),
+        content: second.content().clone(),
+    };
+    drop((first, second, legacy));
+    fs::remove_dir_all(&source).unwrap();
+    let cache = scratch.join("cache");
+    let root = resource_root(&base, std::slice::from_ref(&first_mod), &cache).unwrap();
+    let sentinel = root.join("sentinel");
+    fs::write(&sentinel, b"").unwrap();
+    resource_root(&base, std::slice::from_ref(&first_mod), &cache).unwrap();
+    assert!(
+        sentinel.exists(),
+        "unchanged captured content rebuilt its cache"
+    );
+    resource_root(&base, std::slice::from_ref(&second_mod), &cache).unwrap();
+    assert!(
+        !sentinel.exists(),
+        "different captured identity retained the old cache"
+    );
+    assert!(
+        fs::read_to_string(root.join("assets/ruby/lang/en_us.json"))
+            .unwrap()
+            .contains("New frozen name")
+    );
+    fs::remove_dir_all(scratch).unwrap();
+}
+
 /// A structure mod's worldgen reaches the worldgen loader: its structure,
 /// set, pool and templates join the bundles, and its biome tag keeps only
 /// what the loader knows.
