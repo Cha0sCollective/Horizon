@@ -84,6 +84,29 @@ assigns fluid semantics to it independently of this static template.
 Legacy folders/zips and feature-disabled builds refuse this new field. This is an
 experimental content format; it does not add a stable SDK API or machine save schema.
 
+## Machine type metadata preview
+
+A captured paired package may declare one type at
+`data/<package>/horizon/machine/counter.json`:
+
+```json
+{"format": 1, "save-schema": 1}
+```
+
+Its ID is derived from the primary package namespace and declaration path. One
+iron-template block may bind it with `"machine-type": "<package>:counter"`.
+Unknown/duplicate fields, null or foreign bindings, unsupported format/schema,
+missing types, alias-namespace declarations and oversized declarations reject.
+The declaration limit is 64 KiB. An unbound type is permitted. A bound block
+cannot also use static `state-definition`.
+
+This is read-only type/schema metadata in prepared content; it does not create
+instances, callbacks, ticks, slots, placement generations, migrations or saved
+records. Block geometry and vanilla registry IDs remain unchanged. Existing
+captured identities include these bytes. Legacy content and feature-off builds
+refuse the new field/path; the experimental host Rust Block type exposes a getter
+for its validated binding rather than a constructible public binding field.
+
 ## Passive resident-write diagnostic
 
 Feature-enabled builds expose an explicit local control fixture:

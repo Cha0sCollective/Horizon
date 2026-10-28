@@ -38,7 +38,7 @@ fn static_property_vocabulary_counts_vanilla_and_all_packages() {
 }
 
 #[cfg(feature = "paired-packages")]
-fn static_state_mod(dir: &Path) -> ContentMod {
+fn paired_state_mod(dir: &Path, block: &str) -> ContentMod {
     fs::create_dir_all(dir.join("data/state_demo/horizon/block")).unwrap();
     fs::write(
         dir.join("horizon-paired.toml"),
@@ -66,8 +66,18 @@ capabilities=[]
     // Content parsing is deliberately independent of executable ABI checking.
     fs::write(dir.join("client.wasm"), b"not executed").unwrap();
     fs::write(dir.join("server.wasm"), b"not executed").unwrap();
-    fs::write(
-        dir.join("data/state_demo/horizon/block/marker.json"),
+    fs::write(dir.join("data/state_demo/horizon/block/marker.json"), block).unwrap();
+    let prepared = horizon_mods::paired::PreparedBundle::read_folder(dir).unwrap();
+    ContentMod {
+        id: "state_demo".into(),
+        content: prepared.content().clone(),
+    }
+}
+
+#[cfg(feature = "paired-packages")]
+fn static_state_mod(dir: &Path) -> ContentMod {
+    paired_state_mod(
+        dir,
         r#"{
       "template":"minecraft:iron_block", "state-definition": {
         "format":1,"behavior":"static","properties":[
@@ -75,12 +85,82 @@ capabilities=[]
           {"name":"axis","values":["z","x","y"],"default":"y"}]}}
     "#,
     )
+}
+
+#[cfg(feature = "paired-packages")]
+#[test]
+#[ignore = "full owned content root: run explicitly for machine metadata materialization"]
+fn machine_metadata_preserves_vanilla_ids_and_template_geometry() {
+    use horizon_world::registry::{BlockRegistry, BlockTableFile};
+    let base = prepared().expect("owned 26.3 prepared resources are required for this check");
+    let scratch =
+        std::env::temp_dir().join(format!("horizon-machine-metadata-{}", std::process::id()));
+    fs::create_dir(&scratch).unwrap();
+    let source = scratch.join("package");
+    let ordinary = paired_state_mod(&source, r#"{"template":"minecraft:iron_block"}"#);
+    fs::create_dir_all(source.join("data/state_demo/horizon/machine")).unwrap();
+    fs::write(
+        source.join("data/state_demo/horizon/machine/counter.json"),
+        br#"{"format":1,"save-schema":1}"#,
+    )
     .unwrap();
-    let prepared = horizon_mods::paired::PreparedBundle::read_folder(dir).unwrap();
-    ContentMod {
-        id: "state_demo".into(),
-        content: prepared.content().clone(),
+    let bound = paired_state_mod(
+        &source,
+        r#"{"template":"minecraft:iron_block","machine-type":"state_demo:counter"}"#,
+    );
+    assert_eq!(ordinary.content.blocks[0].machine_type(), None);
+    assert_eq!(
+        bound.content.blocks[0].machine_type(),
+        Some("state_demo:counter")
+    );
+    assert_ne!(
+        ordinary.content.snapshot_identity(),
+        bound.content.snapshot_identity()
+    );
+    let plain_root = resource_root(&base, &[ordinary], &scratch.join("plain-cache")).unwrap();
+    let bound_root = resource_root(&base, &[bound], &scratch.join("bound-cache")).unwrap();
+    assert_ne!(plain_root, bound_root); // Keep both materializations for comparison.
+    assert_ne!(
+        fs::read(plain_root.join(STAMP)).unwrap(),
+        fs::read(bound_root.join(STAMP)).unwrap()
+    ); // The existing captured hash includes metadata.
+    let registry = |root: &Path| {
+        BlockRegistry::from_facts_json(fs::File::open(root.join("facts.json")).unwrap()).unwrap()
+    };
+    let old = registry(&base);
+    let plain = registry(&plain_root);
+    let new = registry(&bound_root);
+    let n = old.len();
+    assert_eq!(plain.len(), n + 1);
+    assert_eq!(new.len(), n + 1);
+    for i in 0..n {
+        let id = BlockStateId(i as u32);
+        assert_eq!(old.state(id), new.state(id));
+        let name = &old.state(id).unwrap().name;
+        assert_eq!(old.default_state(name), new.default_state(name));
     }
+    let appended = BlockStateId(n as u32);
+    assert_eq!(new.state(appended), plain.state(appended));
+    assert_eq!(new.default_state("state_demo:marker"), Some(appended));
+    assert_eq!(plain.default_state("state_demo:marker"), Some(appended));
+    for name in JSON_TABLES.iter().chain(&NBT_TABLES) {
+        assert_eq!(
+            fs::read(plain_root.join(name)).unwrap(),
+            fs::read(bound_root.join(name)).unwrap(),
+            "metadata changed {name}"
+        );
+    }
+    for name in NBT_TABLES {
+        let file = BlockTableFile::open(&bound_root.join(name), &new).unwrap();
+        let table = file.table(name).unwrap();
+        if let Some(Tag::IntArray(shapes)) = table.get("cached_shapes") {
+            let iron = old.default_state("minecraft:iron_block").unwrap().0 as usize;
+            assert_eq!(shapes.len(), n + 1);
+            assert_eq!(shapes[n], shapes[iron]);
+        }
+    }
+    crate::collisions::load(&bound_root, &new).unwrap();
+    fs::remove_dir_all(scratch).unwrap();
 }
 
 #[cfg(feature = "paired-packages")]

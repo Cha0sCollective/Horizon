@@ -16,6 +16,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[cfg(feature = "paired-packages")]
+pub mod machines;
 /// Experimental finite-state planning only. Resource admission still accepts
 /// legacy template declarations; custom state materialization is separate.
 #[cfg(feature = "paired-packages")]
@@ -99,6 +101,13 @@ struct BlockFile {
         deserialize_with = "state_definition"
     )]
     state_definition: Option<Box<serde_json::value::RawValue>>,
+    #[cfg(feature = "paired-packages")]
+    #[serde(default, rename = "machine-type", deserialize_with = "machine_type")]
+    machine_type: Option<String>,
+}
+#[cfg(feature = "paired-packages")]
+fn machine_type<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    String::deserialize(d).map(Some)
 }
 #[cfg(feature = "paired-packages")]
 fn state_definition<'de, D: serde::Deserializer<'de>>(
@@ -124,6 +133,15 @@ pub struct Block {
     /// Experimental static states, admitted only from a captured paired bundle.
     #[cfg(feature = "paired-packages")]
     pub state_plan: Option<states::StatePlan>,
+    #[cfg(feature = "paired-packages")]
+    machine_type: Option<String>,
+}
+impl Block {
+    /// Validated metadata only; this does not install machine behavior.
+    #[cfg(feature = "paired-packages")]
+    pub fn machine_type(&self) -> Option<&str> {
+        self.machine_type.as_deref()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
@@ -176,6 +194,8 @@ pub struct Content {
     pub items: Vec<Item>,
     /// The namespaces it owns: the mod id, then the manifest's `namespaces`.
     pub namespaces: Vec<String>,
+    #[cfg(feature = "paired-packages")]
+    machines: machines::Catalog,
 }
 
 /// Reads a mod's content files ([`Content::reader`]).
@@ -246,6 +266,7 @@ impl Content {
             blocks: Vec::new(),
             items: Vec::new(),
             namespaces: manifest.owned_namespaces().map(str::to_owned).collect(),
+            machines: machines::Catalog::default(),
         };
         content.check(manifest)?;
         Ok(content)
@@ -305,6 +326,8 @@ impl Content {
             blocks: Vec::new(),
             items: Vec::new(),
             namespaces: manifest.owned_namespaces().map(str::to_owned).collect(),
+            #[cfg(feature = "paired-packages")]
+            machines: machines::Catalog::default(),
         };
         content.check(manifest)?;
         Ok(content)
@@ -318,6 +341,11 @@ impl Content {
             #[cfg(feature = "paired-packages")]
             Source::Captured { origin, .. } => origin,
         }
+    }
+
+    #[cfg(feature = "paired-packages")]
+    pub fn machine_types(&self) -> &machines::Catalog {
+        &self.machines
     }
 
     /// No files: a mod with code only.
@@ -351,6 +379,8 @@ impl Content {
         }
         let mut blocks = Vec::new();
         let mut items = Vec::new();
+        #[cfg(feature = "paired-packages")]
+        let mut machine_files = Vec::new();
         for name in &self.files {
             let mut parts = name.splitn(3, '/');
             let (top, namespace, rest) = (
@@ -392,11 +422,32 @@ impl Content {
             } else if let Some(item) = parse("item") {
                 items.push((item, name.clone()));
             } else {
+                #[cfg(feature = "paired-packages")]
+                if parse("machine").is_some() {
+                    if self.snapshot_identity().is_none() {
+                        return Err(format!(
+                            "{name}: machine declarations require captured paired content"
+                        ));
+                    }
+                    if !machine_files.is_empty() {
+                        return Err(format!("{name}: at most one machine type per package"));
+                    }
+                    machine_files.push(name.clone());
+                    continue;
+                }
                 return Err(format!(
                     "{name}: data/{id}/horizon/ holds block/*.json and item/*.json only"
                 ));
             }
         }
+        #[cfg(feature = "paired-packages")]
+        let machines = match machine_files.first() {
+            Some(name) => machines::Catalog::declaration(id, name, &self.file(name)?)
+                .map_err(|e| format!("{name}: {e}"))?,
+            None => machines::Catalog::default(),
+        };
+        #[cfg(feature = "paired-packages")]
+        let mut machine_bound = false;
         let mut ids = BTreeSet::new();
         #[cfg(feature = "paired-packages")]
         let mut static_states = 0usize;
@@ -404,6 +455,28 @@ impl Content {
             let file: BlockFile =
                 serde_json::from_slice(&self.file(&name)?).map_err(|e| format!("{name}: {e}"))?;
             check_block(&file).map_err(|e| format!("{name}: {e}"))?;
+            #[cfg(feature = "paired-packages")]
+            if let Some(binding) = &file.machine_type {
+                if self.snapshot_identity().is_none() {
+                    return Err(format!(
+                        "{name}: machine-type requires captured paired content"
+                    ));
+                }
+                if file.template != "minecraft:iron_block" || file.state_definition.is_some() {
+                    return Err(format!(
+                        "{name}: machine-type requires minecraft:iron_block without state-definition"
+                    ));
+                }
+                machines
+                    .binding(id, binding)
+                    .map_err(|e| format!("{name}: {e}"))?;
+                if machine_bound {
+                    return Err(format!(
+                        "{name}: at most one machine-bound block per package"
+                    ));
+                }
+                machine_bound = true;
+            }
             #[cfg(feature = "paired-packages")]
             let state_plan = match &file.state_definition {
                 Some(raw) => {
@@ -441,6 +514,8 @@ impl Content {
                 item: file.item,
                 #[cfg(feature = "paired-packages")]
                 state_plan,
+                #[cfg(feature = "paired-packages")]
+                machine_type: file.machine_type,
             });
         }
         for (item, name) in items {
@@ -464,6 +539,10 @@ impl Content {
                 max_stack_size: file.max_stack_size,
                 rarity: file.rarity,
             });
+        }
+        #[cfg(feature = "paired-packages")]
+        {
+            self.machines = machines;
         }
         Ok(())
     }
@@ -560,6 +639,181 @@ capabilities = ["registries"]
                 .to_string()
                 .contains("unknown field `state-definition`")
         );
+    }
+
+    #[cfg(not(feature = "paired-packages"))]
+    #[test]
+    fn machine_metadata_requires_the_experimental_feature() {
+        assert!(
+            hmod(
+                "machine-off-declaration",
+                MANIFEST_TEXT,
+                &[(
+                    "data/ruby/horizon/machine/counter.json",
+                    br#"{"format":1,"save-schema":1}"#
+                )]
+            )
+            .is_err()
+        );
+        for binding in [r#""ruby:counter""#, "null"] {
+            let bytes =
+                format!(r#"{{"template":"minecraft:iron_block","machine-type":{binding}}}"#);
+            assert!(
+                hmod(
+                    "machine-off-binding",
+                    MANIFEST_TEXT,
+                    &[("data/ruby/horizon/block/counter.json", bytes.as_bytes())]
+                )
+                .unwrap_err()
+                .contains("unknown field `machine-type`")
+            );
+        }
+    }
+
+    #[cfg(feature = "paired-packages")]
+    fn machine_content(files: &[(&str, &[u8])]) -> Result<Content, String> {
+        Content::captured(
+            PathBuf::from("unused"),
+            &Manifest::parse(MANIFEST_TEXT).unwrap(),
+            files
+                .iter()
+                .map(|(name, bytes)| ((*name).into(), bytes.to_vec()))
+                .collect(),
+            [7; 32],
+        )
+    }
+
+    #[cfg(feature = "paired-packages")]
+    #[test]
+    fn captured_machine_catalog_and_binding_resolve_before_file_order() {
+        let machine = (
+            "data/ruby/horizon/machine/counters/counter.json",
+            br#"{"format":1,"save-schema":1}"#.as_slice(),
+        );
+        let block = (
+            "data/ruby/horizon/block/counter.json",
+            br#"{"template":"minecraft:iron_block","machine-type":"ruby:counters/counter"}"#
+                .as_slice(),
+        );
+        let content = machine_content(&[machine, block]).unwrap();
+        assert_eq!(content.files[0], block.0); // The block is encountered first.
+        assert_eq!(content.machine_types().types().len(), 1);
+        let binding = content.blocks[0].machine_type().unwrap();
+        let ty = content.machine_types().get(binding).unwrap();
+        assert_eq!(ty.id(), "ruby:counters/counter");
+        assert_eq!(ty.save_schema(), 1);
+        assert!(content.blocks[0].state_plan.is_none());
+        assert_eq!(content.snapshot_identity(), Some(&[7; 32]));
+        let unbound = machine_content(&[machine]).unwrap();
+        assert!(unbound.blocks.is_empty());
+        assert_eq!(
+            unbound.machine_types().types(),
+            content.machine_types().types()
+        );
+    }
+
+    #[cfg(feature = "paired-packages")]
+    #[test]
+    fn machine_admission_refuses_legacy_foreign_dangling_and_duplicate_bindings() {
+        let machine = (
+            "data/ruby/horizon/machine/counter.json",
+            br#"{"format":1,"save-schema":1}"#.as_slice(),
+        );
+        let block = (
+            "data/ruby/horizon/block/counter.json",
+            br#"{"template":"minecraft:iron_block","machine-type":"ruby:counter"}"#.as_slice(),
+        );
+        for files in [&[machine][..], &[block][..], &[machine, block][..]] {
+            assert!(hmod("machine-legacy", MANIFEST_TEXT, files).is_err());
+        }
+        assert!(
+            machine_content(&[block])
+                .unwrap_err()
+                .contains("no declaration")
+        );
+        for binding in [
+            "null",
+            "1",
+            r#""other:counter""#,
+            r#""ruby:""#,
+            r#""ruby:missing""#,
+        ] {
+            let bytes =
+                format!(r#"{{"template":"minecraft:iron_block","machine-type":{binding}}}"#);
+            assert!(
+                machine_content(&[machine, (block.0, bytes.as_bytes())]).is_err(),
+                "{binding}"
+            );
+            assert!(
+                hmod(
+                    "machine-legacy-invalid",
+                    MANIFEST_TEXT,
+                    &[(block.0, bytes.as_bytes())]
+                )
+                .is_err()
+            );
+        }
+        let duplicate = br#"{"template":"minecraft:iron_block","machine-type":"ruby:counter","machine-type":"ruby:counter"}"#;
+        assert!(
+            machine_content(&[machine, (block.0, duplicate)])
+                .unwrap_err()
+                .contains("duplicate field")
+        );
+        assert!(
+            machine_content(&[
+                machine,
+                ("data/ruby/horizon/machine/second.json", machine.1)
+            ])
+            .unwrap_err()
+            .contains("at most one machine type")
+        );
+        assert!(
+            machine_content(&[
+                machine,
+                block,
+                ("data/ruby/horizon/block/second.json", block.1)
+            ])
+            .unwrap_err()
+            .contains("at most one machine-bound block")
+        );
+        let mut manifest = Manifest::parse(MANIFEST_TEXT).unwrap();
+        manifest.namespaces.push("alias".into());
+        assert!(
+            Content::captured(
+                PathBuf::from("unused"),
+                &manifest,
+                [(
+                    "data/alias/horizon/machine/counter.json".into(),
+                    machine.1.to_vec()
+                )]
+                .into(),
+                [0; 32]
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(feature = "paired-packages")]
+    #[test]
+    fn machine_binding_requires_iron_without_a_static_definition() {
+        let machine = (
+            "data/ruby/horizon/machine/counter.json",
+            br#"{"format":1,"save-schema":1}"#.as_slice(),
+        );
+        for block in [
+            r#"{"template":"minecraft:stone","machine-type":"ruby:counter"}"#,
+            r#"{"template":"minecraft:iron_block","machine-type":"ruby:counter","state-definition":{"format":1,"behavior":"static","properties":[{"name":"axis","values":["x"],"default":"x"}]}}"#,
+            r#"{"template":"minecraft:iron_block","machine-type":"ruby:counter","state-definition":null}"#,
+        ] {
+            assert!(
+                machine_content(&[
+                    machine,
+                    ("data/ruby/horizon/block/counter.json", block.as_bytes())
+                ])
+                .unwrap_err()
+                .contains("without state-definition")
+            );
+        }
     }
 
     #[cfg(feature = "paired-packages")]
@@ -692,6 +946,8 @@ capabilities = ["registries"]
                 item: true,
                 #[cfg(feature = "paired-packages")]
                 state_plan: None,
+                #[cfg(feature = "paired-packages")]
+                machine_type: None,
             }]
         );
         assert_eq!(content.items[0].id, "ruby:ruby");
