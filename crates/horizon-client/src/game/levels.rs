@@ -499,11 +499,23 @@ impl Game<'_> {
         }
         let back = self.dim;
         let dims: Vec<Dim> = self.levels.parked.keys().copied().collect();
-        for dim in dims {
-            self.enter_level(None, dim)?;
-            self.save_level(wait)?;
+        let loop_result = (|| -> Result<()> {
+            for dim in dims {
+                self.enter_level(None, dim)?;
+                self.save_level(wait)?;
+            }
+            Ok(())
+        })();
+        // A save error must not leave a different native level and hub in place.
+        let restore_result = self.enter_level(None, back);
+        if let Err(error) = &restore_result {
+            log::error!(
+                "parked-save restoration failed: requested {}, active {}: {error}",
+                back.id(),
+                self.dim.id(),
+            );
         }
-        self.enter_level(None, back)
+        loop_result.and(restore_result)
     }
 }
 
@@ -725,3 +737,6 @@ impl Game<'_> {
 
 #[cfg(all(test, feature = "paired-packages"))]
 pub(super) mod entity_owner_tests;
+
+#[cfg(all(test, feature = "paired-packages"))]
+mod parked_save_tests;
