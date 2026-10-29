@@ -130,8 +130,8 @@ impl Stats {
         }
         stats
     }
-    /// `ServerStatsCounter.save`.
-    pub(super) fn write(&self, path: &Path) -> horizon_client::Result<()> {
+    /// The existing saved JSON value, borrowed without consuming notifications.
+    pub(super) fn to_json(&self) -> serde_json::Value {
         let stats: serde_json::Map<String, serde_json::Value> = self
             .values
             .iter()
@@ -142,10 +142,14 @@ impl Stats {
                 (ty.clone(), serde_json::Value::Object(entries))
             })
             .collect();
-        let json = serde_json::json!({
+        serde_json::json!({
             "stats": stats,
             "DataVersion": horizon_world::DATA_VERSION,
-        });
+        })
+    }
+    /// `ServerStatsCounter.save`.
+    pub(super) fn write(&self, path: &Path) -> horizon_client::Result<()> {
+        let json = self.to_json();
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).map_err(|error| format!("{}: {error}", path.display()))?;
         }
@@ -452,6 +456,67 @@ mod tests {
     }
     fn json_read(path: &Path) -> serde_json::Value {
         serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn borrowed_statistics_json_preserves_notifications_and_legacy_pretty_text() {
+        let root = json_scratch("borrowed-projection");
+        let path = root.join("nested/stats.json");
+        let mut stats = Stats {
+            phantom_tick: 17,
+            ..Stats::default()
+        };
+        stats.custom("jump", 8);
+        stats.reset("custom", "minecraft:jump");
+        stats.add("mined", "minecraft:stone", -3);
+        stats.values.insert("example:empty".into(), BTreeMap::new());
+        let before = (
+            stats.values.clone(),
+            stats.events.clone(),
+            stats.dirty.clone(),
+            stats.loaded,
+            stats.phantom_tick,
+        );
+        let expected = serde_json::json!({"DataVersion":horizon_world::DATA_VERSION,"stats":{"minecraft:custom":{"minecraft:jump":0},"minecraft:mined":{"minecraft:stone":-3}}});
+        assert_eq!(stats.to_json(), expected);
+        assert_eq!(stats.to_json(), expected);
+        assert!(!path.exists());
+        assert_eq!(
+            (
+                stats.values.clone(),
+                stats.events.clone(),
+                stats.dirty.clone(),
+                stats.loaded,
+                stats.phantom_tick
+            ),
+            before
+        );
+        stats.write(&path).unwrap();
+        // Authored independently of either formatter call, including old whitespace/order.
+        let text = r#"{
+  "DataVersion": DATA_VERSION,
+  "stats": {
+    "minecraft:custom": {
+      "minecraft:jump": 0
+    },
+    "minecraft:mined": {
+      "minecraft:stone": -3
+    }
+  }
+}"#
+        .replace("DATA_VERSION", &horizon_world::DATA_VERSION.to_string());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        assert_eq!(
+            (
+                stats.values.clone(),
+                stats.events.clone(),
+                stats.dirty.clone(),
+                stats.loaded,
+                stats.phantom_tick
+            ),
+            before
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

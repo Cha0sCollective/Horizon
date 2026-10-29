@@ -411,6 +411,120 @@ impl Game<'_> {
 #[cfg(all(test, feature = "paired-packages"))]
 mod participant_preflight_tests;
 
+#[cfg(feature = "paired-packages")]
+#[allow(dead_code)] // Structured observations; no complete capture operation consumes them yet.
+pub(in crate::game) struct ParticipantProjections {
+    players: Vec<ProjectedParticipant>,
+}
+#[cfg(feature = "paired-packages")]
+#[allow(dead_code)]
+struct ProjectedParticipant {
+    conn: u32,
+    uuid: u128,
+    dimension: String,
+    storage: ParticipantStorage,
+    player: horizon_world::nbt::Tag,
+    advancements: serde_json::Value,
+    stats: serde_json::Value,
+}
+#[cfg(feature = "paired-packages")]
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::game) enum ParticipantProjectionError {
+    Preflight(ParticipantPreflightError),
+    UnavailableAdvancementTree,
+    UnsupportedPlayerData { conn: u32 },
+    UnsupportedStack { conn: u32 },
+    Reservation { conn: u32 },
+}
+
+#[cfg(feature = "paired-packages")]
+#[allow(dead_code)] // No writer, publication permit or gameplay caller is introduced here.
+impl Game<'_> {
+    pub(in crate::game) fn project_checkpoint_participants(
+        &self,
+        expected: &ParticipantRoster,
+    ) -> std::result::Result<ParticipantProjections, ParticipantProjectionError> {
+        use super::slot_retirement::{DeliveryError, check_counts};
+        use ParticipantProjectionError as E;
+        use horizon_client::save::Level;
+        use horizon_world::nbt::Tag;
+
+        self.preflight_checkpoint_participants(expected)
+            .map_err(E::Preflight)?;
+        if self.adv.tree.list.is_empty() || self.adv.pending_tree.is_some() {
+            return Err(E::UnavailableAdvancementTree);
+        }
+        let host = self.checkpoint_participant_host().map_err(E::Preflight)?;
+        // Validate every live owner before any player_tag/item encoder is called.
+        for guest in &host.hub.guests {
+            if guest
+                .saved
+                .as_ref()
+                .is_some_and(|saved| !matches!(saved, Tag::Compound(_)))
+            {
+                return Err(E::UnsupportedPlayerData { conn: guest.conn });
+            }
+            for stack in guest
+                .inventory
+                .iter()
+                .chain(guest.armor.iter())
+                .chain(std::iter::once(&guest.offhand))
+                .chain(guest.ender_items.iter())
+                .flatten()
+            {
+                if &*stack.item == "minecraft:air" || self.res.items().get(&stack.item).is_none() {
+                    return Err(E::UnsupportedStack { conn: guest.conn });
+                }
+                check_counts(stack).map_err(|error| match error {
+                    DeliveryError::Reservation => E::Reservation { conn: guest.conn },
+                    _ => E::UnsupportedStack { conn: guest.conn },
+                })?;
+            }
+        }
+        let mut players = Vec::new();
+        for identity in &expected.identities {
+            players.try_reserve(1).map_err(|_| E::Reservation {
+                conn: identity.conn,
+            })?;
+            // The same-call preflight and continuous borrow preserve this match.
+            let guest = host
+                .hub
+                .guests
+                .iter()
+                .find(|g| g.conn == identity.conn)
+                .expect("preflight checked every expected participant");
+            let play = host
+                .play
+                .get(&identity.conn)
+                .expect("preflight checked play ownership");
+            let mut local = match identity.storage {
+                ParticipantStorage::IntegratedOwner { .. } => self.level.clone(),
+                ParticipantStorage::External { record_uuid } => Level {
+                    player_uuid: Some(record_uuid),
+                    ..Level::default()
+                },
+            };
+            playerdata::store(guest, &mut local);
+            players.push(ProjectedParticipant {
+                conn: identity.conn,
+                uuid: identity.uuid,
+                dimension: identity.dimension.clone(),
+                storage: identity.storage,
+                player: local.player_tag(),
+                advancements: guest
+                    .advancements
+                    .to_json(&self.adv.tree, horizon_world::DATA_VERSION),
+                stats: play.stats.to_json(),
+            });
+        }
+        Ok(ParticipantProjections { players })
+    }
+}
+
+#[cfg(all(test, feature = "paired-packages"))]
+mod player_projection_tests;
+
 fn save_guest_records_to(
     world: &std::path::Path,
     tree: &horizon_client::advancements::Tree,
