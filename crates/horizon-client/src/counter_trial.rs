@@ -1,5 +1,5 @@
-//! Opt-in transient counter with native and staged guest host phases.
-//! No persistence or Game callback binding is established here.
+//! Opt-in counter with native and staged guest host phases.
+//! The World defining child owns opt-in persistent metadata; no Game callback is bound here.
 //! Host configuration/phase authority is required; this is not machine activity
 //! discovery, a saved generation, or a stable behavior interface.
 use crate::{
@@ -36,6 +36,8 @@ pub enum Fault {
     GuestFailure(GuestFailure),
     InstanceExhausted,
     CounterExhausted,
+    /// A persistent placement cannot resume after ambiguous ownership/lifecycle failure.
+    PersistentDomain,
     ReloadMismatch {
         actual: BlockStateId,
     },
@@ -285,12 +287,24 @@ impl Snapshot {
 
 static LAST_INSTANCE: AtomicU64 = AtomicU64::new(0);
 fn allocate_instance(allocator: &AtomicU64) -> Result<u64, Fault> {
+    reserve_instances(allocator, 1).map(|first| first.unwrap())
+}
+/// Reserve the complete bounded restore range with one CAS, never a partial pair.
+fn reserve_instances(allocator: &AtomicU64, count: u64) -> Result<Option<u64>, Fault> {
+    if count == 0 {
+        return Ok(None);
+    }
+    if count > 2 {
+        return Err(Fault::InstanceExhausted);
+    }
     let mut previous = allocator.load(Ordering::Relaxed);
     loop {
-        let next = previous.checked_add(1).ok_or(Fault::InstanceExhausted)?;
+        let next = previous
+            .checked_add(count)
+            .ok_or(Fault::InstanceExhausted)?;
         match allocator.compare_exchange_weak(previous, next, Ordering::Relaxed, Ordering::Relaxed)
         {
-            Ok(_) => return Ok(next),
+            Ok(_) => return Ok(Some(previous + 1)),
             Err(observed) => previous = observed,
         }
     }
@@ -302,6 +316,79 @@ pub(crate) struct Trial {
     fault: Option<Fault>,
 }
 impl Trial {
+    /// Checked native scalar construction; no saved runtime authority is accepted.
+    pub(crate) fn restore_native(
+        configuration: Configuration,
+        active: Option<(u64, Option<i64>)>,
+        retired: Option<(u64, Option<i64>, RetirementReason, i64)>,
+        saved_time: i64,
+    ) -> Result<Self, Fault> {
+        Self::restore_native_from(configuration, active, retired, saved_time, &LAST_INSTANCE)
+    }
+    fn restore_native_from(
+        configuration: Configuration,
+        active: Option<(u64, Option<i64>)>,
+        retired: Option<(u64, Option<i64>, RetirementReason, i64)>,
+        saved_time: i64,
+        allocator: &AtomicU64,
+    ) -> Result<Self, Fault> {
+        let valid = |counter: u64, last: Option<i64>, end: i64| {
+            (counter == 0) == last.is_none() && last.is_none_or(|time| time >= 0 && time <= end)
+        };
+        if configuration.backend != Backend::Native
+            || saved_time < 0
+            || active.is_some_and(|(counter, last)| !valid(counter, last, saved_time))
+            || retired.is_some_and(|(counter, last, _, time)| {
+                time < 0 || time > saved_time || !valid(counter, last, time)
+            })
+        {
+            return Err(Fault::PersistentDomain);
+        }
+        let configuration = Arc::new(configuration);
+        let count = u64::from(active.is_some()) + u64::from(retired.is_some());
+        let first = reserve_instances(allocator, count)?;
+        let record = active.map(|(counter, last_advanced)| Record {
+            instance: first.unwrap(),
+            counter,
+            last_advanced,
+            resident: true,
+        });
+        let last_retirement =
+            retired.map(|(counter, last_advanced, reason, game_time)| Retirement {
+                record: Record {
+                    instance: first.unwrap() + u64::from(active.is_some()),
+                    counter,
+                    last_advanced,
+                    resident: false,
+                },
+                reason,
+                game_time,
+            });
+        Ok(Self {
+            configuration,
+            record,
+            last_retirement,
+            fault: None,
+        })
+    }
+    pub(crate) fn persistent_fault(&mut self) {
+        if self.fault.is_none() {
+            self.fault = Some(Fault::PersistentDomain);
+        }
+    }
+    pub(crate) fn persistent_admit(&mut self) -> Result<u64, Fault> {
+        if let Some(fault) = self.fault {
+            return Err(fault);
+        }
+        let instance = allocate_instance(&LAST_INSTANCE)?;
+        self.record = Some(Record {
+            instance,
+            counter: 0,
+            last_advanced: None,
+            resident: true,
+        });
+        Ok(instance)
+    }
     pub(crate) fn new(configuration: Configuration, current: Option<BlockStateId>) -> Self {
         let mut trial = Self {
             configuration: Arc::new(configuration),
@@ -603,6 +690,98 @@ mod tests {
         world
             .set(POSITION[0], POSITION[1], POSITION[2], BlockStateId(state))
             .unwrap();
+    }
+
+    #[test]
+    fn native_restore_factory_preserves_exact_payloads_and_atomic_reservation() {
+        let allocator = AtomicU64::new(100);
+        let trial = Trial::restore_native_from(
+            configuration("minecraft:overworld"),
+            Some((u64::MAX, Some(10))),
+            Some((7, Some(3), RetirementReason::BlockChanged, 4)),
+            10,
+            &allocator,
+        )
+        .unwrap();
+        let snapshot = trial.snapshot();
+        assert_eq!(snapshot.record().unwrap().counter(), u64::MAX);
+        assert_eq!(snapshot.record().unwrap().last_advanced(), Some(10));
+        assert_eq!(snapshot.record().unwrap().instance(), 101);
+        assert_eq!(snapshot.last_retirement().unwrap().record().counter(), 7);
+        assert_eq!(snapshot.last_retirement().unwrap().record().instance(), 102);
+        assert_eq!(allocator.load(Ordering::Relaxed), 102);
+        let allocator = AtomicU64::new(u64::MAX - 1);
+        assert!(
+            Trial::restore_native_from(
+                configuration("minecraft:overworld"),
+                Some((1, Some(1))),
+                Some((0, None, RetirementReason::BlockChanged, 0)),
+                1,
+                &allocator
+            )
+            .is_err()
+        );
+        assert_eq!(allocator.load(Ordering::Relaxed), u64::MAX - 1);
+        assert_eq!(reserve_instances(&allocator, 1), Ok(Some(u64::MAX)));
+        assert_eq!(
+            reserve_instances(&allocator, 1),
+            Err(Fault::InstanceExhausted)
+        );
+        assert_eq!(reserve_instances(&allocator, 0), Ok(None));
+        assert_eq!(allocator.load(Ordering::Relaxed), u64::MAX);
+    }
+    #[test]
+    fn native_restore_factory_rejects_scalar_chronology_before_reservation() {
+        let allocator = AtomicU64::new(17);
+        for (counter, last) in [(0, Some(0)), (1, None), (1, Some(-1)), (1, Some(11))] {
+            assert!(
+                Trial::restore_native_from(
+                    configuration("minecraft:overworld"),
+                    Some((counter, last)),
+                    None,
+                    10,
+                    &allocator
+                )
+                .is_err()
+            );
+        }
+        for (counter, last, time) in [
+            (0, Some(0), 0),
+            (1, None, 1),
+            (1, Some(-1), 1),
+            (1, Some(4), 3),
+            (1, Some(1), 11),
+            (0, None, -1),
+        ] {
+            assert!(
+                Trial::restore_native_from(
+                    configuration("minecraft:overworld"),
+                    None,
+                    Some((counter, last, RetirementReason::BlockChanged, time)),
+                    10,
+                    &allocator
+                )
+                .is_err()
+            );
+        }
+        assert_eq!(allocator.load(Ordering::Relaxed), 17);
+        let mut trial = Trial::restore_native_from(
+            configuration("minecraft:overworld"),
+            Some((u64::MAX, Some(10))),
+            None,
+            10,
+            &allocator,
+        )
+        .unwrap();
+        assert_eq!(
+            trial.advance(true, true, Some(BlockStateId(1)), 10),
+            Ok(false)
+        );
+        assert_eq!(
+            trial.advance(true, true, Some(BlockStateId(1)), 11),
+            Err(Fault::CounterExhausted)
+        );
+        assert_eq!(trial.snapshot().record().unwrap().counter(), u64::MAX);
     }
 
     #[test]

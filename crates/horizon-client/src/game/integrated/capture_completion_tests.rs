@@ -37,20 +37,34 @@ pub(in crate::game) fn dispatch_capture(
     game: &mut Game<'_>,
     request: CaptureRequest,
 ) -> CaptureCompletion {
-    dispatch(game, request, false)
+    dispatch(game, request, false, CaptureKind::Archive)
 }
 
 pub(in crate::game) fn dispatch_capture_after_observer_timeout(
     game: &mut Game<'_>,
     request: CaptureRequest,
 ) -> CaptureCompletion {
-    dispatch(game, request, true)
+    dispatch(game, request, true, CaptureKind::Archive)
+}
+
+pub(in crate::game) fn dispatch_machine_capture(
+    game: &mut Game<'_>,
+    request: CaptureRequest,
+) -> CaptureCompletion {
+    dispatch(game, request, false, CaptureKind::Machine)
+}
+
+#[derive(Clone, Copy)]
+enum CaptureKind {
+    Archive,
+    Machine,
 }
 
 fn dispatch(
     game: &mut Game<'_>,
     request: CaptureRequest,
     observe_timeout: bool,
+    kind: CaptureKind,
 ) -> CaptureCompletion {
     // The fixture has a channel-backed integrated owner with profile UUID 11.
     // Game stays on this test thread; only owned handles/channels cross threads.
@@ -88,7 +102,10 @@ fn dispatch(
                 blocked.recv().expect("client releases admitted task");
             }
             // No callback, delay, tick or pump is injected into capture itself.
-            let result = owner.capture_fixture_epoch(request);
+            let result = match kind {
+                CaptureKind::Archive => owner.capture_fixture_epoch(request),
+                CaptureKind::Machine => owner.capture_machine_fixture_epoch(request),
+            };
             task_finished.store(true, Ordering::SeqCst);
             let _ = completed.send(result);
         });

@@ -247,7 +247,7 @@ fn slotted(slot: i8, id: &str, count: i32) -> Tag {
         ("count", Tag::Int(count)),
     ])
 }
-fn expected_player(first: bool, owner: bool, three: bool) -> Tag {
+pub(super) fn expected_player(first: bool, owner: bool, three: bool) -> Tag {
     let string = |value: &str| Tag::String(value.into());
     let floats =
         |values: &[f32]| Tag::List(values.iter().map(|v| Tag::Float(v.to_bits())).collect());
@@ -416,7 +416,7 @@ fn expected_player(first: bool, owner: bool, three: bool) -> Tag {
     }
     result
 }
-fn expected_advancements(first: bool) -> serde_json::Value {
+pub(super) fn expected_advancements(first: bool) -> serde_json::Value {
     let criteria = if first {
         serde_json::json!({"a": DATE, "b": DATE})
     } else {
@@ -428,14 +428,14 @@ fn expected_advancements(first: bool) -> serde_json::Value {
         "fixture:unknown": {"criteria": {"opaque": DATE}, "done": false},
     })
 }
-fn expected_stats(first: bool) -> serde_json::Value {
+pub(super) fn expected_stats(first: bool) -> serde_json::Value {
     serde_json::json!({"DataVersion": horizon_world::DATA_VERSION, "stats": {
         "minecraft:custom": {"minecraft:jump": if first { 0 } else { 6 }},
         "minecraft:mined": {"minecraft:stone": if first { -3 } else { 19 }},
     }})
 }
 
-fn setup(
+pub(super) fn setup(
     fixture: &Fixture,
     three: bool,
 ) -> (

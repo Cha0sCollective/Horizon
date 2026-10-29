@@ -1144,11 +1144,11 @@ fn epoch_name(value: &str, prefix: &str) -> CResult<u64> {
     }
     Ok(epoch)
 }
-fn recover_fixture_epoch(
+fn select_fixture_epoch(
     archive_root: &Path,
     identity: &Identity,
     destination: &Path,
-) -> CResult<RecoveryReceipt> {
+) -> CResult<SelectedEpoch> {
     identity.validate()?;
     let archive = owned_dir(archive_root)?;
     ancestors(destination)?;
@@ -1207,6 +1207,26 @@ fn recover_fixture_epoch(
     }
     let (root, manifest) =
         selected.ok_or_else(|| invalid(Phase::Recover, "no complete matching epoch"))?;
+    Ok(SelectedEpoch {
+        root,
+        manifest,
+        rejected,
+        parent,
+    })
+}
+struct SelectedEpoch {
+    root: PathBuf,
+    manifest: Manifest,
+    rejected: Vec<(u64, String)>,
+    parent: PathBuf,
+}
+fn copy_selected_epoch(selected: SelectedEpoch, destination: &Path) -> CResult<RecoveryReceipt> {
+    let SelectedEpoch {
+        root,
+        manifest,
+        rejected,
+        parent,
+    } = selected;
     fresh_dir(destination, Phase::Recover)?;
     for dir in &manifest.directories {
         if let Some(relative) = dir.strip_prefix("world/") {
@@ -1241,8 +1261,26 @@ fn recover_fixture_epoch(
         _lock: lock,
     })
 }
+fn recover_fixture_epoch(
+    archive_root: &Path,
+    identity: &Identity,
+    destination: &Path,
+) -> CResult<RecoveryReceipt> {
+    copy_selected_epoch(
+        select_fixture_epoch(archive_root, identity, destination)?,
+        destination,
+    )
+}
+#[derive(Clone, Copy)]
+enum CaptureProfile {
+    ArchivalOneColumn,
+    NativeCounterPatch,
+}
 impl Game<'_> {
     fn capture_cell_checks(&self) -> CResult<Vec<String>> {
+        self.capture_profile_checks(CaptureProfile::ArchivalOneColumn)
+    }
+    fn capture_profile_checks(&self, profile: CaptureProfile) -> CResult<Vec<String>> {
         let roster = self.observe_checkpoint_participants().map_err(|e| {
             CaptureError::new(Phase::Validate, Failure::Player, None, format!("{e:?}"))
         })?;
@@ -1321,8 +1359,20 @@ impl Game<'_> {
             } else {
                 continue;
             };
-            if world.chunks.len() != 1 || !world.chunks.contains_key(&(0, 0)) || !dropped.is_empty()
-            {
+            let shape = match profile {
+                CaptureProfile::ArchivalOneColumn => {
+                    world.chunks.len() == 1 && world.chunks.contains_key(&(0, 0))
+                }
+                CaptureProfile::NativeCounterPatch => {
+                    dimension == Dim::Overworld
+                        && self.dim == Dim::Overworld
+                        && world.chunks.len() == 9
+                        && (-1..=1).all(|z| {
+                            (-1..=1).all(|x| world.chunks.get(&(x, z)).is_some_and(|c| c.lit))
+                        })
+                }
+            };
+            if !shape || !dropped.is_empty() {
                 return Err(CaptureError::new(
                     Phase::Validate,
                     Failure::Context,
@@ -1348,9 +1398,33 @@ impl Game<'_> {
                 "player dimension is not captured",
             ));
         }
+        if matches!(profile, CaptureProfile::NativeCounterPatch) {
+            if dimensions != [Dim::Overworld.id()] {
+                return Err(invalid(Phase::Validate, "only native OW patch supported"));
+            }
+            for guest in &host.hub.guests {
+                let [x, _, z] = guest.position;
+                if !x.is_finite()
+                    || !z.is_finite()
+                    || !self
+                        .world
+                        .chunks
+                        .contains_key(&((x.floor() as i32) >> 4, (z.floor() as i32) >> 4))
+                {
+                    return Err(invalid(Phase::Validate, "player outside resident patch"));
+                }
+            }
+        }
         Ok(dimensions)
     }
     fn fixture_material(&mut self, request: CaptureRequest) -> CResult<Material> {
+        self.profile_material(request, CaptureProfile::ArchivalOneColumn)
+    }
+    fn profile_material(
+        &mut self,
+        request: CaptureRequest,
+        profile: CaptureProfile,
+    ) -> CResult<Material> {
         request.identity.validate()?;
         if request.epoch == 0 {
             return Err(limit(Phase::Validate));
@@ -1360,7 +1434,7 @@ impl Game<'_> {
         if archive.starts_with(&source) || source.starts_with(&archive) {
             return Err(invalid(Phase::Validate, "overlapping roots"));
         }
-        let dimensions = self.capture_cell_checks()?;
+        let dimensions = self.capture_profile_checks(profile)?;
         let mut counter = None;
         for dimension in [Dim::Overworld, Dim::Nether, Dim::End] {
             let world = if dimension == self.dim {
@@ -1446,7 +1520,7 @@ impl Game<'_> {
                 .flush()
                 .map_err(|e| CaptureError::new(Phase::Save, Failure::NativeSave, None, e))?;
         }
-        if self.capture_cell_checks()? != dimensions {
+        if self.capture_profile_checks(profile)? != dimensions {
             return Err(invalid(Phase::Save, "loaded dimensions changed"));
         }
         Ok(Material {
@@ -1469,6 +1543,8 @@ impl Game<'_> {
         image.rename_published()?.acknowledge()
     }
 }
+#[path = "counter_restore_integration.rs"]
+pub(in crate::game) mod counter_restore_integration;
 #[path = "capture_integration_tests.rs"]
 mod tests;
 

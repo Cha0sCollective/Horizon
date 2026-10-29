@@ -7,6 +7,8 @@ use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
 };
+#[cfg(feature = "paired-packages")]
+pub mod counter_restore;
 
 /// Sections (x, section index, z) waiting to be remeshed, kept by column
 /// (a bit per section index), so the mesh scheduler looks at each column once
@@ -85,6 +87,8 @@ pub struct World {
     residency_observer: Option<Box<crate::residency_observer::Observer>>,
     #[cfg(feature = "paired-packages")]
     counter_trial: Option<Box<crate::counter_trial::Trial>>,
+    #[cfg(feature = "paired-packages")]
+    counter_domain: Option<Box<counter_restore::Domain>>,
     #[cfg(feature = "paired-packages")]
     pub(crate) world_slot_trial: Option<Box<crate::world_slot_trial::Trial>>,
     /// `ChunkAccess.inhabitedTime` of resident chunks: ticks a player spent
@@ -199,6 +203,8 @@ impl World {
             #[cfg(feature = "paired-packages")]
             counter_trial: None,
             #[cfg(feature = "paired-packages")]
+            counter_domain: None,
+            #[cfg(feature = "paired-packages")]
             world_slot_trial: None,
             inhabited: HashMap::new(),
             game_time: 0,
@@ -295,7 +301,7 @@ impl World {
         configuration: crate::counter_trial::Configuration,
     ) -> Result<crate::counter_trial::Snapshot, crate::counter_trial::ConfigError> {
         use crate::counter_trial::{ConfigError, Trial};
-        if self.counter_trial.is_some() {
+        if self.counter_trial.is_some() || self.counter_domain.is_some() {
             return Err(ConfigError::AlreadyEnabled);
         }
         if configuration.state_id() == self.air {
@@ -335,6 +341,7 @@ impl World {
         running: bool,
         eligible: bool,
     ) -> Option<Result<bool, crate::counter_trial::Fault>> {
+        self.persistent_counter_phase_guard();
         let trial = self.counter_trial.as_mut()?;
         let configuration = trial.configuration();
         if !matches!(
@@ -412,6 +419,9 @@ impl World {
     /// Explicit lifetime retirement before the owning World is discarded.
     #[cfg(feature = "paired-packages")]
     pub fn take_counter_trial(&mut self) -> Option<crate::counter_trial::Snapshot> {
+        if let Some(domain) = &mut self.counter_domain {
+            domain.detach();
+        }
         self.counter_trial.take().map(|mut t| {
             t.retire(
                 crate::counter_trial::RetirementReason::Explicit,
@@ -448,7 +458,11 @@ impl World {
             trial.inserted(previous.is_some(), state, self.game_time);
         }
         #[cfg(feature = "paired-packages")]
-        if let (Some(trial), Some(state)) = (&mut self.counter_trial, counter_state) {
+        if self.counter_domain.is_some() {
+            if let Some(state) = counter_state {
+                self.persistent_counter_inserted(previous.is_some(), state);
+            }
+        } else if let (Some(trial), Some(state)) = (&mut self.counter_trial, counter_state) {
             trial.inserted(previous.is_some(), state, self.game_time);
         }
         #[cfg(feature = "paired-packages")]
@@ -572,7 +586,9 @@ impl World {
                 trial.changed([x, y, z], state, self.game_time);
             }
             #[cfg(feature = "paired-packages")]
-            if let Some(trial) = &mut self.counter_trial {
+            if self.counter_domain.is_some() {
+                self.persistent_counter_changed([x, y, z], state);
+            } else if let Some(trial) = &mut self.counter_trial {
                 trial.changed([x, y, z], state, self.game_time);
             }
             self.block_entities
