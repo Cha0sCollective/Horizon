@@ -1062,3 +1062,358 @@ mod mutation_tests {
         assert!(world.drain_mutations().is_none());
     }
 }
+
+/// Named WORLD observations only, ordered by the W1 refusal category.
+#[cfg(feature = "paired-packages")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum WorldOwnerKind {
+    BorrowedBlockEntity,
+    PendingBlockEntityTicker,
+    AddedBlockEntityTicker,
+    NativeBlockEntity,
+    StagedBlockEntities,
+    StagedEntities,
+    SavedBlockEntities,
+    SavedBlockEntitySources,
+    RolledLoot,
+    OpaqueChunkRoot,
+    Postprocess,
+    SavedBlockTicks,
+    SavedFluidTicks,
+    WatchedWrites,
+    MovingPistons,
+    MovingPistonFallback,
+}
+
+#[cfg(feature = "paired-packages")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum WorldOwnerLocation {
+    Block([i32; 3]),
+    Column([i32; 2]),
+}
+
+#[cfg(feature = "paired-packages")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct WorldOwnerPresence {
+    pub kind: WorldOwnerKind,
+    pub location: WorldOwnerLocation,
+}
+
+#[cfg(feature = "paired-packages")]
+impl World {
+    /// Borrowed current named WORLD presence; no inventory census or completion proof.
+    pub fn checkpoint_world_owner(&self) -> Option<WorldOwnerPresence> {
+        use crate::block_entities::CheckpointBlockEntityPending as P;
+        use WorldOwnerKind as K;
+        use WorldOwnerLocation as L;
+        let mut first = None;
+        let mut consider = |kind, location| {
+            let cause = WorldOwnerPresence { kind, location };
+            if first.is_none_or(|old| cause < old) {
+                first = Some(cause);
+            }
+        };
+        if let Some((kind, (x, y, z))) = self.block_entities.checkpoint_pending() {
+            consider(
+                match kind {
+                    P::Out => K::BorrowedBlockEntity,
+                    P::Pending => K::PendingBlockEntityTicker,
+                    P::Added => K::AddedBlockEntityTicker,
+                },
+                L::Block([x, y, z]),
+            );
+        }
+        if let Some(&(x, y, z)) = self.block_entities.keys().min() {
+            consider(K::NativeBlockEntity, L::Block([x, y, z]));
+        }
+        for (&(x, z), chunk) in &self.chunks {
+            let saved = chunk.saved.as_deref();
+            for (kind, present) in [
+                (K::StagedBlockEntities, !chunk.block_entities.is_empty()),
+                (K::StagedEntities, !chunk.entities.is_empty()),
+                (
+                    K::SavedBlockEntities,
+                    saved.is_some_and(|s| !s.block_entities.is_empty()),
+                ),
+                (
+                    K::SavedBlockEntitySources,
+                    saved.is_some_and(|s| !s.block_entity_sources.is_empty()),
+                ),
+                (
+                    K::RolledLoot,
+                    saved.is_some_and(|s| !s.rolled_loot.is_empty()),
+                ),
+                (
+                    K::OpaqueChunkRoot,
+                    saved.is_some_and(|s| !s.root.is_empty()),
+                ),
+                (K::Postprocess, !chunk.postprocess.is_empty()),
+                (
+                    K::SavedBlockTicks,
+                    saved.is_some_and(|s| !s.block_ticks.is_empty()),
+                ),
+                (
+                    K::SavedFluidTicks,
+                    saved.is_some_and(|s| !s.fluid_ticks.is_empty()),
+                ),
+            ] {
+                if present {
+                    consider(kind, L::Column([x, z]));
+                }
+            }
+        }
+        if let Some((position, _, _)) = self.watched_writes.iter().min_by_key(|e| e.0) {
+            consider(
+                K::WatchedWrites,
+                L::Block([position.0, position.1, position.2]),
+            );
+        }
+        if let Some((position, _)) = self.moving_pistons.iter().min_by_key(|e| e.0) {
+            consider(K::MovingPistons, L::Block(*position));
+        }
+        if let Some((position, _)) = self.moving_piston_fallback.iter().min_by_key(|e| e.0) {
+            consider(K::MovingPistonFallback, L::Block(*position));
+        }
+        first
+    }
+}
+
+#[cfg(all(test, feature = "paired-packages"))]
+mod checkpoint_world_owner_tests {
+    use super::*;
+    use crate::{
+        chunk::{ChunkExtras, RolledLoot},
+        containers::BlockEntity,
+    };
+    use WorldOwnerKind as K;
+    use WorldOwnerLocation as L;
+    use horizon_core::{
+        geometry::Direction,
+        position::BlockPos,
+        ticks::{SavedTick, TickPriority, TickTypeId},
+    };
+    use horizon_world::{
+        nbt::{JavaString, Tag},
+        piston_shape::MovingPistonState,
+    };
+
+    fn opaque() -> Tag {
+        Tag::compound([(
+            "opaque",
+            Tag::List(vec![
+                Tag::Float(0x7fc01234),
+                Tag::Double(0x7ff8000000001234),
+                Tag::String(JavaString(vec![0xd800, 0])),
+            ]),
+        )])
+    }
+    fn view(world: &World) -> String {
+        let mut chunks: Vec<_> = world.chunks.iter().collect();
+        chunks.sort_by_key(|(key, _)| **key);
+        let chunks: Vec<_> = chunks
+            .into_iter()
+            .map(|(key, c)| {
+                format!(
+                    "{:?}:{:?}:{:?}",
+                    (
+                        key,
+                        Arc::as_ptr(c),
+                        c.block_entities.as_ptr(),
+                        c.entities.as_ptr(),
+                        c.postprocess.as_ptr(),
+                        c.block_entities.capacity(),
+                        c.entities.capacity(),
+                        c.postprocess.capacity()
+                    ),
+                    (&c.block_entities, &c.entities, &c.postprocess),
+                    c.saved.as_ref().map(|s| (Arc::as_ptr(s), &**s))
+                )
+            })
+            .collect();
+        let bits = |entries: &[([i32; 3], MovingPistonState)]| {
+            entries
+                .iter()
+                .map(|(p, s)| {
+                    (
+                        *p,
+                        s.moved_state,
+                        s.direction,
+                        s.extending,
+                        s.source,
+                        s.progress.to_bits(),
+                        s.previous_progress.to_bits(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        format!(
+            "{:?}:{:?}",
+            chunks,
+            (
+                &world.watched_writes,
+                bits(&world.moving_pistons),
+                bits(&world.moving_piston_fallback),
+                world.chunks.membership_revision()
+            )
+        )
+    }
+    fn check(world: &World, expected: Option<WorldOwnerPresence>) {
+        let before = view(world);
+        assert_eq!(world.checkpoint_world_owner(), expected);
+        assert_eq!(world.checkpoint_world_owner(), expected);
+        assert_eq!(view(world), before);
+    }
+    #[test]
+    fn checkpoint_world_owner_covers_staged_raw_and_deferred_world_categories_immutably() {
+        for kind in [
+            K::StagedBlockEntities,
+            K::StagedEntities,
+            K::SavedBlockEntities,
+            K::SavedBlockEntitySources,
+            K::RolledLoot,
+            K::OpaqueChunkRoot,
+            K::Postprocess,
+            K::SavedBlockTicks,
+            K::SavedFluidTicks,
+            K::WatchedWrites,
+            K::MovingPistons,
+            K::MovingPistonFallback,
+        ] {
+            let mut world = World::new(BlockStateId(0), 17);
+            world.chunks.insert((-1, 2), Arc::new(Chunk::empty(-1, 2)));
+            let chunk = Arc::get_mut(world.chunks.get_mut(&(-1, 2)).unwrap()).unwrap();
+            let mut extras = ChunkExtras::default();
+            let tick = SavedTick {
+                kind: TickTypeId(3),
+                pos: BlockPos::new(-1, 71, 33),
+                delay: -7,
+                priority: TickPriority::High,
+            };
+            match kind {
+                K::StagedBlockEntities => chunk
+                    .block_entities
+                    .push(((-1, 71, 33), BlockEntity::Chest(vec![]))),
+                K::StagedEntities => chunk.entities.push(opaque()),
+                K::SavedBlockEntities => extras.block_entities.push(opaque()),
+                K::SavedBlockEntitySources => {
+                    extras.block_entity_sources.push(((-1, 71, 33), opaque()))
+                }
+                K::RolledLoot => extras.rolled_loot.push(RolledLoot {
+                    pos: (-1, 71, 33),
+                    table: "fixture:loot".into(),
+                    seed: Some(-3),
+                    items: opaque(),
+                }),
+                K::OpaqueChunkRoot => {
+                    extras.root.insert("fixture:opaque".into(), opaque());
+                }
+                K::Postprocess => chunk.postprocess.push([-1, 71, 33]),
+                K::SavedBlockTicks => extras.block_ticks.push(tick),
+                K::SavedFluidTicks => extras.fluid_ticks.push(tick),
+                _ => {}
+            }
+            chunk.saved = Some(Arc::new(extras));
+            let piston = MovingPistonState {
+                moved_state: BlockStateId(13),
+                direction: Direction::Up,
+                extending: true,
+                source: false,
+                progress: f32::from_bits(0x7fc01234),
+                previous_progress: -0.0,
+            };
+            let location = match kind {
+                K::WatchedWrites => {
+                    world.watched_writes.push(((-1, 71, 33), 3, 4));
+                    L::Block([-1, 71, 33])
+                }
+                K::MovingPistons => {
+                    world.moving_pistons.push(([-1, 71, 33], piston));
+                    L::Block([-1, 71, 33])
+                }
+                K::MovingPistonFallback => {
+                    world.moving_piston_fallback.push(([-1, 71, 33], piston));
+                    L::Block([-1, 71, 33])
+                }
+                _ => L::Column([-1, 2]),
+            };
+            check(&world, Some(WorldOwnerPresence { kind, location }));
+        }
+    }
+    #[test]
+    fn checkpoint_world_owner_orders_categories_positions_and_allows_benign_metadata() {
+        let mut world = World::new(BlockStateId(0), 17);
+        for (x, z) in [(8, 0), (-9, 5), (-9, -5)] {
+            let mut c = Chunk::empty(x, z);
+            let mut extra = ChunkExtras::default();
+            extra.block_entity_order.push((x, 70, z));
+            c.saved = Some(Arc::new(extra));
+            world.chunks.insert((x, z), Arc::new(c));
+        }
+        world
+            .block_names
+            .insert((1, 2, 3), "not an inventory".into());
+        world
+            .chest_openers
+            .insert((1, 2, 3), (2, f64::from_bits(0x7ff8000000001234)));
+        check(&world, None);
+        for key in [(8, 0), (-9, 5), (-9, -5)] {
+            Arc::get_mut(world.chunks.get_mut(&key).unwrap())
+                .unwrap()
+                .entities
+                .push(opaque());
+        }
+        check(
+            &world,
+            Some(WorldOwnerPresence {
+                kind: K::StagedEntities,
+                location: L::Column([-9, -5]),
+            }),
+        );
+        world
+            .block_entities
+            .insert((i32::MAX, -7, 1), BlockEntity::Chest(vec![]));
+        check(
+            &world,
+            Some(WorldOwnerPresence {
+                kind: K::PendingBlockEntityTicker,
+                location: L::Block([i32::MAX, -7, 1]),
+            }),
+        );
+        world.block_entities.tickers(|_| 0);
+        check(
+            &world,
+            Some(WorldOwnerPresence {
+                kind: K::NativeBlockEntity,
+                location: L::Block([i32::MAX, -7, 1]),
+            }),
+        );
+        let held = world.block_entities.take(&(i32::MAX, -7, 1)).unwrap();
+        check(
+            &world,
+            Some(WorldOwnerPresence {
+                kind: K::BorrowedBlockEntity,
+                location: L::Block([i32::MAX, -7, 1]),
+            }),
+        );
+        world.block_entities.put((i32::MAX, -7, 1), held);
+        check(
+            &world,
+            Some(WorldOwnerPresence {
+                kind: K::PendingBlockEntityTicker,
+                location: L::Block([i32::MAX, -7, 1]),
+            }),
+        );
+        world.block_entities.tickers(|_| 0); // setup for the independent canceled-entry case
+        world
+            .block_entities
+            .insert((-5, 1, 2), BlockEntity::Chest(vec![]));
+        world.block_entities.remove(&(-5, 1, 2));
+        check(
+            &world,
+            Some(WorldOwnerPresence {
+                kind: K::AddedBlockEntityTicker,
+                location: L::Block([-5, 1, 2]),
+            }),
+        );
+    }
+}

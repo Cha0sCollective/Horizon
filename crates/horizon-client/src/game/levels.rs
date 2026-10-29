@@ -758,3 +758,177 @@ mod parked_save_tests;
 
 #[cfg(all(test, feature = "paired-packages"))]
 mod idle_close_tests;
+
+#[cfg(feature = "paired-packages")]
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::game) enum PendingKind {
+    Shulker,
+    Banner,
+    Names,
+    Pot,
+    Copied,
+}
+#[cfg(feature = "paired-packages")]
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::game) enum SpillKind {
+    Spawns,
+    Removed,
+    Orbs,
+}
+#[cfg(feature = "paired-packages")]
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::game) enum WorldOwnerObservationError {
+    NotAuthoritative,
+    ActingGuest,
+    DuplicateActiveDimension,
+    World {
+        dimension: Dim,
+        cause: horizon_client::world::WorldOwnerPresence,
+    },
+    LevelEvents {
+        dimension: Dim,
+    },
+    Pending {
+        kind: PendingKind,
+        position: [i32; 3],
+    },
+    Spill {
+        kind: SpillKind,
+    },
+    Brushing {
+        position: [i32; 3],
+    },
+    HopperPass,
+    Pregen,
+}
+#[cfg(feature = "paired-packages")]
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::game) struct WorldOwnerLevel {
+    dimension: Dim,
+    resident_columns: usize,
+}
+#[cfg(feature = "paired-packages")]
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::game) struct WorldOwnerObservation {
+    levels: [Option<WorldOwnerLevel>; 3],
+}
+
+#[cfg(feature = "paired-packages")]
+#[allow(dead_code)]
+impl Game<'_> {
+    /// Only named current W1 owners; never global readiness or producer completion.
+    pub(in crate::game) fn observe_checkpoint_world_owners(
+        &self,
+    ) -> std::result::Result<WorldOwnerObservation, WorldOwnerObservationError> {
+        use WorldOwnerObservationError as E;
+        use horizon_client::world::WorldOwnerLocation;
+        if self.remote.is_some()
+            || self.integrated.is_some()
+            || self.options.execution_role.is_client()
+        {
+            return Err(E::NotAuthoritative);
+        }
+        if self.lan_acting.is_some() {
+            return Err(E::ActingGuest);
+        }
+        if self.levels.parked.contains_key(&self.dim) {
+            return Err(E::DuplicateActiveDimension);
+        }
+        let mut first: Option<(u8, usize, Option<WorldOwnerLocation>, E)> = None;
+        let mut consider = |rank, dimension, location, error| {
+            let key = (rank, dimension, location);
+            if first.as_ref().is_none_or(|old| key < (old.0, old.1, old.2)) {
+                first = Some((rank, dimension, location, error));
+            }
+        };
+        let mut levels = [None; 3];
+        for (index, dimension) in [Dim::Overworld, Dim::Nether, Dim::End]
+            .into_iter()
+            .enumerate()
+        {
+            let (world, events) = if dimension == self.dim {
+                (&self.world, &self.level_events)
+            } else if let Some(parked) = self.levels.parked.get(&dimension) {
+                (&parked.world, &parked.level_events)
+            } else {
+                continue;
+            };
+            levels[index] = Some(WorldOwnerLevel {
+                dimension,
+                resident_columns: world.chunks.len(),
+            });
+            if let Some(cause) = world.checkpoint_world_owner() {
+                consider(
+                    cause.kind as u8,
+                    index,
+                    Some(cause.location),
+                    E::World { dimension, cause },
+                );
+            }
+            if !events.is_empty() {
+                consider(16, index, None, E::LevelEvents { dimension });
+            }
+        }
+        for (kind, position) in [
+            (
+                PendingKind::Shulker,
+                self.pending.shulker.keys().min().copied(),
+            ),
+            (
+                PendingKind::Banner,
+                self.pending.banner.keys().min().copied(),
+            ),
+            (PendingKind::Names, self.pending.names.keys().min().copied()),
+            (PendingKind::Pot, self.pending.pot.keys().min().copied()),
+            (
+                PendingKind::Copied,
+                self.pending.copied.keys().min().copied(),
+            ),
+        ] {
+            if let Some(position) = position {
+                consider(
+                    17 + kind as u8,
+                    3,
+                    Some(WorldOwnerLocation::Block(position)),
+                    E::Pending { kind, position },
+                );
+            }
+        }
+        for (kind, present) in [
+            (SpillKind::Spawns, !self.spill.spawns.is_empty()),
+            (SpillKind::Removed, !self.spill.removed.is_empty()),
+            (SpillKind::Orbs, !self.spill.orbs.is_empty()),
+        ] {
+            if present {
+                consider(22 + kind as u8, 3, None, E::Spill { kind });
+            }
+        }
+        if let Some(&position) = self.brushing.keys().min() {
+            consider(
+                25,
+                3,
+                Some(WorldOwnerLocation::Block(position)),
+                E::Brushing { position },
+            );
+        }
+        if self.item_columns.is_some() {
+            consider(26, 3, None, E::HopperPass);
+        }
+        // Presence deliberately includes paused tasks; do not pump or construct one here.
+        if self.cmds.pregen.is_some() {
+            consider(27, 3, None, E::Pregen);
+        }
+        match first {
+            Some((_, _, _, error)) => Err(error),
+            None => Ok(WorldOwnerObservation { levels }),
+        }
+    }
+}
+
+#[cfg(all(test, feature = "paired-packages"))]
+mod world_owner_tests;

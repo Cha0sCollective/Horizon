@@ -390,3 +390,120 @@ mod tests {
         assert_eq!(order.len(), 100);
     }
 }
+
+/// Pending block-entity state observed without promotion or taking payloads.
+#[cfg(feature = "paired-packages")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CheckpointBlockEntityPending {
+    Out,
+    Pending,
+    Added,
+}
+
+#[cfg(feature = "paired-packages")]
+impl BlockEntities {
+    pub(crate) fn checkpoint_pending(&self) -> Option<(CheckpointBlockEntityPending, Pos)> {
+        use CheckpointBlockEntityPending as K;
+        self.out
+            .iter()
+            .copied()
+            .min()
+            .map(|p| (K::Out, p))
+            .or_else(|| self.pending.keys().copied().min().map(|p| (K::Pending, p)))
+            .or_else(|| {
+                self.added
+                    .iter()
+                    .map(|&(p, _)| p)
+                    .min()
+                    .map(|p| (K::Added, p))
+            })
+    }
+}
+
+#[cfg(all(test, feature = "paired-packages"))]
+mod checkpoint_pending_tests {
+    use super::*;
+
+    fn snapshot(value: &BlockEntities) -> String {
+        format!(
+            "{:?}:{:?}:{:?}",
+            (
+                &value.map,
+                &value.tickers,
+                &value.live,
+                &value.added,
+                &value.pending,
+                value.next_slot,
+                value.freed,
+                &value.out,
+                &value.states
+            ),
+            (
+                value.map.capacity(),
+                value.live.capacity(),
+                value.pending.capacity(),
+                value.out.capacity(),
+                value.tickers.capacity(),
+                value.added.capacity(),
+                value.states.capacity(),
+                value.tickers.as_ptr(),
+                value.added.as_ptr(),
+                value.states.as_ptr()
+            ),
+            value
+                .map
+                .iter()
+                .map(|(p, e)| (p, e as *const _))
+                .collect::<Vec<_>>()
+        )
+    }
+
+    fn observe(value: &BlockEntities, expected: Option<(CheckpointBlockEntityPending, Pos)>) {
+        let before = snapshot(value);
+        assert_eq!(value.checkpoint_pending(), expected);
+        assert_eq!(value.checkpoint_pending(), expected);
+        assert_eq!(snapshot(value), before);
+    }
+
+    #[test]
+    fn checkpoint_pending_preserves_native_take_put_and_canceled_added_entries() {
+        use CheckpointBlockEntityPending as K;
+        let mut value = BlockEntities::default();
+        observe(&value, None);
+        value.set_states(vec![Ticking::Yes]);
+        for p in [(8, 70, 1), (-9, 60, 3)] {
+            value.insert(p, BlockEntity::Chest(vec![None; 5]));
+        }
+        observe(&value, Some((K::Pending, (-9, 60, 3))));
+        value.tickers(|_| 0);
+        observe(&value, None);
+        let held = value.take(&(8, 70, 1)).unwrap();
+        let held_before = format!("{held:?}");
+        observe(&value, Some((K::Out, (8, 70, 1))));
+        assert_eq!(format!("{held:?}"), held_before);
+        value.put((8, 70, 1), held);
+        observe(&value, None);
+        value.insert((-20, 0, 0), BlockEntity::Chest(vec![]));
+        value.remove(&(-20, 0, 0));
+        observe(&value, Some((K::Added, (-20, 0, 0))));
+        value.insert((20, 0, 0), BlockEntity::Chest(vec![]));
+        observe(&value, Some((K::Pending, (20, 0, 0))));
+        let held = value.take(&(8, 70, 1)).unwrap();
+        observe(&value, Some((K::Out, (8, 70, 1))));
+        value.put((8, 70, 1), held);
+    }
+
+    #[test]
+    fn checkpoint_pending_uses_signed_positions_without_sweeping_stale_tokens() {
+        use CheckpointBlockEntityPending as K;
+        let mut value = BlockEntities::default();
+        for p in [(i32::MAX, 0, 0), (-1, 7, 0), (-1, -7, 9)] {
+            value.insert(p, BlockEntity::Chest(vec![]));
+            value.remove(&p);
+        }
+        observe(&value, Some((K::Added, (-1, -7, 9))));
+        assert_eq!(value.next_slot, 3);
+        assert_eq!(value.added.len(), 3);
+        assert!(value.pending.is_empty());
+    }
+}

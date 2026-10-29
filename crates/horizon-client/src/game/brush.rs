@@ -244,3 +244,35 @@ impl Game<'_> {
         self.destroy_particles(pos, state);
     }
 }
+
+#[cfg(all(test, feature = "paired-packages"))]
+pub(in crate::game) fn world_owner_test_brush_state() -> BrushState {
+    BrushState {
+        count: 7,
+        resets_at: 123456,
+        cooldown_ends_at: 123499,
+        hit_face: Some([-1, 0, 0]),
+    }
+}
+
+#[cfg(all(test, feature = "paired-packages"))]
+#[allow(clippy::type_complexity)]
+pub(in crate::game) fn world_owner_test_brushing_snapshot(
+    value: &Brushing,
+) -> Vec<([i32; 3], usize, i32, i64, i64, Option<[i32; 3]>)> {
+    let mut rows: Vec<_> = value
+        .iter()
+        .map(|(&p, state)| {
+            (
+                p,
+                state as *const _ as usize,
+                state.count,
+                state.resets_at,
+                state.cooldown_ends_at,
+                state.hit_face,
+            )
+        })
+        .collect();
+    rows.sort_unstable_by_key(|row| row.0);
+    rows
+}
