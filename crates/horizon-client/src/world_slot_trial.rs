@@ -369,3 +369,117 @@ impl World {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(feature = "paired-packages")]
+impl World {
+    /// Presence only, including empty, nonresident, pending, and faulted trials.
+    /// This observation confers no ownership or save/publication authority.
+    pub fn has_world_slot_trial(&self) -> bool {
+        self.world_slot_trial.is_some()
+    }
+}
+
+#[cfg(all(test, feature = "paired-packages"))]
+mod presence_tests {
+    use super::*;
+    use crate::{chunk::Chunk, item_data::BundleSelected, items::ItemStack};
+    use horizon_world::{chunk::BlockState, nbt::Tag};
+    use std::fs;
+    fn configured() -> (World, std::path::PathBuf) {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "horizon-trial-presence-{}-{nonce}",
+            std::process::id()
+        ));
+        for (name, bytes) in [
+            ("horizon-paired.toml", b"format=1\nhost-contract='paired-preview-1'\n[content]\nid='presence'\nname='Presence'\nversion='0'\napi='0.2'\nside='both'\ncapabilities=['registries']\n[client]\nentry='client.wasm'\napi='0.1'\ncapabilities=[]\n[server]\nentry='server.wasm'\napi='0.3'\ncapabilities=[]\n".as_slice()),
+            ("client.wasm", b"not executed".as_slice()), ("server.wasm", b"not executed".as_slice()),
+            ("data/presence/horizon/machine/type.json", br#"{"format":1,"save-schema":1}"#.as_slice()),
+            ("data/presence/horizon/block/cube.json", br#"{"template":"minecraft:iron_block","machine-type":"presence:type"}"#.as_slice()),
+        ] { let path = root.join(name); fs::create_dir_all(path.parent().unwrap()).unwrap(); fs::write(path, bytes).unwrap(); }
+        let bundle = horizon_mods::paired::PreparedBundle::read_folder(&root).unwrap();
+        let configuration = Configuration::new(
+            AuthorityScope::new(91, "minecraft:overworld").unwrap(),
+            bundle
+                .content()
+                .machine_types()
+                .get("presence:type")
+                .unwrap(),
+            BlockState {
+                name: "presence:cube".into(),
+                properties: Default::default(),
+            },
+            BlockStateId(1),
+            [2, 70, 2],
+        )
+        .unwrap();
+        let mut world = World::new(BlockStateId(0), 17);
+        world.insert_streamed_chunk(Chunk::empty(0, 0));
+        assert!(!world.has_world_slot_trial());
+        world.enable_world_slot_trial(configuration).unwrap();
+        (world, root)
+    }
+    #[test]
+    fn presence_observes_empty_active_pending_nonresident_and_faulted_trials_without_taking() {
+        for mode in 0..5 {
+            let (mut world, root) = configured();
+            if mode == 4 {
+                world.world_slot_trial.as_mut().unwrap().last_incarnation = u64::MAX;
+                world.set(2, 70, 2, BlockStateId(1)).unwrap();
+                assert_eq!(
+                    world.world_slot_snapshot().unwrap().fault,
+                    Some(Fault::IncarnationExhausted)
+                );
+            } else if mode > 0 {
+                world.set(2, 70, 2, BlockStateId(1)).unwrap();
+                let key = world.world_slot_snapshot().unwrap().active.unwrap().key;
+                let mut stack = ItemStack::new("minecraft:stone", 7);
+                stack.data_mut().bundle_selected = BundleSelected(4);
+                stack
+                    .data_mut()
+                    .set_other("fixture:opaque", Some(Tag::Int(-73)));
+                let mut child = ItemStack::new("minecraft:dirt", 2);
+                child.data_mut().bundle_selected = BundleSelected(9);
+                stack.data_mut().bundle_contents.push(child);
+                let mut player = SlotProjection::new(Some(stack));
+                let limits = ResolvedLimits::new(64, 64).unwrap();
+                let plan = match world
+                    .prepare_world_slot_transfer(&key, &player, Direction::IntoMachine, 7, limits)
+                    .unwrap()
+                {
+                    Preparation::Prepared(plan) => *plan,
+                    other => panic!("native positive transfer: {other:?}"),
+                };
+                world
+                    .commit_world_slot_transfer(plan, &mut player, limits)
+                    .unwrap();
+                if mode == 2 {
+                    world.set(2, 70, 2, BlockStateId(0)).unwrap();
+                }
+                if mode == 3 {
+                    world.remove_streamed_chunk(&(0, 0));
+                }
+            }
+            let before = format!("{:?}", world.world_slot_snapshot());
+            let allocation = world
+                .world_slot_trial
+                .as_ref()
+                .map(|trial| trial.as_ref() as *const _ as usize);
+            for _ in 0..3 {
+                assert!(world.has_world_slot_trial());
+            }
+            assert_eq!(format!("{:?}", world.world_slot_snapshot()), before);
+            assert_eq!(
+                world
+                    .world_slot_trial
+                    .as_ref()
+                    .map(|trial| trial.as_ref() as *const _ as usize),
+                allocation
+            );
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+}

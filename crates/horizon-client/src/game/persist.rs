@@ -1041,3 +1041,35 @@ fn strip_finalize(tag: &mut Tag) {
         c.remove(&"horizon:finalize".into());
     }
 }
+
+#[cfg(feature = "paired-packages")]
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::game) enum EntityMemoryKind {
+    Uuids,
+    Raw,
+    Unknown,
+    Anonymous,
+}
+
+#[cfg(feature = "paired-packages")]
+impl EntityMemory {
+    /// Retained native metadata only; no reconciliation or payload cloning.
+    #[allow(dead_code)]
+    pub(in crate::game) fn checkpoint_entity_memory(&self) -> Option<EntityMemoryKind> {
+        if !self.uuids.is_empty() {
+            Some(EntityMemoryKind::Uuids)
+        } else if !self.raw.is_empty() {
+            Some(EntityMemoryKind::Raw)
+        } else if !self.unknown.is_empty() {
+            Some(EntityMemoryKind::Unknown)
+        } else if !self.anon.is_empty() {
+            Some(EntityMemoryKind::Anonymous)
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(all(test, feature = "paired-packages"))]
+mod entity_owner_tests;

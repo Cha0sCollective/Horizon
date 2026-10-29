@@ -1361,3 +1361,29 @@ mod tests {
         assert!(!arrival_from_tag(&old).unwrap().plan.end);
     }
 }
+
+#[cfg(feature = "paired-packages")]
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::game) enum PortalEntityOwner {
+    Travel,
+    Arrivals,
+}
+
+#[cfg(feature = "paired-packages")]
+impl Portals {
+    /// Does not load, serialize, resolve, or remove native portal owners.
+    #[allow(dead_code)]
+    pub(in crate::game) fn checkpoint_entity_owner(&self) -> Option<PortalEntityOwner> {
+        if self.travel.is_some() {
+            Some(PortalEntityOwner::Travel)
+        } else if !self.arrivals.is_empty() {
+            Some(PortalEntityOwner::Arrivals)
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(all(test, feature = "paired-packages"))]
+mod entity_owner_tests;

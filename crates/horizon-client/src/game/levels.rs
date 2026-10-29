@@ -506,3 +506,222 @@ impl Game<'_> {
         self.enter_level(None, back)
     }
 }
+
+#[cfg(feature = "paired-packages")]
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::game) enum UnsupportedEntityFamily {
+    Falling,
+    Paintings,
+    ItemFrames,
+    ArmorStands,
+    Cushions,
+    Others,
+    Boats,
+    Carts,
+    Bolts,
+    Crystals,
+    Dragon,
+    DragonFireballs,
+    BreathClouds,
+    Tridents,
+    Rockets,
+    OminousSpawners,
+    Tnts,
+    Mobs,
+    Projectiles,
+    Orbs,
+    LeashKnots,
+    FishingHook,
+}
+#[cfg(feature = "paired-packages")]
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::game) enum EntityOwnerObservationError {
+    NotAuthoritative,
+    ActingGuest,
+    DuplicateActiveDimension,
+    WorldSlotTrial {
+        dimension: Dim,
+    },
+    LoadedEntities {
+        dimension: Dim,
+    },
+    EntityMemory {
+        dimension: Dim,
+        kind: persist::EntityMemoryKind,
+    },
+    UnsupportedEntityFamily {
+        dimension: Dim,
+        family: UnsupportedEntityFamily,
+    },
+    InvalidDroppedPosition {
+        dimension: Dim,
+        id: u32,
+    },
+    OffResidentDropped {
+        dimension: Dim,
+        id: u32,
+    },
+    PortalTravel,
+    PortalArrivals,
+    Reservation,
+}
+#[cfg(feature = "paired-packages")]
+#[allow(dead_code)]
+pub(in crate::game) struct EntityOwnerObservation {
+    levels: Vec<EntityOwnerLevel>,
+}
+#[cfg(feature = "paired-packages")]
+#[allow(dead_code)]
+struct EntityOwnerLevel {
+    dimension: Dim,
+    resident_drops: usize,
+}
+
+#[cfg(feature = "paired-packages")]
+macro_rules! unsupported_entities {
+    ($owner:expr, $projectiles:expr) => {{
+        use UnsupportedEntityFamily as F;
+        [
+            (F::Falling, !$owner.falling.is_empty()),
+            (F::Paintings, !$owner.paintings.is_empty()),
+            (F::ItemFrames, !$owner.item_frames.is_empty()),
+            (F::ArmorStands, !$owner.armor_stands.is_empty()),
+            (F::Cushions, !$owner.cushions.is_empty()),
+            (F::Others, !$owner.others.is_empty()),
+            (F::Boats, !$owner.boats.is_empty()),
+            (F::Carts, !$owner.carts.is_empty()),
+            (F::Bolts, !$owner.bolts.is_empty()),
+            (F::Crystals, !$owner.crystals.is_empty()),
+            (F::Dragon, $owner.dragon.is_some()),
+            (F::DragonFireballs, !$owner.dragon_fireballs.is_empty()),
+            (F::BreathClouds, !$owner.breath_clouds.is_empty()),
+            (F::Tridents, !$owner.tridents.is_empty()),
+            (F::Rockets, !$owner.rockets.is_empty()),
+            (F::OminousSpawners, !$owner.ominous_spawners.is_empty()),
+            (F::Tnts, !$owner.tnts.is_empty()),
+            (F::Mobs, !$owner.mobs.is_empty()),
+            (F::Projectiles, !$projectiles.is_empty()),
+            (F::Orbs, !$owner.orbs.is_empty()),
+            (F::LeashKnots, !$owner.knot_ids.is_empty()),
+        ]
+        .into_iter()
+        .find_map(|(family, present)| present.then_some(family))
+    }};
+}
+#[cfg(feature = "paired-packages")]
+fn inspect_entity_level(
+    dimension: Dim,
+    world: &World,
+    memory: &persist::EntityMemory,
+    dropped: &[ItemEntity],
+    unsupported: Option<UnsupportedEntityFamily>,
+) -> std::result::Result<EntityOwnerLevel, EntityOwnerObservationError> {
+    use EntityOwnerObservationError as E;
+    if world.has_world_slot_trial() {
+        return Err(E::WorldSlotTrial { dimension });
+    }
+    if !world.loaded_entities.is_empty() {
+        return Err(E::LoadedEntities { dimension });
+    }
+    if let Some(kind) = memory.checkpoint_entity_memory() {
+        return Err(E::EntityMemory { dimension, kind });
+    }
+    if let Some(family) = unsupported {
+        return Err(E::UnsupportedEntityFamily { dimension, family });
+    }
+    for item in dropped {
+        let p = item.position;
+        if !p.x.is_finite()
+            || !p.y.is_finite()
+            || !p.z.is_finite()
+            || p.x.floor() < f64::from(i32::MIN)
+            || p.x.floor() > f64::from(i32::MAX)
+            || p.z.floor() < f64::from(i32::MIN)
+            || p.z.floor() > f64::from(i32::MAX)
+        {
+            return Err(E::InvalidDroppedPosition {
+                dimension,
+                id: item.id,
+            });
+        }
+        let column = ((p.x.floor() as i32) >> 4, (p.z.floor() as i32) >> 4);
+        if !world.chunks.contains_key(&column) {
+            return Err(E::OffResidentDropped {
+                dimension,
+                id: item.id,
+            });
+        }
+    }
+    Ok(EntityOwnerLevel {
+        dimension,
+        resident_drops: dropped.len(),
+    })
+}
+#[cfg(feature = "paired-packages")]
+#[allow(dead_code)]
+impl Game<'_> {
+    /// Current named ENTITY owners only; no player check, lasting barrier or readiness token.
+    pub(in crate::game) fn observe_checkpoint_entity_owners(
+        &self,
+    ) -> std::result::Result<EntityOwnerObservation, EntityOwnerObservationError> {
+        use super::nether_portal::PortalEntityOwner;
+        use EntityOwnerObservationError as E;
+        if self.remote.is_some()
+            || self.integrated.is_some()
+            || self.options.execution_role.is_client()
+        {
+            return Err(E::NotAuthoritative);
+        }
+        if self.lan_acting.is_some() {
+            return Err(E::ActingGuest);
+        }
+        if self.levels.parked.contains_key(&self.dim) {
+            return Err(E::DuplicateActiveDimension);
+        }
+        let count = self
+            .levels
+            .parked
+            .len()
+            .checked_add(1)
+            .ok_or(E::Reservation)?;
+        let mut levels = Vec::new();
+        levels.try_reserve(count).map_err(|_| E::Reservation)?;
+        levels.push(inspect_entity_level(
+            self.dim,
+            &self.world,
+            &self.persist,
+            &self.dropped,
+            unsupported_entities!(self, self.creatures.projectiles),
+        )?);
+        for (&dimension, parked) in &self.levels.parked {
+            levels.push(inspect_entity_level(
+                dimension,
+                &parked.world,
+                &parked.persist,
+                &parked.dropped,
+                unsupported_entities!(parked, parked.projectiles),
+            )?);
+        }
+        if self.hook.is_some() {
+            return Err(E::UnsupportedEntityFamily {
+                dimension: self.dim,
+                family: UnsupportedEntityFamily::FishingHook,
+            });
+        }
+        if self.end_portal_travel {
+            return Err(E::PortalTravel);
+        }
+        match self.portals.checkpoint_entity_owner() {
+            Some(PortalEntityOwner::Travel) => return Err(E::PortalTravel),
+            Some(PortalEntityOwner::Arrivals) => return Err(E::PortalArrivals),
+            None => {}
+        }
+        levels.sort_unstable_by_key(|row| row.dimension.id());
+        Ok(EntityOwnerObservation { levels })
+    }
+}
+
+#[cfg(all(test, feature = "paired-packages"))]
+pub(super) mod entity_owner_tests;
