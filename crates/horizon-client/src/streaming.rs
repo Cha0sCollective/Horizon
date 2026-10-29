@@ -3543,3 +3543,257 @@ mod cover_tests {
         }
     }
 }
+
+/// Refusal from the bounded, fresh built-in fixture streamer's capture check.
+#[cfg(feature = "paired-packages")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CapturePristineError {
+    PreviouslySubmitted,
+    QueuePoisoned,
+    Stopped,
+    InconsistentState,
+}
+
+#[cfg(feature = "paired-packages")]
+impl Streaming {
+    /// Checks the named owners without receiving results or changing streaming state.
+    ///
+    /// This is only one premise of the fixed fresh built-in fixture's capture:
+    /// its setup must establish zero native submissions and no outside producer.
+    /// `submit` increments `order` before enqueuing every native job, and workers
+    /// send results only after taking a job. Under that setup, no result can be
+    /// hidden in `results`. This is neither a lease nor a certificate for arbitrary
+    /// generators or live history: `order` can wrap after 2^64 submissions.
+    pub fn require_pristine_fixture_capture(
+        &self,
+    ) -> std::result::Result<(), CapturePristineError> {
+        use CapturePristineError as E;
+        if self.order != 0 {
+            return Err(E::PreviouslySubmitted);
+        }
+        let queue = self.shared.queue.lock().map_err(|_| E::QueuePoisoned)?;
+        if self.shared.stop.load(Ordering::Relaxed) {
+            return Err(E::Stopped);
+        }
+        if !queue.is_empty()
+            || !self.generating.is_empty()
+            || !self.finishing.is_empty()
+            || self.decorating != 0
+            || self.saving != 0
+            || !self.protos.is_empty()
+            || !self.written.is_empty()
+            || !self.failed_finished.is_empty()
+            || !self.deferred.is_empty()
+            || self.generation_save_error.is_some()
+            || !self.lighting.is_empty()
+            || !self.meshing.is_empty()
+            || !self.light_snapshots.is_empty()
+        {
+            return Err(E::InconsistentState);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(all(test, feature = "paired-packages", target_os = "linux"))]
+mod capture_pristine_tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn context() -> Arc<WorkerContext> {
+        use crate::{assets::Assets, biome::Biomes, blocks::BlockFacts, models};
+        static CONTEXT: std::sync::OnceLock<Arc<WorkerContext>> = std::sync::OnceLock::new();
+        CONTEXT
+            .get_or_init(|| {
+                let root = std::env::var_os("HORIZON_TEST_RESOURCES")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| {
+                        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                            .join("../../.local/horizon-client/26.3")
+                    });
+                assert!(
+                    root.join("items.json").is_file(),
+                    "owned prepared resources required"
+                );
+                let assets = Arc::new(Assets::load(&root).unwrap());
+                let render = Arc::new(assets.reload(&root).unwrap());
+                let facts = BlockFacts::load(&root, assets.registry).unwrap();
+                let visibility = models::load_visibility(&root, assets.registry).unwrap();
+                Arc::new(WorkerContext {
+                    tables: Arc::new(
+                        MeshTables::new(&assets, &render, &facts, visibility).unwrap(),
+                    ),
+                    light: Arc::new(LightTables::load(&root, assets.registry, &facts).unwrap()),
+                    biomes: Arc::new(Biomes::load(&root).unwrap()),
+                    assets,
+                    render,
+                })
+            })
+            .clone()
+    }
+
+    #[test]
+    #[ignore = "owned prepared resources: pristine built-in capture streamer"]
+    fn capture_pristine_builtin_constructor_is_repeatable_without_mutation() {
+        let context = context();
+        let generator = Arc::new(
+            crate::testgen::TestTerrain::new(context.assets.registry, &context.biomes).unwrap(),
+        );
+        let streaming = Streaming::new(generator, context, 1);
+        for _ in 0..3 {
+            assert_eq!(streaming.require_pristine_fixture_capture(), Ok(()));
+            assert_eq!(streaming.order, 0);
+            assert!(streaming.shared.queue.lock().unwrap().is_empty());
+            assert!(streaming.generating.is_empty());
+            assert!(streaming.finishing.is_empty());
+            assert_eq!(streaming.decorating, 0);
+            assert_eq!(streaming.saving, 0);
+            assert!(streaming.protos.is_empty());
+            assert!(streaming.written.is_empty());
+            assert!(streaming.failed_finished.is_empty());
+            assert!(streaming.deferred.is_empty());
+            assert!(streaming.generation_save_error.is_none());
+            assert!(streaming.lighting.is_empty());
+            assert!(streaming.meshing.is_empty());
+            assert!(streaming.light_snapshots.is_empty());
+            assert!(!streaming.shared.stop.load(Ordering::Relaxed));
+        }
+    }
+
+    // Only negative cases use this generator: its gates expose actual native
+    // queue/worker/result transitions, and do not establish fixture provenance.
+    struct SaveGate {
+        worker_started: mpsc::Sender<()>,
+        worker_gate: Mutex<Option<mpsc::Receiver<()>>>,
+        save_started: mpsc::Sender<u64>,
+        save_gates: Mutex<[Option<mpsc::Receiver<()>>; 2]>,
+    }
+    impl ChunkGenerator for SaveGate {
+        type Worker = ();
+        fn worker(&self) {
+            self.worker_started.send(()).unwrap();
+            self.worker_gate
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+        }
+        fn proto(&self, _: &mut (), _: i32, _: i32) -> Proto {
+            unreachable!("this negative fixture only submits native Save jobs")
+        }
+        fn finish(&self, _: Proto) -> Chunk {
+            unreachable!("this negative fixture only submits native Save jobs")
+        }
+        fn save_protos(&self, protos: &[&Proto]) -> Result<(), String> {
+            let id = *protos[0].downcast_ref::<u64>().unwrap();
+            let index = match id {
+                11 => 0,
+                22 => 1,
+                _ => unreachable!(),
+            };
+            let gate = self.save_gates.lock().unwrap()[index].take().unwrap();
+            self.save_started.send(id).unwrap();
+            gate.recv_timeout(Duration::from_secs(5)).unwrap();
+            Ok(())
+        }
+    }
+
+    struct ReleaseOnDrop(Option<mpsc::Sender<()>>);
+    impl ReleaseOnDrop {
+        fn release(&mut self) {
+            if let Some(send) = self.0.take() {
+                let _ = send.send(());
+            }
+        }
+    }
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+
+    fn returned_save(done: Done, expected: u64) {
+        let Done::Saved(protos, outcome) = done else {
+            panic!("native worker returned a non-save completion")
+        };
+        assert!(outcome.is_ok());
+        assert_eq!(protos.len(), 1);
+        assert_eq!(*protos[0].1.downcast_ref::<u64>().unwrap(), expected);
+    }
+
+    #[test]
+    #[ignore = "owned prepared resources: native queued in-flight and returned capture refusal"]
+    fn capture_pristine_refuses_native_queued_inflight_and_returned_work_without_draining() {
+        let (worker_started, worker_began) = mpsc::channel();
+        let (worker_release, worker_gate) = mpsc::channel();
+        let (save_started, save_began) = mpsc::channel();
+        let (first_release, first_gate) = mpsc::channel();
+        let (second_release, second_gate) = mpsc::channel();
+        let generator = Arc::new(SaveGate {
+            worker_started,
+            worker_gate: Mutex::new(Some(worker_gate)),
+            save_started,
+            save_gates: Mutex::new([Some(first_gate), Some(second_gate)]),
+        });
+        let mut streaming = Streaming::new(generator, context(), 1);
+        // Declared after Streaming so assertion unwinding releases every gate
+        // before Streaming's unchanged Drop joins the native worker.
+        let mut worker_release = ReleaseOnDrop(Some(worker_release));
+        let mut first_release = ReleaseOnDrop(Some(first_release));
+        let mut second_release = ReleaseOnDrop(Some(second_release));
+        worker_began.recv_timeout(Duration::from_secs(5)).unwrap();
+        streaming.submit(None, 0, Job::Save(vec![((0, 0), Box::new(11_u64))]));
+        streaming.submit(None, 0, Job::Save(vec![((1, 0), Box::new(22_u64))]));
+        assert_eq!(streaming.shared.queue.lock().unwrap().len(), 2);
+        assert_eq!(
+            streaming.require_pristine_fixture_capture(),
+            Err(CapturePristineError::PreviouslySubmitted)
+        );
+        assert_eq!(streaming.order, 2);
+        assert_eq!(streaming.shared.queue.lock().unwrap().len(), 2);
+
+        worker_release.release();
+        assert_eq!(save_began.recv_timeout(Duration::from_secs(5)).unwrap(), 11);
+        assert_eq!(streaming.shared.queue.lock().unwrap().len(), 1);
+        assert_eq!(
+            streaming.require_pristine_fixture_capture(),
+            Err(CapturePristineError::PreviouslySubmitted)
+        );
+        assert_eq!(streaming.shared.queue.lock().unwrap().len(), 1);
+
+        first_release.release();
+        assert_eq!(save_began.recv_timeout(Duration::from_secs(5)).unwrap(), 22);
+        // The worker starts the second job only AFTER sending the first Done.
+        // The real first result is now waiting in Streaming's original channel.
+        assert!(streaming.shared.queue.lock().unwrap().is_empty());
+        assert_eq!(
+            streaming.require_pristine_fixture_capture(),
+            Err(CapturePristineError::PreviouslySubmitted)
+        );
+        returned_save(
+            streaming
+                .results
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap(),
+            11,
+        );
+        second_release.release();
+        returned_save(
+            streaming
+                .results
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap(),
+            22,
+        );
+        // Even after the test observes both actual native completions, no reset
+        // or successful admission is possible for this submitted streamer.
+        assert_eq!(
+            streaming.require_pristine_fixture_capture(),
+            Err(CapturePristineError::PreviouslySubmitted)
+        );
+        assert_eq!(streaming.order, 2);
+        assert!(streaming.deferred.is_empty());
+    }
+}

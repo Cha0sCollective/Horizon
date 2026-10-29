@@ -2994,3 +2994,43 @@ mod player_json_tests {
         std::fs::remove_dir_all(world).unwrap();
     }
 }
+
+/// Detached native PLAYER output for the fixed capture fixture only.
+#[cfg(all(test, feature = "paired-packages", target_os = "linux"))]
+#[derive(Debug)]
+pub(in crate::game) struct CapturePlayerRow {
+    pub(in crate::game) conn: u32,
+    pub(in crate::game) profile_uuid: u128,
+    pub(in crate::game) record_uuid: [i32; 4],
+    pub(in crate::game) integrated_owner: bool,
+    pub(in crate::game) dimension: String,
+    pub(in crate::game) player: horizon_world::nbt::Tag,
+    pub(in crate::game) advancements: serde_json::Value,
+    pub(in crate::game) stats: serde_json::Value,
+}
+
+#[cfg(all(test, feature = "paired-packages", target_os = "linux"))]
+impl ParticipantProjections {
+    /// Moves the already projected values and their validated storage identity.
+    pub(in crate::game) fn into_capture_rows(self) -> Vec<CapturePlayerRow> {
+        self.players
+            .into_iter()
+            .map(|row| {
+                let (record_uuid, integrated_owner) = match row.storage {
+                    ParticipantStorage::IntegratedOwner { record_uuid } => (record_uuid, true),
+                    ParticipantStorage::External { record_uuid } => (record_uuid, false),
+                };
+                CapturePlayerRow {
+                    conn: row.conn,
+                    profile_uuid: row.uuid,
+                    record_uuid,
+                    integrated_owner,
+                    dimension: row.dimension,
+                    player: row.player,
+                    advancements: row.advancements,
+                    stats: row.stats,
+                }
+            })
+            .collect()
+    }
+}

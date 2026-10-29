@@ -865,3 +865,6 @@ mod tests {
         assert_eq!(server.stop().unwrap_err().to_string(), "disk write failed");
     }
 }
+
+#[cfg(all(test, feature = "paired-packages", target_os = "linux"))]
+pub(super) mod capture_completion_tests;

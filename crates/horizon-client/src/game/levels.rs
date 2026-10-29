@@ -932,3 +932,6 @@ impl Game<'_> {
 
 #[cfg(all(test, feature = "paired-packages"))]
 mod world_owner_tests;
+
+#[cfg(all(test, feature = "paired-packages", target_os = "linux"))]
+pub(in crate::game) mod capture_integration;
