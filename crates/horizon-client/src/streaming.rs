@@ -13,7 +13,7 @@ use horizon_core::biome::BiomeZoom;
 use horizon_world::block_render::FaceVisibility;
 use horizon_world::worldgen::decoration_order::DecorationOrder;
 use std::{
-    collections::{BinaryHeap, HashSet},
+    collections::{BinaryHeap, HashSet, VecDeque},
     sync::{
         Arc, Condvar, Mutex, RwLock,
         atomic::{AtomicBool, Ordering},
@@ -163,6 +163,227 @@ struct MeshSettings {
     smooth_lighting: bool,
     cutout_leaves: bool,
 }
+/// The native producer, carried from submission rather than inferred from Done.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(usize)]
+pub enum NativeWorkOrigin {
+    Generate,
+    Decorate,
+    Finish,
+    Light,
+    Mesh,
+    Save,
+    SaveProtosCallback,
+    SaveFinishedCallback,
+}
+const WORK_ORIGINS: [NativeWorkOrigin; 8] = [
+    NativeWorkOrigin::Generate,
+    NativeWorkOrigin::Decorate,
+    NativeWorkOrigin::Finish,
+    NativeWorkOrigin::Light,
+    NativeWorkOrigin::Mesh,
+    NativeWorkOrigin::Save,
+    NativeWorkOrigin::SaveProtosCallback,
+    NativeWorkOrigin::SaveFinishedCallback,
+];
+/// Named lifetime counts for one Streaming instance. Accepted storage callbacks
+/// mean enqueue acceptance only; the storage writer's lifetime is outside this report.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NativeWorkCounts {
+    pub submitted: u64,
+    pub queued: u64,
+    pub worker_held: u64,
+    pub returned: u64,
+    pub reconciling: u64,
+    pub disposed: u64,
+    pub unresolved: u64,
+    pub accepted_storage_handoffs: u64,
+    pub storage_errors: u64,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NativeWorkObservation {
+    pub origins: [(NativeWorkOrigin, NativeWorkCounts); 8],
+    pub initialized_workers: u64,
+    pub worker_initialization_fault: bool,
+    pub worker_exit_fault: bool,
+    pub result_disconnected: bool,
+    pub receipt_mismatch: bool,
+    pub accounting_fault: bool,
+    pub stopped: bool,
+}
+#[derive(Default)]
+struct OwnershipBook {
+    counts: [NativeWorkCounts; 8],
+    initialized_workers: u64,
+    worker_initialization_fault: bool,
+    worker_exit_fault: bool,
+    result_disconnected: bool,
+    receipt_mismatch: bool,
+    accounting_fault: bool,
+}
+#[derive(Clone, Copy)]
+enum WorkPhase {
+    Queued,
+    Worker,
+    Returned,
+    Reconciling,
+}
+impl OwnershipBook {
+    fn add(value: &mut u64) -> bool {
+        if let Some(next) = value.checked_add(1) {
+            *value = next;
+            true
+        } else {
+            false
+        }
+    }
+    fn phase(&mut self, origin: NativeWorkOrigin, phase: WorkPhase) -> &mut u64 {
+        let c = &mut self.counts[origin as usize];
+        match phase {
+            WorkPhase::Queued => &mut c.queued,
+            WorkPhase::Worker => &mut c.worker_held,
+            WorkPhase::Returned => &mut c.returned,
+            WorkPhase::Reconciling => &mut c.reconciling,
+        }
+    }
+}
+struct WorkLease {
+    book: Arc<Mutex<OwnershipBook>>,
+    origin: NativeWorkOrigin,
+    phase: WorkPhase,
+    counted: bool,
+    settled: bool,
+}
+impl WorkLease {
+    fn new(book: &Arc<Mutex<OwnershipBook>>, origin: NativeWorkOrigin, phase: WorkPhase) -> Self {
+        let mut state = book.lock().unwrap_or_else(|e| e.into_inner());
+        let submitted = OwnershipBook::add(&mut state.counts[origin as usize].submitted);
+        let counted = OwnershipBook::add(state.phase(origin, phase));
+        state.accounting_fault |= !submitted || !counted;
+        drop(state);
+        Self {
+            book: book.clone(),
+            origin,
+            phase,
+            counted,
+            settled: false,
+        }
+    }
+    fn advance(&mut self, phase: WorkPhase) {
+        let mut state = self.book.lock().unwrap_or_else(|e| e.into_inner());
+        if self.counted {
+            let old = state.phase(self.origin, self.phase);
+            if let Some(next) = old.checked_sub(1) {
+                *old = next;
+            } else {
+                state.accounting_fault = true;
+            }
+        }
+        self.counted = OwnershipBook::add(state.phase(self.origin, phase));
+        state.accounting_fault |= !self.counted;
+        self.phase = phase;
+    }
+    fn storage(&self, accepted: bool) {
+        let mut state = self.book.lock().unwrap_or_else(|e| e.into_inner());
+        let c = &mut state.counts[self.origin as usize];
+        let ok = OwnershipBook::add(if accepted {
+            &mut c.accepted_storage_handoffs
+        } else {
+            &mut c.storage_errors
+        });
+        state.accounting_fault |= !ok;
+    }
+    fn settle(mut self) {
+        let mut state = self.book.lock().unwrap_or_else(|e| e.into_inner());
+        if self.counted {
+            let old = state.phase(self.origin, self.phase);
+            if let Some(next) = old.checked_sub(1) {
+                *old = next;
+            } else {
+                state.accounting_fault = true;
+            }
+        }
+        let ok = OwnershipBook::add(&mut state.counts[self.origin as usize].disposed);
+        state.accounting_fault |= !ok;
+        self.settled = true;
+    }
+}
+impl Drop for WorkLease {
+    fn drop(&mut self) {
+        if self.settled {
+            return;
+        }
+        let mut state = self.book.lock().unwrap_or_else(|e| e.into_inner());
+        if self.counted {
+            let old = state.phase(self.origin, self.phase);
+            if let Some(next) = old.checked_sub(1) {
+                *old = next;
+            } else {
+                state.accounting_fault = true;
+            }
+        }
+        let ok = OwnershipBook::add(&mut state.counts[self.origin as usize].unresolved);
+        state.accounting_fault |= !ok;
+    }
+}
+struct WorkerLifetime {
+    book: Arc<Mutex<OwnershipBook>>,
+    initialized: bool,
+    stopped: bool,
+}
+impl WorkerLifetime {
+    fn initialized(&mut self) {
+        self.initialized = true;
+        let mut book = self.book.lock().unwrap_or_else(|e| e.into_inner());
+        let ok = OwnershipBook::add(&mut book.initialized_workers);
+        book.accounting_fault |= !ok;
+    }
+}
+impl Drop for WorkerLifetime {
+    fn drop(&mut self) {
+        let mut book = self.book.lock().unwrap_or_else(|e| e.into_inner());
+        if !self.initialized {
+            book.worker_initialization_fault = true;
+        } else if !self.stopped {
+            book.worker_exit_fault = true;
+        }
+    }
+}
+struct ReceivedWork {
+    done: Done,
+    owner: Option<WorkLease>,
+}
+struct Reconciliation(Option<WorkLease>);
+impl Drop for Reconciliation {
+    fn drop(&mut self) {
+        if let Some(owner) = self.0.take()
+            && !thread::panicking()
+        {
+            owner.settle();
+        }
+    }
+}
+#[derive(PartialEq, Eq)]
+enum ResultStamp {
+    Generated(i32, i32),
+    Proto(i32, i32),
+    Decorated(i32, i32),
+    Lit(i32, i32, u64),
+    Meshed(i32, i32, i32, u64),
+    Saved,
+}
+impl Done {
+    fn stamp(&self) -> ResultStamp {
+        match self {
+            Self::Generated(c) => ResultStamp::Generated(c.x, c.z),
+            Self::Proto(x, z, ..) => ResultStamp::Proto(*x, *z),
+            Self::Decorated(x, z, _) => ResultStamp::Decorated(*x, *z),
+            Self::Lit(x, z, _, seq) => ResultStamp::Lit(*x, *z, *seq),
+            Self::Meshed(x, y, z, _, seq) => ResultStamp::Meshed(*x, *y, *z, *seq),
+            Self::Saved(..) => ResultStamp::Saved,
+        }
+    }
+}
 enum Job {
     Generate(i32, i32),
     Decorate(i32, i32, Box<[Proto; 9]>),
@@ -218,6 +439,40 @@ struct Shared {
     /// What meshing reads (block models and sprites), swapped when resource
     /// packs reload; each mesh job takes the current one.
     context: RwLock<Arc<WorkerContext>>,
+    ownership: Arc<Mutex<OwnershipBook>>,
+    returned: Mutex<VecDeque<(ResultStamp, WorkLease)>>,
+    queued_owners: Mutex<FxHashMap<u64, WorkLease>>,
+    #[cfg(test)]
+    work_gate: Mutex<Option<WorkGate>>,
+    #[cfg(test)]
+    idle_wait_gate: Mutex<Option<IdleWaitGate>>,
+    #[cfg(test)]
+    shutdown_events: Mutex<Option<mpsc::Sender<ShutdownEvent>>>,
+}
+#[cfg(test)]
+struct WorkGate {
+    origin: NativeWorkOrigin,
+    entered: mpsc::Sender<()>,
+    release: mpsc::Receiver<()>,
+}
+#[cfg(test)]
+struct IdleWaitGate {
+    entered: mpsc::Sender<()>,
+    release: mpsc::Receiver<()>,
+}
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShutdownEvent {
+    QueueContended,
+    Published,
+}
+#[cfg(test)]
+impl Shared {
+    fn shutdown_event(&self, event: ShutdownEvent) {
+        if let Some(sender) = self.shutdown_events.lock().unwrap().as_ref() {
+            let _ = sender.send(event);
+        }
+    }
 }
 pub struct Streaming {
     shared: Arc<Shared>,
@@ -263,6 +518,7 @@ pub struct Streaming {
     saves: Arc<dyn Saves>,
     /// Results received while `save` waited, for the next `update`.
     deferred: Vec<Done>,
+    deferred_owners: Vec<(usize, WorkLease)>,
     sequence: u64,
     pub center: (i32, i32),
     pub radius: i32,
@@ -461,6 +717,15 @@ impl Streaming {
             ready: Condvar::new(),
             stop: AtomicBool::new(false),
             context: RwLock::new(context.clone()),
+            ownership: Arc::new(Mutex::new(OwnershipBook::default())),
+            returned: Mutex::new(VecDeque::new()),
+            queued_owners: Mutex::new(FxHashMap::default()),
+            #[cfg(test)]
+            work_gate: Mutex::new(None),
+            #[cfg(test)]
+            idle_wait_gate: Mutex::new(None),
+            #[cfg(test)]
+            shutdown_events: Mutex::new(None),
         });
         let (send, results) = mpsc::channel();
         let light_tables = context.light.clone();
@@ -474,26 +739,69 @@ impl Streaming {
                 thread::Builder::new()
                     .name(format!("horizon-worker-{i}"))
                     .spawn(move || {
+                        let mut lifetime = WorkerLifetime {
+                            book: shared.ownership.clone(),
+                            initialized: false,
+                            stopped: false,
+                        };
                         // Ticks and frames come first (horizon_threads).
                         horizon_threads::behind_server();
                         let mut worker = generator.worker();
+                        lifetime.initialized();
                         // The face visibility table and its occlusion cache stay with
                         // the worker across mesh jobs, like vanilla's per-thread cache:
                         // cloning it per job copied every state and face shape.
                         let mut faces: Option<(Arc<MeshTables>, FaceVisibility)> = None;
                         loop {
-                            let job = {
+                            let (job, mut owner) = {
                                 let mut queue = shared.queue.lock().unwrap();
                                 loop {
                                     if shared.stop.load(Ordering::Relaxed) {
+                                        lifetime.stopped = true;
                                         return;
                                     }
                                     if let Some(job) = queue.pop() {
-                                        break job.job;
+                                        let mut owner =
+                                            shared.queued_owners.lock().unwrap().remove(&job.order);
+                                        if let Some(owner) = &mut owner {
+                                            owner.advance(WorkPhase::Worker);
+                                        }
+                                        break (job.job, owner);
+                                    }
+                                    #[cfg(test)]
+                                    {
+                                        let gate = shared.idle_wait_gate.lock().unwrap().take();
+                                        if let Some(gate) = gate {
+                                            gate.entered.send(()).unwrap();
+                                            gate.release
+                                                .recv_timeout(std::time::Duration::from_secs(5))
+                                                .unwrap();
+                                        }
                                     }
                                     queue = shared.ready.wait(queue).unwrap();
                                 }
                             };
+                            #[cfg(test)]
+                            {
+                                let gate = {
+                                    let mut gate = shared.work_gate.lock().unwrap();
+                                    if gate.as_ref().is_some_and(|gate| {
+                                        owner
+                                            .as_ref()
+                                            .is_some_and(|owner| owner.origin == gate.origin)
+                                    }) {
+                                        gate.take()
+                                    } else {
+                                        None
+                                    }
+                                };
+                                if let Some(gate) = gate {
+                                    gate.entered.send(()).unwrap();
+                                    gate.release
+                                        .recv_timeout(std::time::Duration::from_secs(5))
+                                        .unwrap();
+                                }
+                            }
                             let done = match job {
                                 Job::Generate(x, z) => match generator.load(x, z) {
                                     Some(chunk) => {
@@ -514,6 +822,9 @@ impl Streaming {
                                 Job::Save(protos) => {
                                     let refs: Vec<&Proto> = protos.iter().map(|(_, p)| p).collect();
                                     let outcome = generator.save_protos(&refs);
+                                    if let Some(owner) = &owner {
+                                        owner.storage(outcome.is_ok());
+                                    }
                                     Done::Saved(protos, outcome)
                                 }
                                 Job::Light(x, z, region, seq, sky) => {
@@ -547,7 +858,23 @@ impl Streaming {
                                     Done::Meshed(x, sy, z, mesh, seq)
                                 }
                             };
+                            // One lock orders the native send and its receipt across workers.
+                            // Receivers pair only after releasing mpsc's internal receive lock.
+                            let mut returned = shared.returned.lock().unwrap();
+                            let has_receipt = owner.is_some();
+                            if let Some(mut lease) = owner.take() {
+                                lease.advance(WorkPhase::Returned);
+                                returned.push_back((done.stamp(), lease));
+                            }
                             if send.send(done).is_err() {
+                                if has_receipt {
+                                    returned.pop_back();
+                                }
+                                shared
+                                    .ownership
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .result_disconnected = true;
                                 return;
                             }
                         }
@@ -587,6 +914,7 @@ impl Streaming {
             written: Default::default(),
             saves,
             deferred: Vec::new(),
+            deferred_owners: Vec::new(),
             sequence: 0,
             center: (0, 0),
             radius: 8,
@@ -616,6 +944,81 @@ impl Streaming {
     /// Shares generation resources, but gives distant work its own worker state.
     pub fn lod_source(&self) -> Arc<dyn LodSource> {
         self.saves.clone()
+    }
+    /// Borrowed observation only. This neither receives results nor certifies
+    /// readiness, including when every named count is zero. It excludes storage
+    /// writer ownership after an accepted callback handoff.
+    pub fn observe_native_work(&self) -> NativeWorkObservation {
+        let lock = self.shared.ownership.lock();
+        let poisoned = lock.is_err();
+        let state = lock.unwrap_or_else(|e| e.into_inner());
+        NativeWorkObservation {
+            origins: WORK_ORIGINS.map(|origin| (origin, state.counts[origin as usize])),
+            initialized_workers: state.initialized_workers,
+            worker_initialization_fault: state.worker_initialization_fault,
+            worker_exit_fault: state.worker_exit_fault,
+            result_disconnected: state.result_disconnected,
+            receipt_mismatch: state.receipt_mismatch,
+            accounting_fault: state.accounting_fault || poisoned,
+            stopped: self.shared.stop.load(Ordering::Relaxed),
+        }
+    }
+    fn received(&self, done: Done) -> ReceivedWork {
+        let mut returned = self
+            .shared
+            .returned
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let owner = if returned
+            .front()
+            .is_some_and(|(stamp, _)| *stamp == done.stamp())
+        {
+            returned.pop_front().map(|(_, owner)| owner)
+        } else {
+            // Raw synthetic test completions have no receipt. A mismatched
+            // native receipt stays retained rather than settling a different job.
+            if !returned.is_empty() {
+                self.shared
+                    .ownership
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .receipt_mismatch = true;
+            }
+            None
+        };
+        ReceivedWork { done, owner }
+    }
+    fn take_deferred(&mut self) -> Vec<ReceivedWork> {
+        let mut owners = std::mem::take(&mut self.deferred_owners)
+            .into_iter()
+            .peekable();
+        let work = std::mem::take(&mut self.deferred)
+            .into_iter()
+            .enumerate()
+            .map(|(index, done)| {
+                let owner = if owners.peek().is_some_and(|(at, _)| *at == index) {
+                    owners.next().map(|(_, owner)| owner)
+                } else {
+                    None
+                };
+                ReceivedWork { done, owner }
+            })
+            .collect();
+        // Unexpected removed entries fault their leases on Drop.
+        work
+    }
+    fn defer(&mut self, work: ReceivedWork) {
+        if let Some(owner) = work.owner {
+            self.deferred_owners.push((self.deferred.len(), owner));
+        }
+        self.deferred.push(work.done);
+    }
+    fn result_disconnected(&self) {
+        self.shared
+            .ownership
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .result_disconnected = true;
     }
     /// Resource packs reloaded (`LevelRenderer.allChanged`): mesh with the new
     /// models and sprites, and rebuild every loaded section. Meshes in flight
@@ -684,15 +1087,40 @@ impl Streaming {
     /// times four plus `bias`, which orders a column's jobs. A job without a
     /// column (a save) goes ahead of every other.
     fn submit(&mut self, at: Option<(i32, i32)>, bias: i64, job: Job) {
+        let origin = match &job {
+            Job::Generate(..) => NativeWorkOrigin::Generate,
+            Job::Decorate(..) => NativeWorkOrigin::Decorate,
+            Job::Finish(..) => NativeWorkOrigin::Finish,
+            Job::Light(..) => NativeWorkOrigin::Light,
+            Job::Mesh(..) => NativeWorkOrigin::Mesh,
+            Job::Save(..) => NativeWorkOrigin::Save,
+        };
+        let owner = WorkLease::new(&self.shared.ownership, origin, WorkPhase::Queued);
         self.order += 1;
         let priority = at.map_or(i64::MIN, |(x, z)| self.distance(x, z) * 4 + bias);
-        self.shared.queue.lock().unwrap().push(Queued {
+        let mut queue = self.shared.queue.lock().unwrap();
+        if self
+            .shared
+            .queued_owners
+            .lock()
+            .unwrap()
+            .insert(self.order, owner)
+            .is_some()
+        {
+            self.shared
+                .ownership
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .accounting_fault = true;
+        }
+        queue.push(Queued {
             priority,
             at,
             bias,
             order: self.order,
             job,
         });
+        drop(queue);
         self.shared.ready.notify_one();
     }
     /// Rank the queued jobs again when what their priorities were computed
@@ -787,9 +1215,22 @@ impl Streaming {
                 let chunk = Arc::new(chunk);
                 if self.generation_save_error.is_some() {
                     self.failed_finished.push(chunk);
-                } else if let Err(error) = self.saves.save_finished(&chunk) {
-                    self.failed_finished.push(chunk);
-                    self.fail_generation_save(error);
+                } else {
+                    let owner = WorkLease::new(
+                        &self.shared.ownership,
+                        NativeWorkOrigin::SaveFinishedCallback,
+                        WorkPhase::Reconciling,
+                    );
+                    let outcome = self.saves.save_finished(&chunk);
+                    owner.storage(outcome.is_ok());
+                    match outcome {
+                        Ok(()) => owner.settle(),
+                        Err(error) => {
+                            self.failed_finished.push(chunk);
+                            self.fail_generation_save(error);
+                            // Failed or partial storage enqueue stays a named fault.
+                        }
+                    }
                 }
             }
             return;
@@ -938,9 +1379,23 @@ impl Streaming {
         ExtraCover::refresh(&mut self.cover, &self.extra);
         self.requeue();
         self.relight_edits(world);
-        let deferred = std::mem::take(&mut self.deferred);
-        let received = std::iter::from_fn(|| self.results.try_recv().ok());
-        for done in deferred.into_iter().chain(received.collect::<Vec<_>>()) {
+        let deferred = self.take_deferred();
+        let mut received = Vec::new();
+        loop {
+            match self.results.try_recv() {
+                Ok(done) => received.push(self.received(done)),
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.result_disconnected();
+                    break;
+                }
+            }
+        }
+        for ReceivedWork { done, mut owner } in deferred.into_iter().chain(received) {
+            if let Some(owner) = &mut owner {
+                owner.advance(WorkPhase::Reconciling);
+            }
+            let _reconciliation = Reconciliation(owner);
             match done {
                 Done::Proto(x, z, proto, decorated) => {
                     self.generation_scan.exhausted = false;
@@ -1467,7 +1922,7 @@ impl Streaming {
             let left = deadline.saturating_duration_since(std::time::Instant::now());
             match self.results.recv_timeout(left) {
                 Ok(done) => {
-                    self.receive_save_result(done, world);
+                    self.receive_save_result(self.received(done), world);
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     return Err(
@@ -1475,6 +1930,7 @@ impl Streaming {
                     );
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    self.result_disconnected();
                     return Err(
                         "chunk generation workers disconnected before saving finished".into(),
                     );
@@ -1495,7 +1951,17 @@ impl Streaming {
         let outcome = if protos.is_empty() {
             Ok(())
         } else {
-            self.saves.save_protos(&protos)
+            let owner = WorkLease::new(
+                &self.shared.ownership,
+                NativeWorkOrigin::SaveProtosCallback,
+                WorkPhase::Reconciling,
+            );
+            let outcome = self.saves.save_protos(&protos);
+            owner.storage(outcome.is_ok());
+            if outcome.is_ok() {
+                owner.settle();
+            }
+            outcome
         };
         drop(protos);
         if let Err(error) = outcome {
@@ -1509,23 +1975,42 @@ impl Streaming {
         self.decorating > 0 || !self.finishing.is_empty() || self.saving > 0
     }
     fn reconcile_ready_save_results(&mut self, world: &mut World) {
-        let deferred = std::mem::take(&mut self.deferred);
-        let ready: Vec<_> = self.results.try_iter().collect();
+        let deferred = self.take_deferred();
+        let mut ready = Vec::new();
+        loop {
+            match self.results.try_recv() {
+                Ok(done) => ready.push(self.received(done)),
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.result_disconnected();
+                    break;
+                }
+            }
+        }
         for done in deferred.into_iter().chain(ready) {
             self.receive_save_result(done, world);
         }
     }
     // Returns whether the result was reconciled, leaving every unrelated result
     // in arrival order for normal update. `wait` may already have deferred it.
-    fn receive_save_result(&mut self, done: Done, world: &mut World) -> bool {
+    fn receive_save_result(&mut self, work: ReceivedWork, world: &mut World) -> bool {
+        if !matches!(
+            &work.done,
+            Done::Decorated(..) | Done::Generated(..) | Done::Saved(..)
+        ) {
+            self.defer(work);
+            return false;
+        }
+        let ReceivedWork { done, mut owner } = work;
+        if let Some(owner) = &mut owner {
+            owner.advance(WorkPhase::Reconciling);
+        }
+        let _reconciliation = Reconciliation(owner);
         match done {
             Done::Decorated(x, z, region) => self.receive_decorated(x, z, *region),
             Done::Generated(chunk) => self.receive_generated(chunk, world),
             Done::Saved(protos, outcome) => self.receive_saved(protos, outcome),
-            other => {
-                self.deferred.push(other);
-                return false;
-            }
+            _ => unreachable!("generation completion matched above"),
         }
         true
     }
@@ -1542,13 +2027,15 @@ impl Streaming {
         budget: std::time::Duration,
     ) -> crate::Result<bool> {
         let started = std::time::Instant::now();
-        let mut deferred = std::mem::take(&mut self.deferred).into_iter();
+        let mut deferred = self.take_deferred().into_iter();
         while let Some(done) = deferred.next() {
             // Skip unrelated results until a completion makes progress; an
             // unrelated prefix must not repeatedly exhaust the polling budget.
             // Scanning that existing prefix is linear, not a strict time bound.
             if self.receive_save_result(done, world) && started.elapsed() >= budget {
-                self.deferred.extend(deferred);
+                for work in deferred {
+                    self.defer(work);
+                }
                 self.generation_save_result()?;
                 return Ok(false);
             }
@@ -1556,14 +2043,17 @@ impl Streaming {
         let disconnected = loop {
             match self.results.try_recv() {
                 Ok(done) => {
-                    self.receive_save_result(done, world);
+                    self.receive_save_result(self.received(done), world);
                     if started.elapsed() >= budget {
                         self.generation_save_result()?;
                         return Ok(false);
                     }
                 }
                 Err(mpsc::TryRecvError::Empty) => break false,
-                Err(mpsc::TryRecvError::Disconnected) => break true,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.result_disconnected();
+                    break true;
+                }
             }
         };
         self.generation_save_result()?;
@@ -1650,8 +2140,10 @@ impl Streaming {
     /// Wait up to `timeout` for a worker to finish a job; the next `update`
     /// takes it. A server pumps generation with this between its ticks.
     pub fn wait(&mut self, timeout: std::time::Duration) {
-        if let Ok(done) = self.results.recv_timeout(timeout) {
-            self.deferred.push(done);
+        match self.results.recv_timeout(timeout) {
+            Ok(done) => self.defer(self.received(done)),
+            Err(mpsc::RecvTimeoutError::Disconnected) => self.result_disconnected(),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
     }
 }
@@ -1932,16 +2424,62 @@ impl Drop for Streaming {
         while self.saving > 0 {
             let left = deadline.saturating_duration_since(std::time::Instant::now());
             match self.results.recv_timeout(left) {
-                Ok(Done::Saved(protos, outcome)) => self.receive_saved(protos, outcome),
-                Ok(_) => {}
-                Err(_) => break,
+                Ok(done) => {
+                    let ReceivedWork { done, mut owner } = self.received(done);
+                    if let Done::Saved(protos, outcome) = done {
+                        if let Some(owner) = &mut owner {
+                            owner.advance(WorkPhase::Reconciling);
+                        }
+                        let _reconciliation = Reconciliation(owner);
+                        self.receive_saved(protos, outcome);
+                    }
+                    // Other payloads retain an unresolved disposal fact.
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    self.result_disconnected();
+                    break;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => break,
             }
         }
+        // The stop predicate and notification use the worker's queue mutex.
+        // Otherwise notification can fall between its empty-queue check and
+        // Condvar::wait, leaving an idle worker asleep while Drop joins it.
+        let queue = match self.shared.queue.try_lock() {
+            Ok(queue) => queue,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                #[cfg(test)]
+                self.shared.shutdown_event(ShutdownEvent::QueueContended);
+                self.shared.queue.lock().unwrap_or_else(|e| e.into_inner())
+            }
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+        };
         self.shared.stop.store(true, Ordering::Relaxed);
         self.shared.ready.notify_all();
+        drop(queue);
+        #[cfg(test)]
+        self.shared.shutdown_event(ShutdownEvent::Published);
         for t in self.threads.drain(..) {
             let _ = t.join();
         }
+        // Stop owns the remaining queue/result/deferred destruction. None of
+        // those payloads was normally reconciled, so lease Drop records faults.
+        self.shared
+            .queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.shared
+            .queued_owners
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.shared
+            .returned
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.deferred_owners.clear();
     }
 }
 /// The section indexes set in a column's bits, lowest first.
@@ -3795,5 +4333,749 @@ mod capture_pristine_tests {
         );
         assert_eq!(streaming.order, 2);
         assert!(streaming.deferred.is_empty());
+    }
+}
+
+#[cfg(all(test, feature = "paired-packages", target_os = "linux"))]
+mod native_work_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+    const WAIT: Duration = Duration::from_secs(5);
+
+    fn context() -> Arc<WorkerContext> {
+        use crate::{assets::Assets, biome::Biomes, blocks::BlockFacts, models};
+        static CONTEXT: std::sync::OnceLock<Arc<WorkerContext>> = std::sync::OnceLock::new();
+        CONTEXT
+            .get_or_init(|| {
+                let root = std::env::var_os("HORIZON_TEST_RESOURCES")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| {
+                        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                            .join("../../.local/horizon-client/26.3")
+                    });
+                assert!(
+                    root.join("items.json").is_file(),
+                    "owned prepared resources required"
+                );
+                let assets = Arc::new(Assets::load(&root).unwrap());
+                let render = Arc::new(assets.reload(&root).unwrap());
+                let facts = BlockFacts::load(&root, assets.registry).unwrap();
+                let visibility = models::load_visibility(&root, assets.registry).unwrap();
+                Arc::new(WorkerContext {
+                    tables: Arc::new(
+                        MeshTables::new(&assets, &render, &facts, visibility).unwrap(),
+                    ),
+                    light: Arc::new(LightTables::load(&root, assets.registry, &facts).unwrap()),
+                    biomes: Arc::new(Biomes::load(&root).unwrap()),
+                    assets,
+                    render,
+                })
+            })
+            .clone()
+    }
+    struct Release(Option<mpsc::Sender<()>>);
+    impl Release {
+        fn release(&mut self) {
+            if let Some(send) = self.0.take() {
+                let _ = send.send(());
+            }
+        }
+    }
+    impl Drop for Release {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+    struct Payload {
+        value: u64,
+        at: (i32, i32),
+        alive: Arc<()>,
+    }
+    struct Probe {
+        worker_started: mpsc::Sender<()>,
+        worker_gate: Mutex<Option<mpsc::Receiver<()>>>,
+        events: mpsc::Sender<NativeWorkOrigin>,
+        gates: Mutex<VecDeque<(NativeWorkOrigin, mpsc::Receiver<()>)>>,
+        failure: Mutex<Option<String>>,
+        seen: Mutex<Vec<(u64, usize)>>,
+        load: bool,
+        panic_init: bool,
+        panic_job: bool,
+    }
+    impl Probe {
+        fn gate(&self, origin: NativeWorkOrigin) {
+            self.events.send(origin).unwrap();
+            let gate = {
+                let mut gates = self.gates.lock().unwrap();
+                gates
+                    .iter()
+                    .position(|(wanted, _)| *wanted == origin)
+                    .and_then(|index| gates.remove(index).map(|(_, gate)| gate))
+            };
+            if let Some(gate) = gate {
+                gate.recv_timeout(WAIT).unwrap();
+            }
+            assert!(!self.panic_job, "controlled native job panic");
+        }
+        fn outcome(&self) -> Result<(), String> {
+            self.failure.lock().unwrap().clone().map_or(Ok(()), Err)
+        }
+    }
+    impl ChunkGenerator for Probe {
+        type Worker = ();
+        fn worker(&self) {
+            self.worker_started.send(()).unwrap();
+            if let Some(gate) = self.worker_gate.lock().unwrap().take() {
+                gate.recv_timeout(WAIT).unwrap();
+            }
+            assert!(
+                !self.panic_init,
+                "controlled native worker initialization panic"
+            );
+        }
+        fn load(&self, x: i32, z: i32) -> Option<Chunk> {
+            if self.load {
+                self.gate(NativeWorkOrigin::Generate);
+                Some(Chunk::empty(x, z))
+            } else {
+                None
+            }
+        }
+        fn proto(&self, _: &mut (), x: i32, z: i32) -> Proto {
+            self.gate(NativeWorkOrigin::Generate);
+            Box::new(Payload {
+                value: 91,
+                at: (x, z),
+                alive: Arc::new(()),
+            })
+        }
+        fn finish(&self, proto: Proto) -> Chunk {
+            self.gate(NativeWorkOrigin::Finish);
+            let payload = proto
+                .downcast::<Payload>()
+                .unwrap_or_else(|_| panic!("native payload type"));
+            assert_eq!(Arc::strong_count(&payload.alive), 1);
+            Chunk::empty(payload.at.0, payload.at.1)
+        }
+        fn save_protos(&self, protos: &[&Proto]) -> Result<(), String> {
+            self.gate(NativeWorkOrigin::Save);
+            for proto in protos {
+                let payload = proto.downcast_ref::<Payload>().unwrap();
+                self.seen
+                    .lock()
+                    .unwrap()
+                    .push((payload.value, payload as *const Payload as usize));
+            }
+            self.outcome()
+        }
+        fn save_finished(&self, chunk: &Arc<Chunk>) -> Result<(), String> {
+            self.gate(NativeWorkOrigin::SaveFinishedCallback);
+            assert_eq!(
+                chunk.entities[0].get("payload"),
+                Some(&horizon_world::nbt::Tag::Long(731))
+            );
+            self.outcome()
+        }
+    }
+    fn fixture(
+        threads: usize,
+        load: bool,
+        panic_init: bool,
+        panic_job: bool,
+    ) -> (
+        Streaming,
+        Arc<Probe>,
+        mpsc::Receiver<()>,
+        mpsc::Receiver<NativeWorkOrigin>,
+        Release,
+    ) {
+        let (worker_started, workers) = mpsc::channel();
+        let (release, worker_gate) = mpsc::channel();
+        let (events, received) = mpsc::channel();
+        let probe = Arc::new(Probe {
+            worker_started,
+            worker_gate: Mutex::new(Some(worker_gate)),
+            events,
+            gates: Mutex::new(VecDeque::new()),
+            failure: Mutex::new(None),
+            seen: Mutex::new(Vec::new()),
+            load,
+            panic_init,
+            panic_job,
+        });
+        let mut streaming = Streaming::new(probe.clone(), context(), threads);
+        streaming.remote = true;
+        streaming.mesh = false;
+        (streaming, probe, workers, received, Release(Some(release)))
+    }
+    fn gate(probe: &Probe, origin: NativeWorkOrigin) -> Release {
+        let (send, receive) = mpsc::channel();
+        probe.gates.lock().unwrap().push_back((origin, receive));
+        Release(Some(send))
+    }
+    fn counts(streaming: &Streaming, origin: NativeWorkOrigin) -> NativeWorkCounts {
+        streaming.observe_native_work().origins[origin as usize].1
+    }
+    fn payload(value: u64, at: (i32, i32)) -> (Proto, std::sync::Weak<()>, usize) {
+        let alive = Arc::new(());
+        let weak = Arc::downgrade(&alive);
+        let boxed = Box::new(Payload { value, at, alive });
+        let ptr = &*boxed as *const Payload as usize;
+        (boxed, weak, ptr)
+    }
+    fn world() -> World {
+        World::new(
+            context()
+                .assets
+                .registry
+                .default_state("minecraft:air")
+                .unwrap(),
+            0,
+        )
+    }
+
+    #[test]
+    #[ignore = "owned prepared resources: actual native handoffs and borrowed observation"]
+    fn native_work_borrowed_observation_and_explicit_origin_handoffs() {
+        let (mut streaming, probe, workers, events, mut worker_release) =
+            fixture(1, false, false, false);
+        workers.recv_timeout(WAIT).unwrap();
+        let mut generate_release = gate(&probe, NativeWorkOrigin::Generate);
+        let mut finish_release = gate(&probe, NativeWorkOrigin::Finish);
+        let (finish, finish_alive, _) = payload(72, (0, 0));
+        streaming.submit(None, 0, Job::Generate(1, 0));
+        streaming.submit(None, 0, Job::Finish(finish));
+        let before = streaming.observe_native_work();
+        for _ in 0..3 {
+            assert_eq!(streaming.observe_native_work(), before);
+        }
+        assert_eq!(streaming.shared.queue.lock().unwrap().len(), 2);
+        assert_eq!(counts(&streaming, NativeWorkOrigin::Generate).queued, 1);
+        assert_eq!(counts(&streaming, NativeWorkOrigin::Finish).queued, 1);
+        assert!(finish_alive.upgrade().is_some());
+        worker_release.release();
+        assert_eq!(
+            events.recv_timeout(WAIT).unwrap(),
+            NativeWorkOrigin::Generate
+        );
+        assert_eq!(
+            counts(&streaming, NativeWorkOrigin::Generate).worker_held,
+            1
+        );
+        generate_release.release();
+        assert_eq!(events.recv_timeout(WAIT).unwrap(), NativeWorkOrigin::Finish);
+        assert_eq!(counts(&streaming, NativeWorkOrigin::Generate).returned, 1);
+        assert_eq!(counts(&streaming, NativeWorkOrigin::Finish).worker_held, 1);
+        streaming.wait(WAIT);
+        let Done::Proto(1, 0, ref proto, false) = streaming.deferred[0] else {
+            panic!("actual proto result")
+        };
+        assert_eq!(proto.downcast_ref::<Payload>().unwrap().value, 91);
+        assert_eq!(
+            streaming.deferred_owners[0].1.origin,
+            NativeWorkOrigin::Generate
+        );
+        assert_eq!(
+            streaming.require_pristine_fixture_capture(),
+            Err(CapturePristineError::PreviouslySubmitted)
+        );
+        finish_release.release();
+        streaming.wait(WAIT);
+        assert!(finish_alive.upgrade().is_none());
+        assert_eq!(
+            streaming.deferred_owners[1].1.origin,
+            NativeWorkOrigin::Finish
+        );
+        let mut world = world();
+        streaming.update(&mut world);
+        assert_eq!(counts(&streaming, NativeWorkOrigin::Generate).disposed, 1);
+        assert_eq!(counts(&streaming, NativeWorkOrigin::Finish).disposed, 1);
+        assert!(!streaming.observe_native_work().receipt_mismatch);
+        assert_eq!(
+            streaming.require_pristine_fixture_capture(),
+            Err(CapturePristineError::PreviouslySubmitted)
+        );
+        let region: Box<[Proto; 9]> = Box::new(std::array::from_fn(|i| {
+            Box::new(Payload {
+                value: 100 + i as u64,
+                at: (9 + (i % 3) as i32, 9 + (i / 3) as i32),
+                alive: Arc::new(()),
+            }) as Proto
+        }));
+        let expected: Vec<_> = region
+            .iter()
+            .map(|proto| {
+                let payload = proto.downcast_ref::<Payload>().unwrap();
+                (
+                    payload.at,
+                    payload.value,
+                    payload as *const Payload as usize,
+                )
+            })
+            .collect();
+        streaming.decorating = 1;
+        streaming.submit(None, 0, Job::Decorate(10, 10, region));
+        streaming.wait(WAIT);
+        assert_eq!(counts(&streaming, NativeWorkOrigin::Decorate).returned, 1);
+        streaming.reconcile_ready_save_results(&mut world);
+        assert_eq!(counts(&streaming, NativeWorkOrigin::Decorate).disposed, 1);
+        for (at, value, address) in expected {
+            let payload = streaming.protos[&at]
+                .as_ref()
+                .unwrap()
+                .downcast_ref::<Payload>()
+                .unwrap();
+            assert_eq!(
+                (payload.value, payload as *const Payload as usize),
+                (value, address)
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "owned prepared resources: native light and mesh cancelled indexes retain results"]
+    fn native_work_forget_reload_and_stale_result_disposal_keep_ownership() {
+        let (mut streaming, probe, workers, events, mut worker_release) =
+            fixture(1, false, false, false);
+        workers.recv_timeout(WAIT).unwrap();
+        let mut save_release = gate(&probe, NativeWorkOrigin::Save);
+        let (light_entered, light_started) = mpsc::channel();
+        let (light_release, light_gate) = mpsc::channel();
+        *streaming.shared.work_gate.lock().unwrap() = Some(WorkGate {
+            origin: NativeWorkOrigin::Light,
+            entered: light_entered,
+            release: light_gate,
+        });
+        let mut light_release = Release(Some(light_release));
+        let mut world = world();
+        world.chunks.insert((0, 0), Arc::new(Chunk::empty(0, 0)));
+        let region = || {
+            Box::new(std::array::from_fn(|z| {
+                std::array::from_fn(|x| Some(Arc::new(Chunk::empty(x as i32 - 1, z as i32 - 1))))
+            }))
+        };
+        streaming.lighting.insert((0, 0), 41);
+        streaming.meshing.insert((0, 0, 0), 42);
+        streaming.submit(None, 0, Job::Light(0, 0, region(), 41, true));
+        streaming.submit(
+            None,
+            0,
+            Job::Mesh(
+                0,
+                0,
+                0,
+                region(),
+                42,
+                MeshSettings {
+                    nether: false,
+                    zoom: BiomeZoom::new(0),
+                    blend_radius: 0,
+                    smooth_lighting: true,
+                    cutout_leaves: false,
+                },
+            ),
+        );
+        let (save, alive, address) = payload(115, (4, 4));
+        streaming.submit(None, 0, Job::Save(vec![((4, 4), save)]));
+        worker_release.release();
+        light_started.recv_timeout(WAIT).unwrap();
+        assert_eq!(counts(&streaming, NativeWorkOrigin::Light).worker_held, 1);
+        assert_eq!(counts(&streaming, NativeWorkOrigin::Mesh).queued, 1);
+        let held = streaming.forget(&mut world, 0, 0).unwrap();
+        streaming.reload_resources(&mut world, context());
+        assert!(streaming.lighting.is_empty() && streaming.meshing.is_empty());
+        assert_eq!(counts(&streaming, NativeWorkOrigin::Light).worker_held, 1);
+        assert_eq!(counts(&streaming, NativeWorkOrigin::Mesh).queued, 1);
+        light_release.release();
+        assert_eq!(events.recv_timeout(WAIT).unwrap(), NativeWorkOrigin::Save);
+        assert_eq!(counts(&streaming, NativeWorkOrigin::Light).returned, 1);
+        assert_eq!(counts(&streaming, NativeWorkOrigin::Mesh).returned, 1);
+        let before = streaming.observe_native_work();
+        assert_eq!(streaming.observe_native_work(), before);
+        assert_eq!(
+            before.origins[NativeWorkOrigin::Save as usize]
+                .1
+                .worker_held,
+            1
+        );
+        assert!(alive.upgrade().is_some());
+        streaming.wait(WAIT);
+        streaming.wait(WAIT);
+        assert_eq!(streaming.deferred.len(), 2);
+        assert_eq!(counts(&streaming, NativeWorkOrigin::Light).returned, 1);
+        streaming.update(&mut world); // Native stale sequence branches dispose both results.
+        assert_eq!(counts(&streaming, NativeWorkOrigin::Light).disposed, 1);
+        assert_eq!(counts(&streaming, NativeWorkOrigin::Mesh).disposed, 1);
+        assert_eq!(held.x, 0);
+        save_release.release();
+        streaming.wait(WAIT);
+        let Done::Saved(ref protos, Ok(())) = streaming.deferred[0] else {
+            panic!("native save result")
+        };
+        assert_eq!(
+            protos[0].1.downcast_ref::<Payload>().unwrap() as *const Payload as usize,
+            address
+        );
+        assert_eq!(*probe.seen.lock().unwrap(), [(115, address)]);
+        // This test submitted a bare save directly; restore its native checkout count.
+        streaming.saving = 1;
+        streaming.reconcile_ready_save_results(&mut world);
+        assert_eq!(
+            counts(&streaming, NativeWorkOrigin::Save).accepted_storage_handoffs,
+            1
+        );
+        assert_eq!(counts(&streaming, NativeWorkOrigin::Save).disposed, 1);
+        assert!(alive.upgrade().is_some());
+    }
+
+    #[test]
+    #[ignore = "owned prepared resources: synchronous callbacks and native save failure retention"]
+    fn native_work_storage_callbacks_report_enqueue_acceptance_and_partial_failure() {
+        let (mut streaming, probe, workers, events, mut worker_release) =
+            fixture(1, false, false, false);
+        workers.recv_timeout(WAIT).unwrap();
+        worker_release.release();
+        let mut world = world();
+        let (proto, alive, address) = payload(991, (0, 0));
+        streaming.protos.insert((0, 0), Some(proto));
+        streaming.written.insert((0, 0));
+        streaming
+            .save_until(&mut world, Instant::now() + WAIT)
+            .unwrap();
+        assert_eq!(events.recv_timeout(WAIT).unwrap(), NativeWorkOrigin::Save);
+        assert_eq!(
+            counts(&streaming, NativeWorkOrigin::SaveProtosCallback).accepted_storage_handoffs,
+            1
+        );
+        assert_eq!(*probe.seen.lock().unwrap(), [(991, address)]);
+        assert!(alive.upgrade().is_some());
+        *probe.failure.lock().unwrap() =
+            Some("controlled accepted-prefix/entity-enqueue failure".into());
+        streaming.written.insert((0, 0));
+        assert!(
+            streaming
+                .save_until(&mut world, Instant::now() + WAIT)
+                .is_err()
+        );
+        assert_eq!(
+            streaming.protos[&(0, 0)]
+                .as_ref()
+                .unwrap()
+                .downcast_ref::<Payload>()
+                .unwrap() as *const Payload as usize,
+            address
+        );
+        assert!(streaming.written.contains(&(0, 0)));
+        let c = counts(&streaming, NativeWorkOrigin::SaveProtosCallback);
+        assert_eq!(
+            (c.accepted_storage_handoffs, c.storage_errors, c.unresolved),
+            (1, 1, 1)
+        );
+        assert!(streaming.generation_save_error().is_some());
+        assert_eq!(events.recv_timeout(WAIT).unwrap(), NativeWorkOrigin::Save);
+        // A separate real callback retains its complete failed column, including NBT.
+        let (mut finished, finished_probe, started, _finished_events, mut release) =
+            fixture(1, false, false, false);
+        started.recv_timeout(WAIT).unwrap();
+        release.release();
+        *finished_probe.failure.lock().unwrap() = Some("partial native finished enqueue".into());
+        let mut chunk = Chunk::empty(1000, 1000);
+        chunk.fresh = true;
+        chunk.entities.push(horizon_world::nbt::Tag::compound([(
+            "payload",
+            horizon_world::nbt::Tag::Long(731),
+        )]));
+        finished.receive_generated(chunk, &mut world);
+        let saved = &finished.failed_finished[0];
+        assert_eq!(
+            saved.entities[0].get("payload"),
+            Some(&horizon_world::nbt::Tag::Long(731))
+        );
+        let ptr = Arc::as_ptr(saved);
+        let before = finished.observe_native_work();
+        assert_eq!(finished.observe_native_work(), before);
+        assert_eq!(Arc::as_ptr(&finished.failed_finished[0]), ptr);
+        let c = counts(&finished, NativeWorkOrigin::SaveFinishedCallback);
+        assert_eq!(
+            (c.storage_errors, c.unresolved, c.accepted_storage_handoffs),
+            (1, 1, 0)
+        );
+        let (mut asynchronous, async_probe, started, _async_events, mut release) =
+            fixture(1, false, false, false);
+        started.recv_timeout(WAIT).unwrap();
+        *async_probe.failure.lock().unwrap() = Some("native worker storage refusal".into());
+        let (proto, alive, address) = payload(882, (2, 3));
+        asynchronous.protos.insert((2, 3), Some(proto));
+        asynchronous.written.insert((2, 3));
+        asynchronous.save(&mut world, false).unwrap();
+        assert!(asynchronous.protos[&(2, 3)].is_none());
+        release.release();
+        asynchronous.wait(WAIT);
+        assert_eq!(counts(&asynchronous, NativeWorkOrigin::Save).returned, 1);
+        assert!(
+            asynchronous
+                .save_until(&mut world, Instant::now() + WAIT)
+                .is_err()
+        );
+        let retained = asynchronous.protos[&(2, 3)]
+            .as_ref()
+            .unwrap()
+            .downcast_ref::<Payload>()
+            .unwrap();
+        assert_eq!(
+            (retained.value, retained as *const Payload as usize),
+            (882, address)
+        );
+        assert!(alive.upgrade().is_some() && asynchronous.written.contains(&(2, 3)));
+        let c = counts(&asynchronous, NativeWorkOrigin::Save);
+        assert_eq!(
+            (c.storage_errors, c.accepted_storage_handoffs, c.disposed),
+            (1, 0, 1)
+        );
+    }
+
+    #[test]
+    #[ignore = "owned prepared resources: concurrent native workers pair send receipts in order"]
+    fn native_work_concurrent_native_sends_preserve_origin_and_payload_pairing() {
+        let (mut streaming, probe, workers, events, mut release) = fixture(2, true, false, false);
+        workers.recv_timeout(WAIT).unwrap();
+        workers.recv_timeout(WAIT).unwrap();
+        let mut generate_release = gate(&probe, NativeWorkOrigin::Generate);
+        let mut finish_release = gate(&probe, NativeWorkOrigin::Finish);
+        let (finish, alive, _) = payload(19, (7, 8));
+        streaming.submit(None, 0, Job::Generate(5, 6));
+        streaming.submit(None, 0, Job::Finish(finish));
+        release.release();
+        let mut entered = [
+            events.recv_timeout(WAIT).unwrap(),
+            events.recv_timeout(WAIT).unwrap(),
+        ];
+        entered.sort_by_key(|origin| *origin as usize);
+        assert_eq!(
+            entered,
+            [NativeWorkOrigin::Generate, NativeWorkOrigin::Finish]
+        );
+        assert_eq!(
+            counts(&streaming, NativeWorkOrigin::Generate).worker_held,
+            1
+        );
+        assert_eq!(counts(&streaming, NativeWorkOrigin::Finish).worker_held, 1);
+        assert!(alive.upgrade().is_some());
+        generate_release.release();
+        finish_release.release();
+        streaming.wait(WAIT);
+        streaming.wait(WAIT);
+        assert_eq!(streaming.deferred.len(), 2);
+        for (index, owner) in &streaming.deferred_owners {
+            let Done::Generated(ref chunk) = streaming.deferred[*index] else {
+                panic!("native generated result")
+            };
+            assert_eq!(
+                (chunk.x, chunk.z),
+                match owner.origin {
+                    NativeWorkOrigin::Generate => (5, 6),
+                    NativeWorkOrigin::Finish => (7, 8),
+                    _ => panic!("lost origin"),
+                }
+            );
+        }
+        assert!(alive.upgrade().is_none());
+        let mut world = world();
+        assert!(
+            !streaming
+                .poll_save_budget(&mut world, Duration::ZERO)
+                .unwrap()
+        );
+        assert_eq!(
+            streaming.deferred.len(),
+            1,
+            "early native receive preserves its owned tail"
+        );
+        assert_eq!(streaming.deferred_owners.len(), 1);
+        let tail = streaming.deferred_owners[0].1.origin;
+        assert_eq!(counts(&streaming, tail).returned, 1);
+        assert_eq!(counts(&streaming, tail).disposed, 0);
+        streaming.update(&mut world);
+        assert_eq!(counts(&streaming, NativeWorkOrigin::Generate).disposed, 1);
+        assert_eq!(counts(&streaming, NativeWorkOrigin::Finish).disposed, 1);
+        assert!(!streaming.observe_native_work().receipt_mismatch);
+    }
+
+    #[test]
+    #[ignore = "owned prepared resources: native panic disconnection and unprocessed Drop"]
+    fn native_work_worker_faults_failed_send_and_unprocessed_drop_stay_named() {
+        {
+            let (streaming, _probe, workers, _events, mut release) =
+                fixture(1, false, false, false);
+            workers.recv_timeout(WAIT).unwrap();
+            let shared = streaming.shared.clone();
+            let (idle_entered, idle_seen) = mpsc::channel();
+            let (idle_release, idle_gate) = mpsc::channel();
+            let mut idle_release = Release(Some(idle_release));
+            *shared.idle_wait_gate.lock().unwrap() = Some(IdleWaitGate {
+                entered: idle_entered,
+                release: idle_gate,
+            });
+            let (shutdown, shutdown_seen) = mpsc::channel();
+            *shared.shutdown_events.lock().unwrap() = Some(shutdown);
+            release.release();
+            idle_seen.recv_timeout(WAIT).unwrap();
+            // The actual worker has checked stop=false and an empty queue,
+            // and still holds that same mutex immediately before its wait.
+            let (completed, completion) = mpsc::channel();
+            let dropping = thread::spawn(move || {
+                drop(streaming);
+                let _ = completed.send(());
+            });
+            let first = shutdown_seen.recv_timeout(WAIT);
+            let stop_while_worker_holds_queue = shared.stop.load(Ordering::Relaxed);
+            idle_release.release();
+            let rescue = || {
+                // Baseline publishes/notifies before this worker enters wait.
+                // Acquire its queue mutex after releasing the gate, so this
+                // failure-only wake cannot itself fall into the pre-wait gap.
+                let queue = shared.queue.lock().unwrap_or_else(|e| e.into_inner());
+                shared.ready.notify_all();
+                drop(queue);
+            };
+            if first != Ok(ShutdownEvent::QueueContended) {
+                rescue();
+            }
+            let mut finished = completion.recv_timeout(WAIT);
+            let completed_before_rescue = finished.is_ok();
+            if finished.is_err() {
+                rescue();
+                finished = completion.recv_timeout(WAIT);
+            }
+            if finished.is_err() {
+                // A broken shutdown must fail this bounded test, not join
+                // indefinitely. No such detachment occurs on the passing path.
+                drop(dropping);
+                panic!("native idle Streaming::drop did not finish after the rescue wake");
+            }
+            dropping.join().unwrap();
+            assert_eq!(first, Ok(ShutdownEvent::QueueContended));
+            assert!(
+                completed_before_rescue,
+                "normal idle shutdown failed; a cleanup rescue cannot qualify as success"
+            );
+            assert!(!stop_while_worker_holds_queue);
+            assert_eq!(
+                shutdown_seen.recv_timeout(WAIT),
+                Ok(ShutdownEvent::Published)
+            );
+            assert!(shared.stop.load(Ordering::Relaxed));
+            let book = shared.ownership.lock().unwrap();
+            assert_eq!(book.initialized_workers, 1);
+            assert!(!book.worker_initialization_fault && !book.worker_exit_fault);
+            assert!(
+                book.counts
+                    .iter()
+                    .all(|counts| *counts == NativeWorkCounts::default())
+            );
+        }
+        for blocking in [false, true] {
+            let (mut streaming, _probe, workers, _events, mut release) =
+                fixture(1, false, false, false);
+            workers.recv_timeout(WAIT).unwrap();
+            release.release();
+            let (send, receive) = mpsc::channel();
+            drop(send);
+            streaming.results = receive;
+            assert!(!streaming.observe_native_work().result_disconnected);
+            let mut world = world();
+            if blocking {
+                streaming
+                    .save_until(&mut world, Instant::now() + WAIT)
+                    .unwrap();
+            } else {
+                streaming.save(&mut world, false).unwrap();
+            }
+            assert!(
+                streaming.observe_native_work().result_disconnected,
+                "idle direct reconciliation must name disconnection"
+            );
+        }
+        for (panic_init, panic_job, disconnect) in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            let (mut streaming, _probe, workers, _events, mut release) =
+                fixture(1, false, panic_init, panic_job);
+            workers.recv_timeout(WAIT).unwrap();
+            let book = streaming.shared.ownership.clone();
+            let (proto, alive, _) = payload(87, (0, 0));
+            streaming.submit(None, 0, Job::Finish(proto));
+            if disconnect {
+                let (send, receive) = mpsc::channel();
+                drop(send);
+                streaming.results = receive;
+            }
+            release.release();
+            for handle in streaming.threads.drain(..) {
+                assert_eq!(handle.join().is_err(), panic_init || panic_job);
+            }
+            let observation = streaming.observe_native_work();
+            assert_eq!(observation.worker_initialization_fault, panic_init);
+            assert_eq!(observation.worker_exit_fault, !panic_init);
+            assert_eq!(observation.result_disconnected, disconnect);
+            if panic_init {
+                assert!(alive.upgrade().is_some());
+            }
+            drop(streaming);
+            assert!(alive.upgrade().is_none());
+            assert_eq!(
+                book.lock().unwrap().counts[NativeWorkOrigin::Finish as usize].unresolved,
+                1
+            );
+        }
+        let (mut streaming, _probe, workers, _events, mut release) =
+            fixture(1, false, false, false);
+        workers.recv_timeout(WAIT).unwrap();
+        let book = streaming.shared.ownership.clone();
+        streaming.submit(None, 0, Job::Generate(0, 0));
+        release.release();
+        streaming.wait(WAIT);
+        let Done::Proto(_, _, ref proto, _) = streaming.deferred[0] else {
+            panic!()
+        };
+        let alive = Arc::downgrade(&proto.downcast_ref::<Payload>().unwrap().alive);
+        assert_eq!(counts(&streaming, NativeWorkOrigin::Generate).returned, 1);
+        assert!(alive.upgrade().is_some());
+        drop(streaming);
+        assert!(alive.upgrade().is_none());
+        assert_eq!(
+            book.lock().unwrap().counts[NativeWorkOrigin::Generate as usize].unresolved,
+            1
+        );
+    }
+
+    #[test]
+    fn native_work_checked_exhaustion_retains_fault_without_wrapping() {
+        let book = Arc::new(Mutex::new(OwnershipBook::default()));
+        {
+            let mut state = book.lock().unwrap();
+            let c = &mut state.counts[NativeWorkOrigin::Generate as usize];
+            c.submitted = u64::MAX;
+            c.queued = u64::MAX;
+            c.accepted_storage_handoffs = u64::MAX;
+            c.unresolved = u64::MAX;
+        }
+        let lease = WorkLease::new(&book, NativeWorkOrigin::Generate, WorkPhase::Queued);
+        lease.storage(true);
+        drop(lease);
+        let state = book.lock().unwrap();
+        assert!(state.accounting_fault);
+        let c = state.counts[NativeWorkOrigin::Generate as usize];
+        assert_eq!(
+            (
+                c.submitted,
+                c.queued,
+                c.accepted_storage_handoffs,
+                c.unresolved
+            ),
+            (u64::MAX, u64::MAX, u64::MAX, u64::MAX)
+        );
     }
 }

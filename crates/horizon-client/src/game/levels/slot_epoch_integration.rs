@@ -994,3 +994,5 @@ mod advance_tests;
 mod recapture_tests;
 #[path = "slot_epoch_integration_tests.rs"]
 mod tests;
+#[path = "used_streamer_tick_tests.rs"]
+mod used_streamer_tests;
