@@ -29,6 +29,8 @@ const MANIFEST_LIMIT: usize = 256 << 10;
 const NODE_LIMIT: usize = 16_384;
 const NBT_LIMIT: usize = 1 << 20;
 const OWNER_RECORD: [i32; 4] = [-1, -2, 3, 4];
+const SLOT_MEMBER: &str = "world/data/horizon/slot_checkpoint.nbt";
+const SLOT_KIND: &str = "fresh-native-slot-capture-cell";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -81,6 +83,7 @@ pub(in crate::game) enum Failure {
     Limit,
     Path,
     Identity,
+    Profile,
     NativeSave,
     Io,
     InvalidImage,
@@ -196,6 +199,10 @@ fn json_bytes<T: Serialize>(value: &T, cap: usize) -> CResult<Vec<u8>> {
 }
 struct Budget {
     nodes: usize,
+    probe: bool,
+    duplicate: bool,
+    slot_kind: bool,
+    slot_schema: bool,
 }
 struct Seed<'a> {
     budget: &'a mut Budget,
@@ -261,14 +268,26 @@ impl<'de> Visitor<'de> for Seed<'_> {
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> std::result::Result<Value, A::Error> {
         let mut values = serde_json::Map::new();
         while let Some(key) = map.next_key::<String>()? {
-            if key.len() > 4096 || values.contains_key(&key) || self.budget.nodes >= NODE_LIMIT {
+            if key.len() > 4096 || self.budget.nodes >= NODE_LIMIT {
                 return Err(de::Error::custom("JSON key/duplicate bound"));
+            }
+            if values.contains_key(&key) {
+                if !self.budget.probe {
+                    return Err(de::Error::custom("JSON key/duplicate bound"));
+                }
+                self.budget.duplicate = true;
             }
             self.budget.nodes += 1;
             let value = map.next_value_seed(Seed {
                 budget: &mut *self.budget,
                 depth: self.depth + 1,
             })?;
+            if self.depth == 0 && key == "kind" && value.as_str() == Some(SLOT_KIND) {
+                self.budget.slot_kind = true;
+            }
+            if self.depth == 0 && key == "schema" && value.as_u64() == Some(2) {
+                self.budget.slot_schema = true;
+            }
             values.insert(key, value);
         }
         Ok(Value::Object(values))
@@ -278,7 +297,13 @@ fn parse_json<T: DeserializeOwned>(bytes: &[u8], cap: usize) -> CResult<T> {
     if bytes.len() > cap {
         return Err(limit(Phase::Recover));
     }
-    let mut budget = Budget { nodes: 0 };
+    let mut budget = Budget {
+        nodes: 0,
+        probe: false,
+        duplicate: false,
+        slot_kind: false,
+        slot_schema: false,
+    };
     let mut deserializer = serde_json::Deserializer::from_slice(bytes);
     let value = Seed {
         budget: &mut budget,
@@ -288,6 +313,32 @@ fn parse_json<T: DeserializeOwned>(bytes: &[u8], cap: usize) -> CResult<T> {
     .map_err(|e| invalid(Phase::Recover, e))?;
     deserializer.end().map_err(|e| invalid(Phase::Recover, e))?;
     serde_json::from_value(value).map_err(|e| invalid(Phase::Recover, e))
+}
+/// Same structural budget; duplicate retention is classification ONLY, never admission.
+fn envelope_probe(bytes: &[u8]) -> CResult<(Value, bool, bool)> {
+    if bytes.len() > MANIFEST_LIMIT {
+        return Err(limit(Phase::Recover));
+    }
+    let mut budget = Budget {
+        nodes: 0,
+        probe: true,
+        duplicate: false,
+        slot_kind: false,
+        slot_schema: false,
+    };
+    let mut decoder = serde_json::Deserializer::from_slice(bytes);
+    let value = Seed {
+        budget: &mut budget,
+        depth: 0,
+    }
+    .deserialize(&mut decoder)
+    .map_err(|e| invalid(Phase::Recover, e))?;
+    decoder.end().map_err(|e| invalid(Phase::Recover, e))?;
+    let known_slot = budget.slot_kind || (budget.slot_schema && value.get("slot_path").is_some());
+    Ok((value, budget.duplicate, known_slot))
+}
+fn profile_error(detail: impl fmt::Display) -> CaptureError {
+    CaptureError::new(Phase::Recover, Failure::Profile, None, detail)
 }
 fn tag_bounds(root: &Tag) -> CResult<()> {
     let mut work = vec![(root, 0usize)];
@@ -857,6 +908,9 @@ impl PendingImage {
         sync_tree(&self.root, Phase::SyncMembers)
     }
     fn write_manifest_temp(&mut self) -> CResult<()> {
+        self.write_manifest_temp_for(RecoveryProfile::ArchiveOnly)
+    }
+    fn write_manifest_temp_for(&mut self, profile: RecoveryProfile) -> CResult<()> {
         let entries = tree(&self.root, &[], Phase::Manifest)?;
         let mut players: Vec<_> = self.players.iter().map(|r| r.descriptor.clone()).collect();
         players.sort_by(|a, b| a.record_uuid.cmp(&b.record_uuid));
@@ -872,7 +926,23 @@ impl PendingImage {
             files: entries.files,
         };
         validate_manifest(&manifest, self.request.epoch, &self.request.identity)?;
-        let bytes = json_bytes(&manifest, MANIFEST_LIMIT)?;
+        let bytes = if profile == RecoveryProfile::ActiveSlot {
+            let slot =
+                counter_restore_integration::slot_epoch_integration::SlotManifest::from_manifest(
+                    manifest.clone(),
+                );
+            slot.validate(&self.request.identity, self.request.epoch)?;
+            json_bytes(&slot, MANIFEST_LIMIT)?
+        } else {
+            if manifest
+                .files
+                .iter()
+                .any(|member| member.path == SLOT_MEMBER)
+            {
+                return Err(profile_error("legacy publisher cannot ignore slot member"));
+            }
+            json_bytes(&manifest, MANIFEST_LIMIT)?
+        };
         let path = self.root.join("manifest.json.tmp");
         write_bytes(&path, &bytes, true, Phase::Manifest)?;
         File::open(&path)
@@ -898,11 +968,16 @@ impl PendingImage {
         sync_dir(&self.root, Phase::Manifest)
     }
     fn rename_published(self) -> CResult<PromotedImage> {
+        self.rename_published_for(RecoveryProfile::ArchiveOnly)
+    }
+    fn rename_published_for(self, profile: RecoveryProfile) -> CResult<PromotedImage> {
         let manifest = self
             .manifest
             .as_ref()
             .ok_or_else(|| invalid(Phase::Promote, "manifest absent"))?;
-        verify_image(&self.root, self.request.epoch, &self.request.identity)?;
+        let envelope =
+            verify_complete_envelope(&self.root, self.request.epoch, &self.request.identity)?;
+        check_recovery_profile(&envelope.manifest, envelope.slot_manifest.as_ref(), profile)?;
         let destination = self
             .request
             .archive_root
@@ -1088,10 +1163,21 @@ fn verify_image(root: &Path, epoch: u64, identity: &Identity) -> CResult<Manifes
     let bytes = bounded_read(&root.join("manifest.json"), MANIFEST_LIMIT, Phase::Recover)?;
     let manifest: Manifest = parse_json(&bytes, MANIFEST_LIMIT)?;
     validate_manifest(&manifest, epoch, identity)?;
+    verify_manifest_members(root, &manifest)?;
+    Ok(manifest)
+}
+fn verify_manifest_members(root: &Path, manifest: &Manifest) -> CResult<()> {
+    verify_manifest_physical(root, manifest)?;
+    verify_manifest_semantics(root, manifest)
+}
+fn verify_manifest_physical(root: &Path, manifest: &Manifest) -> CResult<()> {
     let actual = tree(root, &["manifest.json"], Phase::Recover)?;
     if actual.files != manifest.files || actual.directories != manifest.directories {
         return Err(invalid(Phase::Recover, "manifest entry/hash mismatch"));
     }
+    Ok(())
+}
+fn verify_manifest_semantics(root: &Path, manifest: &Manifest) -> CResult<()> {
     for row in &manifest.players {
         let bytes = bounded_read(
             &root.join(player_target(row, "data")),
@@ -1129,7 +1215,148 @@ fn verify_image(root: &Path, epoch: u64, identity: &Identity) -> CResult<Manifes
     {
         return Err(invalid(Phase::Recover, "counter archive descriptor"));
     }
-    Ok(manifest)
+    Ok(())
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecoveryProfile {
+    ArchiveOnly,
+    CounterOnly,
+    ActiveSlot,
+}
+struct CompleteEnvelope {
+    manifest: Manifest,
+    slot_manifest: Option<Value>,
+}
+fn check_recovery_profile(
+    manifest: &Manifest,
+    slot_manifest: Option<&Value>,
+    profile: RecoveryProfile,
+) -> CResult<()> {
+    let has_slot = manifest
+        .files
+        .iter()
+        .any(|member| member.path == SLOT_MEMBER);
+    match profile {
+        RecoveryProfile::ArchiveOnly | RecoveryProfile::CounterOnly
+            if slot_manifest.is_some() || has_slot =>
+        {
+            return Err(profile_error(
+                "selected slot owner requires slot recovery profile",
+            ));
+        }
+        RecoveryProfile::ActiveSlot => {
+            let value =
+                slot_manifest.ok_or_else(|| profile_error("selected epoch has no slot profile"))?;
+            let slot: counter_restore_integration::slot_epoch_integration::SlotManifest =
+                serde_json::from_value(value.clone()).map_err(profile_error)?;
+            slot.validate(&manifest.identity, manifest.epoch)?;
+        }
+        _ => {}
+    }
+    if matches!(
+        profile,
+        RecoveryProfile::CounterOnly | RecoveryProfile::ActiveSlot
+    ) && !manifest
+        .files
+        .iter()
+        .any(|member| member.path == counter_restore_integration::FRAME_PATH)
+    {
+        return Err(profile_error("selected epoch lacks native counter frame"));
+    }
+    Ok(())
+}
+fn verify_complete_envelope(
+    root: &Path,
+    epoch: u64,
+    identity: &Identity,
+) -> CResult<CompleteEnvelope> {
+    let bytes = bounded_read(&root.join("manifest.json"), MANIFEST_LIMIT, Phase::Recover)?;
+    let (mut value, duplicate, known_slot) = envelope_probe(&bytes)?;
+    if !known_slot {
+        let manifest: Manifest = parse_json(&bytes, MANIFEST_LIMIT)?;
+        validate_manifest(&manifest, epoch, identity)?;
+        if manifest
+            .files
+            .iter()
+            .any(|member| member.path == SLOT_MEMBER)
+        {
+            return Err(profile_error(
+                "legacy envelope contains reserved slot owner member",
+            ));
+        }
+        verify_manifest_members(root, &manifest)?;
+        return Ok(CompleteEnvelope {
+            manifest,
+            slot_manifest: None,
+        });
+    }
+    // Identity remains a hard refusal even when known-profile fields are invalid.
+    let actual: Identity = serde_json::from_value(
+        value
+            .get("identity")
+            .cloned()
+            .ok_or_else(|| profile_error("slot identity missing"))?,
+    )
+    .map_err(profile_error)?;
+    actual.validate()?;
+    if &actual != identity {
+        return Err(CaptureError::new(
+            Phase::Recover,
+            Failure::Identity,
+            None,
+            "epoch build/content mismatch",
+        ));
+    }
+    if duplicate {
+        return Err(profile_error("duplicate known slot manifest field"));
+    }
+    if value.get("schema").and_then(Value::as_u64) != Some(2)
+        || value.get("kind").and_then(Value::as_str) != Some(SLOT_KIND)
+    {
+        return Err(profile_error("strict slot schema/kind mismatch"));
+    }
+    if value.get("slot_path").and_then(Value::as_str) != Some(SLOT_MEMBER) {
+        return Err(profile_error("slot_path required exact String"));
+    }
+    for required in [SLOT_MEMBER, counter_restore_integration::FRAME_PATH] {
+        let declared = value
+            .get("files")
+            .and_then(Value::as_array)
+            .is_some_and(|files| {
+                files
+                    .iter()
+                    .any(|member| member.get("path").and_then(Value::as_str) == Some(required))
+            });
+        if !declared {
+            return Err(profile_error(
+                "required slot/counter member missing from profile declaration",
+            ));
+        }
+    }
+    let raw = value.clone();
+    let map = value
+        .as_object_mut()
+        .ok_or_else(|| profile_error("slot manifest object"))?;
+    map.remove("slot_path");
+    map.insert("schema".into(), 1.into());
+    map.insert("kind".into(), "fresh-native-capture-cell".into());
+    let manifest: Manifest = serde_json::from_value(value).map_err(profile_error)?;
+    validate_manifest(&manifest, epoch, identity).map_err(|error| {
+        if error.code == Failure::Identity {
+            error
+        } else {
+            profile_error(error.detail)
+        }
+    })?;
+    // With coherent profile declarations, missing/hash-bad physical files use
+    // ordinary whole-envelope corruption fallback. Once bytes match, PLAYER and
+    // archive semantics are ranked refusals; they cannot select an older owner.
+    verify_manifest_physical(root, &manifest)?;
+    verify_manifest_semantics(root, &manifest).map_err(|error| profile_error(error.detail))?;
+    Ok(CompleteEnvelope {
+        manifest,
+        slot_manifest: Some(raw),
+    })
 }
 fn epoch_name(value: &str, prefix: &str) -> CResult<u64> {
     let suffix = value
@@ -1148,6 +1375,19 @@ fn select_fixture_epoch(
     archive_root: &Path,
     identity: &Identity,
     destination: &Path,
+) -> CResult<SelectedEpoch> {
+    select_fixture_epoch_for(
+        archive_root,
+        identity,
+        destination,
+        RecoveryProfile::ArchiveOnly,
+    )
+}
+fn select_fixture_epoch_for(
+    archive_root: &Path,
+    identity: &Identity,
+    destination: &Path,
+    profile: RecoveryProfile,
 ) -> CResult<SelectedEpoch> {
     identity.validate()?;
     let archive = owned_dir(archive_root)?;
@@ -1199,17 +1439,21 @@ fn select_fixture_epoch(
     let mut rejected = Vec::new();
     // Verify ALL published identities; a wrong-build epoch is not silently skipped.
     for (epoch, root) in candidates {
-        match verify_image(&root, epoch, identity) {
-            Ok(manifest) => selected = Some((root, manifest)),
+        match verify_complete_envelope(&root, epoch, identity) {
+            Ok(envelope) => selected = Some(Ok((root, envelope))),
             Err(error) if error.code == Failure::Identity => return Err(error),
+            Err(error) if error.code == Failure::Profile => selected = Some(Err(error)),
             Err(error) => rejected.push((epoch, error.detail)),
         }
     }
-    let (root, manifest) =
-        selected.ok_or_else(|| invalid(Phase::Recover, "no complete matching epoch"))?;
+    let (root, envelope) =
+        selected.ok_or_else(|| invalid(Phase::Recover, "no complete matching epoch"))??;
+    check_recovery_profile(&envelope.manifest, envelope.slot_manifest.as_ref(), profile)?;
     Ok(SelectedEpoch {
         root,
-        manifest,
+        manifest: envelope.manifest,
+        slot_manifest: envelope.slot_manifest,
+        profile,
         rejected,
         parent,
     })
@@ -1217,15 +1461,24 @@ fn select_fixture_epoch(
 struct SelectedEpoch {
     root: PathBuf,
     manifest: Manifest,
+    slot_manifest: Option<Value>,
+    profile: RecoveryProfile,
     rejected: Vec<(u64, String)>,
     parent: PathBuf,
 }
 fn copy_selected_epoch(selected: SelectedEpoch, destination: &Path) -> CResult<RecoveryReceipt> {
+    check_recovery_profile(
+        &selected.manifest,
+        selected.slot_manifest.as_ref(),
+        selected.profile,
+    )?;
     let SelectedEpoch {
         root,
         manifest,
         rejected,
         parent,
+        slot_manifest: _,
+        profile: _,
     } = selected;
     fresh_dir(destination, Phase::Recover)?;
     for dir in &manifest.directories {
@@ -1275,6 +1528,7 @@ fn recover_fixture_epoch(
 enum CaptureProfile {
     ArchivalOneColumn,
     NativeCounterPatch,
+    NativeSlotPatch,
 }
 impl Game<'_> {
     fn capture_cell_checks(&self) -> CResult<Vec<String>> {
@@ -1344,7 +1598,11 @@ impl Game<'_> {
         if let Some(tag) = &self.level.player_extra {
             tag_bounds(tag)?;
         }
-        self.observe_checkpoint_entity_owners().map_err(|e| {
+        let entity_owners = match profile {
+            CaptureProfile::NativeSlotPatch => self.observe_slot_epoch_entity_owners(),
+            _ => self.observe_checkpoint_entity_owners(),
+        };
+        entity_owners.map_err(|e| {
             CaptureError::new(Phase::Validate, Failure::Entity, None, format!("{e:?}"))
         })?;
         self.observe_checkpoint_world_owners().map_err(|e| {
@@ -1363,7 +1621,7 @@ impl Game<'_> {
                 CaptureProfile::ArchivalOneColumn => {
                     world.chunks.len() == 1 && world.chunks.contains_key(&(0, 0))
                 }
-                CaptureProfile::NativeCounterPatch => {
+                CaptureProfile::NativeCounterPatch | CaptureProfile::NativeSlotPatch => {
                     dimension == Dim::Overworld
                         && self.dim == Dim::Overworld
                         && world.chunks.len() == 9
@@ -1398,7 +1656,10 @@ impl Game<'_> {
                 "player dimension is not captured",
             ));
         }
-        if matches!(profile, CaptureProfile::NativeCounterPatch) {
+        if matches!(
+            profile,
+            CaptureProfile::NativeCounterPatch | CaptureProfile::NativeSlotPatch
+        ) {
             if dimensions != [Dim::Overworld.id()] {
                 return Err(invalid(Phase::Validate, "only native OW patch supported"));
             }

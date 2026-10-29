@@ -3,7 +3,7 @@ use super::*;
 use horizon_client::world::counter_restore::{
     CounterFrameV2, CounterTarget, NativeBinding, Placement, RuntimeCounterKey, WorldId,
 };
-const FRAME_PATH: &str = "world/data/horizon/counter_checkpoint.json";
+pub(super) const FRAME_PATH: &str = "world/data/horizon/counter_checkpoint.json";
 const FRAME_LIMIT: usize = 16 << 10;
 const POSITION: [i32; 3] = [2, 70, 2];
 fn native_error(phase: Phase, error: impl fmt::Display) -> CaptureError {
@@ -143,7 +143,12 @@ fn recover_machine_fixture_epoch(
     expected_world: WorldId,
     host_target: &CounterTarget,
 ) -> CResult<MachineRecovery> {
-    let selected = select_fixture_epoch(archive_root, identity, destination)?;
+    let selected = select_fixture_epoch_for(
+        archive_root,
+        identity,
+        destination,
+        RecoveryProfile::CounterOnly,
+    )?;
     // Refuse the selected envelope here; never borrow V2 from an older candidate.
     let frame = read_machine_image(
         &selected.root,
@@ -217,5 +222,7 @@ impl Game<'_> {
             .ok_or_else(|| invalid(Phase::Recover, "active placement required"))
     }
 }
+#[path = "slot_epoch_integration.rs"]
+pub(super) mod slot_epoch_integration;
 #[path = "counter_restore_integration_tests.rs"]
 mod tests;

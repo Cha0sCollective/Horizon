@@ -604,6 +604,14 @@ pub(in crate::game) struct EntityOwnerObservation {
 struct EntityOwnerLevel {
     dimension: Dim,
     resident_drops: usize,
+    #[cfg(all(test, target_os = "linux"))]
+    accounted_slots: u8,
+}
+#[cfg(feature = "paired-packages")]
+enum EntitySlotProfile {
+    Ordinary,
+    #[cfg(all(test, target_os = "linux"))]
+    SlotFixture,
 }
 
 #[cfg(feature = "paired-packages")]
@@ -649,6 +657,17 @@ fn inspect_entity_level(
     if world.has_world_slot_trial() {
         return Err(E::WorldSlotTrial { dimension });
     }
+    inspect_entity_level_owners(dimension, world, memory, dropped, unsupported)
+}
+#[cfg(feature = "paired-packages")]
+fn inspect_entity_level_owners(
+    dimension: Dim,
+    world: &World,
+    memory: &persist::EntityMemory,
+    dropped: &[ItemEntity],
+    unsupported: Option<UnsupportedEntityFamily>,
+) -> std::result::Result<EntityOwnerLevel, EntityOwnerObservationError> {
+    use EntityOwnerObservationError as E;
     if !world.loaded_entities.is_empty() {
         return Err(E::LoadedEntities { dimension });
     }
@@ -684,6 +703,8 @@ fn inspect_entity_level(
     Ok(EntityOwnerLevel {
         dimension,
         resident_drops: dropped.len(),
+        #[cfg(all(test, target_os = "linux"))]
+        accounted_slots: 0,
     })
 }
 #[cfg(feature = "paired-packages")]
@@ -692,6 +713,18 @@ impl Game<'_> {
     /// Current named ENTITY owners only; no player check, lasting barrier or readiness token.
     pub(in crate::game) fn observe_checkpoint_entity_owners(
         &self,
+    ) -> std::result::Result<EntityOwnerObservation, EntityOwnerObservationError> {
+        self.observe_entity_owners_profile(EntitySlotProfile::Ordinary)
+    }
+    #[cfg(all(test, target_os = "linux"))]
+    pub(in crate::game) fn observe_slot_epoch_entity_owners(
+        &self,
+    ) -> std::result::Result<EntityOwnerObservation, EntityOwnerObservationError> {
+        self.observe_entity_owners_profile(EntitySlotProfile::SlotFixture)
+    }
+    fn observe_entity_owners_profile(
+        &self,
+        profile: EntitySlotProfile,
     ) -> std::result::Result<EntityOwnerObservation, EntityOwnerObservationError> {
         use super::nether_portal::PortalEntityOwner;
         use EntityOwnerObservationError as E;
@@ -715,13 +748,32 @@ impl Game<'_> {
             .ok_or(E::Reservation)?;
         let mut levels = Vec::new();
         levels.try_reserve(count).map_err(|_| E::Reservation)?;
-        levels.push(inspect_entity_level(
-            self.dim,
-            &self.world,
-            &self.persist,
-            &self.dropped,
-            unsupported_entities!(self, self.creatures.projectiles),
-        )?);
+        let active = match profile {
+            EntitySlotProfile::Ordinary => inspect_entity_level(
+                self.dim,
+                &self.world,
+                &self.persist,
+                &self.dropped,
+                unsupported_entities!(self, self.creatures.projectiles),
+            ),
+            #[cfg(all(test, target_os = "linux"))]
+            EntitySlotProfile::SlotFixture => {
+                self.slot_epoch_projection()
+                    .map_err(|_| E::WorldSlotTrial {
+                        dimension: self.dim,
+                    })?;
+                let mut row = inspect_entity_level_owners(
+                    self.dim,
+                    &self.world,
+                    &self.persist,
+                    &self.dropped,
+                    unsupported_entities!(self, self.creatures.projectiles),
+                )?;
+                row.accounted_slots = 1;
+                Ok(row)
+            }
+        }?;
+        levels.push(active);
         for (&dimension, parked) in &self.levels.parked {
             levels.push(inspect_entity_level(
                 dimension,

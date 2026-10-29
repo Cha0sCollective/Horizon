@@ -49,7 +49,7 @@ fn disk(root: &Path) -> Disk {
     walk(root, &mut out);
     out
 }
-fn tickets(game: &mut Game<'_>, present: bool) {
+pub(super) fn tickets(game: &mut Game<'_>, present: bool) {
     let players = if present {
         game.lan
             .as_ref()
@@ -75,7 +75,7 @@ fn tickets(game: &mut Game<'_>, present: bool) {
     }));
     assert_eq!(game.tickets.levels().block_ticking(0, 0), present);
 }
-fn source(
+pub(super) fn source(
     fixture: &Fixture,
 ) -> (
     Game<'_>,
@@ -380,7 +380,10 @@ fn channel_guest(conn: u32) -> (Guest, mpsc::Receiver<Out>) {
     (g, rx)
 }
 /// Fresh native Game, no call to setup() and no trial until checked install at the end.
-fn loaded<'a>(fixture: &'a Fixture, root: &Path) -> (Game<'a>, Vec<mpsc::Receiver<Out>>) {
+pub(super) fn loaded<'a>(
+    fixture: &'a Fixture,
+    root: &Path,
+) -> (Game<'a>, Vec<mpsc::Receiver<Out>>) {
     let mut game = fixture.game();
     let _discarded_fresh_body = game.player.take();
     assert!(game.inventory.iter().all(Option::is_none));

@@ -86,6 +86,63 @@ pub struct DecodedSlotFrame {
     header: Box<Header>,
     allocation: Option<RestoreAllocation>,
 }
+/// Immutable context borrowed from the sole decoded candidate, without runtime authority.
+#[derive(Debug)]
+pub struct SlotFrameView<'a> {
+    pub world: WorldId,
+    pub dimension: &'a str,
+    pub position: [i32; 3],
+    pub package_identity: &'a str,
+    pub type_id: &'a str,
+    pub block_id: &'a str,
+    pub save_schema: u32,
+    pub observed_state: &'a str,
+    pub saved_game_time: i64,
+    pub machine_high_water: u64,
+    pub slot_high_water: u64,
+    pub allocation: SlotFrameAllocation<'a>,
+}
+#[derive(Debug)]
+pub enum SlotFrameAllocation<'a> {
+    Dormant,
+    Active {
+        slot_generation: u64,
+        machine_generation: u64,
+        revision: u64,
+        stack: Option<&'a ItemStack>,
+    },
+}
+impl DecodedSlotFrame {
+    pub fn view(&self) -> SlotFrameView<'_> {
+        let allocation = match self.allocation.as_ref() {
+            Some(value) => SlotFrameAllocation::Active {
+                slot_generation: value.generation,
+                // The private decoder validates this pair before constructing a frame.
+                machine_generation: self
+                    .header
+                    .machine_generation
+                    .expect("validated active slot generation"),
+                revision: value.revision,
+                stack: value.stack.as_ref(),
+            },
+            None => SlotFrameAllocation::Dormant,
+        };
+        SlotFrameView {
+            world: self.header.world,
+            dimension: &self.header.target.dimension,
+            position: self.header.target.position,
+            package_identity: &self.header.package,
+            type_id: &self.header.type_id,
+            block_id: &self.header.block_id,
+            save_schema: 1,
+            observed_state: &self.header.observed,
+            saved_game_time: self.header.time,
+            machine_high_water: self.header.machine_head,
+            slot_high_water: self.header.slot_head,
+            allocation,
+        }
+    }
+}
 #[derive(Debug)]
 pub struct RejectedSlotFrame {
     pub error: SlotRestoreError,
