@@ -608,10 +608,13 @@ struct EntityOwnerLevel {
     accounted_slots: u8,
 }
 #[cfg(feature = "paired-packages")]
+#[derive(Clone, Copy)]
 enum EntitySlotProfile {
     Ordinary,
     #[cfg(all(test, target_os = "linux"))]
     SlotFixture,
+    #[cfg(all(test, target_os = "linux"))]
+    SlotAdvance,
 }
 
 #[cfg(feature = "paired-packages")]
@@ -722,6 +725,12 @@ impl Game<'_> {
     ) -> std::result::Result<EntityOwnerObservation, EntityOwnerObservationError> {
         self.observe_entity_owners_profile(EntitySlotProfile::SlotFixture)
     }
+    #[cfg(all(test, target_os = "linux"))]
+    pub(in crate::game) fn observe_slot_advance_entity_owners(
+        &self,
+    ) -> std::result::Result<EntityOwnerObservation, EntityOwnerObservationError> {
+        self.observe_entity_owners_profile(EntitySlotProfile::SlotAdvance)
+    }
     fn observe_entity_owners_profile(
         &self,
         profile: EntitySlotProfile,
@@ -757,11 +766,14 @@ impl Game<'_> {
                 unsupported_entities!(self, self.creatures.projectiles),
             ),
             #[cfg(all(test, target_os = "linux"))]
-            EntitySlotProfile::SlotFixture => {
-                self.slot_epoch_projection()
-                    .map_err(|_| E::WorldSlotTrial {
-                        dimension: self.dim,
-                    })?;
+            EntitySlotProfile::SlotFixture | EntitySlotProfile::SlotAdvance => {
+                match profile {
+                    EntitySlotProfile::SlotAdvance => self.slot_advance_projection(),
+                    _ => self.slot_epoch_projection(),
+                }
+                .map_err(|_| E::WorldSlotTrial {
+                    dimension: self.dim,
+                })?;
                 let mut row = inspect_entity_level_owners(
                     self.dim,
                     &self.world,
@@ -876,6 +888,8 @@ enum WorldObservationProfile {
     Ordinary,
     #[cfg(all(test, target_os = "linux"))]
     NativeSlotRecapture,
+    #[cfg(all(test, target_os = "linux"))]
+    NativeSlotAdvance,
 }
 
 #[cfg(feature = "paired-packages")]
@@ -892,6 +906,12 @@ impl Game<'_> {
         &self,
     ) -> std::result::Result<WorldOwnerObservation, WorldOwnerObservationError> {
         self.observe_world_owners_profile(WorldObservationProfile::NativeSlotRecapture)
+    }
+    #[cfg(all(test, target_os = "linux"))]
+    pub(in crate::game) fn observe_slot_advance_world_owners(
+        &self,
+    ) -> std::result::Result<WorldOwnerObservation, WorldOwnerObservationError> {
+        self.observe_world_owners_profile(WorldObservationProfile::NativeSlotAdvance)
     }
     fn observe_world_owners_profile(
         &self,
@@ -940,6 +960,14 @@ impl Game<'_> {
                 WorldObservationProfile::NativeSlotRecapture => {
                     if dimension == self.dim {
                         world.checkpoint_world_owner_for_native_empty_roots()
+                    } else {
+                        world.checkpoint_world_owner()
+                    }
+                }
+                #[cfg(all(test, target_os = "linux"))]
+                WorldObservationProfile::NativeSlotAdvance => {
+                    if dimension == self.dim {
+                        world.checkpoint_world_owner_for_native_previous_tick_roots()
                     } else {
                         world.checkpoint_world_owner()
                     }

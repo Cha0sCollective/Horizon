@@ -948,7 +948,10 @@ impl PendingImage {
             files: entries.files,
         };
         validate_manifest(&manifest, self.request.epoch, &self.request.identity)?;
-        let bytes = if profile == RecoveryProfile::ActiveSlot {
+        let bytes = if matches!(
+            profile,
+            RecoveryProfile::ActiveSlot | RecoveryProfile::AdvancedSlot
+        ) {
             let slot =
                 counter_restore_integration::slot_epoch_integration::SlotManifest::from_manifest(
                     manifest.clone(),
@@ -1274,6 +1277,7 @@ enum RecoveryProfile {
     ArchiveOnly,
     CounterOnly,
     ActiveSlot,
+    AdvancedSlot,
 }
 struct CompleteEnvelope {
     manifest: Manifest,
@@ -1296,7 +1300,7 @@ fn check_recovery_profile(
                 "selected slot owner requires slot recovery profile",
             ));
         }
-        RecoveryProfile::ActiveSlot => {
+        RecoveryProfile::ActiveSlot | RecoveryProfile::AdvancedSlot => {
             let value =
                 slot_manifest.ok_or_else(|| profile_error("selected epoch has no slot profile"))?;
             let slot: counter_restore_integration::slot_epoch_integration::SlotManifest =
@@ -1307,7 +1311,7 @@ fn check_recovery_profile(
     }
     if matches!(
         profile,
-        RecoveryProfile::CounterOnly | RecoveryProfile::ActiveSlot
+        RecoveryProfile::CounterOnly | RecoveryProfile::ActiveSlot | RecoveryProfile::AdvancedSlot
     ) && !manifest
         .files
         .iter()
@@ -1410,6 +1414,33 @@ fn verify_complete_envelope(
         slot_manifest: Some(raw),
     })
 }
+fn validate_selected_slot_scalar(root: &Path) -> CResult<()> {
+    // Selection is complete. Semantic failure here refuses before copy and
+    // cannot retry an older image; envelope verification retains its old contract.
+    let frame = horizon_client::world::counter_restore::CounterFrameV2::decode(&bounded_read(
+        &root.join(counter_restore_integration::FRAME_PATH),
+        16 << 10,
+        Phase::Recover,
+    )?)
+    .map_err(profile_error)?;
+    let counter: CounterArchive = parse_json(
+        &bounded_read(
+            &root.join("research/counter.json"),
+            JSON_LIMIT,
+            Phase::Recover,
+        )?,
+        JSON_LIMIT,
+    )
+    .map_err(|error| profile_error(error.detail))?;
+    use horizon_client::world::counter_restore::Placement;
+    if !matches!(frame.placement,Placement::Active {counter:3|4,last_advanced:Some(time),..} if time==frame.saved_game_time)
+        || frame.last_retired.is_some()
+        || !matches!(frame.placement,Placement::Active {counter:value,last_advanced,..} if value==counter.counter&&last_advanced==counter.last_advanced)
+    {
+        return Err(profile_error("known slot3/4 scalar/diagnostic mismatch"));
+    }
+    Ok(())
+}
 fn epoch_name(value: &str, prefix: &str) -> CResult<u64> {
     let suffix = value
         .strip_prefix(prefix)
@@ -1501,6 +1532,9 @@ fn select_fixture_epoch_for(
     let (root, envelope) =
         selected.ok_or_else(|| invalid(Phase::Recover, "no complete matching epoch"))??;
     check_recovery_profile(&envelope.manifest, envelope.slot_manifest.as_ref(), profile)?;
+    if envelope.slot_manifest.is_some() {
+        validate_selected_slot_scalar(&root)?;
+    }
     Ok(SelectedEpoch {
         root,
         manifest: envelope.manifest,
@@ -1582,6 +1616,7 @@ enum CaptureProfile {
     NativeCounterPatch,
     NativeSlotPatch,
     NativeSlotRecapture,
+    NativeSlotAdvance,
 }
 impl Game<'_> {
     fn capture_cell_checks(&self) -> CResult<Vec<String>> {
@@ -1655,6 +1690,7 @@ impl Game<'_> {
             CaptureProfile::NativeSlotPatch | CaptureProfile::NativeSlotRecapture => {
                 self.observe_slot_epoch_entity_owners()
             }
+            CaptureProfile::NativeSlotAdvance => self.observe_slot_advance_entity_owners(),
             _ => self.observe_checkpoint_entity_owners(),
         };
         entity_owners.map_err(|e| {
@@ -1662,11 +1698,17 @@ impl Game<'_> {
         })?;
         let world_owners = match profile {
             CaptureProfile::NativeSlotRecapture => self.observe_slot_recapture_world_owners(),
+            CaptureProfile::NativeSlotAdvance => self.observe_slot_advance_world_owners(),
             _ => self.observe_checkpoint_world_owners(),
         };
         world_owners.map_err(|e| {
             CaptureError::new(Phase::Validate, Failure::World, None, format!("{e:?}"))
         })?;
+        if matches!(profile, CaptureProfile::NativeSlotAdvance) && !self.world.modified.is_empty() {
+            return Err(profile_error(
+                "advanced fixture requires nine clean native columns",
+            ));
+        }
         let mut dimensions = Vec::new();
         for dimension in [Dim::Overworld, Dim::Nether, Dim::End] {
             let (world, streaming, dropped) = if dimension == self.dim {
@@ -1682,7 +1724,8 @@ impl Game<'_> {
                 }
                 CaptureProfile::NativeCounterPatch
                 | CaptureProfile::NativeSlotPatch
-                | CaptureProfile::NativeSlotRecapture => {
+                | CaptureProfile::NativeSlotRecapture
+                | CaptureProfile::NativeSlotAdvance => {
                     dimension == Dim::Overworld
                         && self.dim == Dim::Overworld
                         && world.chunks.len() == 9
@@ -1722,6 +1765,7 @@ impl Game<'_> {
             CaptureProfile::NativeCounterPatch
                 | CaptureProfile::NativeSlotPatch
                 | CaptureProfile::NativeSlotRecapture
+                | CaptureProfile::NativeSlotAdvance
         ) {
             if dimensions != [Dim::Overworld.id()] {
                 return Err(invalid(Phase::Validate, "only native OW patch supported"));

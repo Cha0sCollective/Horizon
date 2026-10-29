@@ -1136,6 +1136,7 @@ pub struct WorldOwnerPresence {
 enum WorldRootProfile {
     Ordinary,
     NativeEmpty,
+    NativePreviousTick,
 }
 
 /// Closed native metadata shapes for the fixed restored Overworld fixture.
@@ -1175,6 +1176,13 @@ impl World {
     /// metadata; it is not a barrier, history certificate or general admission.
     pub fn checkpoint_world_owner_for_native_empty_roots(&self) -> Option<WorldOwnerPresence> {
         self.checkpoint_world_owner_profile(WorldRootProfile::NativeEmpty)
+    }
+    /// Fixed one-counter-phase fixture only. Every other owner check is shared;
+    /// the exact empty metadata must belong to the immediately previous tick.
+    pub fn checkpoint_world_owner_for_native_previous_tick_roots(
+        &self,
+    ) -> Option<WorldOwnerPresence> {
+        self.checkpoint_world_owner_profile(WorldRootProfile::NativePreviousTick)
     }
     fn checkpoint_world_owner_profile(
         &self,
@@ -1227,6 +1235,11 @@ impl World {
                         WorldRootProfile::NativeEmpty => {
                             !saved.is_some_and(|s| native_empty_root(s, self.game_time))
                         }
+                        WorldRootProfile::NativePreviousTick => !self
+                            .game_time
+                            .checked_sub(1)
+                            .filter(|time| *time >= 0)
+                            .is_some_and(|time| saved.is_some_and(|s| native_empty_root(s, time))),
                     },
                 ),
                 (K::Postprocess, !chunk.postprocess.is_empty()),
@@ -1530,6 +1543,153 @@ mod native_empty_root_tests {
             last_update: 126,
             ..Default::default()
         }
+    }
+    fn previous_stable(world: &World, kind: Option<K>) {
+        let chunk = &world.chunks[&(-1, 2)];
+        let saved = chunk.saved.as_ref().unwrap();
+        let root = saved.root.clone();
+        let identity = (
+            Arc::as_ptr(chunk),
+            Arc::as_ptr(saved),
+            world.game_time,
+            world.day_time,
+            world.revision,
+            world.chunks.membership_revision(),
+        );
+        let mut rng = world.random.clone();
+        let sample = [rng.next_int(), rng.next_int()];
+        for _ in 0..2 {
+            assert_eq!(
+                world
+                    .checkpoint_world_owner_for_native_previous_tick_roots()
+                    .map(|value| value.kind),
+                kind
+            );
+        }
+        assert_eq!(saved.root, root);
+        assert_eq!(
+            (
+                Arc::as_ptr(chunk),
+                Arc::as_ptr(saved),
+                world.game_time,
+                world.day_time,
+                world.revision,
+                world.chunks.membership_revision()
+            ),
+            identity
+        );
+        let mut rng = world.random.clone();
+        assert_eq!([rng.next_int(), rng.next_int()], sample);
+    }
+    #[test]
+    fn native_previous_tick_roots_accept_only_one_checked_tick() {
+        let mut world = fixture(extras());
+        world.game_time = 127;
+        previous_stable(&world, None);
+        assert_eq!(
+            world.checkpoint_world_owner().unwrap().kind,
+            K::OpaqueChunkRoot
+        );
+        assert_eq!(
+            world
+                .checkpoint_world_owner_for_native_empty_roots()
+                .unwrap()
+                .kind,
+            K::OpaqueChunkRoot
+        );
+        for time in [i64::MIN, -1, 0, 126, 128, i64::MAX] {
+            world.game_time = time;
+            previous_stable(&world, Some(K::OpaqueChunkRoot));
+        }
+        let mut absent = World::new(BlockStateId(0), 17);
+        absent.game_time = 127;
+        absent.chunks.insert((-1, 2), Arc::new(Chunk::empty(-1, 2)));
+        assert_eq!(
+            absent
+                .checkpoint_world_owner_for_native_previous_tick_roots()
+                .unwrap()
+                .kind,
+            K::OpaqueChunkRoot
+        );
+    }
+    #[test]
+    fn native_previous_tick_roots_refuse_each_root_and_time_mismatch() {
+        for case in 0..9 {
+            let mut data = extras();
+            match case {
+                0 => {
+                    data.root.remove(&"InhabitedTime".into());
+                }
+                1 => {
+                    data.root
+                        .insert("future".into(), Tag::ByteArray(vec![0, 128, 255]));
+                }
+                2 => {
+                    data.root.insert("InhabitedTime".into(), Tag::Int(0));
+                }
+                3 => {
+                    data.root.insert("InhabitedTime".into(), Tag::Long(1));
+                }
+                4 => {
+                    data.root.insert(
+                        "structures".into(),
+                        Tag::compound([("References", Tag::Compound(Compound::new()))]),
+                    );
+                }
+                5 => {
+                    data.root.insert(
+                        "PostProcessing".into(),
+                        Tag::List(vec![Tag::List(Vec::new()); 23]),
+                    );
+                }
+                6 => {
+                    data.root
+                        .insert("PostProcessing".into(), Tag::List(vec![Tag::Int(0); 24]));
+                }
+                7 => data.last_update = 125,
+                8 => data.block_entity_order.push((1, 70, 1)),
+                _ => unreachable!(),
+            };
+            let mut world = fixture(data);
+            world.game_time = 127;
+            previous_stable(&world, Some(K::OpaqueChunkRoot));
+        }
+    }
+    #[test]
+    fn native_previous_tick_roots_keep_remaining_owners_and_priority() {
+        let mut world = fixture(extras());
+        world.game_time = 127;
+        let p = (-1, 71, 33);
+        world.block_entities.insert(p, BlockEntity::Chest(vec![]));
+        previous_stable(&world, Some(K::PendingBlockEntityTicker));
+        world.block_entities.tickers(|_| 0);
+        previous_stable(&world, Some(K::NativeBlockEntity));
+        let held = world.block_entities.take(&p).unwrap();
+        previous_stable(&world, Some(K::BorrowedBlockEntity));
+        world.block_entities.put(p, held);
+        world.block_entities.remove(&p);
+        previous_stable(&world, Some(K::AddedBlockEntityTicker));
+        world.block_entities.tickers(|_| 0);
+        world.watched_writes.push(((7, 71, 33), 3, 4));
+        world.watched_writes.push(((-7, 71, 33), 3, 4));
+        previous_stable(&world, Some(K::WatchedWrites));
+        assert_eq!(
+            world
+                .checkpoint_world_owner_for_native_previous_tick_roots()
+                .unwrap()
+                .location,
+            WorldOwnerLocation::Block([-7, 71, 33])
+        );
+        let chunk = Arc::make_mut(world.chunks.get_mut(&(-1, 2)).unwrap());
+        Arc::make_mut(chunk.saved.as_mut().unwrap())
+            .block_ticks
+            .push(SavedTick {
+                kind: TickTypeId(3),
+                pos: BlockPos::new(-1, 71, 33),
+                delay: -7,
+                priority: TickPriority::High,
+            });
+        previous_stable(&world, Some(K::SavedBlockTicks));
     }
     fn fixture(extras: ChunkExtras) -> World {
         let mut world = World::new(BlockStateId(0), 17);
