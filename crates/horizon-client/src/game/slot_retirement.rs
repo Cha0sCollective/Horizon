@@ -20,7 +20,7 @@ pub(super) enum DeliveryError {
 }
 
 /// Only the known count encoding boundary, not a general component/NBT validator.
-fn check_counts(root: &ItemStack) -> Result<(), DeliveryError> {
+pub(super) fn check_counts(root: &ItemStack) -> Result<(), DeliveryError> {
     let mut work = Vec::new();
     work.try_reserve(1)
         .map_err(|_| DeliveryError::Reservation)?;

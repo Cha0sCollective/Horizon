@@ -182,6 +182,9 @@ mod shield;
 mod shoulders;
 mod sign_edit;
 #[cfg(feature = "paired-packages")]
+#[allow(dead_code)] // Dormant adapter until all ownership and ingress gates are qualified.
+mod slot_player;
+#[cfg(feature = "paired-packages")]
 #[allow(dead_code)] // Dormant receiver until all World-loss consumers are qualified.
 mod slot_retirement;
 mod sniffers;
