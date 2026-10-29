@@ -11409,11 +11409,10 @@ impl Game<'_> {
         )?;
         // Prepare entities while the chunk writer runs, then use one barrier.
         self.save_entities(false)?;
-        self.save_raids();
-        if wait {
-            self.save.flush()?;
-        }
-        Ok(())
+        let raid_result = self.save_raids();
+        let flush_result = if wait { self.save.flush() } else { Ok(()) };
+        // The earlier metadata error wins, but already queued writes still drain.
+        raid_result.and(flush_result)
     }
     fn render(&mut self) -> Result<bool> {
         if let Some(loader) = &self.world_loader {

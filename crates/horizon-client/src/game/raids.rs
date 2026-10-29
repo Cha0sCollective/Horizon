@@ -272,8 +272,12 @@ impl Game<'_> {
         if self.raiding.loaded == Some(self.dim) {
             return;
         }
-        if self.raiding.loaded.is_some() {
-            self.save_raids();
+        if self.raiding.loaded.is_some()
+            && let Err(error) = self.save_raids()
+        {
+            // Lazy dimension replacement keeps its existing policy. Strict save
+            // callers propagate this failure instead of acknowledging completion.
+            log::warn!("could not save previous dimension raids: {error}");
         }
         self.raiding.loaded = Some(self.dim);
         self.raiding.bar_hurts.clear();
@@ -287,12 +291,12 @@ impl Game<'_> {
         };
     }
     /// `Raids` as its dimension's `raids.dat`, when it changed.
-    pub(super) fn save_raids(&mut self) {
+    pub(super) fn save_raids(&mut self) -> horizon_client::Result<()> {
         let Some(dim) = self.raiding.loaded else {
-            return;
+            return Ok(());
         };
         if !self.raiding.raids.dirty || self.remote.is_some() {
-            return;
+            return Ok(());
         }
         let tag = horizon_world::nbt::Tag::compound([
             ("data", self.raiding.raids.to_nbt()),
@@ -301,10 +305,14 @@ impl Game<'_> {
                 horizon_world::nbt::Tag::Int(horizon_world::DATA_VERSION),
             ),
         ]);
-        if horizon_client::save::write_dat(&self.raids_path(dim), tag).is_ok() {
+        let path = self.raids_path(dim);
+        let result: horizon_client::Result<()> = horizon_client::save::write_dat(&path, tag)
+            .map_err(|error| format!("could not save raids at {}: {error}", path.display()).into());
+        if result.is_ok() {
             self.raiding.raids.dirty = false;
         }
         self.save_raid_omen_position();
+        result
     }
     /// `ServerPlayer.raidOmenPosition` from the player data.
     fn load_raid_omen_position(&mut self) {
@@ -1427,6 +1435,9 @@ fn raid_name_tag(name: BarName) -> Tag {
         ]),
     }
 }
+
+#[cfg(test)]
+mod metadata_tests;
 
 #[cfg(test)]
 mod tests {

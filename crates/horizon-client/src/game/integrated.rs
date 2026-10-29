@@ -825,7 +825,7 @@ fn server_game(
 }
 
 #[cfg(test)]
-mod transition_ownership_tests;
+pub(super) mod transition_ownership_tests;
 
 #[cfg(test)]
 mod tests {

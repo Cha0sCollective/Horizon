@@ -65,13 +65,13 @@ fn shared() -> &'static Shared {
     shared
 }
 
-struct Fixture {
+pub(in crate::game) struct Fixture {
     root: PathBuf,
     shared: &'static Shared,
 }
 
 impl Fixture {
-    fn new(label: &str) -> Self {
+    pub(in crate::game) fn new(label: &str) -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let unique = NEXT.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!(
@@ -86,7 +86,7 @@ impl Fixture {
         }
     }
 
-    fn game(&self) -> Game<'_> {
+    pub(in crate::game) fn game(&self) -> Game<'_> {
         // Deliberately explicit: Options::read consumes test-runner arguments
         // and can inherit session/account configuration.
         let options = Options {
