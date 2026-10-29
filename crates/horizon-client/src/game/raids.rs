@@ -268,16 +268,13 @@ impl Game<'_> {
             .join("data/minecraft/raids.dat")
     }
     /// The raids of the player's dimension (the previous one saved first).
-    fn load_raids(&mut self) {
+    fn load_raids(&mut self) -> horizon_client::Result<()> {
         if self.raiding.loaded == Some(self.dim) {
-            return;
+            return Ok(());
         }
-        if self.raiding.loaded.is_some()
-            && let Err(error) = self.save_raids()
-        {
-            // Lazy dimension replacement keeps its existing policy. Strict save
-            // callers propagate this failure instead of acknowledging completion.
-            log::warn!("could not save previous dimension raids: {error}");
+        if self.raiding.loaded.is_some() {
+            // Retain the previous dimension's native owner until its save succeeds.
+            self.save_raids()?;
         }
         self.raiding.loaded = Some(self.dim);
         self.raiding.bar_hurts.clear();
@@ -289,6 +286,11 @@ impl Game<'_> {
             Some(data) => Raids::from_nbt(&data, seed),
             None => Raids::default(),
         };
+        Ok(())
+    }
+    /// Direct access never treats a retained different dimension as the current one.
+    fn raids_are_current(&self) -> bool {
+        self.raiding.loaded == Some(self.dim)
     }
     /// `Raids` as its dimension's `raids.dat`, when it changed.
     pub(super) fn save_raids(&mut self) -> horizon_client::Result<()> {
@@ -390,7 +392,10 @@ impl Game<'_> {
         let Some(pos) = self.player_block() else {
             return OmenTick::Continue;
         };
-        self.load_raids();
+        if let Err(error) = self.load_raids() {
+            log::warn!("could not load raids for omen tick: {error}");
+            return OmenTick::Continue;
+        }
         self.load_raid_omen_position();
         match e.id {
             "bad_omen" => {
@@ -433,7 +438,10 @@ impl Game<'_> {
         {
             return None;
         }
-        self.load_raids();
+        if let Err(error) = self.load_raids() {
+            log::warn!("could not load raids for creation: {error}");
+            return None;
+        }
         let center = raid::raid_center(at, &self.village_pois());
         let seed = self.world.random.next_long();
         let difficulty = self.difficulty_id();
@@ -449,14 +457,23 @@ impl Game<'_> {
     }
     /// `ServerLevel.getRaidAt`.
     pub(super) fn raiding_nearby(&self, at: [i32; 3]) -> Option<i32> {
+        if !self.raids_are_current() {
+            return None;
+        }
         self.raiding.raids.nearby(at).map(|(id, _)| id)
     }
     pub(super) fn raid_started(&self, id: i32) -> bool {
+        if !self.raids_are_current() {
+            return false;
+        }
         self.raiding.raids.get(id).is_some_and(|r| r.started)
     }
     /// `/raid start`: a raid in the local village at the given omen level.
     pub(super) fn raid_command_create(&mut self, at: [i32; 3], omen_level: i32) -> bool {
-        self.load_raids();
+        if let Err(error) = self.load_raids() {
+            log::warn!("could not load raids for raid command: {error}");
+            return false;
+        }
         let Some(id) = self.create_or_extend_raid(at, None) else {
             return false;
         };
@@ -467,17 +484,26 @@ impl Game<'_> {
         true
     }
     pub(super) fn raid_command_stop(&mut self, id: i32) {
+        if !self.raids_are_current() {
+            return;
+        }
         if let Some(r) = self.raiding.raids.get_mut(id) {
             r.stop();
         }
     }
     pub(super) fn raid_set_omen(&mut self, id: i32, level: i32) -> i32 {
+        if !self.raids_are_current() {
+            return 0;
+        }
         let Some(r) = self.raiding.raids.get_mut(id) else {
             return 0;
         };
         std::mem::replace(&mut r.omen_level, level)
     }
     pub(super) fn raid_glow(&mut self, id: i32) {
+        if !self.raids_are_current() {
+            return;
+        }
         for m in &mut self.mobs {
             if raider::state(m).is_some_and(|s| s.raid_id == Some(id)) {
                 m.add_effect("glowing", 1000, 1);
@@ -486,6 +512,9 @@ impl Game<'_> {
     }
     /// The `/raid check` summary line.
     pub(super) fn raid_status_text(&self, id: i32) -> String {
+        if !self.raids_are_current() {
+            return String::new();
+        }
         let Some(r) = self.raiding.raids.get(id) else {
             return String::new();
         };
@@ -598,7 +627,10 @@ impl Game<'_> {
         if self.remote.is_some() {
             return;
         }
-        self.load_raids();
+        if let Err(error) = self.load_raids() {
+            log::warn!("could not load raids for raid tick: {error}");
+            return;
+        }
         self.register_loaded_raiders();
         for id in self.raiding.raids.ids() {
             self.flush_raid_bar(id);
@@ -1036,6 +1068,9 @@ impl Game<'_> {
     /// a hero of the village, and the raider leaves the raid (its health
     /// stays in the bar's total).
     pub(super) fn raider_died(&mut self, m: &Mob, by_player: bool) {
+        if !self.raids_are_current() {
+            return;
+        }
         let Some(s) = raider::state(m) else {
             return;
         };
@@ -1118,6 +1153,9 @@ impl Game<'_> {
     /// The raid bar a living player at `at` is in (`Raid.getPlayers`): red,
     /// notched in tens. The name is the translate component the client draws.
     pub(super) fn raid_boss_at(&self, at: [f64; 3], alive: bool) -> Option<(i32, Tag, f32)> {
+        if !self.raids_are_current() {
+            return None;
+        }
         if !alive || self.dim != Dim::Overworld {
             return None;
         }
@@ -1438,6 +1476,9 @@ fn raid_name_tag(name: BarName) -> Tag {
 
 #[cfg(test)]
 mod metadata_tests;
+
+#[cfg(test)]
+mod lifetime_tests;
 
 #[cfg(test)]
 mod tests {
