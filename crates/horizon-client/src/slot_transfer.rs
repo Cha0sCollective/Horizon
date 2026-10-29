@@ -88,6 +88,10 @@ impl SlotProjection {
             stack: self.stack.clone(),
         }
     }
+    /// Consume the projection, preserving the exact original stack representation.
+    pub fn into_stack(self) -> Option<ItemStack> {
+        self.stack
+    }
     /// Native equality ignores runtime bundle selection, including nested stacks.
     /// An equal replacement must retain the original raw value, not publish `stack`.
     pub fn replace(&mut self, stack: Option<ItemStack>) -> Result<(), TransferError> {
@@ -269,6 +273,22 @@ mod tests {
             data.bundle_selected.0,
             data.container[0].1.data().unwrap().bundle_selected.0,
         )
+    }
+    #[test]
+    fn consuming_extraction_preserves_none_zero_and_original_metadata_allocation() {
+        assert!(SlotProjection::new(None).into_stack().is_none());
+        for count in [0, 3] {
+            let stack = rich(count, 4);
+            let original_box = stack.extra.as_deref().unwrap() as *const _;
+            let extracted = SlotProjection::new(Some(stack)).into_stack().unwrap();
+            assert_eq!(extracted.count, count);
+            assert_eq!(selections(&extracted), (4, 14));
+            assert_eq!(
+                extracted.extra.as_deref().unwrap() as *const _,
+                original_box
+            );
+            assert_eq!(extracted, rich(count, 4));
+        }
     }
     fn limits(n: u32) -> ResolvedLimits {
         ResolvedLimits::new(n, n).unwrap()

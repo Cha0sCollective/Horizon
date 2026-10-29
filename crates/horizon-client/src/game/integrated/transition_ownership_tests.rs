@@ -1,5 +1,7 @@
 //! Actual headless Game transitions. The coordinator runs these from an owned,
 //! isolated process cwd/home/temp; this module changes no process-wide settings.
+#[cfg(feature = "paired-packages")]
+mod slot_retirement_tests;
 use super::super::{
     Dim, Game, Options, PackResources, Progress, Resources, boats, execution_role, load_resources,
     minecarts, mod_packages,

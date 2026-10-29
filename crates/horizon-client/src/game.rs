@@ -181,6 +181,9 @@ mod shader_packs;
 mod shield;
 mod shoulders;
 mod sign_edit;
+#[cfg(feature = "paired-packages")]
+#[allow(dead_code)] // Dormant receiver until all World-loss consumers are qualified.
+mod slot_retirement;
 mod sniffers;
 mod spawner;
 mod spear;
