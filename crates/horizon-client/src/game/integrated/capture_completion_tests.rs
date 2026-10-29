@@ -65,12 +65,25 @@ pub(in crate::game) fn dispatch_slot_capture_after_observer_timeout(
 ) -> CaptureCompletion {
     dispatch(game, request, true, CaptureKind::Slot)
 }
+pub(in crate::game) fn dispatch_slot_recapture(
+    game: &mut Game<'_>,
+    request: CaptureRequest,
+) -> CaptureCompletion {
+    dispatch(game, request, false, CaptureKind::SlotRecapture)
+}
+pub(in crate::game) fn dispatch_slot_recapture_after_observer_timeout(
+    game: &mut Game<'_>,
+    request: CaptureRequest,
+) -> CaptureCompletion {
+    dispatch(game, request, true, CaptureKind::SlotRecapture)
+}
 
 #[derive(Clone, Copy)]
 enum CaptureKind {
     Archive,
     Machine,
     Slot,
+    SlotRecapture,
 }
 
 fn dispatch(
@@ -119,6 +132,7 @@ fn dispatch(
                 CaptureKind::Archive => owner.capture_fixture_epoch(request),
                 CaptureKind::Machine => owner.capture_machine_fixture_epoch(request),
                 CaptureKind::Slot => owner.capture_slot_fixture_epoch(request),
+                CaptureKind::SlotRecapture => owner.recapture_slot_fixture_epoch(request),
             };
             task_finished.store(true, Ordering::SeqCst);
             let _ = completed.send(result);

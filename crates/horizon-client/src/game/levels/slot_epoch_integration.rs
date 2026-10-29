@@ -234,6 +234,12 @@ struct SlotInstallFailure {
     error: CaptureError,
     slot: DecodedSlotFrame,
 }
+
+#[derive(Clone, Copy)]
+enum SlotCaptureOrigin {
+    Initial,
+    Restored,
+}
 /// Refusal-only diagnostics over already bounded detached projections. Never
 /// reads mutable owners, changes a projection, or weakens the equality guard.
 fn projection_change_diagnostics(
@@ -420,13 +426,79 @@ impl Game<'_> {
         &mut self,
         request: CaptureRequest,
     ) -> CaptureCompletion {
-        self.capture_profile_checks(CaptureProfile::NativeSlotPatch)?;
+        self.capture_slot_from_origin(request, SlotCaptureOrigin::Initial)
+    }
+    pub(in crate::game) fn recapture_slot_fixture_epoch(
+        &mut self,
+        request: CaptureRequest,
+    ) -> CaptureCompletion {
+        self.capture_slot_from_origin(request, SlotCaptureOrigin::Restored)
+    }
+    fn checked_inherited_slot_files(
+        &self,
+        binding: &NativeBinding,
+        live: &CounterFrameV2,
+        live_slot: &[u8],
+    ) -> CResult<InheritedSlotFiles> {
+        let inherited = InheritedSlotFiles::read(&self.world_root, Phase::Validate)?;
+        let counter = CounterFrameV2::decode(&inherited.counter)
+            .map_err(|error| native_error(Phase::Validate, error))?;
+        let slot = decode_slot_frame(&inherited.slot, self.res.items())
+            .map_err(|error| native_error(Phase::Validate, error))?;
+        let expected_world = self
+            .world
+            .counter_domain_snapshot()
+            .ok_or_else(|| profile_error("restored native domain absent"))?
+            .world;
+        let host = target(self.dim)?;
+        correlate_slot(&slot, &counter, expected_world, &host)?;
+        if counter != *live
+            || counter
+                .encode()
+                .map_err(|error| native_error(Phase::Validate, error))?
+                != inherited.counter
+            || inherited.slot != live_slot
+            || counter.package_identity != digest_identity(binding.package_identity())
+            || counter.type_id != binding.type_id()
+            || counter.binding.block_id != binding.block_id()
+            || counter.save_schema != 1
+            || self
+                .world
+                .block(host.position[0], host.position[1], host.position[2])
+                != binding.state_id()
+        {
+            return Err(invalid(
+                Phase::Validate,
+                "inherited sidecars/live native context mismatch",
+            ));
+        }
+        Ok(inherited)
+    }
+    fn capture_slot_from_origin(
+        &mut self,
+        request: CaptureRequest,
+        origin: SlotCaptureOrigin,
+    ) -> CaptureCompletion {
+        let profile = match origin {
+            SlotCaptureOrigin::Initial => CaptureProfile::NativeSlotPatch,
+            SlotCaptureOrigin::Restored => CaptureProfile::NativeSlotRecapture,
+        };
+        self.capture_profile_checks(profile)?;
         let binding = fixture_binding(self)?;
         if request.identity.counter_content != digest_identity(binding.package_identity()) {
             return Err(profile_error("actual package identity mismatch"));
         }
         let (counter, slot_bytes) = self.slot_epoch_projection()?;
-        let material = self.profile_material(request, CaptureProfile::NativeSlotPatch)?;
+        let inherited = match origin {
+            SlotCaptureOrigin::Initial => None,
+            SlotCaptureOrigin::Restored => {
+                Some(self.checked_inherited_slot_files(&binding, &counter, &slot_bytes)?)
+            }
+        };
+        let material = self.profile_material(request, profile)?;
+        if let Some(files) = &inherited {
+            files.require_unchanged(&material.source, Phase::Save)?;
+        }
         let host = target(self.dim)?;
         correlate(
             &counter,
@@ -463,22 +535,30 @@ impl Game<'_> {
                 "counter/slot/PLAYER projections changed during native save",
             ));
         }
+        let source = material.source.clone();
         let mut image = material.copy()?;
         image.overlay()?;
-        write_bytes(
-            &make_parents(&image.root, FRAME_PATH, Phase::Overlay)?,
-            &counter
-                .encode()
-                .map_err(|e| native_error(Phase::Overlay, e))?,
-            true,
-            Phase::Overlay,
-        )?;
-        write_bytes(
-            &make_parents(&image.root, SLOT_MEMBER, Phase::Overlay)?,
-            &slot_bytes,
-            true,
-            Phase::Overlay,
-        )?;
+        let counter_bytes = counter
+            .encode()
+            .map_err(|error| native_error(Phase::Overlay, error))?;
+        if let Some(files) = &inherited {
+            image.replace_inherited_slot_files(&source, files, &counter_bytes, &slot_bytes)?;
+        } else {
+            write_bytes(
+                &make_parents(&image.root, FRAME_PATH, Phase::Overlay)?,
+                &counter
+                    .encode()
+                    .map_err(|e| native_error(Phase::Overlay, e))?,
+                true,
+                Phase::Overlay,
+            )?;
+            write_bytes(
+                &make_parents(&image.root, SLOT_MEMBER, Phase::Overlay)?,
+                &slot_bytes,
+                true,
+                Phase::Overlay,
+            )?;
+        }
         image.sync_members()?;
         image.write_manifest_temp_for(RecoveryProfile::ActiveSlot)?;
         image.finish_manifest()?;
@@ -535,5 +615,7 @@ impl Game<'_> {
         }
     }
 }
+#[path = "slot_recapture_integration_tests.rs"]
+mod recapture_tests;
 #[path = "slot_epoch_integration_tests.rs"]
 mod tests;

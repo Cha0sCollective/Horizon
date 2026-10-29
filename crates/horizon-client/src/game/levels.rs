@@ -871,11 +871,31 @@ pub(in crate::game) struct WorldOwnerObservation {
 }
 
 #[cfg(feature = "paired-packages")]
+#[derive(Clone, Copy)]
+enum WorldObservationProfile {
+    Ordinary,
+    #[cfg(all(test, target_os = "linux"))]
+    NativeSlotRecapture,
+}
+
+#[cfg(feature = "paired-packages")]
 #[allow(dead_code)]
 impl Game<'_> {
     /// Only named current W1 owners; never global readiness or producer completion.
     pub(in crate::game) fn observe_checkpoint_world_owners(
         &self,
+    ) -> std::result::Result<WorldOwnerObservation, WorldOwnerObservationError> {
+        self.observe_world_owners_profile(WorldObservationProfile::Ordinary)
+    }
+    #[cfg(all(test, target_os = "linux"))]
+    pub(in crate::game) fn observe_slot_recapture_world_owners(
+        &self,
+    ) -> std::result::Result<WorldOwnerObservation, WorldOwnerObservationError> {
+        self.observe_world_owners_profile(WorldObservationProfile::NativeSlotRecapture)
+    }
+    fn observe_world_owners_profile(
+        &self,
+        profile: WorldObservationProfile,
     ) -> std::result::Result<WorldOwnerObservation, WorldOwnerObservationError> {
         use WorldOwnerObservationError as E;
         use horizon_client::world::WorldOwnerLocation;
@@ -914,7 +934,18 @@ impl Game<'_> {
                 dimension,
                 resident_columns: world.chunks.len(),
             });
-            if let Some(cause) = world.checkpoint_world_owner() {
+            let cause = match profile {
+                WorldObservationProfile::Ordinary => world.checkpoint_world_owner(),
+                #[cfg(all(test, target_os = "linux"))]
+                WorldObservationProfile::NativeSlotRecapture => {
+                    if dimension == self.dim {
+                        world.checkpoint_world_owner_for_native_empty_roots()
+                    } else {
+                        world.checkpoint_world_owner()
+                    }
+                }
+            };
+            if let Some(cause) = cause {
                 consider(
                     cause.kind as u8,
                     index,

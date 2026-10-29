@@ -885,6 +885,28 @@ impl Material {
     }
 }
 impl PendingImage {
+    /// Compare both inherited inputs before touching either pending copy. Source
+    /// files and the older immutable epoch are never overlay destinations.
+    fn replace_inherited_slot_files(
+        &self,
+        source: &Path,
+        inherited: &InheritedSlotFiles,
+        counter: &[u8],
+        slot: &[u8],
+    ) -> CResult<()> {
+        if counter.len() > 16 << 10 || slot.len() > 1 << 20 {
+            return Err(limit(Phase::Overlay));
+        }
+        inherited.require_unchanged(source, Phase::Overlay)?;
+        inherited.require_unchanged(&self.root.join("world"), Phase::Overlay)?;
+        write_bytes(
+            &self.root.join(counter_restore_integration::FRAME_PATH),
+            counter,
+            false,
+            Phase::Overlay,
+        )?;
+        write_bytes(&self.root.join(SLOT_MEMBER), slot, false, Phase::Overlay)
+    }
     fn overlay(&mut self) -> CResult<()> {
         for row in &self.players {
             for (kind, bytes) in [
@@ -1005,6 +1027,36 @@ impl PendingImage {
     }
     fn promote(self) -> CaptureCompletion {
         self.rename_published()?.acknowledge()
+    }
+}
+
+/// Exact archival bytes carried from an explicitly restored working world.
+/// This is private input accounting, not a save lease or runtime authority.
+struct InheritedSlotFiles {
+    counter: Vec<u8>,
+    slot: Vec<u8>,
+}
+impl InheritedSlotFiles {
+    fn read(source: &Path, phase: Phase) -> CResult<Self> {
+        Ok(Self {
+            counter: bounded_read(
+                &source.join("data/horizon/counter_checkpoint.json"),
+                16 << 10,
+                phase,
+            )?,
+            slot: bounded_read(
+                &source.join("data/horizon/slot_checkpoint.nbt"),
+                1 << 20,
+                phase,
+            )?,
+        })
+    }
+    fn require_unchanged(&self, source: &Path, phase: Phase) -> CResult<()> {
+        let current = Self::read(source, phase)?;
+        if current.counter != self.counter || current.slot != self.slot {
+            return Err(invalid(phase, "validated inherited sidecar bytes changed"));
+        }
+        Ok(())
     }
 }
 impl PromotedImage {
@@ -1529,6 +1581,7 @@ enum CaptureProfile {
     ArchivalOneColumn,
     NativeCounterPatch,
     NativeSlotPatch,
+    NativeSlotRecapture,
 }
 impl Game<'_> {
     fn capture_cell_checks(&self) -> CResult<Vec<String>> {
@@ -1599,13 +1652,19 @@ impl Game<'_> {
             tag_bounds(tag)?;
         }
         let entity_owners = match profile {
-            CaptureProfile::NativeSlotPatch => self.observe_slot_epoch_entity_owners(),
+            CaptureProfile::NativeSlotPatch | CaptureProfile::NativeSlotRecapture => {
+                self.observe_slot_epoch_entity_owners()
+            }
             _ => self.observe_checkpoint_entity_owners(),
         };
         entity_owners.map_err(|e| {
             CaptureError::new(Phase::Validate, Failure::Entity, None, format!("{e:?}"))
         })?;
-        self.observe_checkpoint_world_owners().map_err(|e| {
+        let world_owners = match profile {
+            CaptureProfile::NativeSlotRecapture => self.observe_slot_recapture_world_owners(),
+            _ => self.observe_checkpoint_world_owners(),
+        };
+        world_owners.map_err(|e| {
             CaptureError::new(Phase::Validate, Failure::World, None, format!("{e:?}"))
         })?;
         let mut dimensions = Vec::new();
@@ -1621,7 +1680,9 @@ impl Game<'_> {
                 CaptureProfile::ArchivalOneColumn => {
                     world.chunks.len() == 1 && world.chunks.contains_key(&(0, 0))
                 }
-                CaptureProfile::NativeCounterPatch | CaptureProfile::NativeSlotPatch => {
+                CaptureProfile::NativeCounterPatch
+                | CaptureProfile::NativeSlotPatch
+                | CaptureProfile::NativeSlotRecapture => {
                     dimension == Dim::Overworld
                         && self.dim == Dim::Overworld
                         && world.chunks.len() == 9
@@ -1658,7 +1719,9 @@ impl Game<'_> {
         }
         if matches!(
             profile,
-            CaptureProfile::NativeCounterPatch | CaptureProfile::NativeSlotPatch
+            CaptureProfile::NativeCounterPatch
+                | CaptureProfile::NativeSlotPatch
+                | CaptureProfile::NativeSlotRecapture
         ) {
             if dimensions != [Dim::Overworld.id()] {
                 return Err(invalid(Phase::Validate, "only native OW patch supported"));

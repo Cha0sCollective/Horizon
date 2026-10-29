@@ -1132,9 +1132,54 @@ pub struct WorldOwnerPresence {
 }
 
 #[cfg(feature = "paired-packages")]
+#[derive(Clone, Copy)]
+enum WorldRootProfile {
+    Ordinary,
+    NativeEmpty,
+}
+
+/// Closed native metadata shapes for the fixed restored Overworld fixture.
+/// No arbitrary root field, pending work or item-bearing source is admitted.
+#[cfg(feature = "paired-packages")]
+fn native_empty_root(extras: &crate::chunk::ChunkExtras, time: i64) -> bool {
+    use horizon_world::nbt::{Compound, Tag};
+    fn field<'a>(map: &'a Compound, name: &str) -> Option<&'a Tag> {
+        map.iter()
+            .find(|(key, _)| key.0.iter().copied().eq(name.encode_utf16()))
+            .map(|(_, value)| value)
+    }
+    if extras.last_update != time || !extras.block_entity_order.is_empty() || extras.root.len() != 3
+    {
+        return false;
+    }
+    if field(&extras.root, "InhabitedTime") != Some(&Tag::Long(0)) {
+        return false;
+    }
+    let Some(Tag::Compound(structures)) = field(&extras.root, "structures") else {
+        return false;
+    };
+    if structures.len() != 2 || !["References", "starts"].into_iter().all(|key| {
+        matches!(field(structures, key), Some(Tag::Compound(values)) if values.is_empty())
+    }) { return false; }
+    matches!(field(&extras.root, "PostProcessing"), Some(Tag::List(sections))
+        if sections.len() == crate::chunk::SECTIONS && sections.iter().all(|section| matches!(section, Tag::List(values) if values.is_empty())))
+}
+
+#[cfg(feature = "paired-packages")]
 impl World {
     /// Borrowed current named WORLD presence; no inventory census or completion proof.
     pub fn checkpoint_world_owner(&self) -> Option<WorldOwnerPresence> {
+        self.checkpoint_world_owner_profile(WorldRootProfile::Ordinary)
+    }
+    /// Fixed restored-fixture observation only. This recognizes exact empty native
+    /// metadata; it is not a barrier, history certificate or general admission.
+    pub fn checkpoint_world_owner_for_native_empty_roots(&self) -> Option<WorldOwnerPresence> {
+        self.checkpoint_world_owner_profile(WorldRootProfile::NativeEmpty)
+    }
+    fn checkpoint_world_owner_profile(
+        &self,
+        profile: WorldRootProfile,
+    ) -> Option<WorldOwnerPresence> {
         use crate::block_entities::CheckpointBlockEntityPending as P;
         use WorldOwnerKind as K;
         use WorldOwnerLocation as L;
@@ -1177,7 +1222,12 @@ impl World {
                 ),
                 (
                     K::OpaqueChunkRoot,
-                    saved.is_some_and(|s| !s.root.is_empty()),
+                    match profile {
+                        WorldRootProfile::Ordinary => saved.is_some_and(|s| !s.root.is_empty()),
+                        WorldRootProfile::NativeEmpty => {
+                            !saved.is_some_and(|s| native_empty_root(s, self.game_time))
+                        }
+                    },
                 ),
                 (K::Postprocess, !chunk.postprocess.is_empty()),
                 (
@@ -1447,5 +1497,274 @@ mod checkpoint_world_owner_tests {
                 location: L::Block([-5, 1, 2]),
             }),
         );
+    }
+}
+
+#[cfg(all(test, feature = "paired-packages"))]
+mod native_empty_root_tests {
+    use super::*;
+    use crate::{chunk::ChunkExtras, containers::BlockEntity};
+    use WorldOwnerKind as K;
+    use horizon_core::{
+        position::BlockPos,
+        random::RandomSource,
+        ticks::{SavedTick, TickPriority, TickTypeId},
+    };
+    use horizon_world::nbt::{Compound, Tag};
+    fn extras() -> ChunkExtras {
+        let Tag::Compound(root) = Tag::compound([
+            ("InhabitedTime", Tag::Long(0)),
+            (
+                "structures",
+                Tag::compound([
+                    ("References", Tag::Compound(Compound::new())),
+                    ("starts", Tag::Compound(Compound::new())),
+                ]),
+            ),
+            ("PostProcessing", Tag::List(vec![Tag::List(Vec::new()); 24])),
+        ]) else {
+            unreachable!()
+        };
+        ChunkExtras {
+            root,
+            last_update: 126,
+            ..Default::default()
+        }
+    }
+    fn fixture(extras: ChunkExtras) -> World {
+        let mut world = World::new(BlockStateId(0), 17);
+        world.game_time = 126;
+        let mut chunk = Chunk::empty(-1, 2);
+        chunk.saved = Some(Arc::new(extras));
+        world.chunks.insert((-1, 2), Arc::new(chunk));
+        world
+    }
+    fn stable(world: &World, kind: Option<K>) {
+        let chunk = &world.chunks[&(-1, 2)];
+        let saved = chunk.saved.as_ref().unwrap();
+        let root = saved.root.clone();
+        let pointer = (
+            Arc::as_ptr(chunk),
+            Arc::as_ptr(saved),
+            world.chunks.membership_revision(),
+            world.revision,
+            world.game_time,
+            world.day_time,
+        );
+        let mut random = world.random.clone();
+        let rng = [random.next_int(), random.next_int()];
+        for _ in 0..2 {
+            assert_eq!(
+                world
+                    .checkpoint_world_owner_for_native_empty_roots()
+                    .map(|p| p.kind),
+                kind
+            );
+        }
+        assert_eq!(saved.root, root);
+        assert_eq!(
+            (
+                Arc::as_ptr(chunk),
+                Arc::as_ptr(saved),
+                world.chunks.membership_revision(),
+                world.revision,
+                world.game_time,
+                world.day_time
+            ),
+            pointer
+        );
+        let mut random = world.random.clone();
+        assert_eq!([random.next_int(), random.next_int()], rng);
+    }
+    #[test]
+    fn native_empty_roots_recognize_only_fixed_metadata_without_changing_ordinary_observation() {
+        let world = fixture(extras());
+        stable(&world, None);
+        assert_eq!(
+            world.checkpoint_world_owner().unwrap().kind,
+            K::OpaqueChunkRoot
+        );
+        let mut absent = World::new(BlockStateId(0), 17);
+        absent.chunks.insert((-1, 2), Arc::new(Chunk::empty(-1, 2)));
+        assert_eq!(
+            absent
+                .checkpoint_world_owner_for_native_empty_roots()
+                .unwrap()
+                .kind,
+            K::OpaqueChunkRoot
+        );
+        assert!(absent.checkpoint_world_owner().is_none());
+    }
+    #[test]
+    fn native_empty_roots_refuse_missing_extra_mistyped_nonempty_and_wrong_time_shapes() {
+        for case in 0..13 {
+            let mut saved = extras();
+            match case {
+                0 => {
+                    saved.root.remove(&"InhabitedTime".into());
+                }
+                1 => {
+                    saved
+                        .root
+                        .insert("fixture:opaque".into(), Tag::ByteArray(vec![0, 128, 255]));
+                }
+                2 => {
+                    saved.root.insert("InhabitedTime".into(), Tag::Int(0));
+                }
+                3 => {
+                    saved.root.insert("InhabitedTime".into(), Tag::Long(1));
+                }
+                4 => {
+                    saved.root.insert(
+                        "structures".into(),
+                        Tag::compound([("References", Tag::Compound(Compound::new()))]),
+                    );
+                }
+                5 => {
+                    saved.root.insert(
+                        "structures".into(),
+                        Tag::compound([
+                            ("References", Tag::compound([("future", Tag::Int(7))])),
+                            ("starts", Tag::Compound(Compound::new())),
+                        ]),
+                    );
+                }
+                6 => {
+                    saved.root.insert(
+                        "structures".into(),
+                        Tag::compound([
+                            ("References", Tag::Compound(Compound::new())),
+                            (
+                                "starts",
+                                Tag::compound([("loot", Tag::List(vec![Tag::Int(7)]))]),
+                            ),
+                        ]),
+                    );
+                }
+                7 => {
+                    saved.root.insert(
+                        "PostProcessing".into(),
+                        Tag::List(vec![Tag::List(Vec::new()); 23]),
+                    );
+                }
+                8 => {
+                    saved.root.insert(
+                        "PostProcessing".into(),
+                        Tag::List(vec![Tag::List(Vec::new()); 25]),
+                    );
+                }
+                9 => {
+                    saved
+                        .root
+                        .insert("PostProcessing".into(), Tag::List(vec![Tag::Int(0); 24]));
+                }
+                10 => {
+                    let mut sections = vec![Tag::List(Vec::new()); 24];
+                    sections[0] = Tag::List(vec![Tag::Short(0)]);
+                    saved
+                        .root
+                        .insert("PostProcessing".into(), Tag::List(sections));
+                }
+                11 => saved.last_update = 125,
+                12 => saved.block_entity_order.push((1, 70, 1)),
+                _ => unreachable!(),
+            }
+            stable(&fixture(saved), Some(K::OpaqueChunkRoot));
+        }
+    }
+    #[test]
+    fn native_empty_roots_keep_every_other_world_category_and_priority() {
+        for kind in [
+            K::StagedBlockEntities,
+            K::StagedEntities,
+            K::SavedBlockEntities,
+            K::SavedBlockEntitySources,
+            K::RolledLoot,
+            K::Postprocess,
+            K::SavedBlockTicks,
+            K::SavedFluidTicks,
+            K::WatchedWrites,
+            K::MovingPistons,
+            K::MovingPistonFallback,
+        ] {
+            let mut world = fixture(extras());
+            let mut chunk = (*world.chunks[&(-1, 2)]).clone();
+            let mut saved = chunk.saved.as_ref().unwrap().as_ref().clone();
+            let raw = || Tag::compound([("opaque", Tag::ByteArray(vec![0, 128, 255]))]);
+            let tick = SavedTick {
+                kind: TickTypeId(3),
+                pos: BlockPos::new(-1, 71, 33),
+                delay: -7,
+                priority: TickPriority::High,
+            };
+            match kind {
+                K::StagedBlockEntities => chunk
+                    .block_entities
+                    .push(((-1, 71, 33), BlockEntity::Chest(vec![]))),
+                K::StagedEntities => chunk.entities.push(raw()),
+                K::SavedBlockEntities => saved.block_entities.push(raw()),
+                K::SavedBlockEntitySources => {
+                    saved.block_entity_sources.push(((-1, 71, 33), raw()))
+                }
+                K::RolledLoot => saved.rolled_loot.push(crate::chunk::RolledLoot {
+                    pos: (-1, 71, 33),
+                    table: "fixture:loot".into(),
+                    seed: Some(-3),
+                    items: raw(),
+                }),
+                K::Postprocess => chunk.postprocess.push([-1, 71, 33]),
+                K::SavedBlockTicks => saved.block_ticks.push(tick),
+                K::SavedFluidTicks => saved.fluid_ticks.push(tick),
+                _ => {}
+            }
+            chunk.saved = Some(Arc::new(saved));
+            world.chunks.insert((-1, 2), Arc::new(chunk));
+            let piston = horizon_world::piston_shape::MovingPistonState {
+                moved_state: BlockStateId(13),
+                direction: horizon_core::geometry::Direction::Up,
+                extending: true,
+                source: false,
+                progress: 0.25,
+                previous_progress: 0.0,
+            };
+            match kind {
+                K::WatchedWrites => world.watched_writes.push(((-1, 71, 33), 3, 4)),
+                K::MovingPistons => world.moving_pistons.push(([-1, 71, 33], piston)),
+                K::MovingPistonFallback => {
+                    world.moving_piston_fallback.push(([-1, 71, 33], piston))
+                }
+                _ => {}
+            }
+            stable(&world, Some(kind));
+        }
+        let mut world = fixture(extras());
+        let p = (-1, 71, 33);
+        world.block_entities.insert(p, BlockEntity::Chest(vec![]));
+        stable(&world, Some(K::PendingBlockEntityTicker));
+        world.block_entities.tickers(|_| 0);
+        stable(&world, Some(K::NativeBlockEntity));
+        let held = world.block_entities.take(&p).unwrap();
+        stable(&world, Some(K::BorrowedBlockEntity));
+        world.block_entities.put(p, held);
+        world.block_entities.remove(&p);
+        stable(&world, Some(K::AddedBlockEntityTicker));
+        world.block_entities.tickers(|_| 0);
+        world.watched_writes.push(((7, 71, 33), 3, 4));
+        world.watched_writes.push(((-7, 71, 33), 3, 4));
+        stable(&world, Some(K::WatchedWrites));
+        assert_eq!(
+            world
+                .checkpoint_world_owner_for_native_empty_roots()
+                .unwrap()
+                .location,
+            WorldOwnerLocation::Block([-7, 71, 33])
+        );
+        let chunk = Arc::make_mut(world.chunks.get_mut(&(-1, 2)).unwrap());
+        Arc::make_mut(chunk.saved.as_mut().unwrap())
+            .root
+            .insert("fixture:unknown".into(), Tag::Int(7));
+        stable(&world, Some(K::OpaqueChunkRoot));
+        world.block_entities.insert(p, BlockEntity::Chest(vec![]));
+        stable(&world, Some(K::PendingBlockEntityTicker));
     }
 }
