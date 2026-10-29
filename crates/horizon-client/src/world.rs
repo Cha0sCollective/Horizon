@@ -9,6 +9,8 @@ use std::{
 };
 #[cfg(feature = "paired-packages")]
 pub mod counter_restore;
+#[cfg(feature = "paired-packages")]
+pub mod slot_restore;
 
 /// Sections (x, section index, z) waiting to be remeshed, kept by column
 /// (a bit per section index), so the mesh scheduler looks at each column once
@@ -454,7 +456,9 @@ impl World {
             });
         let previous = self.chunks.insert(key, Arc::new(chunk));
         #[cfg(feature = "paired-packages")]
-        if let (Some(trial), Some(state)) = (&mut self.world_slot_trial, slot_state) {
+        if !self.has_persistent_slot_mode()
+            && let (Some(trial), Some(state)) = (&mut self.world_slot_trial, slot_state)
+        {
             trial.inserted(previous.is_some(), state, self.game_time);
         }
         #[cfg(feature = "paired-packages")]
@@ -464,6 +468,12 @@ impl World {
             }
         } else if let (Some(trial), Some(state)) = (&mut self.counter_trial, counter_state) {
             trial.inserted(previous.is_some(), state, self.game_time);
+        }
+        #[cfg(feature = "paired-packages")]
+        if self.has_persistent_slot_mode()
+            && let Some(state) = slot_state
+        {
+            self.persistent_slot_inserted(previous.is_some(), state);
         }
         #[cfg(feature = "paired-packages")]
         if let Some(observer) = &mut self.residency_observer {
@@ -582,7 +592,9 @@ impl World {
         let previous = Arc::make_mut(chunk).set(x & 15, y, z & 15, state.0);
         if previous != state.0 {
             #[cfg(feature = "paired-packages")]
-            if let Some(trial) = &mut self.world_slot_trial {
+            if !self.has_persistent_slot_mode()
+                && let Some(trial) = &mut self.world_slot_trial
+            {
                 trial.changed([x, y, z], state, self.game_time);
             }
             #[cfg(feature = "paired-packages")]
@@ -590,6 +602,10 @@ impl World {
                 self.persistent_counter_changed([x, y, z], state);
             } else if let Some(trial) = &mut self.counter_trial {
                 trial.changed([x, y, z], state, self.game_time);
+            }
+            #[cfg(feature = "paired-packages")]
+            if self.has_persistent_slot_mode() {
+                self.persistent_slot_changed([x, y, z], state);
             }
             self.block_entities
                 .state_changed((x, y, z), previous, state.0);

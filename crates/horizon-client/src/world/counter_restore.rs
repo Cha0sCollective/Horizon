@@ -213,13 +213,16 @@ impl NativeBinding {
     pub fn state_id(&self) -> BlockStateId {
         self.state_id
     }
+    pub(super) fn physical_state(&self, state: BlockStateId) -> Option<&BlockState> {
+        self.registry.state(state)
+    }
     fn symbolic_state(&self) -> BlockState {
         BlockState {
             name: self.block_id.clone(),
             properties: BTreeMap::new(),
         }
     }
-    fn configuration(
+    pub(super) fn configuration(
         &self,
         target: &CounterTarget,
         scope: AuthorityScope,
@@ -521,8 +524,26 @@ pub(super) struct Domain {
     session: Arc<Session>,
     status: DomainStatus,
     binding: NativeBinding,
+    pub(super) slot: Option<super::slot_restore::SlotDomain>,
+}
+pub(super) struct SlotAnchor<'a> {
+    pub world: WorldId,
+    pub target: &'a CounterTarget,
+    pub high_water: u64,
+    pub generation: Option<u64>,
+    pub binding: &'a NativeBinding,
 }
 impl Domain {
+    pub(super) fn slot_anchor(&self) -> Result<SlotAnchor<'_>> {
+        self.healthy()?;
+        Ok(SlotAnchor {
+            world: self.world,
+            target: &self.target,
+            high_water: self.high_water,
+            generation: self.active_key.as_ref().map(|key| key.generation),
+            binding: &self.binding,
+        })
+    }
     pub(super) fn detach(&mut self) {
         if self.active_key.is_some() {
             self.retired_key = self.active_key.take();
@@ -544,7 +565,7 @@ impl Domain {
             generation,
         }
     }
-    fn configuration_matches(&self, configuration: &Configuration) -> bool {
+    pub(super) fn configuration_matches(&self, configuration: &Configuration) -> bool {
         configuration.backend() == &crate::counter_trial::Backend::Native
             && configuration.scope().dimension() == self.target.dimension
             && configuration.position() == self.target.position
@@ -632,6 +653,7 @@ impl World {
             session: session.clone(),
             status: DomainStatus::Healthy,
             binding: binding.clone(),
+            slot: None,
         });
         let trial = Box::new(
             Trial::restore_native(configuration, Some((0, None)), None, self.game_time)
@@ -694,6 +716,7 @@ impl World {
             session: session.clone(),
             status: DomainStatus::Healthy,
             binding: binding.clone(),
+            slot: None,
         });
         let active = match frame.placement {
             Placement::Active {

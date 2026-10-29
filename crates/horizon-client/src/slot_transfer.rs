@@ -74,6 +74,17 @@ impl SlotSnapshot {
     }
 }
 impl SlotProjection {
+    /// Move an already validated durable value into fresh projection authority.
+    pub(crate) fn restored(stack: Option<ItemStack>, revision: u64) -> Self {
+        Self {
+            identity: Arc::new(()),
+            revision,
+            stack,
+        }
+    }
+    pub(crate) fn borrowed(&self) -> (u64, Option<&ItemStack>) {
+        (self.revision, self.stack.as_ref())
+    }
     pub fn new(stack: Option<ItemStack>) -> Self {
         Self {
             identity: Arc::new(()),
@@ -251,6 +262,22 @@ mod tests {
 
     fn stack(count: u32) -> ItemStack {
         ItemStack::new("minecraft:stone", count)
+    }
+    #[test]
+    fn restored_projection_moves_box_preserves_revision_and_rejects_old_identity() {
+        let value = rich(7, -1);
+        let address = value.extra.as_deref().unwrap() as *const _;
+        let restored = SlotProjection::restored(Some(value), u64::MAX);
+        let (revision, stack) = restored.borrowed();
+        assert_eq!(revision, u64::MAX);
+        assert_eq!(
+            stack.unwrap().extra.as_deref().unwrap() as *const _,
+            address
+        );
+        let second = SlotProjection::restored(Some(rich(7, -1)), u64::MAX);
+        assert!(!restored.snapshot().matches(&second));
+        let value = restored.into_stack().unwrap();
+        assert_eq!(value.extra.as_deref().unwrap() as *const _, address);
     }
     fn rich(count: u32, selection: i32) -> ItemStack {
         let mut value = stack(count);

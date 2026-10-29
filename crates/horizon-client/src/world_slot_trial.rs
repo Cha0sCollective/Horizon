@@ -38,10 +38,12 @@ impl Eq for SlotKey {}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Fault {
     IncarnationExhausted,
+    PersistentDomain,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     Disabled,
+    Detached,
     PendingRetirement,
     Fault(Fault),
     StaleKey,
@@ -141,7 +143,86 @@ pub(crate) struct Trial {
     pending: Option<PendingRetirement>,
     fault: Option<Fault>,
 }
+/// Owned restore input; no old key or projection identity is accepted.
+#[derive(Debug)]
+pub(crate) struct RestoreAllocation {
+    pub generation: u64,
+    pub revision: u64,
+    pub stack: Option<crate::items::ItemStack>,
+}
+pub(crate) struct AllocationView<'a> {
+    pub key: &'a SlotKey,
+    pub revision: u64,
+    pub stack: Option<&'a crate::items::ItemStack>,
+    pub resident: bool,
+}
+pub(crate) struct TrialView<'a> {
+    pub configuration: &'a Configuration,
+    pub high_water: u64,
+    pub active: Option<AllocationView<'a>>,
+    pub pending: bool,
+    pub fault: Option<Fault>,
+}
 impl Trial {
+    pub(crate) fn restore_checked(
+        configuration: Configuration,
+        high_water: u64,
+        input: &mut Option<RestoreAllocation>,
+    ) -> Result<Self, Error> {
+        if configuration.backend() != &crate::counter_trial::Backend::Native
+            || input.as_ref().is_some_and(|allocation| {
+                allocation.generation == 0 || allocation.generation > high_water
+            })
+        {
+            return Err(Error::Fault(Fault::IncarnationExhausted));
+        }
+        let identity = Arc::new(());
+        let active = input.take().map(|allocation| OwnedSlot {
+            key: SlotKey {
+                scope: configuration.scope().clone(),
+                trial: identity.clone(),
+                incarnation: allocation.generation,
+            },
+            slot: SlotProjection::restored(allocation.stack, allocation.revision),
+            resident: true,
+        });
+        Ok(Self {
+            configuration: Arc::new(configuration),
+            identity,
+            last_incarnation: high_water,
+            active,
+            pending: None,
+            fault: None,
+        })
+    }
+    pub(crate) fn borrowed(&self) -> TrialView<'_> {
+        TrialView {
+            configuration: &self.configuration,
+            high_water: self.last_incarnation,
+            active: self.active.as_ref().map(|active| {
+                let (revision, stack) = active.slot.borrowed();
+                AllocationView {
+                    key: &active.key,
+                    revision,
+                    stack,
+                    resident: active.resident,
+                }
+            }),
+            pending: self.pending.is_some(),
+            fault: self.fault,
+        }
+    }
+    pub(crate) fn persistent_retire(&mut self, reason: RetirementReason, time: i64) {
+        self.retire(reason, time);
+    }
+    pub(crate) fn persistent_fault(&mut self) {
+        if self.fault.is_none() {
+            self.fault = Some(Fault::PersistentDomain);
+        }
+    }
+    pub(crate) fn persistent_admit(&mut self) {
+        self.admit();
+    }
     fn new(configuration: Configuration, current: BlockStateId) -> Self {
         let mut trial = Self {
             configuration: Arc::new(configuration),
@@ -275,7 +356,7 @@ impl World {
         &mut self,
         configuration: Configuration,
     ) -> Result<Snapshot, ConfigError> {
-        if self.world_slot_trial.is_some() {
+        if self.world_slot_trial.is_some() || self.has_persistent_slot_mode() {
             return Err(ConfigError::AlreadyEnabled);
         }
         if configuration.state_id() == self.air {
@@ -296,6 +377,13 @@ impl World {
         self.world_slot_trial.as_ref().map(|t| t.snapshot())
     }
     pub fn read_world_slot(&self, key: &SlotKey) -> Result<ActiveSnapshot, Error> {
+        self.persistent_slot_guard()?;
+        if self.has_persistent_slot_mode() {
+            self.world_slot_trial
+                .as_ref()
+                .ok_or(Error::Disabled)?
+                .ready(key, self.world_slot_current())?;
+        }
         self.world_slot_trial
             .as_ref()
             .ok_or(Error::Disabled)?
@@ -313,6 +401,7 @@ impl World {
         amount: u32,
         limits: ResolvedLimits,
     ) -> Result<Preparation, Error> {
+        self.persistent_slot_guard()?;
         let trial = self.world_slot_trial.as_ref().ok_or(Error::Disabled)?;
         trial.ready(key, self.world_slot_current())?;
         let active = trial.active.as_ref().ok_or(Error::StaleKey)?;
@@ -334,6 +423,7 @@ impl World {
         player: &mut SlotProjection,
         fresh_limits: ResolvedLimits,
     ) -> Result<CommittedTransfer, Error> {
+        self.persistent_slot_guard()?;
         let current = self.world_slot_current();
         let trial = self.world_slot_trial.as_mut().ok_or(Error::Disabled)?;
         trial.ready(&plan.key, current)?;
@@ -344,9 +434,19 @@ impl World {
     }
     /// The caller now owns this value and must retain it if its sink refuses it.
     pub fn take_world_slot_retirement(&mut self) -> Option<PendingRetirement> {
-        self.world_slot_trial.as_mut()?.pending.take()
+        let pending = self.world_slot_trial.as_mut()?.pending.take()?;
+        self.detach_persistent_slot();
+        Some(pending)
     }
     pub fn reconcile_world_slot_trial(&mut self) -> Result<Snapshot, Error> {
+        self.persistent_slot_guard()?;
+        if self.has_persistent_slot_mode() {
+            return self
+                .world_slot_trial
+                .as_ref()
+                .map(|trial| trial.snapshot())
+                .ok_or(Error::Disabled);
+        }
         let current = self.world_slot_current();
         let trial = self.world_slot_trial.as_mut().ok_or(Error::Disabled)?;
         trial.available()?;
@@ -358,6 +458,9 @@ impl World {
     }
     /// Move every owner out. No automatic Drop delivery or receiver is implied.
     pub fn take_world_slot_trial(&mut self) -> Option<Teardown> {
+        if self.world_slot_trial.is_some() {
+            self.detach_persistent_slot();
+        }
         self.world_slot_trial.take().map(|trial| Teardown {
             configuration: trial.configuration,
             active: trial.active,
@@ -372,10 +475,11 @@ mod tests;
 
 #[cfg(feature = "paired-packages")]
 impl World {
-    /// Presence only, including empty, nonresident, pending, and faulted trials.
+    /// Presence only, including empty/nonresident trials and retained persistent
+    /// participation after an owner was taken or the trial was torn down.
     /// This observation confers no ownership or save/publication authority.
     pub fn has_world_slot_trial(&self) -> bool {
-        self.world_slot_trial.is_some()
+        self.world_slot_trial.is_some() || self.has_persistent_slot_mode()
     }
 }
 
