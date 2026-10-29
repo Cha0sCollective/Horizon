@@ -27,6 +27,35 @@ pub(super) struct GuestCrafting {
     machine: Option<(i32, Box<Menu>)>,
 }
 
+#[cfg(feature = "paired-packages")]
+impl GuestCrafting {
+    /// Conservative observation only: even an empty cached menu is refused.
+    #[allow(dead_code)] // Dormant until a complete capture operation is qualified.
+    pub(super) fn checkpoint_menus_absent(&self) -> bool {
+        self.inventory.is_none() && self.table.is_none() && self.machine.is_none()
+    }
+}
+
+#[cfg(all(test, feature = "paired-packages"))]
+mod checkpoint_predicate_tests {
+    use super::*;
+
+    #[test]
+    fn cached_menus_are_refused_without_clearing_them() {
+        let mut state = GuestCrafting::default();
+        assert!(state.checkpoint_menus_absent());
+        state.inventory = Some(Box::new(Menu::new(Kind::Inventory)));
+        assert!(!state.checkpoint_menus_absent());
+        assert!(state.inventory.take().is_some());
+        state.table = Some((1, 0, Box::new(Menu::new(Kind::Crafting)), [1, 2, 3]));
+        assert!(!state.checkpoint_menus_absent());
+        assert!(state.table.take().is_some());
+        state.machine = Some((2, Box::new(Menu::new(Kind::Furnace("smelting")))));
+        assert!(!state.checkpoint_menus_absent());
+        assert!(state.machine.is_some());
+    }
+}
+
 /// ServerboundContainerClickPacket's input.
 pub(super) fn input(id: i32) -> Input {
     match id {

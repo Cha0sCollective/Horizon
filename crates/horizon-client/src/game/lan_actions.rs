@@ -103,6 +103,66 @@ pub(super) struct GuestPlay {
     sculk: super::sculk::PlayerEvents,
 }
 
+#[cfg(feature = "paired-packages")]
+impl GuestPlay {
+    /// Player-owned activity subset, not global checkpoint admission.
+    #[allow(dead_code)] // No complete capture operation calls this observation yet.
+    pub(super) fn checkpoint_participant_idle(&self) -> bool {
+        self.mining.is_none()
+            && self.using.is_none()
+            && self.digging.is_none()
+            && self.delayed.is_none()
+            && self.sign_editing.is_none()
+            && self.merchant.is_none()
+            && self.station.is_none()
+            && self.mount_window.is_none()
+            && self.lectern.is_none()
+            && self.hook.is_none()
+            && self.crafting.checkpoint_menus_absent()
+            && !self.left_game
+            && !self.won_game
+            && !self.respawn_requested
+            && self.portal.process.is_none()
+            && self.portal.cooldown == 0
+    }
+}
+
+#[cfg(all(test, feature = "paired-packages"))]
+mod checkpoint_predicate_tests {
+    use super::*;
+
+    #[test]
+    fn private_activity_refuses_without_consuming_state() {
+        let mut play = GuestPlay::default();
+        assert!(play.checkpoint_participant_idle());
+        play.using = Some((3, 7));
+        assert!(!play.checkpoint_participant_idle());
+        assert_eq!(play.using.take(), Some((3, 7)));
+        play.digging = Some(([1, 2, 3], [0, 1, 0]));
+        assert!(!play.checkpoint_participant_idle());
+        assert!(play.digging.take().is_some());
+        play.delayed = Some(([4, 5, 6], 8));
+        assert!(!play.checkpoint_participant_idle());
+        assert!(play.delayed.take().is_some());
+        play.portal.cooldown = 1;
+        assert!(!play.checkpoint_participant_idle());
+        assert_eq!(play.portal.cooldown, 1);
+        play.portal.cooldown = 0;
+        play.sign_editing = Some([1, 2, 3]);
+        assert!(!play.checkpoint_participant_idle());
+        assert_eq!(play.sign_editing.take(), Some([1, 2, 3]));
+        play.won_game = true;
+        assert!(!play.checkpoint_participant_idle());
+        play.won_game = false;
+        play.respawn_requested = true;
+        assert!(!play.checkpoint_participant_idle());
+        play.respawn_requested = false;
+        play.left_game = true;
+        assert!(!play.checkpoint_participant_idle());
+        assert!(play.left_game);
+    }
+}
+
 /// A guest's command waiting for the hub (`LanHost::commands`).
 pub(super) struct GuestCommand {
     pub(super) conn: u32,

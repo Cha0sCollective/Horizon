@@ -140,6 +140,277 @@ fn record_uuid(
     }
 }
 
+// Dormant PLAYER-only observations. These do not authorize checkpoint publication.
+#[cfg(feature = "paired-packages")]
+use std::sync::atomic::AtomicUsize;
+
+#[cfg(feature = "paired-packages")]
+#[allow(dead_code)]
+type ParticipantCheck<T> = std::result::Result<T, ParticipantPreflightError>;
+
+#[cfg(feature = "paired-packages")]
+#[allow(dead_code)] // No complete capture operation consumes this observation yet.
+pub(in crate::game) struct ParticipantRoster {
+    host_identity: Arc<lan::Shared>,
+    owner_uuid: Option<u128>,
+    level_player_uuid: Option<[i32; 4]>,
+    identities: Vec<ParticipantIdentity>,
+}
+#[cfg(feature = "paired-packages")]
+#[allow(dead_code)]
+struct ParticipantIdentity {
+    conn: u32,
+    uuid: u128,
+    dimension: String,
+    sender_identity: Arc<AtomicUsize>,
+    storage: ParticipantStorage,
+}
+#[cfg(feature = "paired-packages")]
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ParticipantStorage {
+    IntegratedOwner { record_uuid: [i32; 4] },
+    External { record_uuid: [i32; 4] },
+}
+#[cfg(feature = "paired-packages")]
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::game) enum ParticipantPreflightError {
+    NotAuthoritative,
+    ActingGuest,
+    MissingHost,
+    MissingOwner,
+    OwnerMismatch,
+    MissingMapping,
+    InvalidIdentity { conn: u32 },
+    DuplicateConnection { conn: u32 },
+    DuplicateUuid { conn: u32 },
+    DuplicateRecord { conn: u32 },
+    RosterMismatch,
+    UnsupportedPlayer { conn: u32 },
+    OrphanPlay { conn: u32 },
+    UnsupportedServerState,
+}
+
+#[cfg(feature = "paired-packages")]
+#[allow(dead_code)]
+impl ParticipantRoster {
+    fn validate(&self) -> ParticipantCheck<()> {
+        use ParticipantPreflightError as E;
+        for (index, p) in self.identities.iter().enumerate() {
+            if !matches!(
+                p.dimension.as_str(),
+                "minecraft:overworld" | "minecraft:the_nether" | "minecraft:the_end"
+            ) {
+                return Err(E::InvalidIdentity { conn: p.conn });
+            }
+            let record = record_uuid(self.owner_uuid, self.level_player_uuid, p.uuid)
+                .ok_or(E::MissingMapping)?;
+            let expected = if Some(p.uuid) == self.owner_uuid {
+                ParticipantStorage::IntegratedOwner {
+                    record_uuid: record,
+                }
+            } else {
+                ParticipantStorage::External {
+                    record_uuid: record,
+                }
+            };
+            if p.storage != expected {
+                return Err(E::InvalidIdentity { conn: p.conn });
+            }
+            for other in &self.identities[..index] {
+                if p.conn == other.conn {
+                    return Err(E::DuplicateConnection { conn: p.conn });
+                }
+                if p.uuid == other.uuid {
+                    return Err(E::DuplicateUuid { conn: p.conn });
+                }
+                let other_record = match other.storage {
+                    ParticipantStorage::IntegratedOwner { record_uuid }
+                    | ParticipantStorage::External { record_uuid } => record_uuid,
+                };
+                if record == other_record {
+                    return Err(E::DuplicateRecord { conn: p.conn });
+                }
+            }
+        }
+        if self.owner_uuid.is_some()
+            && self
+                .identities
+                .iter()
+                .filter(|p| Some(p.uuid) == self.owner_uuid)
+                .count()
+                != 1
+        {
+            return Err(E::MissingOwner);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "paired-packages")]
+#[allow(dead_code)] // Dormant; this does not qualify global capture readiness.
+impl Game<'_> {
+    fn checkpoint_participant_host(&self) -> ParticipantCheck<&LanHost> {
+        use ParticipantPreflightError as E;
+        if self.remote.is_some()
+            || self.integrated.is_some()
+            || self.options.execution_role.is_client()
+        {
+            return Err(E::NotAuthoritative);
+        }
+        if self.lan_acting.is_some() {
+            return Err(E::ActingGuest);
+        }
+        self.lan.as_ref().ok_or(E::MissingHost)
+    }
+
+    /// Native expected population only; no item snapshot or lasting lease.
+    pub(in crate::game) fn observe_checkpoint_participants(
+        &self,
+    ) -> ParticipantCheck<ParticipantRoster> {
+        use ParticipantPreflightError as E;
+        let host = self.checkpoint_participant_host()?;
+        let owner_uuid = host.owner.as_ref().map(|owner| owner.uuid);
+        if let Some(serving) = &self.serving
+            && owner_uuid != Some(serving.owner)
+        {
+            return Err(E::OwnerMismatch);
+        }
+        if let Some(owner) = &host.owner {
+            if owner.saved.is_some() {
+                return Err(E::OwnerMismatch);
+            }
+            if self.level.player_uuid.is_none() {
+                return Err(E::MissingMapping);
+            }
+        }
+        let mut identities = Vec::new();
+        for guest in &host.hub.guests {
+            if !guest.placed
+                || guest.inventory.len() != 36
+                || guest.ender_items.len() != 27
+                || guest.selected >= 9
+            {
+                return Err(E::UnsupportedPlayer { conn: guest.conn });
+            }
+            let record = record_uuid(owner_uuid, self.level.player_uuid, guest.uuid)
+                .ok_or(E::MissingMapping)?;
+            identities.push(ParticipantIdentity {
+                conn: guest.conn,
+                uuid: guest.uuid,
+                dimension: guest.dimension.clone(),
+                sender_identity: guest.sender.pending.clone(),
+                storage: if owner_uuid == Some(guest.uuid) {
+                    ParticipantStorage::IntegratedOwner {
+                        record_uuid: record,
+                    }
+                } else {
+                    ParticipantStorage::External {
+                        record_uuid: record,
+                    }
+                },
+            });
+        }
+        let roster = ParticipantRoster {
+            host_identity: host.hub.lan.shared.clone(),
+            owner_uuid,
+            level_player_uuid: self.level.player_uuid,
+            identities,
+        };
+        roster.validate()?;
+        Ok(roster)
+    }
+
+    /// Checks current PLAYER owners only. Global owners and byte coverage are separate.
+    pub(in crate::game) fn preflight_checkpoint_participants(
+        &self,
+        expected: &ParticipantRoster,
+    ) -> ParticipantCheck<()> {
+        use ParticipantPreflightError as E;
+        self.checkpoint_participant_host()?;
+        expected.validate()?;
+        let current = self.observe_checkpoint_participants()?;
+        if !Arc::ptr_eq(&current.host_identity, &expected.host_identity)
+            || current.owner_uuid != expected.owner_uuid
+            || current.level_player_uuid != expected.level_player_uuid
+            || current.identities.len() != expected.identities.len()
+            || current.identities.iter().any(|p| {
+                !expected.identities.iter().any(|e| {
+                    p.conn == e.conn
+                        && p.uuid == e.uuid
+                        && p.dimension == e.dimension
+                        && p.storage == e.storage
+                        && Arc::ptr_eq(&p.sender_identity, &e.sender_identity)
+                })
+            })
+        {
+            return Err(E::RosterMismatch);
+        }
+        if !self.server_trips.is_empty()
+            || !self.level_teleports.is_empty()
+            || self.pending_save.is_some()
+            || self.pending_entry.is_some()
+            || self.world_loader.is_some()
+            || self.rest_loader.is_some()
+            || self.saved_for_exit
+            || self.player.is_some()
+            || self.inventory.iter().any(Option::is_some)
+            || self.armor.iter().any(Option::is_some)
+            || self.offhand.is_some()
+            || self.carried.is_some()
+            || self.craft_grid.iter().any(Option::is_some)
+            || self.scratch_slot.is_some()
+            || self.ender_items.iter().any(Option::is_some)
+            || self.container.is_some()
+            || self.station.is_some()
+            || self.ender_open.is_some()
+            || self.craft_table.is_some()
+            || self.inv_drag.is_some()
+            || self.last_quick_moved.is_some()
+        {
+            return Err(E::UnsupportedServerState);
+        }
+        let host = self.checkpoint_participant_host()?;
+        for &conn in host.play.keys() {
+            if !host.hub.guests.iter().any(|g| g.conn == conn) {
+                return Err(E::OrphanPlay { conn });
+            }
+        }
+        for g in &host.hub.guests {
+            if !g.loaded
+                || g.motion.is_none()
+                || !g.left_reason.is_empty()
+                || g.dead
+                || g.death_time != 0
+                || g.awaiting_teleport.is_some()
+                || g.carried.is_some()
+                || g.craft_grid.iter().any(Option::is_some)
+                || g.craft_result.is_some()
+                || g.menu.is_some()
+                || g.drag.is_some()
+                || g.vehicle.is_some()
+                || g.sleeping
+                || g.bed.is_some()
+                || g.sleep_timer != 0
+                || g.sent_bed.is_some()
+                || g.loaded_body.is_some()
+                || !g.inbox.is_empty()
+                || !host
+                    .play
+                    .get(&g.conn)
+                    .is_some_and(|p| p.checkpoint_participant_idle())
+            {
+                return Err(E::UnsupportedPlayer { conn: g.conn });
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(all(test, feature = "paired-packages"))]
+mod participant_preflight_tests;
+
 fn save_guest_records_to(
     world: &std::path::Path,
     tree: &horizon_client::advancements::Tree,
