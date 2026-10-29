@@ -478,17 +478,32 @@ impl Game<'_> {
             return Ok(());
         }
         let back = self.dim;
-        for dim in closing {
-            self.enter_level(None, dim)?;
-            self.save_level(true)?;
-            self.enter_level(None, back)?;
-            #[cfg(feature = "paired-packages")]
-            if let Some(parked) = self.levels.parked.get_mut(&dim) {
-                super::counter_control::retire_world_counter(&mut parked.world, "idle-level-close");
+        let loop_result = (|| -> Result<()> {
+            for dim in closing {
+                self.enter_level(None, dim)?;
+                self.save_level(true)?;
+                self.enter_level(None, back)?;
+                #[cfg(feature = "paired-packages")]
+                if let Some(parked) = self.levels.parked.get_mut(&dim) {
+                    super::counter_control::retire_world_counter(
+                        &mut parked.world,
+                        "idle-level-close",
+                    );
+                }
+                self.levels.parked.remove(&dim);
             }
-            self.levels.parked.remove(&dim);
+            Ok(())
+        })();
+        // Completed closes stay closed; a failed save retains its native owner.
+        let restore_result = self.enter_level(None, back);
+        if let Err(error) = &restore_result {
+            log::error!(
+                "idle-close restoration failed: requested {}, active {}: {error}",
+                back.id(),
+                self.dim.id(),
+            );
         }
-        Ok(())
+        loop_result.and(restore_result)
     }
 
     /// Save every parked level (`MinecraftServer.saveAllChunks`); the level
@@ -740,3 +755,6 @@ pub(super) mod entity_owner_tests;
 
 #[cfg(all(test, feature = "paired-packages"))]
 mod parked_save_tests;
+
+#[cfg(all(test, feature = "paired-packages"))]
+mod idle_close_tests;
