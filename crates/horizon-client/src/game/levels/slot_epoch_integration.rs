@@ -990,6 +990,8 @@ impl Game<'_> {
 }
 #[path = "slot_advance_capture_tests.rs"]
 mod advance_tests;
+#[path = "native_write_fence_tests.rs"]
+mod native_write_fence_tests;
 #[path = "slot_recapture_integration_tests.rs"]
 mod recapture_tests;
 #[path = "slot_epoch_integration_tests.rs"]

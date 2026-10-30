@@ -1974,6 +1974,148 @@ impl Streaming {
     fn save_in_flight(&self) -> bool {
         self.decorating > 0 || !self.finishing.is_empty() || self.saving > 0
     }
+    /// Close this streamer's native write producers without scheduling more work,
+    /// then poll the fixture's storage writers under the same exclusive borrow.
+    ///
+    /// This is only a prerequisite experiment for inspected built-in generators.
+    /// The caller must exclusively own the Game, account for every participating
+    /// SaveDir, and exclude external producers. Arbitrary generator callbacks do
+    /// not acquire that premise through this method. No capture admission or
+    /// transferable readiness receipt follows from success.
+    ///
+    /// The deadline bounds deliberate waits, not callbacks, mutex acquisition,
+    /// operating-system I/O, or destruction. The final observation does not
+    /// promise future worker health after the borrow ends.
+    pub fn native_write_fence_until(
+        &mut self,
+        world: &mut World,
+        deadline: std::time::Instant,
+        mut writers_finished: impl FnMut() -> crate::Result<bool>,
+    ) -> crate::Result<()> {
+        loop {
+            self.reconcile_native_fence_results(world);
+            if self.native_fence_producers_closed()? {
+                break;
+            }
+            Self::native_fence_wait(deadline)?;
+        }
+        // All checked-out producers have returned. The existing synchronous
+        // proto contract retains written markers on failed/partial handoff.
+        self.save_until(world, deadline)?;
+        loop {
+            Self::native_fence_deadline(deadline)?;
+            if writers_finished()? {
+                // A worker may fault while the writer is being polled. This
+                // must be a fresh validation AFTER the final writer poll.
+                self.reconcile_native_fence_results(world);
+                if !self.native_fence_producers_closed()? || !self.written.is_empty() {
+                    return Err("native write fence changed during writer polling".into());
+                }
+                Self::native_fence_deadline(deadline)?;
+                return Ok(());
+            }
+            // Fail early on faults without allowing any owner-side scheduling.
+            self.native_fence_producers_closed()?;
+            Self::native_fence_wait(deadline)?;
+        }
+    }
+    fn native_fence_deadline(deadline: std::time::Instant) -> crate::Result<()> {
+        if std::time::Instant::now() >= deadline {
+            return Err("native write fence deadline exceeded".into());
+        }
+        Ok(())
+    }
+    fn native_fence_wait(deadline: std::time::Instant) -> crate::Result<()> {
+        Self::native_fence_deadline(deadline)?;
+        thread::sleep(
+            deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .min(std::time::Duration::from_millis(1)),
+        );
+        Ok(())
+    }
+    fn native_fence_producers_closed(&self) -> crate::Result<bool> {
+        self.generation_save_result()?;
+        let observation = self.observe_native_work();
+        if observation.accounting_fault
+            || observation.receipt_mismatch
+            || observation.worker_initialization_fault
+            || observation.worker_exit_fault
+            || observation.result_disconnected
+            || observation.stopped
+        {
+            return Err(format!("native write fence ownership fault: {observation:?}").into());
+        }
+        let mut closed = observation.initialized_workers == self.threads.len() as u64;
+        for (origin, counts) in observation.origins {
+            let total = [
+                counts.queued,
+                counts.worker_held,
+                counts.returned,
+                counts.reconciling,
+                counts.disposed,
+                counts.unresolved,
+            ]
+            .into_iter()
+            .try_fold(0u64, u64::checked_add);
+            if total != Some(counts.submitted)
+                || counts.unresolved != 0
+                || counts.storage_errors != 0
+            {
+                return Err(
+                    format!("native write fence inconsistent {origin:?}: {counts:?}").into(),
+                );
+            }
+            if !matches!(origin, NativeWorkOrigin::Light | NativeWorkOrigin::Mesh) {
+                closed &= counts.queued == 0
+                    && counts.worker_held == 0
+                    && counts.returned == 0
+                    && counts.reconciling == 0;
+            }
+        }
+        Ok(closed
+            && self.generating.is_empty()
+            && !self.save_in_flight()
+            && self.protos.values().all(Option::is_some)
+            && self.failed_finished.is_empty())
+    }
+    fn reconcile_native_fence_results(&mut self, world: &mut World) {
+        let mut ready = self.take_deferred();
+        loop {
+            match self.results.try_recv() {
+                Ok(done) => ready.push(self.received(done)),
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.result_disconnected();
+                    break;
+                }
+            }
+        }
+        for work in ready {
+            if matches!(&work.done, Done::Proto(..)) {
+                let ReceivedWork { done, mut owner } = work;
+                if let Some(owner) = &mut owner {
+                    owner.advance(WorkPhase::Reconciling);
+                }
+                let _reconciliation = Reconciliation(owner);
+                let Done::Proto(x, z, proto, decorated) = done else {
+                    unreachable!()
+                };
+                self.generation_scan.exhausted = false;
+                self.generating.remove(&(x, z));
+                // Retain the actual payload, including out-of-range protos.
+                // A subsequent ordinary update owns its normal disposition.
+                self.protos.insert((x, z), Some(proto));
+                if decorated || !self.decorates {
+                    self.decorated.insert((x, z));
+                }
+            } else {
+                // Generated is deliberately included: Generate can load a
+                // fresh finished column and invoke a late storage callback.
+                self.receive_save_result(work, world);
+            }
+        }
+    }
     fn reconcile_ready_save_results(&mut self, world: &mut World) {
         let deferred = self.take_deferred();
         let mut ready = Vec::new();
@@ -5049,6 +5191,547 @@ mod native_work_tests {
             book.lock().unwrap().counts[NativeWorkOrigin::Generate as usize].unresolved,
             1
         );
+    }
+
+    mod write_fence {
+        use super::*;
+
+        fn initialized(streaming: &Streaming, count: u64) {
+            let deadline = Instant::now() + WAIT;
+            while streaming.observe_native_work().initialized_workers != count {
+                assert!(Instant::now() < deadline, "native initialization handshake");
+                thread::yield_now();
+            }
+        }
+        fn short() -> Instant {
+            Instant::now() + Duration::from_millis(30)
+        }
+
+        #[test]
+        #[ignore = "owned prepared resources: native queued/held/returned producer closure"]
+        fn native_write_fence_retains_timeout_payload_then_transfers_proto_without_rescheduling() {
+            let (mut streaming, probe, workers, events, mut init) = fixture(1, false, false, false);
+            workers.recv_timeout(WAIT).unwrap();
+            let (proto, alive, _) = payload(81, (0, 0));
+            let mut held = gate(&probe, NativeWorkOrigin::Finish);
+            streaming.finishing.insert((0, 0));
+            streaming.submit(None, 0, Job::Finish(proto));
+            streaming.generating.insert((1, 0));
+            streaming.submit(None, 0, Job::Generate(1, 0));
+            let mut world = world();
+            let mut polls = 0;
+            let original = streaming.native_write_fence_until(&mut world, short(), || {
+                polls += 1;
+                Ok(true)
+            });
+            assert!(original.unwrap_err().to_string().contains("deadline"));
+            assert_eq!(polls, 0);
+            assert_eq!(counts(&streaming, NativeWorkOrigin::Finish).queued, 1);
+            assert!(alive.upgrade().is_some());
+            init.release();
+            assert_eq!(events.recv_timeout(WAIT).unwrap(), NativeWorkOrigin::Finish);
+            let original = streaming.native_write_fence_until(&mut world, short(), || {
+                polls += 1;
+                Ok(true)
+            });
+            assert!(original.unwrap_err().to_string().contains("deadline"));
+            assert_eq!(polls, 0);
+            assert_eq!(counts(&streaming, NativeWorkOrigin::Finish).worker_held, 1);
+            assert!(alive.upgrade().is_some());
+            held.release();
+            streaming.wait(WAIT);
+            streaming.wait(WAIT);
+            let Done::Proto(1, 0, ref proto, _) = streaming.deferred[1] else {
+                panic!("native proto")
+            };
+            let address = proto.downcast_ref::<Payload>().unwrap() as *const Payload as usize;
+            let submitted = streaming.order;
+            streaming
+                .native_write_fence_until(&mut world, Instant::now() + WAIT, || {
+                    polls += 1;
+                    Ok(true)
+                })
+                .unwrap();
+            assert_eq!(polls, 1);
+            assert_eq!(streaming.order, submitted);
+            assert_eq!(
+                streaming.protos[&(1, 0)]
+                    .as_ref()
+                    .unwrap()
+                    .downcast_ref::<Payload>()
+                    .unwrap() as *const Payload as usize,
+                address
+            );
+            assert_eq!(counts(&streaming, NativeWorkOrigin::Generate).disposed, 1);
+            assert_eq!(counts(&streaming, NativeWorkOrigin::Finish).disposed, 1);
+            assert_eq!(
+                streaming.require_pristine_fixture_capture(),
+                Err(CapturePristineError::PreviouslySubmitted)
+            );
+        }
+
+        struct InitProbe {
+            entered: mpsc::Sender<usize>,
+            gates: Mutex<VecDeque<mpsc::Receiver<()>>>,
+            next: std::sync::atomic::AtomicUsize,
+            panic_second: bool,
+        }
+        impl ChunkGenerator for InitProbe {
+            type Worker = ();
+            fn worker(&self) {
+                let (id, gate) = {
+                    let mut gates = self.gates.lock().unwrap();
+                    (
+                        self.next.fetch_add(1, Ordering::SeqCst),
+                        gates.pop_front().unwrap(),
+                    )
+                };
+                self.entered.send(id).unwrap();
+                gate.recv_timeout(WAIT).unwrap();
+                assert!(!(self.panic_second && id == 1), "controlled init panic");
+            }
+            fn proto(&self, _: &mut (), _: i32, _: i32) -> Proto {
+                Box::new(())
+            }
+            fn finish(&self, _: Proto) -> Chunk {
+                unreachable!()
+            }
+        }
+        #[test]
+        #[ignore = "owned prepared resources: every actual worker must initialize"]
+        fn native_write_fence_waits_for_all_workers_and_refuses_delayed_init_panic() {
+            for panic_second in [false, true] {
+                let (entered, seen) = mpsc::channel();
+                let (first, first_gate) = mpsc::channel();
+                let (second, second_gate) = mpsc::channel();
+                let generator = Arc::new(InitProbe {
+                    entered,
+                    gates: Mutex::new(VecDeque::from([first_gate, second_gate])),
+                    next: std::sync::atomic::AtomicUsize::new(0),
+                    panic_second,
+                });
+                let mut streaming = Streaming::new(generator, context(), 2);
+                let mut first = Release(Some(first));
+                let mut second = Release(Some(second));
+                let mut ids = [
+                    seen.recv_timeout(WAIT).unwrap(),
+                    seen.recv_timeout(WAIT).unwrap(),
+                ];
+                ids.sort();
+                assert_eq!(ids, [0, 1]);
+                first.release();
+                initialized(&streaming, 1);
+                let mut world = world();
+                let mut polls = 0;
+                let original = streaming.native_write_fence_until(&mut world, short(), || {
+                    polls += 1;
+                    Ok(true)
+                });
+                assert!(original.unwrap_err().to_string().contains("deadline"));
+                assert_eq!(polls, 0, "one initialized worker is insufficient");
+                second.release();
+                let result =
+                    streaming.native_write_fence_until(&mut world, Instant::now() + WAIT, || {
+                        polls += 1;
+                        Ok(true)
+                    });
+                assert_eq!(result.is_err(), panic_second);
+                assert_eq!(polls, usize::from(!panic_second));
+                assert_eq!(
+                    streaming.observe_native_work().worker_initialization_fault,
+                    panic_second
+                );
+                // Streaming::drop joins both actual pool threads, including the unwind.
+            }
+        }
+
+        #[test]
+        #[ignore = "owned prepared resources: unrelated native payload identity and order"]
+        fn native_write_fence_preserves_light_mesh_payloads_and_revalidates_late_worker_fault() {
+            let (mut streaming, _probe, workers, _events, mut init) =
+                fixture(1, false, false, false);
+            workers.recv_timeout(WAIT).unwrap();
+            let mut world = world();
+            let mut center = Chunk::empty(0, 0);
+            let stone = context()
+                .assets
+                .registry
+                .default_state("minecraft:stone")
+                .unwrap();
+            Arc::make_mut(&mut center.sections[4]).set(0, stone.0);
+            let center = Arc::new(center);
+            let region = || {
+                Box::new(std::array::from_fn(|z| {
+                    std::array::from_fn(|x| {
+                        Some(if x == 1 && z == 1 {
+                            center.clone()
+                        } else {
+                            Arc::new(Chunk::empty(x as i32 - 1, z as i32 - 1))
+                        })
+                    })
+                }))
+            };
+            streaming.submit(None, 0, Job::Light(0, 0, region(), 51, true));
+            streaming.submit(
+                None,
+                0,
+                Job::Mesh(
+                    0,
+                    4,
+                    0,
+                    region(),
+                    52,
+                    MeshSettings {
+                        nether: false,
+                        zoom: BiomeZoom::new(0),
+                        blend_radius: 0,
+                        smooth_lighting: true,
+                        cutout_leaves: false,
+                    },
+                ),
+            );
+            init.release();
+            streaming.wait(WAIT);
+            streaming.wait(WAIT);
+            let identities = |streaming: &Streaming| {
+                streaming
+                    .deferred
+                    .iter()
+                    .map(|done| match done {
+                        Done::Lit(_, _, sections, seq) => {
+                            (0, *seq, sections.as_ptr() as usize, sections.len())
+                        }
+                        Done::Meshed(_, _, _, mesh, seq) => {
+                            (1, *seq, mesh.solid.as_ptr() as usize, mesh.solid.len())
+                        }
+                        _ => panic!("unexpected deferred native payload"),
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let before = identities(&streaming);
+            assert!(before.iter().all(|row| row.3 > 0));
+            streaming
+                .native_write_fence_until(&mut world, Instant::now() + WAIT, || Ok(true))
+                .unwrap();
+            assert_eq!(identities(&streaming), before);
+            assert_eq!(counts(&streaming, NativeWorkOrigin::Light).returned, 1);
+            assert_eq!(counts(&streaming, NativeWorkOrigin::Mesh).returned, 1);
+
+            let (entered, seen) = mpsc::channel();
+            let (release, blocked) = mpsc::channel();
+            *streaming.shared.work_gate.lock().unwrap() = Some(WorkGate {
+                origin: NativeWorkOrigin::Light,
+                entered,
+                release: blocked,
+            });
+            streaming.submit(None, 0, Job::Light(1, 0, region(), 53, true));
+            seen.recv_timeout(WAIT).unwrap();
+            let book = streaming.shared.ownership.clone();
+            let mut release = Some(release);
+            let original =
+                streaming.native_write_fence_until(&mut world, Instant::now() + WAIT, || {
+                    // Deliberate channel disconnect unwinds the REAL worker during
+                    // the final writer poll, after producer closure passed.
+                    drop(release.take());
+                    let deadline = Instant::now() + WAIT;
+                    while !book.lock().unwrap().worker_exit_fault {
+                        assert!(Instant::now() < deadline);
+                        thread::yield_now();
+                    }
+                    Ok(true)
+                });
+            assert!(
+                original.is_err(),
+                "final post-writer validation must refuse"
+            );
+            let fault = streaming.observe_native_work();
+            assert!(fault.worker_exit_fault);
+            assert_eq!(
+                fault.origins[NativeWorkOrigin::Light as usize].1.unresolved,
+                1
+            );
+            assert_eq!(identities(&streaming), before);
+        }
+
+        struct LateFinished {
+            save: Arc<crate::save::SaveDir>,
+            entered: mpsc::Sender<()>,
+            gate: Mutex<Option<mpsc::Receiver<()>>>,
+            callback: mpsc::Sender<usize>,
+            partial: bool,
+            book: std::sync::OnceLock<Arc<Mutex<OwnershipBook>>>,
+        }
+        impl ChunkGenerator for LateFinished {
+            type Worker = ();
+            fn worker(&self) {}
+            fn load(&self, x: i32, z: i32) -> Option<Chunk> {
+                self.entered.send(()).unwrap();
+                let gate = self.gate.lock().unwrap().take().unwrap();
+                gate.recv_timeout(WAIT).unwrap();
+                let mut chunk = Chunk::empty(x, z);
+                chunk.fresh = true;
+                chunk.entities.push(horizon_world::nbt::Tag::compound([(
+                    "payload",
+                    horizon_world::nbt::Tag::Long(731),
+                )]));
+                Some(chunk)
+            }
+            fn proto(&self, _: &mut (), _: i32, _: i32) -> Proto {
+                unreachable!()
+            }
+            fn finish(&self, _: Proto) -> Chunk {
+                unreachable!()
+            }
+            fn save_finished(&self, chunk: &Arc<Chunk>) -> Result<(), String> {
+                {
+                    let book = self.book.get().unwrap().lock().unwrap();
+                    assert_eq!(
+                        book.counts[NativeWorkOrigin::Generate as usize].reconciling,
+                        1
+                    );
+                    assert_eq!(
+                        book.counts[NativeWorkOrigin::SaveFinishedCallback as usize].reconciling,
+                        1
+                    );
+                }
+                self.callback.send(Arc::as_ptr(chunk) as usize).unwrap();
+                self.save
+                    .save_later(
+                        std::slice::from_ref(chunk),
+                        context().assets.registry,
+                        &context().biomes,
+                    )
+                    .map_err(|e| e.to_string())?;
+                if self.partial {
+                    return Err("controlled failure after real region enqueue".into());
+                }
+                self.save
+                    .save_finished_entities_later(chunk)
+                    .map_err(|e| e.to_string())
+            }
+        }
+        #[test]
+        #[ignore = "owned prepared resources: late Generate finished callback and real writer ownership"]
+        fn native_write_fence_late_finished_handoff_precedes_writer_and_retains_partial_failure() {
+            for partial in [false, true] {
+                let unique = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos();
+                let root = std::env::temp_dir()
+                    .join(format!("h08nf1-late-{}-{unique}", std::process::id()));
+                std::fs::create_dir(&root).unwrap();
+                let save = Arc::new(crate::save::SaveDir::new(root.clone()));
+                let (entered, seen) = mpsc::channel();
+                let (release, gate) = mpsc::channel();
+                let mut release = Release(Some(release));
+                let (callback, callbacks) = mpsc::channel();
+                let generator = Arc::new(LateFinished {
+                    save: save.clone(),
+                    entered,
+                    gate: Mutex::new(Some(gate)),
+                    callback,
+                    partial,
+                    book: std::sync::OnceLock::new(),
+                });
+                let mut streaming = Streaming::new(generator.clone(), context(), 1);
+                assert!(
+                    generator
+                        .book
+                        .set(streaming.shared.ownership.clone())
+                        .is_ok()
+                );
+                streaming.generating.insert((1000, 1000));
+                streaming.submit(None, 0, Job::Generate(1000, 1000));
+                seen.recv_timeout(WAIT).unwrap();
+                assert!(
+                    save.writes_finished().unwrap(),
+                    "initial writer zero precedes the late callback"
+                );
+                let (writer_entered, writer_seen) = mpsc::channel();
+                let (writer_release, writer_gate) = mpsc::channel();
+                let mut writer_release = Release(Some(writer_release));
+                save.native_fence_writer_step(move || {
+                    writer_entered.send(()).unwrap();
+                    writer_gate.recv_timeout(WAIT).unwrap();
+                });
+                release.release();
+                streaming.wait(WAIT);
+                let mut world = world();
+                let mut polls = 0;
+                let original = streaming.native_write_fence_until(&mut world, short(), || {
+                    polls += 1;
+                    save.writes_finished()
+                });
+                assert!(original.is_err());
+                let pointer = callbacks.recv_timeout(WAIT).unwrap();
+                writer_seen.recv_timeout(WAIT).unwrap();
+                assert!(!save.writes_finished().unwrap());
+                if partial {
+                    assert_eq!(polls, 0);
+                    assert_eq!(Arc::as_ptr(&streaming.failed_finished[0]) as usize, pointer);
+                    assert_eq!(
+                        streaming.failed_finished[0].entities[0].get("payload"),
+                        Some(&horizon_world::nbt::Tag::Long(731))
+                    );
+                    assert!(streaming.generation_save_error().is_some());
+                    assert_eq!(
+                        counts(&streaming, NativeWorkOrigin::SaveFinishedCallback).unresolved,
+                        1
+                    );
+                } else {
+                    assert!(polls > 0);
+                    assert_eq!(
+                        save.load_entities(1000, 1000)[0].get("payload"),
+                        Some(&horizon_world::nbt::Tag::Long(731))
+                    );
+                }
+                // Preserve the original failure above; cleanup cannot qualify it.
+                writer_release.release();
+                let completed =
+                    streaming.native_write_fence_until(&mut world, Instant::now() + WAIT, || {
+                        save.writes_finished()
+                    });
+                assert_eq!(completed.is_err(), partial);
+                drop(streaming);
+                drop(generator);
+                drop(save);
+                std::fs::remove_dir_all(root).unwrap();
+            }
+        }
+
+        #[test]
+        #[ignore = "owned prepared resources: native accounting/disconnect/job-unwind refusal"]
+        fn native_write_fence_refuses_accounting_disconnect_and_job_unwind() {
+            for mode in 0..3 {
+                let (mut streaming, _probe, workers, _events, mut init) =
+                    fixture(1, false, false, mode == 2);
+                workers.recv_timeout(WAIT).unwrap();
+                let mut alive = None;
+                if mode == 0 {
+                    streaming.shared.ownership.lock().unwrap().accounting_fault = true;
+                } else if mode == 1 {
+                    let (send, receive) = mpsc::channel();
+                    drop(send);
+                    streaming.results = receive;
+                } else {
+                    let (proto, weak, _) = payload(93, (0, 0));
+                    alive = Some(weak);
+                    streaming.finishing.insert((0, 0));
+                    streaming.submit(None, 0, Job::Finish(proto));
+                }
+                init.release();
+                let original =
+                    streaming.native_write_fence_until(&mut world(), Instant::now() + WAIT, || {
+                        panic!("fault cannot reach writers")
+                    });
+                assert!(original.is_err());
+                if mode == 2 {
+                    let observation = streaming.observe_native_work();
+                    assert!(observation.worker_exit_fault);
+                    assert_eq!(counts(&streaming, NativeWorkOrigin::Finish).unresolved, 1);
+                    // Unwind destroyed the worker-held proto; this proves a
+                    // named fault/refusal, never invented payload recovery.
+                    assert!(alive.unwrap().upgrade().is_none());
+                }
+            }
+        }
+
+        #[test]
+        #[ignore = "owned prepared resources: decorated proto ownership and existing synchronous handoff"]
+        fn native_write_fence_flushes_written_protos_and_keeps_failed_markers() {
+            for failure in [false, true] {
+                let (mut streaming, probe, workers, _events, mut init) =
+                    fixture(1, false, false, false);
+                workers.recv_timeout(WAIT).unwrap();
+                if failure {
+                    *probe.failure.lock().unwrap() =
+                        Some("controlled proto enqueue failure".into());
+                }
+                let region: Box<[Proto; 9]> = Box::new(std::array::from_fn(|i| {
+                    payload(201 + i as u64, (i as i32 % 3 - 1, i as i32 / 3 - 1)).0
+                }));
+                let mut expected: Vec<_> = region
+                    .iter()
+                    .map(|proto| {
+                        let payload = proto.downcast_ref::<Payload>().unwrap();
+                        (payload.value, payload as *const Payload as usize)
+                    })
+                    .collect();
+                expected.sort();
+                streaming.decorating = 1;
+                streaming.submit(None, 0, Job::Decorate(0, 0, region));
+                init.release();
+                streaming.wait(WAIT);
+                let mut polls = 0;
+                let original =
+                    streaming.native_write_fence_until(&mut world(), Instant::now() + WAIT, || {
+                        polls += 1;
+                        Ok(true)
+                    });
+                assert_eq!(original.is_err(), failure);
+                assert_eq!(polls, usize::from(!failure));
+                assert_eq!(streaming.protos.len(), 9);
+                assert_eq!(streaming.written.len(), if failure { 9 } else { 0 });
+                let mut actual: Vec<_> = streaming
+                    .protos
+                    .values()
+                    .map(|proto| {
+                        let payload = proto.as_ref().unwrap().downcast_ref::<Payload>().unwrap();
+                        (payload.value, payload as *const Payload as usize)
+                    })
+                    .collect();
+                actual.sort();
+                assert_eq!(actual, expected);
+                let mut seen = probe.seen.lock().unwrap().clone();
+                seen.sort();
+                assert_eq!(seen, expected);
+                let callback = counts(&streaming, NativeWorkOrigin::SaveProtosCallback);
+                assert_eq!(callback.accepted_storage_handoffs, u64::from(!failure));
+                assert_eq!(callback.storage_errors, u64::from(failure));
+                assert_eq!(callback.unresolved, u64::from(failure));
+            }
+        }
+
+        #[test]
+        #[ignore = "owned prepared resources: actual writer panic refuses the borrowed fence"]
+        fn native_write_fence_writer_panic_times_out_without_discarding_pending_snapshot() {
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let root = std::env::temp_dir().join(format!(
+                "h08nf1-writer-panic-{}-{unique}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&root).unwrap();
+            let save = crate::save::SaveDir::new(root.clone());
+            let (entered, seen) = mpsc::channel();
+            save.native_fence_writer_step(move || {
+                entered.send(()).unwrap();
+                panic!("controlled actual writer panic");
+            });
+            let entity = horizon_world::nbt::Tag::compound([(
+                "payload",
+                horizon_world::nbt::Tag::Long(731),
+            )]);
+            save.save_entities_later(vec![((0, 0), vec![entity.clone()])])
+                .unwrap();
+            seen.recv_timeout(WAIT).unwrap();
+            let (mut streaming, _probe, workers, _events, mut init) =
+                fixture(1, false, false, false);
+            workers.recv_timeout(WAIT).unwrap();
+            init.release();
+            initialized(&streaming, 1);
+            let original = streaming
+                .native_write_fence_until(&mut world(), short(), || save.writes_finished());
+            assert!(original.unwrap_err().to_string().contains("deadline"));
+            assert!(!save.writes_finished().unwrap());
+            assert_eq!(save.load_entities(0, 0), [entity]);
+            drop(streaming);
+            drop(save); // Reap both native and writer threads.
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]

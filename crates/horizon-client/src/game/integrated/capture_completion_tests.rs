@@ -90,6 +90,133 @@ pub(in crate::game) fn dispatch_slot_advance_after_observer_timeout(
     dispatch(game, request, true, CaptureKind::SlotAdvance)
 }
 
+/// Closed test operation: owned data crosses channels; Game never leaves its owner.
+pub(in crate::game) struct NativeFenceRequest {
+    pub capture: CaptureRequest,
+    pub observe_timeout: bool,
+}
+#[derive(Debug)]
+pub(in crate::game) struct NativeFenceProof {
+    pub writer_polls: usize,
+    pub observation: horizon_client::streaming::NativeWorkObservation,
+    pub refusal: String,
+}
+type NativeFenceCompletion = Result<NativeFenceProof, String>;
+
+pub(in crate::game) fn dispatch_native_write_fence(
+    game: &mut Game<'_>,
+    request: NativeFenceRequest,
+) -> NativeFenceCompletion {
+    assert!(
+        game.serving.is_none(),
+        "fixture must not replace a live server"
+    );
+    let flags = Arc::new(Flags::default());
+    let (tasks, pending) = channel();
+    game.serving = Some(Serving {
+        flags: flags.clone(),
+        tasks: pending,
+        owner: 11,
+        pending: None,
+    });
+    let integrated = Integrated {
+        flags,
+        thread: None,
+        tasks,
+        world_name: "native write fence fixture".into(),
+    };
+    let client = std::thread::spawn(move || -> NativeFenceCompletion {
+        let (completed, completion) = sync_channel(1);
+        let (admitted, admission) = sync_channel(1);
+        let (release, blocked) = sync_channel(1);
+        let mut release = ReleaseOnDrop(Some(release));
+        let finished = Arc::new(AtomicBool::new(false));
+        let task_finished = finished.clone();
+        let observe_timeout = request.observe_timeout;
+        let started = Instant::now();
+        let observer = integrated.call(move |owner| {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if observe_timeout {
+                    admitted
+                        .send(())
+                        .map_err(|_| "fence admission observer lost".to_owned())?;
+                    blocked
+                        .recv()
+                        .map_err(|_| "fence admission release lost".to_owned())?;
+                }
+                owner.native_write_fence_fixture_operation(request.capture)
+            }))
+            .unwrap_or_else(|_| Err("native write fence Task panicked".into()));
+            task_finished.store(true, Ordering::SeqCst);
+            let _ = completed.send(result);
+        });
+        let mut sequencing_error = None;
+        let later = if observe_timeout {
+            if observer.is_some() || started.elapsed() < Duration::from_secs(10) {
+                sequencing_error = Some("real call observer did not time out".to_owned());
+            }
+            if admission.recv_timeout(Duration::from_secs(5)).is_err()
+                || finished.load(Ordering::SeqCst)
+            {
+                sequencing_error = Some("fence admission/completion ordering failed".to_owned());
+            }
+            let (later, later_seen) = sync_channel(1);
+            let later_finished = finished.clone();
+            if integrated
+                .tasks
+                .send(Box::new(move |_| {
+                    let _ = later.send(later_finished.load(Ordering::SeqCst));
+                }))
+                .is_err()
+            {
+                sequencing_error = Some("later native Task enqueue failed".to_owned());
+            }
+            if later_seen.try_recv() != Err(TryRecvError::Empty) {
+                sequencing_error =
+                    Some("later Task entered the exclusive fence operation".to_owned());
+            }
+            Some(later_seen)
+        } else {
+            None
+        };
+        // Always release admission, even when sequencing failed. The final
+        // receipt is independent of call's observer, with no retry/cancellation.
+        release.release();
+        let original = completion
+            .recv()
+            .unwrap_or_else(|_| Err("native fence final receipt lost".into()));
+        if !finished.load(Ordering::SeqCst) {
+            sequencing_error = Some("native fence final completion flag absent".into());
+        }
+        if let Some(later) = later
+            && later.recv() != Ok(true)
+        {
+            sequencing_error = Some("later Task did not follow definite completion".into());
+        }
+        eprintln!(
+            "NATIVE_WRITE_FENCE_TASK_COMPLETE observer_some={} final_receipts=1 later_excluded={}",
+            observer.is_some(),
+            sequencing_error.is_none()
+        );
+        if let Some(error) = sequencing_error {
+            return Err(error);
+        }
+        original
+    });
+    while !client.is_finished() {
+        game.run_tasks();
+        std::thread::yield_now();
+    }
+    game.run_tasks();
+    // Every success/error path joins the client. The fixed operation catches
+    // assertions so a failing owner task cannot strand the final-receipt wait.
+    let original = client
+        .join()
+        .unwrap_or_else(|_| Err("native fence client panicked".into()));
+    let _ = game.serving.take();
+    original
+}
+
 #[derive(Clone, Copy)]
 enum CaptureKind {
     Archive,

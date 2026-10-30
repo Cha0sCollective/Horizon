@@ -1904,6 +1904,8 @@ fn read_region_record(
 /// x, z): reads see them before the region files do.
 type PendingWrites = Mutex<HashMap<(Folder, i32, i32), (u64, Record)>>;
 type WriteBatch = (Folder, Vec<((i32, i32), Record, u64)>);
+#[cfg(test)]
+type WriterTestStep = Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>>;
 /// The region folders of a dimension.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Folder {
@@ -1957,6 +1959,8 @@ pub struct SaveDir {
     pub tables: OnceLock<Arc<SaveTables>>,
     /// The dimension's skylight and height, from its folder name.
     pub shape: LevelShape,
+    #[cfg(test)]
+    writer_test_step: WriterTestStep,
 }
 fn is_forced_ticket(ticket: &Tag) -> bool {
     matches!(ticket.get("type"), Some(Tag::String(t)) if *t == JavaString::from("minecraft:forced"))
@@ -1975,6 +1979,8 @@ impl SaveDir {
             outstanding: Default::default(),
             tables: OnceLock::new(),
             shape,
+            #[cfg(test)]
+            writer_test_step: Default::default(),
         }
     }
     /// 26.3's TicketStorage: persistent tickets live in each dimension's
@@ -2149,10 +2155,19 @@ impl SaveDir {
         );
         let pending = self.pending.clone();
         let outstanding = self.outstanding.clone();
+        #[cfg(test)]
+        let writer_test_step = self.writer_test_step.clone();
         let thread = std::thread::Builder::new()
             .name("horizon-region-writer".into())
             .spawn(move || {
                 for (kind, batch) in receive {
+                    #[cfg(test)]
+                    {
+                        let step = writer_test_step.lock().unwrap().take();
+                        if let Some(step) = step {
+                            step();
+                        }
+                    }
                     let cache = match kind {
                         Folder::Region => &regions,
                         Folder::Entities => &entity_regions,
@@ -2234,6 +2249,10 @@ impl SaveDir {
             .map_err(|_| "writer poisoned")?;
         self.write_result()?;
         Ok(*count == 0)
+    }
+    #[cfg(test)]
+    pub(crate) fn native_fence_writer_step(&self, step: impl FnOnce() + Send + 'static) {
+        *self.writer_test_step.lock().unwrap() = Some(Box::new(step));
     }
     fn write_result(&self) -> Result<()> {
         match &*self
@@ -5823,6 +5842,130 @@ mod tests {
         }
         drop(save);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    mod native_write_fence {
+        use super::*;
+        use std::time::{Duration, Instant};
+
+        fn poll(save: &super::super::SaveDir, deadline: Instant) -> super::super::Result<()> {
+            loop {
+                if Instant::now() >= deadline {
+                    return Err("writer poll deadline exceeded".into());
+                }
+                if save.writes_finished()? {
+                    return Ok(());
+                }
+                std::thread::yield_now();
+            }
+        }
+        fn retained(save: &super::super::SaveDir, chunk: &Arc<Chunk>) {
+            let pending = save.pending.lock().unwrap();
+            let (_, super::super::Record::FinishedEntities(held)) =
+                &pending[&(super::super::Folder::Entities, chunk.x, chunk.z)]
+            else {
+                panic!("actual pending snapshot must remain owned")
+            };
+            assert!(Arc::ptr_eq(held, chunk));
+            drop(pending);
+            assert_eq!(save.load_entities(chunk.x, chunk.z), chunk.entities);
+        }
+        struct Release(Option<std::sync::mpsc::Sender<()>>);
+        impl Release {
+            fn release(&mut self) {
+                if let Some(send) = self.0.take() {
+                    let _ = send.send(());
+                }
+            }
+        }
+        impl Drop for Release {
+            fn drop(&mut self) {
+                self.release();
+            }
+        }
+
+        #[test]
+        fn native_write_fence_writer_timeout_and_panic_keep_original_pending_owner() {
+            for panic_writer in [false, true] {
+                let (dir, chunk) = finished_entities_fixture(if panic_writer {
+                    "h08nf1-panic"
+                } else {
+                    "h08nf1-held"
+                });
+                let save = super::super::SaveDir::new(dir.clone());
+                let (entered, seen) = std::sync::mpsc::channel();
+                let (release, blocked) = std::sync::mpsc::channel();
+                let mut release = Release(Some(release));
+                save.native_fence_writer_step(move || {
+                    entered.send(()).unwrap();
+                    blocked.recv_timeout(Duration::from_secs(5)).unwrap();
+                    assert!(
+                        !panic_writer,
+                        "controlled real writer unwind before completion tail"
+                    );
+                });
+                save.save_finished_entities_later(&chunk).unwrap();
+                seen.recv_timeout(Duration::from_secs(5)).unwrap();
+                retained(&save, &chunk);
+                if panic_writer {
+                    release.release();
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while !save
+                        .writer
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .unwrap()
+                        .thread
+                        .is_finished()
+                    {
+                        assert!(Instant::now() < deadline);
+                        std::thread::yield_now();
+                    }
+                }
+                let original = poll(&save, Instant::now() + Duration::from_millis(30));
+                assert!(original.unwrap_err().to_string().contains("deadline"));
+                assert!(!save.writes_finished().unwrap());
+                retained(&save, &chunk);
+                assert_eq!(*save.outstanding.count.lock().unwrap(), 1);
+                assert!(
+                    save.outstanding.error.lock().unwrap().is_none(),
+                    "panic has no production exit guard; pending ownership and timeout are the proof"
+                );
+                // The original result is fixed before any cleanup release.
+                release.release();
+                if !panic_writer {
+                    poll(&save, Instant::now() + Duration::from_secs(5)).unwrap();
+                    assert!(save.pending.lock().unwrap().is_empty());
+                    assert_eq!(
+                        super::super::SaveDir::new(dir.clone()).load_entities(1, 2),
+                        chunk.entities
+                    );
+                }
+                drop(save); // Join the actual writer, including the panic path.
+                std::fs::remove_dir_all(dir).unwrap();
+            }
+        }
+
+        #[test]
+        fn native_write_fence_writer_io_failure_stays_sticky_with_original_arc() {
+            let (dir, chunk) = finished_entities_fixture("h08nf1-io-failure");
+            std::fs::write(dir.join("entities"), b"blocked").unwrap();
+            let save = super::super::SaveDir::new(dir.clone());
+            save.save_finished_entities_later(&chunk).unwrap();
+            let original = poll(&save, Instant::now() + Duration::from_secs(5));
+            assert!(
+                original
+                    .unwrap_err()
+                    .to_string()
+                    .contains("failed to write entities")
+            );
+            assert!(save.writes_finished().is_err());
+            retained(&save, &chunk);
+            assert!(poll(&save, Instant::now() + Duration::from_secs(5)).is_err());
+            drop(save);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     #[test]
