@@ -1904,8 +1904,91 @@ fn read_region_record(
 /// x, z): reads see them before the region files do.
 type PendingWrites = Mutex<HashMap<(Folder, i32, i32), (u64, Record)>>;
 type WriteBatch = (Folder, Vec<((i32, i32), Record, u64)>);
-#[cfg(test)]
+#[cfg(any(test, all(feature = "native-writer-test-control", debug_assertions)))]
 type WriterTestStep = Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>>;
+
+/// Fixed developer-fixture actions before the real writer's next batch.
+/// Available only with the nondefault feature and debug assertions; not a stable host API.
+#[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+#[doc(hidden)]
+pub enum NativeWriterTestAction {
+    Block,
+    Panic,
+}
+
+/// Owned one-shot command gate. Drop cancels without panicking or waiting.
+/// Declare this after the Game/SaveDir so cancellation precedes writer teardown.
+#[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+#[doc(hidden)]
+#[must_use = "retain the control until the fixture triggers or cancels its writer action"]
+pub struct NativeWriterTestControl {
+    entered: mpsc::Receiver<()>,
+    entered_seen: bool,
+    command: Option<mpsc::Sender<()>>,
+}
+
+#[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+impl NativeWriterTestControl {
+    /// Acknowledge actual batch reception, not durability. A timeout does not cancel.
+    pub fn wait_entered(&mut self, timeout: std::time::Duration) -> Result<()> {
+        if !self.entered_seen {
+            self.entered
+                .recv_timeout(timeout)
+                .map_err(|error| format!("native writer test entry: {error}"))?;
+            self.entered_seen = true;
+        }
+        Ok(())
+    }
+
+    /// Request the fixed action once. Dropping this receipt cannot retract that request.
+    /// Success means command submission, not writer completion or panic detection.
+    pub fn trigger(&mut self) -> Result<()> {
+        self.command
+            .take()
+            .ok_or("native writer test action already requested")?
+            .send(())
+            .map_err(|_| "native writer test command receiver stopped".into())
+    }
+}
+
+#[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+impl Drop for NativeWriterTestControl {
+    fn drop(&mut self) {
+        drop(self.command.take());
+    }
+}
+
+/// Non-atomic copies of actual writer state, not a durability/readiness capability.
+/// The observer releases each lock before taking the next; I/O, locks and joins have
+/// no universal hard deadline. This developer-fixture type is not a stable host API.
+#[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct NativeWriterTestObservation {
+    outstanding_batches: usize,
+    pending_records: usize,
+    sticky_error: Option<String>,
+    thread_finished: Option<bool>,
+}
+
+#[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+impl NativeWriterTestObservation {
+    pub fn outstanding_batches(&self) -> usize {
+        self.outstanding_batches
+    }
+
+    pub fn pending_records(&self) -> usize {
+        self.pending_records
+    }
+
+    pub fn sticky_error(&self) -> Option<&str> {
+        self.sticky_error.as_deref()
+    }
+
+    pub fn thread_finished(&self) -> Option<bool> {
+        self.thread_finished
+    }
+}
 /// The region folders of a dimension.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Folder {
@@ -1959,7 +2042,7 @@ pub struct SaveDir {
     pub tables: OnceLock<Arc<SaveTables>>,
     /// The dimension's skylight and height, from its folder name.
     pub shape: LevelShape,
-    #[cfg(test)]
+    #[cfg(any(test, all(feature = "native-writer-test-control", debug_assertions)))]
     writer_test_step: WriterTestStep,
 }
 fn is_forced_ticket(ticket: &Tag) -> bool {
@@ -1979,7 +2062,7 @@ impl SaveDir {
             outstanding: Default::default(),
             tables: OnceLock::new(),
             shape,
-            #[cfg(test)]
+            #[cfg(any(test, all(feature = "native-writer-test-control", debug_assertions)))]
             writer_test_step: Default::default(),
         }
     }
@@ -2155,13 +2238,16 @@ impl SaveDir {
         );
         let pending = self.pending.clone();
         let outstanding = self.outstanding.clone();
-        #[cfg(test)]
+        #[cfg(any(test, all(feature = "native-writer-test-control", debug_assertions)))]
         let writer_test_step = self.writer_test_step.clone();
         let thread = std::thread::Builder::new()
             .name("horizon-region-writer".into())
             .spawn(move || {
                 for (kind, batch) in receive {
-                    #[cfg(test)]
+                    #[cfg(any(
+                        test,
+                        all(feature = "native-writer-test-control", debug_assertions)
+                    ))]
                     {
                         let step = writer_test_step.lock().unwrap().take();
                         if let Some(step) = step {
@@ -2253,6 +2339,80 @@ impl SaveDir {
     #[cfg(test)]
     pub(crate) fn native_fence_writer_step(&self, step: impl FnOnce() + Send + 'static) {
         *self.writer_test_step.lock().unwrap() = Some(Box::new(step));
+    }
+
+    /// Arm one fixed action for the next actual batch. An occupied slot is refused.
+    /// Cancellation before entry leaves a harmless hook until a batch consumes it;
+    /// use one arm per fresh fixture. This exposes no callback or simulated result.
+    #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+    #[doc(hidden)]
+    pub fn arm_native_writer_test_control(
+        &self,
+        action: NativeWriterTestAction,
+    ) -> Result<NativeWriterTestControl> {
+        let mut slot = self
+            .writer_test_step
+            .lock()
+            .map_err(|_| "native writer test slot poisoned")?;
+        if slot.is_some() {
+            return Err("native writer test slot occupied".into());
+        }
+        let (entered, entry) = mpsc::channel();
+        let (command, requested) = mpsc::channel();
+        *slot = Some(Box::new(move || {
+            // A dropped observer cannot retract a command already queued by trigger.
+            let _ = entered.send(());
+            if requested.recv().is_ok() {
+                match action {
+                    NativeWriterTestAction::Block => {}
+                    NativeWriterTestAction::Panic => {
+                        panic!("controlled native writer test panic before completion tail");
+                    }
+                }
+            }
+        }));
+        Ok(NativeWriterTestControl {
+            entered: entry,
+            entered_seen: false,
+            command: Some(command),
+        })
+    }
+
+    /// Copy actual diagnostic state under separate locks. Never repairs a panic's
+    /// stranded count, clears an error or joins/replaces a writer. After a panic,
+    /// flush/ordinary saving may wait forever: release controls and directly drop
+    /// the owned headless fixture instead, without a live Integrated wrapper.
+    #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+    #[doc(hidden)]
+    pub fn observe_native_writer_for_test(&self) -> Result<NativeWriterTestObservation> {
+        let outstanding_batches = *self
+            .outstanding
+            .count
+            .lock()
+            .map_err(|_| "writer poisoned")?;
+        let pending_records = self
+            .pending
+            .lock()
+            .map_err(|_| "pending writes poisoned")?
+            .len();
+        let sticky_error = self
+            .outstanding
+            .error
+            .lock()
+            .map_err(|_| "writer poisoned")?
+            .clone();
+        let thread_finished = self
+            .writer
+            .lock()
+            .map_err(|_| "writer poisoned")?
+            .as_ref()
+            .map(|writer| writer.thread.is_finished());
+        Ok(NativeWriterTestObservation {
+            outstanding_batches,
+            pending_records,
+            sticky_error,
+            thread_finished,
+        })
     }
     fn write_result(&self) -> Result<()> {
         match &*self
@@ -5842,6 +6002,248 @@ mod tests {
         }
         drop(save);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+    mod native_writer_test_control {
+        use super::super::{NativeWriterTestAction as Action, SaveDir};
+        use super::*;
+        use std::time::{Duration, Instant};
+
+        const WAIT: Duration = Duration::from_secs(5);
+
+        struct Scratch(std::path::PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                // SaveDir/control locals are declared later and drop first on unwind.
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        fn wait_written(save: &SaveDir) {
+            let deadline = Instant::now() + WAIT;
+            loop {
+                if save.writes_finished().unwrap() {
+                    return;
+                }
+                assert!(Instant::now() < deadline, "real writer did not finish");
+                std::thread::yield_now();
+            }
+        }
+
+        fn wait_panicked(save: &SaveDir) {
+            let deadline = Instant::now() + WAIT;
+            while save
+                .observe_native_writer_for_test()
+                .unwrap()
+                .thread_finished()
+                != Some(true)
+            {
+                assert!(Instant::now() < deadline, "real writer did not terminate");
+                std::thread::yield_now();
+            }
+        }
+
+        fn pending_owner(save: &SaveDir, chunk: &Arc<Chunk>) {
+            let observed = save.observe_native_writer_for_test().unwrap();
+            assert_eq!(observed.outstanding_batches(), 1);
+            assert_eq!(observed.pending_records(), 1);
+            assert_eq!(observed.sticky_error(), None);
+            assert!(!save.writes_finished().unwrap());
+            let pending = save.pending.lock().unwrap();
+            let (_, super::super::Record::FinishedEntities(held)) =
+                &pending[&(super::super::Folder::Entities, chunk.x, chunk.z)]
+            else {
+                panic!("original actual batch record must remain pending")
+            };
+            assert!(Arc::ptr_eq(held, chunk));
+            drop(pending);
+            assert_eq!(save.load_entities(chunk.x, chunk.z), chunk.entities);
+        }
+
+        fn written(save: &SaveDir, scratch: &Scratch, chunk: &Arc<Chunk>) {
+            wait_written(save);
+            let observed = save.observe_native_writer_for_test().unwrap();
+            assert_eq!(observed.outstanding_batches(), 0);
+            assert_eq!(observed.pending_records(), 0);
+            assert_eq!(observed.sticky_error(), None);
+            assert_eq!(observed.thread_finished(), Some(false));
+            // A fresh SaveDir has no pending map or region cache from the writer.
+            assert_eq!(
+                SaveDir::new(scratch.0.clone()).load_entities(chunk.x, chunk.z),
+                chunk.entities
+            );
+        }
+
+        #[test]
+        fn native_writer_test_control_block_requires_real_batch_then_writes_native_record() {
+            let (dir, chunk) = finished_entities_fixture("closed-control-block");
+            let scratch = Scratch(dir);
+            let save = SaveDir::new(scratch.0.clone());
+            let observed = save.observe_native_writer_for_test().unwrap();
+            assert_eq!(observed.outstanding_batches(), 0);
+            assert_eq!(observed.pending_records(), 0);
+            assert_eq!(observed.sticky_error(), None);
+            assert_eq!(observed.thread_finished(), None);
+            let mut control = save.arm_native_writer_test_control(Action::Block).unwrap();
+            assert!(control.wait_entered(Duration::ZERO).is_err());
+            assert!(save.arm_native_writer_test_control(Action::Panic).is_err());
+            save.save_finished_entities_later(&chunk).unwrap();
+            control.wait_entered(WAIT).unwrap();
+            control.wait_entered(Duration::ZERO).unwrap();
+            pending_owner(&save, &chunk);
+            assert_eq!(
+                save.observe_native_writer_for_test()
+                    .unwrap()
+                    .thread_finished(),
+                Some(false)
+            );
+            assert!(
+                SaveDir::new(scratch.0.clone())
+                    .load_entities(chunk.x, chunk.z)
+                    .is_empty()
+            );
+            control.trigger().unwrap();
+            assert!(control.trigger().is_err());
+            drop(control);
+            written(&save, &scratch, &chunk);
+            drop(save);
+            std::fs::remove_dir_all(&scratch.0).unwrap();
+        }
+
+        #[test]
+        fn native_writer_test_control_drop_before_entry_cancels_both_actions() {
+            for action in [Action::Block, Action::Panic] {
+                let (dir, chunk) = finished_entities_fixture("closed-control-cancel-before");
+                let scratch = Scratch(dir);
+                let save = SaveDir::new(scratch.0.clone());
+                let control = save.arm_native_writer_test_control(action).unwrap();
+                drop(control);
+                assert!(save.arm_native_writer_test_control(Action::Block).is_err());
+                save.save_finished_entities_later(&chunk).unwrap();
+                written(&save, &scratch, &chunk);
+                drop(save);
+                std::fs::remove_dir_all(&scratch.0).unwrap();
+            }
+        }
+
+        #[test]
+        fn native_writer_test_control_drop_after_entry_cancels_both_actions() {
+            for action in [Action::Block, Action::Panic] {
+                let (dir, chunk) = finished_entities_fixture("closed-control-cancel-after");
+                let scratch = Scratch(dir);
+                let save = SaveDir::new(scratch.0.clone());
+                let mut control = save.arm_native_writer_test_control(action).unwrap();
+                save.save_finished_entities_later(&chunk).unwrap();
+                control.wait_entered(WAIT).unwrap();
+                pending_owner(&save, &chunk);
+                drop(control);
+                written(&save, &scratch, &chunk);
+                drop(save);
+                std::fs::remove_dir_all(&scratch.0).unwrap();
+            }
+        }
+
+        #[test]
+        fn native_writer_test_control_owner_unwind_cancels_without_writer_panic() {
+            let (dir, chunk) = finished_entities_fixture("closed-control-owner-unwind");
+            let scratch = Scratch(dir);
+            let save = SaveDir::new(scratch.0.clone());
+            let owner = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut control = save.arm_native_writer_test_control(Action::Panic).unwrap();
+                save.save_finished_entities_later(&chunk).unwrap();
+                control.wait_entered(WAIT).unwrap();
+                pending_owner(&save, &chunk);
+                panic!("controlled fixture owner unwind releases its receipt");
+            }));
+            let panic = owner.expect_err("the fixture owner must unwind");
+            assert_eq!(
+                panic.downcast_ref::<&str>().copied(),
+                Some("controlled fixture owner unwind releases its receipt")
+            );
+            written(&save, &scratch, &chunk);
+            drop(save);
+            std::fs::remove_dir_all(&scratch.0).unwrap();
+        }
+
+        #[test]
+        fn native_writer_test_control_trigger_then_drop_preserves_real_panic_and_pending_owner() {
+            for before_entry in [true, false] {
+                let (dir, chunk) = finished_entities_fixture("closed-control-panic");
+                let scratch = Scratch(dir);
+                let save = SaveDir::new(scratch.0.clone());
+                let mut control = save.arm_native_writer_test_control(Action::Panic).unwrap();
+                if before_entry {
+                    control.trigger().unwrap();
+                    drop(control);
+                    save.save_finished_entities_later(&chunk).unwrap();
+                } else {
+                    save.save_finished_entities_later(&chunk).unwrap();
+                    control.wait_entered(WAIT).unwrap();
+                    pending_owner(&save, &chunk);
+                    control.trigger().unwrap();
+                    drop(control);
+                }
+                wait_panicked(&save);
+                pending_owner(&save, &chunk);
+                // Panic preceded the I/O closure/completion tail: no error/count repair.
+                assert!(
+                    SaveDir::new(scratch.0.clone())
+                        .load_entities(chunk.x, chunk.z)
+                        .is_empty()
+                );
+                pending_owner(&save, &chunk);
+                // Never call flush after this panic; Drop closes the queue and joins.
+                drop(save);
+                std::fs::remove_dir_all(&scratch.0).unwrap();
+            }
+        }
+
+        #[test]
+        fn native_writer_test_control_observer_copies_real_sticky_io_error() {
+            let (dir, chunk) = finished_entities_fixture("closed-control-io-error");
+            let scratch = Scratch(dir);
+            std::fs::write(scratch.0.join("entities"), b"blocked").unwrap();
+            let save = SaveDir::new(scratch.0.clone());
+            let mut control = save.arm_native_writer_test_control(Action::Block).unwrap();
+            save.save_finished_entities_later(&chunk).unwrap();
+            control.wait_entered(WAIT).unwrap();
+            pending_owner(&save, &chunk);
+            control.trigger().unwrap();
+            drop(control);
+            let deadline = Instant::now() + WAIT;
+            loop {
+                let observed = save.observe_native_writer_for_test().unwrap();
+                if observed.outstanding_batches() == 0 {
+                    assert_eq!(observed.pending_records(), 1);
+                    assert!(
+                        observed
+                            .sticky_error()
+                            .unwrap()
+                            .contains("failed to write entities")
+                    );
+                    assert_eq!(observed.thread_finished(), Some(false));
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "real I/O error tail did not finish"
+                );
+                std::thread::yield_now();
+            }
+            assert!(save.writes_finished().is_err());
+            assert_eq!(save.load_entities(chunk.x, chunk.z), chunk.entities);
+            std::fs::remove_file(scratch.0.join("entities")).unwrap();
+            assert!(save.writes_finished().is_err());
+            assert!(
+                save.observe_native_writer_for_test()
+                    .unwrap()
+                    .sticky_error()
+                    .is_some()
+            );
+            drop(save);
+            std::fs::remove_dir_all(&scratch.0).unwrap();
+        }
     }
 
     mod native_write_fence {

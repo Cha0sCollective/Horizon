@@ -96,6 +96,8 @@ controllers = ["dep:gilrs", "dep:horizon-dualsense"]
 mods = ["horizon-mods/runtime"]
 # Experimental immutable package capture only; no discovery or activation.
 paired-packages = ["horizon-mods/paired-packages"]
+# Closed developer fixtures for the real native writer; absent without debug assertions.
+native-writer-test-control = []
 # Records the call sites of mob random draws (`mob_ai_probe` traces).
 rng-trace = ["horizon-core/rng-trace"]
 
