@@ -97,6 +97,58 @@ fn comparison_reports_specific_components_without_granting_network_authority() {
     assert_eq!(a, snapshot());
 }
 
+#[test]
+fn local_wire_projection_requires_exact_snapshot_scheme_and_captured_hex() {
+    use horizon_client::lan::peer_contract::{ContractMismatch, WireContract};
+    // Synthetic projection inputs exercise spelling/field mapping, not local
+    // executable capture or a successful frozen-input constructor.
+    let mut local = snapshot();
+    local.build = format!("sha256:{}", "01".repeat(32));
+    local.package.1 = "23".repeat(32);
+    let wire = local.to_wire_contract().unwrap();
+    assert_eq!(wire.claims().build, [1; 32]);
+    assert_eq!(wire.claims().package, [0x23; 32]);
+    assert_eq!(wire.claims().registries, &local.registries);
+    let decoded = WireContract::decode(&wire.encode().unwrap()).unwrap();
+    assert_eq!(wire.compare(&decoded), Ok(()));
+    assert!(selected_pins().external_network().is_err());
+    for build in [
+        "sha256:test".to_owned(),
+        "01".repeat(32),
+        format!("sha256:{}", "AA".repeat(32)),
+        format!("sha256:{}", "g0".repeat(32)),
+    ] {
+        let mut changed = local.clone();
+        changed.build = build;
+        assert!(changed.to_wire_contract().is_err());
+    }
+    for digest in [
+        "f".repeat(63),
+        "FF".repeat(32),
+        "gg".repeat(32),
+        "é".repeat(32),
+    ] {
+        let mut changed = local.clone();
+        changed.package.1 = digest;
+        assert!(changed.to_wire_contract().is_err());
+    }
+    let mut changed = local.clone();
+    changed.domain = "future-snapshot";
+    assert!(changed.to_wire_contract().is_err());
+    let mut changed = local.clone();
+    changed.package_scheme.push('2');
+    assert!(changed.to_wire_contract().is_err());
+    let mut changed = local.clone();
+    changed.schema.1 = 2;
+    assert!(changed.to_wire_contract().is_err());
+    let mut changed = local;
+    changed.registries.features[0] ^= 1;
+    assert_eq!(
+        wire.compare(&changed.to_wire_contract().unwrap()),
+        Err(ContractMismatch::Features)
+    );
+}
+
 #[cfg(all(feature = "paired-packages", feature = "mods"))]
 mod resource {
     use super::*;
@@ -352,6 +404,389 @@ mod resource {
                 "game/peer_contract_snapshot_tests.rs"
             ]
             .map(|p| fs::read(source.join(p)).unwrap()),
+            before_sources
+        );
+    }
+
+    #[test]
+    #[ignore = "isolated pinned HORIZON_TEST_RESOURCES and prebuilt HORIZON_COUNTER_PAIR_FIXTURE"]
+    fn actual_frozen_input_owners_wire_data_and_mutation_controls() {
+        use horizon_client::lan::peer_contract::{ContractMismatch, WireContract};
+        use horizon_world::{nbt::Tag, registry::BlockStateId};
+        let base = PathBuf::from(
+            std::env::var_os("HORIZON_TEST_RESOURCES").expect("pinned resources required"),
+        );
+        let pair = PathBuf::from(
+            std::env::var_os("HORIZON_COUNTER_PAIR_FIXTURE").expect("prebuilt Rust pair required"),
+        );
+        let before_pair = tree(&pair);
+        let before_base =
+            ["facts.json", "registries.json"].map(|p| fs::read(base.join(p)).unwrap());
+        let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+        let paths = [
+            "lan/peer_contract.rs",
+            "lan/mod.rs",
+            "game/mod_packages.rs",
+            "game/peer_contract_snapshot_tests.rs",
+            "lan/data.rs",
+        ];
+        let before_sources = paths.map(|p| fs::read(source.join(p)).unwrap());
+        let scratch = Scratch::new();
+        // Change only a scratch copy later; the provenance fixture stays read-only.
+        let local_pair = scratch.0.join("captured-pair");
+        copy_tree(&pair, &local_pair);
+        let a = captured(&local_pair);
+        let b = captured(&local_pair);
+        assert!(!Arc::ptr_eq(
+            a.catalog.as_ref().unwrap(),
+            b.catalog.as_ref().unwrap()
+        ));
+        let root_a = materialize(&a, &base, &scratch.0.join("cache-a"));
+        let root_b = materialize(&b, &base, &scratch.0.join("cache-b"));
+        let tables_before =
+            ["facts.json", "registries.json"].map(|p| fs::read(root_a.join(p)).unwrap());
+        let (sync_a, blocks_a) = load(&root_a);
+        let (sync_b, blocks_b) = load(&root_b);
+        // The production registry is immutable/static too. Leak only these
+        // finite test registries so the exact lifetime contract is exercised.
+        let blocks_a: &'static BlockRegistry = Box::leak(Box::new(blocks_a));
+        let blocks_b: &'static BlockRegistry = Box::leak(Box::new(blocks_b));
+        let sync_a = Arc::new(sync_a);
+        let sync_b = Arc::new(sync_b);
+        let first = a
+            .freeze_peer_inputs(sync_a.clone(), blocks_a)
+            .unwrap()
+            .unwrap();
+        let second = b
+            .freeze_peer_inputs(sync_b.clone(), blocks_b)
+            .unwrap()
+            .unwrap();
+        assert!(Arc::ptr_eq(&first.sync, &sync_a));
+        assert!(Arc::ptr_eq(
+            first.packages.catalog.as_ref().unwrap(),
+            a.catalog.as_ref().unwrap()
+        ));
+        assert!(std::ptr::eq(first.sync(), sync_a.as_ref()));
+        assert!(std::ptr::eq(first.blocks(), blocks_a));
+        assert!(!Arc::ptr_eq(&first.sync, &second.sync));
+        let encoded = first.wire_contract().encode().unwrap();
+        assert_eq!(encoded, second.wire_contract().encode().unwrap());
+        assert_eq!(first.snapshot.compare(&second.snapshot), Ok(()));
+        let decoded = WireContract::decode(&encoded).unwrap();
+        assert_eq!(first.wire_contract().compare(&decoded), Ok(()));
+        assert_eq!(decoded.claims().machine_id, first.snapshot.schema.0);
+        assert_eq!(
+            decoded.claims().package,
+            *first
+                .packages
+                .catalog()
+                .unwrap()
+                .prepared()
+                .values()
+                .next()
+                .unwrap()
+                .identity()
+        );
+        // Independent measurement of the actual current test executable; this
+        // digest is never an argument to freeze_peer_inputs.
+        let mut executable = fs::File::open(std::env::current_exe().unwrap()).unwrap();
+        let mut hasher = Sha256::new();
+        let mut buffer = [0u8; 128 << 10];
+        loop {
+            let count = executable.read(&mut buffer).unwrap();
+            if count == 0 {
+                break;
+            }
+            hasher.update(&buffer[..count]);
+        }
+        let actual_build: [u8; 32] = hasher.finalize().into();
+        assert_eq!(decoded.claims().build, actual_build);
+        assert_eq!(
+            captured_hex_digest(first.packages.build.strip_prefix("sha256:").unwrap()).unwrap(),
+            actual_build
+        );
+        let catalog_weak = Arc::downgrade(a.catalog.as_ref().unwrap());
+        let sync_weak = Arc::downgrade(&sync_a);
+        let mut shared = sync_a.clone();
+        assert!(Arc::get_mut(&mut shared).is_none());
+        drop(shared);
+        drop(sync_a);
+        drop(a);
+        assert!(Arc::ptr_eq(&sync_weak.upgrade().unwrap(), &first.sync));
+        assert!(Arc::ptr_eq(
+            &catalog_weak.upgrade().unwrap(),
+            first.packages.catalog.as_ref().unwrap()
+        ));
+        assert_eq!(first.wire_contract().encode().unwrap(), encoded);
+        assert!(std::ptr::eq(first.blocks(), blocks_a));
+
+        // An independently loaded mutable owner can change. It cannot replace
+        // the exact Arc already held by either frozen value.
+        let mut controls = Arc::new(SyncData::load(&root_b).unwrap());
+        Arc::get_mut(&mut controls)
+            .unwrap()
+            .features
+            .push("example:wire_control".into());
+        let changed = b
+            .freeze_peer_inputs(controls.clone(), blocks_b)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            first.wire_contract().compare(changed.wire_contract()),
+            Err(ContractMismatch::Features)
+        );
+        drop(changed);
+        Arc::get_mut(&mut controls).unwrap().features.pop();
+        let (registry_index, tag_index) = controls
+            .tags
+            .registries
+            .iter()
+            .enumerate()
+            .find_map(|(r, registry)| {
+                registry
+                    .tags
+                    .iter()
+                    .position(|t| !t.ids.is_empty())
+                    .map(|t| (r, t))
+            })
+            .unwrap();
+        let removed = Arc::get_mut(&mut controls).unwrap().tags.registries[registry_index].tags
+            [tag_index]
+            .ids
+            .pop()
+            .unwrap();
+        let changed = b
+            .freeze_peer_inputs(controls.clone(), blocks_b)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            first.wire_contract().compare(changed.wire_contract()),
+            Err(ContractMismatch::Tags)
+        );
+        drop(changed);
+        Arc::get_mut(&mut controls).unwrap().tags.registries[registry_index].tags[tag_index]
+            .ids
+            .push(removed);
+
+        let ids = Arc::get_mut(&mut controls)
+            .unwrap()
+            .builtin
+            .registries
+            .get_mut("minecraft:item")
+            .unwrap();
+        let names = [ids.names[0].clone(), ids.names[1].clone()];
+        ids.names.swap(0, 1);
+        ids.ids.insert(names[0].clone(), 1);
+        ids.ids.insert(names[1].clone(), 0);
+        let changed = b
+            .freeze_peer_inputs(controls.clone(), blocks_b)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            first.wire_contract().compare(changed.wire_contract()),
+            Err(ContractMismatch::Builtin)
+        );
+        drop(changed);
+        let ids = Arc::get_mut(&mut controls)
+            .unwrap()
+            .builtin
+            .registries
+            .get_mut("minecraft:item")
+            .unwrap();
+        ids.names.swap(0, 1);
+        ids.ids.insert(names[0].clone(), 0);
+        ids.ids.insert(names[1].clone(), 1);
+
+        let dynamic = Arc::get_mut(&mut controls)
+            .unwrap()
+            .dynamic
+            .registries
+            .get_mut("minecraft:worldgen/biome")
+            .unwrap();
+        dynamic.swap(0, 1);
+        assert!(b.freeze_peer_inputs(controls.clone(), blocks_b).is_err());
+        Arc::get_mut(&mut controls)
+            .unwrap()
+            .dynamic
+            .registries
+            .get_mut("minecraft:worldgen/biome")
+            .unwrap()
+            .swap(0, 1);
+        Arc::get_mut(&mut controls)
+            .unwrap()
+            .dynamic
+            .registries
+            .get_mut("minecraft:worldgen/biome")
+            .unwrap()[0]
+            .1 = Some(Tag::Int(123));
+        assert!(b.freeze_peer_inputs(controls.clone(), blocks_b).is_err());
+        Arc::get_mut(&mut controls)
+            .unwrap()
+            .dynamic
+            .registries
+            .get_mut("minecraft:worldgen/biome")
+            .unwrap()[0]
+            .1 = None;
+        let restored = b
+            .freeze_peer_inputs(controls.clone(), blocks_b)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            first.wire_contract().compare(restored.wire_contract()),
+            Ok(())
+        );
+        drop(restored);
+
+        // Change exactly one actual default while preserving states and IDs.
+        let (name, old, replacement) = (0..blocks_b.len())
+            .find_map(|index| {
+                let id = BlockStateId(index as u32);
+                let state = blocks_b.state(id).unwrap();
+                let default = blocks_b.default_state(&state.name).unwrap();
+                (default != id).then(|| (state.name.clone(), default, id))
+            })
+            .expect("actual resource block with multiple states");
+        let changed_blocks: &'static BlockRegistry = {
+            let mut facts: serde_json::Value =
+                serde_json::from_slice(&fs::read(root_b.join("facts.json")).unwrap()).unwrap();
+            assert_eq!(facts["defaults"][&name], serde_json::json!(old.0));
+            facts["defaults"][&name] = serde_json::json!(replacement.0);
+            let bytes = serde_json::to_vec(&facts).unwrap();
+            Box::leak(Box::new(
+                BlockRegistry::from_facts_json(bytes.as_slice()).unwrap(),
+            ))
+        };
+        let changed = b
+            .freeze_peer_inputs(controls.clone(), changed_blocks)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            first.wire_contract().compare(changed.wire_contract()),
+            Err(ContractMismatch::Blocks)
+        );
+        drop(changed);
+
+        let machine_file = b
+            .catalog()
+            .unwrap()
+            .prepared()
+            .values()
+            .next()
+            .unwrap()
+            .content()
+            .files
+            .iter()
+            .find(|p| p.contains("/horizon/machine/"))
+            .unwrap()
+            .clone();
+        let mut bytes = fs::read(local_pair.join(&machine_file)).unwrap();
+        bytes.push(b'\n');
+        fs::write(local_pair.join(&machine_file), bytes).unwrap();
+        let recaptured = captured(&local_pair);
+        let changed = recaptured
+            .freeze_peer_inputs(controls.clone(), blocks_b)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            first.wire_contract().compare(changed.wire_contract()),
+            Err(ContractMismatch::PackageContent)
+        );
+        drop(changed);
+        assert_eq!(first.wire_contract().encode().unwrap(), encoded);
+        assert_eq!(second.wire_contract().encode().unwrap(), encoded);
+
+        // Explicitly synthetic build-field control, not a second executable.
+        let mut synthetic_build = b.clone();
+        synthetic_build
+            .build
+            .replace_range(7..8, if &b.build[7..8] == "0" { "1" } else { "0" });
+        let changed = synthetic_build
+            .freeze_peer_inputs(controls.clone(), blocks_b)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            first.wire_contract().compare(changed.wire_contract()),
+            Err(ContractMismatch::Executable)
+        );
+        drop(changed);
+        let mut missing = b.clone();
+        missing.catalog = None;
+        assert!(
+            missing
+                .freeze_peer_inputs(controls.clone(), blocks_b)
+                .is_err()
+        );
+        let mut multiple = b.clone();
+        multiple.identities.insert("extra".into(), "0".repeat(64));
+        assert!(
+            multiple
+                .freeze_peer_inputs(controls.clone(), blocks_b)
+                .is_err()
+        );
+        let legacy = scratch.0.join("wire-extra-legacy");
+        fs::create_dir(&legacy).unwrap();
+        fs::write(
+            legacy.join("horizon-mod.toml"),
+            "id='wire_extra'\nname='Wire extra'\nversion='1'\napi='0.1'\ncapabilities=[]",
+        )
+        .unwrap();
+        fs::write(legacy.join("mod.wasm"), b"unexecuted legacy control").unwrap();
+        let extra = Packages::read(&BTreeSet::new(), &[local_pair, legacy]).unwrap();
+        assert!(
+            extra
+                .freeze_peer_inputs(controls.clone(), blocks_b)
+                .is_err()
+        );
+        Arc::get_mut(&mut controls)
+            .unwrap()
+            .features
+            .push("minecraft:vanilla".into());
+        assert!(b.freeze_peer_inputs(controls.clone(), blocks_b).is_err());
+        assert!(
+            Packages::default()
+                .freeze_peer_inputs(controls, blocks_b)
+                .unwrap()
+                .is_none(),
+            "no-pair capture does not inspect even inconsistent registry inputs"
+        );
+
+        // Decoded equality never changes the old external or world-pin guards.
+        assert_eq!(first.wire_contract().compare(&decoded), Ok(()));
+        assert!(
+            first.packages.external_network().is_err()
+                && second.packages.external_network().is_err()
+        );
+        let unmarked = scratch.0.join("unmarked-wire-world");
+        fs::create_dir(&unmarked).unwrap();
+        fs::write(unmarked.join("level.dat"), b"untouched").unwrap();
+        assert!(first.packages.check_world(&unmarked).is_err());
+        assert!(first.packages.record_world(&unmarked).is_err());
+        assert_eq!(fs::read(unmarked.join("level.dat")).unwrap(), b"untouched");
+        assert!(!unmarked.join(WORLD_PACKAGES).exists());
+        let pinned = scratch.0.join("pinned-wire-world");
+        fs::create_dir(&pinned).unwrap();
+        first.packages.record_world(&pinned).unwrap();
+        let pin_before = fs::read(pinned.join(WORLD_PACKAGES)).unwrap();
+        assert!(Packages::default().check_world(&pinned).is_err());
+        second.packages.check_world(&pinned).unwrap();
+        assert_eq!(fs::read(pinned.join(WORLD_PACKAGES)).unwrap(), pin_before);
+        drop(b);
+        drop(sync_b);
+        assert_eq!(second.wire_contract().encode().unwrap(), encoded);
+        drop(first);
+        assert!(catalog_weak.upgrade().is_none());
+        assert!(sync_weak.upgrade().is_none());
+        assert_eq!(tree(&pair), before_pair);
+        assert_eq!(
+            ["facts.json", "registries.json"].map(|p| fs::read(base.join(p)).unwrap()),
+            before_base
+        );
+        assert_eq!(
+            ["facts.json", "registries.json"].map(|p| fs::read(root_a.join(p)).unwrap()),
+            tables_before
+        );
+        assert_eq!(
+            paths.map(|p| fs::read(source.join(p)).unwrap()),
             before_sources
         );
     }

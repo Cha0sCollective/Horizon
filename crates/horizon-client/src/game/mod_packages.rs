@@ -1,14 +1,20 @@
 //! Startup-owned experimental packages, shared by the window and server thread.
 use horizon_client::Result;
+use horizon_client::lan::{
+    data::SyncData,
+    peer_contract::{WireClaims, WireContract},
+};
+#[cfg(feature = "paired-packages")]
+use horizon_mods::paired::catalog::Catalog;
+use horizon_world::registry::BlockRegistry;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
+    sync::Arc,
 };
-#[cfg(feature = "paired-packages")]
-use {horizon_mods::paired::catalog::Catalog, std::sync::Arc};
 
 const WORLD_PACKAGES: &str = "horizon-paired-packages.json";
 const MAX_WORLD_PACKAGES: u64 = 64 << 10;
@@ -27,8 +33,76 @@ pub(super) struct PeerSnapshot {
     registries: horizon_client::lan::data::RegistrySnapshot,
 }
 
+/// Retains the exact supplied local objects, but is not a live network freeze,
+/// admission receipt or proof that any sender/hub uses them. Only the package
+/// capture method constructs it; decoded claims are never constructor inputs.
+#[allow(dead_code)]
+pub(super) struct FrozenHostInputs {
+    packages: Packages,
+    sync: Arc<SyncData>,
+    blocks: &'static BlockRegistry,
+    snapshot: PeerSnapshot,
+    wire: WireContract,
+}
+
+#[allow(dead_code)]
+impl FrozenHostInputs {
+    pub(super) fn wire_contract(&self) -> &WireContract {
+        &self.wire
+    }
+    pub(super) fn sync(&self) -> &SyncData {
+        &self.sync
+    }
+    pub(super) fn blocks(&self) -> &'static BlockRegistry {
+        self.blocks
+    }
+}
+
+fn captured_hex_digest(value: &str) -> std::result::Result<[u8; 32], String> {
+    if value.len() != 64 {
+        return Err("wire projection requires captured SHA256".into());
+    }
+    let nibble = |b| match b {
+        b'0'..=b'9' => Ok(b - b'0'),
+        b'a'..=b'f' => Ok(b - b'a' + 10),
+        _ => Err("wire projection requires lowercase captured SHA256".to_owned()),
+    };
+    let mut digest = [0; 32];
+    for (out, pair) in digest
+        .iter_mut()
+        .zip(value.as_bytes().as_chunks::<2>().0.iter())
+    {
+        *out = nibble(pair[0])? * 16 + nibble(pair[1])?;
+    }
+    Ok(digest)
+}
+
 #[allow(dead_code)]
 impl PeerSnapshot {
+    /// Explicit projection to the separately defined wire v1 data format.
+    fn to_wire_contract(&self) -> std::result::Result<WireContract, String> {
+        if self.domain != "horizon-peer-snapshot-1/package"
+            || self.package_scheme != "paired-folder-sha256-1"
+        {
+            return Err("unsupported captured snapshot wire projection".into());
+        }
+        let build = self
+            .build
+            .strip_prefix("sha256:")
+            .ok_or("wire projection requires captured executable SHA256")?;
+        WireContract::from_claims(WireClaims {
+            protocol: self.protocol,
+            game: &self.game,
+            build: captured_hex_digest(build)?,
+            package_id: &self.package.0,
+            package: captured_hex_digest(&self.package.1)?,
+            machine_id: &self.schema.0,
+            schema: self.schema.1,
+            registries: &self.registries,
+        })
+        .map_err(|e| e.to_string())
+    }
+
     /// Matching data never relaxes Packages::external_network or world pins.
     pub fn compare(&self, other: &Self) -> std::result::Result<(), &'static str> {
         if self.domain != other.domain || self.protocol != other.protocol || self.game != other.game
@@ -81,6 +155,29 @@ struct WorldPackages {
 }
 
 impl Packages {
+    /// Dormant local capture only: no claimed build/hash, decoded wire value or
+    /// mutable path can be supplied in place of retained startup provenance.
+    #[allow(dead_code)]
+    pub(super) fn freeze_peer_inputs(
+        &self,
+        sync: Arc<SyncData>,
+        blocks: &'static BlockRegistry,
+    ) -> std::result::Result<Option<FrozenHostInputs>, String> {
+        let Some(snapshot) = self.peer_snapshot(&sync, blocks)? else {
+            return Ok(None);
+        };
+        let wire = snapshot.to_wire_contract()?;
+        // Bounded package capture/preflight precedes cloning its one identity
+        // map. The catalog and registry data retain the exact existing owners.
+        Ok(Some(FrozenHostInputs {
+            packages: self.clone(),
+            sync,
+            blocks,
+            snapshot,
+            wire,
+        }))
+    }
+
     /// Dormant bounded capture. It uses retained startup identities and never
     /// reopens a package path or accepts a caller's asserted executable digest.
     #[allow(dead_code)]
