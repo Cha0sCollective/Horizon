@@ -11,6 +11,8 @@ pub(super) struct WorldRequest {
     pub creative: bool,
     pub create: Option<horizon_client::title::WorldOptions>,
     identity_intent: IdentityIntent,
+    #[cfg(feature = "paired-packages")]
+    expected_checkpoint_world: Option<horizon_client::world::counter_restore::WorldId>,
 }
 
 pub(super) struct PreparedWorld {
@@ -22,6 +24,39 @@ pub(super) struct PreparedWorld {
     pub session_lock: WorldSession,
     pub rand_sequences: horizon_client::random_sequences::RandomSequences,
     pub locator: Option<Arc<VanillaTerrain>>,
+    #[cfg(feature = "paired-packages")]
+    pub native_checkpoint_origin: Option<NativeCheckpointOrigin>,
+}
+
+/// Factory-issued provenance for the actual built-in native TestTerrain provider.
+/// This owner cannot be cloned or reconstructed from options or identity bytes.
+#[cfg(feature = "paired-packages")]
+pub(in crate::game) struct NativeCheckpointOrigin {
+    root: PathBuf,
+    dimension: Dim,
+    save: std::sync::Weak<SaveDir>,
+}
+#[cfg(feature = "paired-packages")]
+impl NativeCheckpointOrigin {
+    pub(in crate::game) fn validate(
+        &self,
+        root: &std::path::Path,
+        dimension: Dim,
+        save: &Arc<SaveDir>,
+    ) -> Result<()> {
+        if self.root != root
+            || self.dimension != dimension
+            || dimension != Dim::Overworld
+            || !self
+                .save
+                .upgrade()
+                .is_some_and(|owner| Arc::ptr_eq(&owner, save))
+            || save.root != horizon_client::save::dimension_dir(root, dimension.id())
+        {
+            return Err("native session checkpoint provider provenance mismatch".into());
+        }
+        Ok(())
+    }
 }
 
 impl WorldRequest {
@@ -40,11 +75,23 @@ impl WorldRequest {
             creative,
             create: create.cloned(),
             identity_intent: IdentityIntent::Legacy,
+            #[cfg(feature = "paired-packages")]
+            expected_checkpoint_world: None,
         })
     }
 
     pub(super) fn with_identity_intent(mut self, intent: IdentityIntent) -> Self {
         self.identity_intent = intent;
+        self
+    }
+
+    #[cfg(feature = "paired-packages")]
+    pub(in crate::game) fn with_expected_checkpoint_world(
+        mut self,
+        expected: horizon_client::world::counter_restore::WorldId,
+    ) -> Self {
+        self.identity_intent = IdentityIntent::RequireExistingIdentity;
+        self.expected_checkpoint_world = Some(expected);
         self
     }
 
@@ -55,6 +102,12 @@ impl WorldRequest {
         options: &Options,
         settings: &Settings,
     ) -> Result<PreparedWorld> {
+        #[cfg(feature = "paired-packages")]
+        if self.expected_checkpoint_world.is_some()
+            && self.identity_intent != IdentityIntent::RequireExistingIdentity
+        {
+            return Err("checkpoint recovery requires existing identified native world".into());
+        }
         options.mod_packages.check_world(&self.save_root)?;
         #[cfg(feature = "paired-packages")]
         let identity_preflight =
@@ -71,6 +124,8 @@ impl WorldRequest {
             creative,
             create,
             identity_intent,
+            #[cfg(feature = "paired-packages")]
+            expected_checkpoint_world,
         } = self;
         let name = name.as_deref();
         let create = create.as_ref();
@@ -82,6 +137,9 @@ impl WorldRequest {
             // truncate a lock target. The same facts are checked under lock.
             let lock = horizon_client::save::SessionLock::acquire(&save_root)?;
             preflight.recheck(&save_root)?;
+            if let Some(expected) = expected_checkpoint_world {
+                preflight.require_checkpoint_world(expected)?;
+            }
             options.mod_packages.check_world(&save_root)?;
             // Package v1 FIRST: an anchor alone would make a paired new root
             // look like an unmarked existing world. Failures retain artifacts.
@@ -154,8 +212,16 @@ impl WorldRequest {
             level.position = None;
         }
         let dim = Dim::from_id(&level.dimension);
-        let (mut streaming, save, locator) =
-            make_streaming(res, pack, options, settings, &save_root, dim, level.seed)?;
+        let NativeStreaming {
+            mut streaming,
+            save,
+            locator,
+            #[cfg(feature = "paired-packages")]
+            native_checkpoint_origin,
+        } = make_native_streaming(res, pack, options, settings, &save_root, dim, level.seed)?;
+        #[cfg(feature = "paired-packages")]
+        let native_checkpoint_origin = native_checkpoint_origin
+            .filter(|_| session_lock.expected_world().is_some() && dim == Dim::Overworld);
         streaming.radius = settings.render_distance;
         let mut world = World::new(res.facts().air, level.seed);
         #[cfg(feature = "paired-packages")]
@@ -193,6 +259,8 @@ impl WorldRequest {
             session_lock,
             rand_sequences,
             locator,
+            #[cfg(feature = "paired-packages")]
+            native_checkpoint_origin,
         })
     }
 }
@@ -336,11 +404,34 @@ pub(super) fn make_streaming(
     dim: Dim,
     seed: i64,
 ) -> Result<(Streaming, Arc<SaveDir>, Option<Arc<VanillaTerrain>>)> {
+    let native = make_native_streaming(res, pack, options, settings, world_root, dim, seed)?;
+    Ok((native.streaming, native.save, native.locator))
+}
+
+struct NativeStreaming {
+    streaming: Streaming,
+    save: Arc<SaveDir>,
+    locator: Option<Arc<VanillaTerrain>>,
+    #[cfg(feature = "paired-packages")]
+    native_checkpoint_origin: Option<NativeCheckpointOrigin>,
+}
+
+fn make_native_streaming(
+    res: &Resources,
+    pack: &PackResources,
+    options: &Options,
+    settings: &Settings,
+    world_root: &std::path::Path,
+    dim: Dim,
+    seed: i64,
+) -> Result<NativeStreaming> {
     let save = Arc::new(SaveDir::new(horizon_client::save::dimension_dir(
         world_root,
         dim.id(),
     )));
     let mut locator = None;
+    #[cfg(feature = "paired-packages")]
+    let mut native_checkpoint_origin = None;
     let flat = (dim == Dim::Overworld)
         .then(|| horizon_client::save::world_gen_settings(world_root))
         .flatten()
@@ -364,6 +455,14 @@ pub(super) fn make_streaming(
         )
     } else if options.test_terrain && dim == Dim::Overworld {
         let inner = Arc::new(TestTerrain::new(pack.assets.registry, res.biomes())?);
+        #[cfg(feature = "paired-packages")]
+        {
+            native_checkpoint_origin = Some(NativeCheckpointOrigin {
+                root: world_root.to_path_buf(),
+                dimension: dim,
+                save: Arc::downgrade(&save),
+            });
+        }
         Streaming::new(
             Arc::new(Persistent {
                 inner,
@@ -407,7 +506,13 @@ pub(super) fn make_streaming(
     // A server draws nothing: neither the integrated server nor the
     // dedicated one meshes sections.
     streaming.mesh = options.execution_role.is_client();
-    Ok((streaming, save, locator))
+    Ok(NativeStreaming {
+        streaming,
+        save,
+        locator,
+        #[cfg(feature = "paired-packages")]
+        native_checkpoint_origin,
+    })
 }
 
 #[cfg(test)]

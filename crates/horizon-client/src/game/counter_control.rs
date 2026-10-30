@@ -317,6 +317,9 @@ impl Game<'_> {
     }
 
     pub(super) fn retire_counter_trial(&mut self, boundary: &str) {
+        // Includes world-only fixture/remote replacements sharing the same save.
+        // Returning to an earlier SaveDir never reconstructs this authority.
+        self.native_checkpoint_origin = None;
         retire_world_counter(&mut self.world, boundary);
     }
 

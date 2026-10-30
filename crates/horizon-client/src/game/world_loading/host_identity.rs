@@ -329,6 +329,15 @@ pub(super) struct IdentityPreflight {
 }
 #[cfg(feature = "paired-packages")]
 impl IdentityPreflight {
+    /// Called after the exact identity/native-level under-lock recheck and before
+    /// any world recording or native streaming construction for recovery.
+    pub(super) fn require_checkpoint_world(&self, expected: WorldId) -> Result<()> {
+        if self.world != expected || !matches!(&self.kind, PreflightKind::Existing { .. }) {
+            return Err(failure("checkpoint world", "trusted expected UUID mismatch").into());
+        }
+        Ok(())
+    }
+
     pub(super) fn read(root: &Path, intent: IdentityIntent) -> Result<Option<Self>> {
         match intent {
             IdentityIntent::Legacy => Ok(None),

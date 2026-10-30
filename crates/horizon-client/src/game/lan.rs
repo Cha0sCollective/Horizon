@@ -525,6 +525,877 @@ impl Game<'_> {
 #[cfg(all(test, feature = "paired-packages"))]
 mod player_projection_tests;
 
+/// Detached observations of actual native participants. A row grants no admission.
+#[cfg(feature = "paired-packages")]
+#[derive(Clone, Debug)]
+pub(in crate::game) struct SessionPlayerRow {
+    pub(in crate::game) conn: u32,
+    pub(in crate::game) profile_uuid: u128,
+    pub(in crate::game) record_uuid: [i32; 4],
+    pub(in crate::game) integrated_owner: bool,
+    pub(in crate::game) dimension: String,
+    pub(in crate::game) player: horizon_world::nbt::Tag,
+    pub(in crate::game) advancements: serde_json::Value,
+    pub(in crate::game) stats: serde_json::Value,
+}
+
+/// Native NBT reading normalizes signed zero. All other finite values and types
+/// must agree; in particular NaN cannot make two observations agree.
+#[cfg(feature = "paired-packages")]
+pub(in crate::game) fn session_player_tags_equal(
+    a: &horizon_world::nbt::Tag,
+    b: &horizon_world::nbt::Tag,
+) -> bool {
+    use horizon_world::nbt::Tag;
+    fn equal(a: &Tag, b: &Tag, depth: usize) -> bool {
+        if depth > 64 {
+            return false;
+        }
+        match (a, b) {
+            (Tag::Float(a), Tag::Float(b)) => {
+                let (a, b) = (f32::from_bits(*a), f32::from_bits(*b));
+                a.is_finite() && b.is_finite() && a == b
+            }
+            (Tag::Double(a), Tag::Double(b)) => {
+                let (a, b) = (f64::from_bits(*a), f64::from_bits(*b));
+                a.is_finite() && b.is_finite() && a == b
+            }
+            (Tag::List(a), Tag::List(b)) => {
+                a.len() == b.len() && a.iter().zip(b).all(|(a, b)| equal(a, b, depth + 1))
+            }
+            (Tag::Compound(a), Tag::Compound(b)) => {
+                a.len() == b.len()
+                    && a.iter()
+                        .all(|(key, a)| b.get(key).is_some_and(|b| equal(a, b, depth + 1)))
+            }
+            _ => a == b,
+        }
+    }
+    equal(a, b, 0)
+}
+
+#[cfg(feature = "paired-packages")]
+fn session_player_payload_supported(root: &horizon_world::nbt::Tag) -> bool {
+    use horizon_world::nbt::Tag;
+    let mut work = vec![(root, 0usize)];
+    let mut nodes = 0usize;
+    let string = |s: &horizon_world::nbt::JavaString| {
+        s.0.len() <= 4096 && char::decode_utf16(s.0.iter().copied()).all(|c| c.is_ok())
+    };
+    while let Some((tag, depth)) = work.pop() {
+        nodes += 1;
+        if nodes > 16_384 || depth > 32 {
+            return false;
+        }
+        match tag {
+            Tag::End => return false,
+            Tag::Float(v) if !f32::from_bits(*v).is_finite() => return false,
+            Tag::Double(v) if !f64::from_bits(*v).is_finite() => return false,
+            Tag::String(s) if !string(s) => return false,
+            Tag::List(values) => {
+                if values.len() > 16_384usize.saturating_sub(nodes + work.len())
+                    || work.try_reserve(values.len()).is_err()
+                {
+                    return false;
+                }
+                work.extend(values.iter().map(|tag| (tag, depth + 1)));
+            }
+            Tag::Compound(values) => {
+                if values.len() > 16_384usize.saturating_sub(nodes + work.len())
+                    || work.try_reserve(values.len()).is_err()
+                {
+                    return false;
+                }
+                for (key, value) in values {
+                    if !string(key)
+                        || matches!(
+                            key.to_string().as_deref(),
+                            Ok("minecraft:attribute_modifiers"
+                                | "!minecraft:attribute_modifiers"
+                                | "attribute_modifiers")
+                        )
+                    {
+                        return false;
+                    }
+                    work.push((value, depth + 1));
+                }
+            }
+            Tag::ByteArray(values) if values.len() > 1 << 20 => return false,
+            Tag::IntArray(values) if values.len() > (1 << 20) / 4 => return false,
+            Tag::LongArray(values) if values.len() > (1 << 20) / 8 => return false,
+            _ => {}
+        }
+    }
+    true
+}
+
+/// Level::write emits a native UUID record even when a dedicated session has no
+/// local player. This exact inert record is metadata, never a participant row.
+#[cfg(feature = "paired-packages")]
+pub(in crate::game) fn session_empty_native_player(tag: &horizon_world::nbt::Tag) -> bool {
+    use horizon_client::save::Level;
+    use horizon_world::nbt::Tag;
+    if !session_player_payload_supported(tag) {
+        return false;
+    }
+    let Some(Tag::IntArray(uuid)) = tag.get("UUID") else {
+        return false;
+    };
+    let Ok(uuid) = <[i32; 4]>::try_from(uuid.as_slice()) else {
+        return false;
+    };
+    let mut parsed = Level::default();
+    parsed.read_player(tag);
+    if !(0..=3).contains(&parsed.game_mode) {
+        return false;
+    }
+    let mut expected = Level {
+        player_uuid: Some(uuid),
+        game_mode: parsed.game_mode,
+        creative: parsed.game_mode == 1,
+        rotation: parsed.rotation,
+        health: 20.0,
+        food: 20,
+        saturation: 5.0,
+        ..Level::default()
+    };
+    let mut extra = horizon_world::nbt::Compound::new();
+    for (key, default) in [("Fire", -20i16), ("Air", 300i16)] {
+        if let Some(value) = tag.get(key) {
+            if value != &Tag::Short(default) {
+                return false;
+            }
+            extra.insert(key.into(), value.clone());
+        }
+    }
+    expected.player_extra = Some(Tag::Compound(extra));
+    session_player_tags_equal(tag, &expected.player_tag())
+}
+
+/// This initial body profile supports only fields installed below. Unknown saved
+/// state cannot survive merely because player_extra would copy it back unchanged.
+#[cfg(feature = "paired-packages")]
+pub(in crate::game) fn validate_session_player_tag(tag: &horizon_world::nbt::Tag) -> Result<()> {
+    use horizon_client::save::Level;
+    use horizon_world::nbt::Tag;
+    if !session_player_payload_supported(tag) {
+        return Err("unsupported session player payload or item attributes".into());
+    }
+    let Tag::Compound(fields) = tag else {
+        return Err("session player is not a compound".into());
+    };
+    for key in fields.keys() {
+        if !matches!(
+            key.to_string().as_deref(),
+            Ok("DataVersion"
+                | "UUID"
+                | "Pos"
+                | "Rotation"
+                | "Motion"
+                | "OnGround"
+                | "fall_distance"
+                | "Health"
+                | "AbsorptionAmount"
+                | "foodLevel"
+                | "foodSaturationLevel"
+                | "foodExhaustionLevel"
+                | "foodTickTimer"
+                | "XpLevel"
+                | "XpP"
+                | "XpTotal"
+                | "SelectedItemSlot"
+                | "XpSeed"
+                | "playerGameType"
+                | "Inventory"
+                | "EnderItems"
+                | "equipment"
+                | "recipeBook"
+                | "abilities"
+                | "Dimension"
+                | "seenCredits"
+                | "LastDeathLocation"
+                | "respawn"
+                | "Fire"
+                | "Air"
+                | "Invulnerable"
+                | "PortalCooldown"
+                | "Score"
+                | "SleepTimer"
+                | "HurtTime"
+                | "DeathTime"
+                | "FallFlying")
+        ) {
+            return Err("unsupported saved session player field".into());
+        }
+    }
+    // The native writer always supplies these fields, but this body profile has
+    // no restoration path for their nondefault state. Require their exact types.
+    for (key, expected) in [
+        ("Invulnerable", Tag::Byte(0)),
+        ("PortalCooldown", Tag::Int(0)),
+        ("Score", Tag::Int(0)),
+        ("SleepTimer", Tag::Short(0)),
+        ("HurtTime", Tag::Short(0)),
+        ("DeathTime", Tag::Short(0)),
+        ("FallFlying", Tag::Byte(0)),
+    ] {
+        if tag.get(key) != Some(&expected) {
+            return Err("unsupported nondefault or malformed native session player field".into());
+        }
+    }
+    let Some(Tag::IntArray(uuid)) = tag.get("UUID") else {
+        return Err("session player UUID is not an int array".into());
+    };
+    let uuid: [i32; 4] = uuid
+        .as_slice()
+        .try_into()
+        .map_err(|_| "session player UUID has wrong length")?;
+    if !matches!(tag.get("Fire"), Some(Tag::Short(_)))
+        || !matches!(tag.get("Air"), Some(Tag::Short(_)))
+        || !matches!(tag.get("DataVersion"), Some(Tag::Int(v)) if *v == horizon_world::DATA_VERSION)
+    {
+        return Err("unsupported session player body encoding".into());
+    }
+    let Some(Tag::Compound(abilities)) = tag.get("abilities") else {
+        return Err("session player abilities are missing".into());
+    };
+    if abilities.len() != 7
+        || abilities.keys().any(|key| {
+            !matches!(
+                key.to_string().as_deref(),
+                Ok("invulnerable"
+                    | "mayfly"
+                    | "instabuild"
+                    | "mayBuild"
+                    | "flying"
+                    | "flySpeed"
+                    | "walkSpeed")
+            )
+        })
+        || !matches!(tag.get("abilities").and_then(|a| a.get("flySpeed")),
+        Some(Tag::Float(v)) if f32::from_bits(*v) == 0.05)
+        || !matches!(tag.get("abilities").and_then(|a| a.get("walkSpeed")),
+            Some(Tag::Float(v)) if f32::from_bits(*v) == 0.1)
+    {
+        return Err("unsupported session player abilities".into());
+    }
+    let mut level = Level {
+        player_uuid: Some(uuid),
+        ..Level::default()
+    };
+    level.read_player(tag);
+    level.player_extra = Some(tag.clone());
+    if level.position.is_none()
+        || !matches!(
+            level.dimension.as_str(),
+            "minecraft:overworld" | "minecraft:the_nether" | "minecraft:the_end"
+        )
+        || !(0..=3).contains(&level.game_mode)
+        || !(0..9).contains(&level.selected_slot)
+        || !(level.health > 0.0 && level.health <= 20.0)
+        || level.absorption < 0.0
+        || !(0..=20).contains(&level.food)
+        || level.saturation < 0.0
+        || level.food_exhaustion < 0.0
+        || level.food_tick_timer < 0
+        || level.fall_distance < 0.0
+        || level.xp_level < 0
+        || level.xp_total < 0
+        || !(0.0..=1.0).contains(&level.xp_progress)
+        || !session_player_tags_equal(tag, &level.player_tag())
+    {
+        return Err("session player data is not a supported native saved projection".into());
+    }
+    Ok(())
+}
+
+#[cfg(feature = "paired-packages")]
+fn session_player_level(
+    guest: &horizon_client::lan::guest::Guest,
+    record_uuid: [i32; 4],
+) -> Result<horizon_client::save::Level> {
+    use horizon_client::save::Level;
+    let body = guest
+        .motion
+        .as_deref()
+        .ok_or("session player has no live body")?;
+    if body.attributes.instances().any(|(_, key, value)| {
+        body.attributes
+            .catalog()
+            .default_base("minecraft:player", key.attribute())
+            != Some(value.base_value())
+            || !value.modifiers().is_empty()
+    }) {
+        return Err("nondefault session player body attributes are unsupported".into());
+    }
+    // These mirror fields are native owners too. A stale guest cache cannot hide
+    // a changed body, nor can a stale body silently replace a newer guest value.
+    if !(0..=3).contains(&guest.game_mode)
+        || [body.position.x, body.position.y, body.position.z] != guest.position
+        || [body.yaw, body.pitch] != [guest.yaw, guest.pitch]
+        || body.ground.on_ground != guest.on_ground
+        || body.health.health() != guest.health
+        || body.health.food.food != guest.food
+        || body.health.food.saturation != guest.saturation
+        || body.may_fly != matches!(guest.game_mode, 1 | 3)
+        || body.invulnerable != matches!(guest.game_mode, 1 | 3)
+        || body.spectator != (guest.game_mode == 3)
+        || body.flying != guest.flying
+        || body.flying_speed != 0.05
+        || body.fall_flying
+        || guest.fall_flying
+        || body.ticks_frozen != 0
+        || !guest.effects.saved().is_empty()
+        || (matches!(guest.game_mode, 0 | 2) && body.flying)
+        || (guest.game_mode == 3 && !body.flying)
+        || !(i16::MIN as i32..=i16::MAX as i32).contains(&body.fire_ticks)
+        || !(i16::MIN as i32..=i16::MAX as i32).contains(&body.air)
+    {
+        return Err("unsupported or inconsistent actual session player body".into());
+    }
+    // Every non-body value comes from the actual guest via the native writer.
+    // In particular the integrated owner's cached Level supplies no body values.
+    let mut level = Level {
+        player_uuid: Some(record_uuid),
+        ..Level::default()
+    };
+    playerdata::store(guest, &mut level);
+    level.position = Some([body.position.x, body.position.y, body.position.z]);
+    level.rotation = [body.yaw, body.pitch];
+    level.on_ground = body.ground.on_ground;
+    level.health = body.health.health();
+    level.absorption = body.health.absorption();
+    level.fall_distance = body.fall_distance;
+    let Some(horizon_world::nbt::Tag::Compound(extra)) = &mut level.player_extra else {
+        return Err("session native body extras were not projected".into());
+    };
+    extra.insert(
+        "Fire".into(),
+        horizon_world::nbt::Tag::Short(body.fire_ticks as i16),
+    );
+    extra.insert(
+        "Air".into(),
+        horizon_world::nbt::Tag::Short(body.air as i16),
+    );
+    level.food = body.health.food.food;
+    level.saturation = body.health.food.saturation;
+    level.flying = body.flying;
+    level.motion = [body.velocity.x, body.velocity.y, body.velocity.z];
+    level.food_exhaustion = body.health.food.exhaustion;
+    level.food_tick_timer = body.health.food.timer;
+    validate_session_player_tag(&level.player_tag())?;
+    Ok(level)
+}
+
+#[cfg(feature = "paired-packages")]
+fn session_body_matches_level(
+    body: &horizon_client::motion::PlayerMotion,
+    level: &horizon_client::save::Level,
+) -> bool {
+    use horizon_world::nbt::Tag;
+    let extra = level.player_extra.as_ref();
+    let fire = match extra.and_then(|tag| tag.get("Fire")) {
+        Some(Tag::Short(value)) => i32::from(*value),
+        _ => return false,
+    };
+    let air = match extra.and_then(|tag| tag.get("Air")) {
+        Some(Tag::Short(value)) => i32::from(*value),
+        _ => return false,
+    };
+    Some([body.position.x, body.position.y, body.position.z]) == level.position
+        && [body.yaw, body.pitch] == level.rotation
+        && [body.velocity.x, body.velocity.y, body.velocity.z] == level.motion
+        && body.ground.on_ground == level.on_ground
+        && body.health.health() == level.health
+        && body.health.absorption() == level.absorption
+        && body.fire_ticks == fire
+        && body.air == air
+        && body.fall_distance == level.fall_distance
+        && body.health.food.food == level.food
+        && body.health.food.saturation == level.saturation
+        && body.health.food.exhaustion == level.food_exhaustion
+        && body.health.food.timer == level.food_tick_timer
+        && body.may_fly == matches!(level.mode(), 1 | 3)
+        && body.invulnerable == matches!(level.mode(), 1 | 3)
+        && body.spectator == (level.mode() == 3)
+        && body.flying == level.flying
+}
+
+#[cfg(feature = "paired-packages")]
+#[allow(dead_code)] // Only the internal session operation may consume these rows.
+impl Game<'_> {
+    pub(in crate::game) fn project_session_participant_rows(
+        &self,
+        expected: &ParticipantRoster,
+    ) -> Result<Vec<SessionPlayerRow>> {
+        // Reuse the existing population/owner checks, without constructing the
+        // research projection (which deliberately retains its cached Level rules).
+        self.preflight_checkpoint_participants(expected)
+            .map_err(|error| format!("session participant preflight: {error:?}"))?;
+        if self.adv.tree.list.is_empty() || self.adv.pending_tree.is_some() {
+            return Err("session advancement tree is unavailable".into());
+        }
+        let host = self
+            .checkpoint_participant_host()
+            .map_err(|error| format!("session participant host: {error:?}"))?;
+        let mut rows = Vec::new();
+        for identity in &expected.identities {
+            let guest = host
+                .hub
+                .guests
+                .iter()
+                .find(|g| g.conn == identity.conn)
+                .ok_or("session participant disappeared")?;
+            // Inspect the live graph before invoking a native item/player encoder.
+            let mut stacks = guest
+                .inventory
+                .iter()
+                .chain(guest.armor.iter())
+                .chain(std::iter::once(&guest.offhand))
+                .chain(guest.ender_items.iter())
+                .flatten()
+                .map(|stack| (stack, 0usize))
+                .collect::<Vec<_>>();
+            let mut nodes = 0usize;
+            while let Some((stack, depth)) = stacks.pop() {
+                nodes += 1;
+                if nodes > 16_384
+                    || depth > 32
+                    || stack.count == 0
+                    || stack.count > i32::MAX as u32
+                    || &*stack.item == "minecraft:air"
+                    || self.res.items().get(&stack.item).is_none()
+                {
+                    return Err("unsupported live session item graph".into());
+                }
+                if let Some(data) = stack.data() {
+                    if data.container.iter().enumerate().any(|(index, (slot, _))| {
+                        data.container[..index]
+                            .iter()
+                            .any(|(other, _)| other == slot)
+                    }) {
+                        return Err("duplicate live session container cell".into());
+                    }
+                    for (key, value) in &data.other {
+                        if matches!(
+                            key.as_str(),
+                            "minecraft:attribute_modifiers"
+                                | "!minecraft:attribute_modifiers"
+                                | "attribute_modifiers"
+                        ) || !session_player_payload_supported(value)
+                        {
+                            return Err("unsupported live session item component".into());
+                        }
+                    }
+                    let children = data
+                        .container
+                        .len()
+                        .checked_add(data.charged.len())
+                        .and_then(|n| n.checked_add(data.bundle_contents.len()))
+                        .and_then(|n| {
+                            n.checked_add(
+                                data.pot_decorations
+                                    .as_ref()
+                                    .map_or(0, |p| p.iter().flatten().count()),
+                            )
+                        })
+                        .ok_or("session item graph size overflow")?;
+                    if children > 16_384usize.saturating_sub(nodes + stacks.len()) {
+                        return Err("session item graph exceeds bound".into());
+                    }
+                    stacks
+                        .try_reserve(children)
+                        .map_err(|_| "session item graph allocation")?;
+                    stacks.extend(data.container.iter().map(|(_, stack)| (stack, depth + 1)));
+                    stacks.extend(data.charged.iter().map(|stack| (stack, depth + 1)));
+                    stacks.extend(data.bundle_contents.iter().map(|stack| (stack, depth + 1)));
+                    if let Some(pots) = &data.pot_decorations {
+                        stacks.extend(pots.iter().flatten().map(|stack| (stack, depth + 1)));
+                    }
+                }
+            }
+            // The whole graph is bounded and finite before the structured native
+            // encoder. A modelled field which the codec would coerce must refuse.
+            for stack in guest
+                .inventory
+                .iter()
+                .chain(guest.armor.iter())
+                .chain(std::iter::once(&guest.offhand))
+                .chain(guest.ender_items.iter())
+                .flatten()
+            {
+                let tag = horizon_client::save::item_to_nbt(stack);
+                if !session_player_payload_supported(&tag)
+                    || horizon_client::save::item_from_nbt(&tag).as_ref() != Some(stack)
+                {
+                    return Err("native session item encoding changes a live stack".into());
+                }
+            }
+            let play = host
+                .play
+                .get(&identity.conn)
+                .ok_or("session play owner missing")?;
+            let (record_uuid, integrated_owner) = match identity.storage {
+                ParticipantStorage::IntegratedOwner { record_uuid } => (record_uuid, true),
+                ParticipantStorage::External { record_uuid } => (record_uuid, false),
+            };
+            let level = session_player_level(guest, record_uuid)?;
+            rows.try_reserve(1)
+                .map_err(|_| "session player row allocation")?;
+            rows.push(SessionPlayerRow {
+                conn: identity.conn,
+                profile_uuid: identity.uuid,
+                record_uuid,
+                integrated_owner,
+                dimension: identity.dimension.clone(),
+                player: level.player_tag(),
+                advancements: guest
+                    .advancements
+                    .to_json(&self.adv.tree, horizon_world::DATA_VERSION),
+                stats: play.stats.to_json(),
+            });
+        }
+        Ok(rows)
+    }
+
+    /// The caller owns the whole fresh Game until every installation check passes.
+    /// This is not a join/reconnect entry point and never runs guest gameplay.
+    pub(in crate::game) fn install_session_checkpoint_participants(
+        &mut self,
+        mut host: LanHost,
+        checked: &super::levels::session_checkpoint::CheckedSessionPlayers,
+    ) -> Result<()> {
+        use horizon_client::{motion::PlayerMotion, save::Level};
+        use std::sync::atomic::Ordering;
+        let rows = checked.rows();
+        if self.lan.is_some()
+            || self.remote.is_some()
+            || self.integrated.is_some()
+            || self.options.execution_role.is_client()
+            || self.lan_acting.is_some()
+            || self.player.is_some()
+            || !self.server_trips.is_empty()
+            || !self.level_teleports.is_empty()
+            || self.pending_save.is_some()
+            || self.pending_entry.is_some()
+            || self.world_loader.is_some()
+            || self.rest_loader.is_some()
+            || self.saved_for_exit
+            || self.carried.is_some()
+            || self.craft_grid.iter().any(Option::is_some)
+            || self.scratch_slot.is_some()
+            || self.container.is_some()
+            || self.station.is_some()
+            || self.ender_open.is_some()
+            || self.craft_table.is_some()
+            || self.inv_drag.is_some()
+            || self.last_quick_moved.is_some()
+            || !self.guest_packets.is_empty()
+            || !self.guest_entity_events.is_empty()
+            || !host.commands.is_empty()
+            || !host.quiet.is_empty()
+            || !host.models.is_empty()
+            || !host.broken.is_empty()
+            || !host.mob_state.is_empty()
+            || !host.mob_players.is_empty()
+            || !host.states.as_slice().is_empty()
+            || !host.waypoints.is_empty()
+            || !host.waypoint_dead.is_empty()
+            || host.border_sent.is_some()
+            || host.host_crack.is_some()
+            || !host.hub.riding.passengers.is_empty()
+            || !host.hub.riding.vehicle.is_empty()
+            || host.hub.guests.len() != rows.len()
+            || host.hub.config.integrated != host.owner.is_some()
+            || host
+                .owner
+                .as_ref()
+                .is_some_and(|owner| owner.saved.is_some())
+            || self
+                .serving
+                .as_ref()
+                .is_some_and(|s| Some(s.owner) != host.owner.as_ref().map(|o| o.uuid))
+        {
+            return Err("session recovery requires a fresh headless participant owner".into());
+        }
+        // Opening the native file populated either the integrated owner's
+        // redundant cache or the dedicated server's inert native metadata record.
+        let native_uuid = self
+            .level
+            .player_uuid
+            .ok_or("native local-player UUID is missing")?;
+        let local_tag = self.level.player_tag();
+        let local = rows.iter().find(|row| row.record_uuid == native_uuid);
+        let local_matches = match &host.owner {
+            Some(owner) => local.is_some_and(|row| {
+                row.integrated_owner
+                    && row.profile_uuid == owner.uuid
+                    && session_player_tags_equal(&local_tag, &row.player)
+            }),
+            None => local.is_none() && session_empty_native_player(&local_tag),
+        };
+        if !local_matches {
+            return Err("native local-player cache differs from its verified participant".into());
+        }
+        let mut inventory = vec![None; 36];
+        let mut armor = [None, None, None, None];
+        let mut offhand = None;
+        for (slot, item, count, damage) in &self.level.inventory {
+            let stack = Some(ItemStack {
+                item: Arc::from(item.as_str()),
+                count: *count,
+                damage: *damage,
+                extra: self.level.inventory_components.get(slot).cloned(),
+            });
+            match *slot {
+                0..=35 => inventory[usize::from(*slot)] = stack,
+                100..=103 => armor[usize::from(103 - *slot)] = stack,
+                150 => offhand = stack,
+                _ => return Err("unsupported local-player inventory cell".into()),
+            }
+        }
+        if self.inventory != inventory
+            || self.armor != armor
+            || self.offhand != offhand
+            || self.ender_items != self.level.ender_items
+        {
+            return Err("native local-player item cache has changed".into());
+        }
+        for &conn in host.play.keys() {
+            if !host.hub.guests.iter().any(|g| g.conn == conn) {
+                return Err("fresh participant host has orphan play state".into());
+            }
+        }
+        for (index, guest) in host.hub.guests.iter().enumerate() {
+            if host.hub.guests[..index]
+                .iter()
+                .any(|g| g.uuid == guest.uuid || g.conn == guest.conn)
+                || !guest.placed
+                || !guest.loaded
+                || guest.inventory.len() != 36
+                || guest.ender_items.len() != 27
+                || guest.inventory.iter().any(Option::is_some)
+                || guest.armor.iter().any(Option::is_some)
+                || guest.offhand.is_some()
+                || guest.ender_items.iter().any(Option::is_some)
+                || guest.motion.is_some()
+                || guest.loaded_body.is_some()
+                || guest.saved_absorption.is_some()
+                || guest.saved.is_some()
+                || guest.logs_kept.is_some()
+                || !guest.left_reason.is_empty()
+                || guest.dead
+                || guest.death_time != 0
+                || guest.awaiting_teleport.is_some()
+                || guest.carried.is_some()
+                || guest.craft_grid.iter().any(Option::is_some)
+                || guest.craft_result.is_some()
+                || guest.menu.is_some()
+                || guest.drag.is_some()
+                || guest.vehicle.is_some()
+                || guest.sleeping
+                || guest.bed.is_some()
+                || guest.sleep_timer != 0
+                || guest.sent_bed.is_some()
+                || !guest.inbox.is_empty()
+                || !guest.moves.is_empty()
+                || guest.sender.pending.load(Ordering::Acquire) != 0
+                || !guest.effects.saved().is_empty()
+                || !guest.sent_effects.is_empty()
+                || guest.advancements_loaded
+                || !guest.advancements.criteria.is_empty()
+                || !guest.advancements_changed.is_empty()
+                || !guest.recipes_unlocked.is_empty()
+                || guest.health != 20.0
+                || guest.food != 20
+                || guest.saturation != 5.0
+                || guest.xp_level != 0
+                || guest.xp_total != 0
+                || guest.xp_progress != 0.0
+                || guest.xp_seed != 0
+                || guest.seen_credits
+                || guest.last_death.is_some()
+                || guest.spawn.is_some()
+                || guest.respawn_elsewhere.is_some()
+                || guest.recipe_book.write()
+                    != horizon_client::recipe_book::Settings::default().write()
+                || host.play.get(&guest.conn).is_some_and(|play| {
+                    !play.checkpoint_participant_idle()
+                        || !play.stats.values.is_empty()
+                        || !play.stats.events.is_empty()
+                })
+            {
+                return Err("session recovery participant is not fresh and empty".into());
+            }
+            let row = rows
+                .iter()
+                .find(|row| row.profile_uuid == guest.uuid)
+                .ok_or("session recovery actual participant UUID mismatch")?;
+            let owner = host.owner.as_ref().map(|o| o.uuid);
+            if row.integrated_owner != (owner == Some(guest.uuid))
+                || record_uuid(owner, self.level.player_uuid, guest.uuid) != Some(row.record_uuid)
+                || guest.dimension != row.dimension
+            {
+                return Err("session recovery participant storage mapping mismatch".into());
+            }
+        }
+        if rows.iter().filter(|row| row.integrated_owner).count()
+            != usize::from(host.owner.is_some())
+        {
+            return Err("session recovery integrated owner mismatch".into());
+        }
+        for guest in &mut host.hub.guests {
+            let row = rows
+                .iter()
+                .find(|row| row.profile_uuid == guest.uuid)
+                .ok_or("session recovery participant row missing")?;
+            validate_session_player_tag(&row.player)?;
+            let mut level = Level {
+                player_uuid: Some(row.record_uuid),
+                ..Level::default()
+            };
+            level.read_player(&row.player);
+            level.player_extra = Some(row.player.clone());
+            playerdata::apply(guest, &level);
+            let position = level.position.ok_or("session player position missing")?;
+            let mut body = PlayerMotion::new(
+                self.motion,
+                Vec3::new(position[0], position[1], position[2]),
+            )?;
+            let mut pending = true;
+            body.load_saved_state_once(&mut pending, &level)?;
+            // Consume native staging exactly once; no enter/leave_guest side effects.
+            guest
+                .loaded_body
+                .take()
+                .ok_or("native player body was not staged")?
+                .apply(&mut body);
+            let absorption = guest
+                .saved_absorption
+                .take()
+                .ok_or("native absorption was not staged")?;
+            body.internal_set_absorption(absorption)?;
+            body.velocity = Vec3::new(level.motion[0], level.motion[1], level.motion[2]);
+            body.health.food.exhaustion = level.food_exhaustion;
+            body.health.food.timer = level.food_tick_timer;
+            body.yaw = level.rotation[0];
+            body.head_yaw = body.yaw;
+            body.pitch = level.rotation[1];
+            body.ground.on_ground = level.on_ground;
+            body.server_copy = true;
+            body.may_fly = matches!(level.mode(), 1 | 3);
+            body.invulnerable = body.may_fly;
+            body.spectator = level.mode() == 3;
+            body.flying = level.flying;
+            if pending || !session_body_matches_level(&body, &level) {
+                return Err("actual restored session body differs from saved body".into());
+            }
+            guest.motion = Some(Box::new(body));
+            guest.advancements =
+                horizon_client::advancements::Progress::from_json(&row.advancements);
+            guest.advancements_loaded = true;
+            let play = host.play.entry(guest.conn).or_default();
+            play.stats.loaded = true;
+            let values = row
+                .stats
+                .get("stats")
+                .and_then(serde_json::Value::as_object)
+                .ok_or("session statistics object missing")?;
+            for (kind, entries) in values {
+                let entries = entries
+                    .as_object()
+                    .ok_or("session statistics entries malformed")?;
+                let values = play.stats.values.entry(kind.clone()).or_default();
+                for (key, value) in entries {
+                    let value = value
+                        .as_i64()
+                        .and_then(|n| i32::try_from(n).ok())
+                        .ok_or("session statistic is not an i32")?;
+                    values.insert(key.clone(), value);
+                }
+            }
+            // This projection reads every admitted saved body value directly from
+            // the installed motion, before inspecting its native encoding.
+            if !session_player_tags_equal(
+                &session_player_level(guest, row.record_uuid)?.player_tag(),
+                &row.player,
+            ) || guest
+                .advancements
+                .to_json(&self.adv.tree, horizon_world::DATA_VERSION)
+                != row.advancements
+                || play.stats.to_json() != row.stats
+            {
+                return Err("session participant restoration changed a saved value".into());
+            }
+        }
+        let dedicated_cache = host.owner.is_none();
+        self.lan = Some(host);
+        self.inventory.fill(None);
+        self.armor.fill(None);
+        self.offhand = None;
+        self.ender_items.fill(None);
+        self.restore_player_state = false;
+        self.level.inventory.clear();
+        self.level.inventory_components.clear();
+        self.level.ender_items = vec![None; 27];
+        self.level.player_extra = dedicated_cache.then_some(local_tag);
+        // Keep the verified native singleplayer UUID. In dedicated mode it is
+        // the inert metadata record, never one of the external guest records;
+        // the next native save must not overwrite a guest with this empty cache.
+        self.level.active_effects.clear();
+        self.level.position = None;
+        if !dedicated_cache {
+            self.level.rotation = [0.0; 2];
+        }
+        self.level.motion = [0.0; 3];
+        self.level.health = 20.0;
+        self.level.absorption = 0.0;
+        self.level.food = 20;
+        self.level.saturation = 5.0;
+        self.level.food_exhaustion = 0.0;
+        self.level.food_tick_timer = 0;
+        self.level.fall_distance = 0.0;
+        self.level.on_ground = false;
+        self.level.flying = false;
+        self.level.xp_level = 0;
+        self.level.xp_progress = 0.0;
+        self.level.xp_total = 0;
+        self.level.xp_seed = 0;
+        self.level.selected_slot = 0;
+        self.level.spawn = None;
+        self.level.respawn_elsewhere = None;
+        self.level.seen_credits = false;
+        self.level.last_death = None;
+        self.level.recipe_book = Default::default();
+        self.potions = Default::default();
+        self.experience = Default::default();
+        self.adv.progress = Default::default();
+        self.stats = Default::default();
+        self.spawn = None;
+        self.respawn_config = None;
+        let roster = self
+            .observe_checkpoint_participants()
+            .map_err(|error| format!("restored session roster: {error:?}"))?;
+        let actual = self.project_session_participant_rows(&roster)?;
+        if actual.len() != rows.len()
+            || actual.iter().any(|actual| {
+                !rows.iter().any(|row| {
+                    actual.profile_uuid == row.profile_uuid
+                        && actual.record_uuid == row.record_uuid
+                        && actual.integrated_owner == row.integrated_owner
+                        && actual.dimension == row.dimension
+                        && session_player_tags_equal(&actual.player, &row.player)
+                        && actual.advancements == row.advancements
+                        && actual.stats == row.stats
+                })
+            })
+        {
+            return Err("installed session participants differ from verified rows".into());
+        }
+        Ok(())
+    }
+}
+
 fn save_guest_records_to(
     world: &std::path::Path,
     tree: &horizon_client::advancements::Tree,

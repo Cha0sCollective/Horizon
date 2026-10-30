@@ -30,6 +30,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(feature = "paired-packages")]
+pub(in crate::game) mod session_checkpoint;
+
 /// Server ticks a level other than the Overworld stays loaded with no player
 /// in it, before it is saved and closed (vanilla unloads a level's chunks
 /// once no ticket holds them; the Overworld stays loaded).
@@ -202,6 +205,11 @@ impl Game<'_> {
 
     /// Exchange the level in place with `p`.
     fn swap_level(&mut self, p: &mut Parked) {
+        #[cfg(feature = "paired-packages")]
+        {
+            // Swapping away and back must never revive initial-open provenance.
+            self.native_checkpoint_origin = None;
+        }
         use std::mem::swap;
         swap(&mut self.world, &mut p.world);
         swap(&mut self.streaming, &mut p.streaming);
@@ -1043,6 +1051,157 @@ impl Game<'_> {
 
 #[cfg(all(test, feature = "paired-packages"))]
 mod world_owner_tests;
+
+/// The session profile admits native history, rather than the research fixture's
+/// exact-tick empty roots. Validate every opaque field before accepting it.
+#[cfg(feature = "paired-packages")]
+fn session_native_metadata(extras: &horizon_client::chunk::ChunkExtras, clock: i64) -> bool {
+    use horizon_world::nbt::{Compound, Tag};
+    fn field<'a>(map: &'a Compound, key: &str) -> Option<&'a Tag> {
+        map.get(&key.into())
+    }
+    if extras.last_update < 0 || extras.last_update > clock || !extras.block_entity_order.is_empty()
+    {
+        return false;
+    }
+    // Fresh full native chunks, including snapshots made before a reload, may
+    // have no preserved root fields. The encoder supplies its empty defaults.
+    if extras.root.is_empty() {
+        return true;
+    }
+    if extras.root.len() != 3
+        || !matches!(field(&extras.root, "InhabitedTime"), Some(Tag::Long(value)) if *value >= 0)
+    {
+        return false;
+    }
+    let Some(Tag::Compound(structures)) = field(&extras.root, "structures") else {
+        return false;
+    };
+    if structures.len() != 2
+        || !["References", "starts"].into_iter().all(|key| {
+            matches!(field(structures, key), Some(Tag::Compound(values)) if values.is_empty())
+        })
+    {
+        return false;
+    }
+    matches!(field(&extras.root, "PostProcessing"), Some(Tag::List(sections))
+        if sections.len() == horizon_client::chunk::SECTIONS
+            && sections.iter().all(|section| matches!(section, Tag::List(values) if values.is_empty())))
+}
+
+#[cfg(feature = "paired-packages")]
+impl Game<'_> {
+    /// Full named WORLD/ENTITY census for one native session. The caller must
+    /// independently project the checked persistent counter and slot before
+    /// accounting the sole supported slot. No research profile is enabled here.
+    pub(in crate::game) fn inspect_session_checkpoint_owners(&self) -> Result<()> {
+        use horizon_client::world::WorldOwnerKind as K;
+        if self.remote.is_some()
+            || self.integrated.is_some()
+            || self.options.execution_role.is_client()
+            || self.lan_acting.is_some()
+            || self.dim != Dim::Overworld
+            || !self.levels.parked.is_empty()
+        {
+            return Err("session checkpoint requires one authoritative initial Overworld".into());
+        }
+        if self.world.game_time < 0 {
+            return Err("session checkpoint requires a nonnegative native clock".into());
+        }
+        // The library owns private borrowed/pending/added block-entity queues.
+        // Its ordering guarantees all those categories precede opaque roots.
+        // Do not accept a minimum OpaqueChunkRoot as a complete owner census:
+        // every chunk and every later named family is checked below as well.
+        if let Some(cause) = self.world.checkpoint_world_owner()
+            && cause.kind < K::OpaqueChunkRoot
+        {
+            return Err(format!("session checkpoint unsupported WORLD owner: {cause:?}").into());
+        }
+        if self.world.block_entities.keys().next().is_some()
+            || !self.world.chest_openers.is_empty()
+            || !self.world.block_names.is_empty()
+        {
+            return Err("session checkpoint native block-entity ownership".into());
+        }
+        for (&(x, z), chunk) in &self.world.chunks {
+            if chunk.x != x
+                || chunk.z != z
+                || !chunk.block_entities.is_empty()
+                || !chunk.block_names.is_empty()
+                || !chunk.entities.is_empty()
+                || !chunk.structure_refs.is_empty()
+                || !chunk.structure_starts.is_empty()
+                || !chunk.postprocess.is_empty()
+            {
+                return Err(
+                    format!("session checkpoint unsupported chunk owner at {x},{z}").into(),
+                );
+            }
+            if let Some(saved) = &chunk.saved
+                && (!saved.block_entities.is_empty()
+                    || !saved.block_entity_sources.is_empty()
+                    || !saved.rolled_loot.is_empty()
+                    || !saved.block_ticks.is_empty()
+                    || !saved.fluid_ticks.is_empty()
+                    || !session_native_metadata(saved, self.world.game_time))
+            {
+                return Err(
+                    format!("session checkpoint unsupported saved owner at {x},{z}").into(),
+                );
+            }
+        }
+        if !self.world.watched_writes.is_empty()
+            || !self.world.moving_pistons.is_empty()
+            || !self.world.moving_piston_fallback.is_empty()
+            || self.world.inhabited.values().any(|ticks| *ticks < 0)
+            || self.block_ticks.blocks.count() != 0
+            || self.block_ticks.fluids.count() != 0
+            || !self.block_ticks.comparator_outputs.is_empty()
+            || !self.block_ticks.torch_toggles.is_empty()
+            || !self.block_ticks.moving_pistons.is_empty()
+            || !self.block_ticks.piston_pushes.is_empty()
+            || !self.block_ticks.block_events.is_empty()
+            || !self.level_events.is_empty()
+        {
+            return Err("session checkpoint deferred WORLD ownership".into());
+        }
+        if !self.pending.shulker.is_empty()
+            || !self.pending.banner.is_empty()
+            || !self.pending.names.is_empty()
+            || !self.pending.pot.is_empty()
+            || !self.pending.copied.is_empty()
+            || !self.spill.spawns.is_empty()
+            || !self.spill.removed.is_empty()
+            || !self.spill.orbs.is_empty()
+            || !self.brushing.is_empty()
+            || self.item_columns.is_some()
+            || self.cmds.pregen.is_some()
+            || !self.hoppers.is_empty()
+            || !self.lectern_pulses.is_empty()
+            || !self.lid_openers.is_empty()
+        {
+            return Err("session checkpoint pending WORLD owner or producer".into());
+        }
+        // Deliberately omit only the slot-trial check: capture must already have
+        // checked its persistent frame, health, target and current schema.
+        inspect_entity_level_owners(
+            self.dim,
+            &self.world,
+            &self.persist,
+            &self.dropped,
+            unsupported_entities!(self, self.creatures.projectiles),
+        )
+        .map_err(|error| format!("session checkpoint unsupported ENTITY owner: {error:?}"))?;
+        if !self.dropped.is_empty()
+            || self.hook.is_some()
+            || self.end_portal_travel
+            || self.portals.checkpoint_entity_owner().is_some()
+        {
+            return Err("session checkpoint dropped, fishing or portal ENTITY owner".into());
+        }
+        Ok(())
+    }
+}
 
 #[cfg(all(test, feature = "paired-packages", target_os = "linux"))]
 pub(in crate::game) mod capture_integration;

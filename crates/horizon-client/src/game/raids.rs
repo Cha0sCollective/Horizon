@@ -61,6 +61,120 @@ impl Raiding {
     }
 }
 
+/// The dormant session primitive admits metadata for an empty native raid set,
+/// never the permissive native decoder's partial-result or default fallback.
+#[cfg(feature = "paired-packages")]
+#[allow(dead_code)]
+pub(in crate::game) fn validate_session_empty_raids(tag: &Tag) -> horizon_client::Result<()> {
+    let Tag::Compound(root) = tag else {
+        return Err("session raids root is not a compound".into());
+    };
+    if root.len() != 2 || tag.get("DataVersion") != Some(&Tag::Int(horizon_world::DATA_VERSION)) {
+        return Err("session raids root keys/version".into());
+    }
+    let Some(data @ Tag::Compound(fields)) = tag.get("data") else {
+        return Err("session raids data is not a compound".into());
+    };
+    if fields.len() != 2
+        || !matches!(data.get("next_id"), Some(Tag::Int(id)) if *id > 0)
+        || !matches!(data.get("tick"), Some(Tag::Int(tick)) if *tick >= 0)
+    {
+        return Err("session raids require exact empty native counters".into());
+    }
+    let decoded = Raids::from_nbt(data, 0);
+    if !decoded.map.is_empty() || !decoded.ids().is_empty() || decoded.to_nbt() != *data {
+        return Err("session raids native metadata roundtrip".into());
+    }
+    Ok(())
+}
+
+#[cfg(feature = "paired-packages")]
+impl Raiding {
+    fn session_checkpoint_projection(&self, dim: Dim) -> horizon_client::Result<Option<Tag>> {
+        if dim != Dim::Overworld
+            || self.loaded.is_some_and(|loaded| loaded != Dim::Overworld)
+            || !self.raids.map.is_empty()
+            || !self.raids.ids().is_empty()
+            || self.patrol.next_tick != 0
+            || self.siege.tonight
+            || self.siege.set_up
+            || self.siege.zombies_to_spawn != 0
+            || self.siege.next_spawn_time != 0
+            || self.siege.spot != [0; 3]
+            || self.omen_position.is_some()
+            || !self.bar_hurts.is_empty()
+            || !self.homes.is_empty()
+        {
+            return Err("session checkpoint unsupported raid, patrol, siege or omen owner".into());
+        }
+        if self.loaded.is_none() {
+            if self.raids.next_id != 1 || self.raids.tick != 0 {
+                return Err("session checkpoint unloaded raid metadata is not pristine".into());
+            }
+            return Ok(None);
+        }
+        let tag = Tag::compound([
+            ("data", self.raids.to_nbt()),
+            ("DataVersion", Tag::Int(horizon_world::DATA_VERSION)),
+        ]);
+        validate_session_empty_raids(&tag)?;
+        Ok(Some(tag))
+    }
+}
+
+#[cfg(feature = "paired-packages")]
+#[allow(dead_code)] // Used only by the dormant internal session primitive.
+impl Game<'_> {
+    pub(in crate::game) fn session_checkpoint_raids(&self) -> horizon_client::Result<Option<Tag>> {
+        self.raiding.session_checkpoint_projection(self.dim)
+    }
+
+    /// A checked native write of the actual loaded projection, including a clean
+    /// clock advanced since autosave. This never invents dirty state or changes it.
+    pub(in crate::game) fn write_session_checkpoint_raids(&self) -> horizon_client::Result<()> {
+        if self.remote.is_some() {
+            return Err("session raid write requires an authoritative game".into());
+        }
+        if let Some(tag) = self.session_checkpoint_raids()? {
+            let path = self.raids_path(self.dim);
+            horizon_client::save::write_dat(&path, tag).map_err(|error| {
+                format!(
+                    "could not save session empty raids at {}: {error}",
+                    path.display()
+                )
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Called only after complete image verification, on the unpublished fresh
+    /// candidate. Empty native decoding needs no raid seed or world-random draw.
+    pub(in crate::game) fn install_session_checkpoint_raids(
+        &mut self,
+        verified: Option<&Tag>,
+    ) -> horizon_client::Result<()> {
+        if self.session_checkpoint_raids()?.is_some() {
+            return Err("session raid candidate already loaded".into());
+        }
+        if let Some(tag) = verified {
+            validate_session_empty_raids(tag)?;
+            let data = tag.get("data").ok_or("session raids data absent")?;
+            self.raiding.raids = Raids::from_nbt(data, 0);
+            self.raiding.loaded = Some(self.dim);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(in crate::game) fn session_checkpoint_raid_observation(&self) -> (bool, Option<Tag>) {
+        (
+            self.raiding.raids.dirty,
+            self.session_checkpoint_raids()
+                .expect("checked native raid observation"),
+        )
+    }
+}
+
 /// `SectionPos` of a block position.
 pub(super) fn section(p: [i32; 3]) -> (i32, i32, i32) {
     (p[0] >> 4, p[1] >> 4, p[2] >> 4)
@@ -1479,6 +1593,178 @@ mod metadata_tests;
 
 #[cfg(test)]
 mod lifetime_tests;
+
+#[cfg(all(test, feature = "paired-packages"))]
+mod session_checkpoint_tests {
+    use super::*;
+
+    #[test]
+    fn empty_native_raid_profile_is_closed_and_preserves_live_metadata() {
+        let mut state = Raiding {
+            loaded: Some(Dim::Overworld),
+            ..Default::default()
+        };
+        state.raids.next_id = 73;
+        state.raids.tick = 409;
+        state.raids.dirty = false;
+        let tag = state
+            .session_checkpoint_projection(Dim::Overworld)
+            .unwrap()
+            .unwrap();
+        validate_session_empty_raids(&tag).unwrap();
+        assert_eq!(tag.get("data").unwrap().get("next_id"), Some(&Tag::Int(73)));
+        assert_eq!(tag.get("data").unwrap().get("tick"), Some(&Tag::Int(409)));
+        assert!(tag.get("data").unwrap().get("raids").is_none());
+        assert!(!state.raids.dirty);
+        let decoded = Raids::from_nbt(tag.get("data").unwrap(), 0);
+        assert_eq!(decoded.next_id, 73);
+        assert_eq!(decoded.tick, 409);
+        assert_eq!(decoded.to_nbt(), *tag.get("data").unwrap());
+        // Native integer history is preserved without an arbitrary profile cap.
+        state.raids.next_id = i32::MAX;
+        state.raids.tick = i32::MAX;
+        validate_session_empty_raids(
+            &state
+                .session_checkpoint_projection(Dim::Overworld)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+
+        for (field, bad) in [
+            ("next_id", Tag::Int(0)),
+            ("next_id", Tag::Int(-1)),
+            ("next_id", Tag::Long(73)),
+            ("next_id", Tag::Float(73.0f32.to_bits())),
+            ("tick", Tag::Int(-1)),
+            ("tick", Tag::Long(409)),
+            ("tick", Tag::Short(0)),
+            ("tick", Tag::String("409".into())),
+            ("raids", Tag::List(Vec::new())),
+            ("raids", Tag::List(vec![Tag::Compound(Default::default())])),
+            ("unknown", Tag::Byte(0)),
+        ] {
+            let mut changed = tag.clone();
+            let Tag::Compound(root) = &mut changed else {
+                unreachable!()
+            };
+            let Tag::Compound(data) = root.get_mut(&"data".into()).unwrap() else {
+                unreachable!()
+            };
+            data.insert(field.into(), bad);
+            assert!(
+                validate_session_empty_raids(&changed).is_err(),
+                "field {field}"
+            );
+        }
+        for missing in ["next_id", "tick"] {
+            let mut changed = tag.clone();
+            let Tag::Compound(root) = &mut changed else {
+                unreachable!()
+            };
+            let Tag::Compound(data) = root.get_mut(&"data".into()).unwrap() else {
+                unreachable!()
+            };
+            data.remove(&missing.into());
+            assert!(validate_session_empty_raids(&changed).is_err());
+        }
+        for (field, value) in [
+            (
+                "DataVersion",
+                Tag::Long(i64::from(horizon_world::DATA_VERSION)),
+            ),
+            ("DataVersion", Tag::Int(horizon_world::DATA_VERSION - 1)),
+            ("data", Tag::List(Vec::new())),
+            ("unknown", Tag::Int(0)),
+        ] {
+            let mut changed = tag.clone();
+            let Tag::Compound(root) = &mut changed else {
+                unreachable!()
+            };
+            root.insert(field.into(), value);
+            assert!(validate_session_empty_raids(&changed).is_err());
+        }
+        for missing in ["DataVersion", "data"] {
+            let mut changed = tag.clone();
+            let Tag::Compound(root) = &mut changed else {
+                unreachable!()
+            };
+            root.remove(&missing.into());
+            assert!(validate_session_empty_raids(&changed).is_err());
+        }
+        assert!(validate_session_empty_raids(&Tag::List(Vec::new())).is_err());
+
+        let fresh = Raiding::default();
+        assert!(
+            fresh
+                .session_checkpoint_projection(Dim::Overworld)
+                .unwrap()
+                .is_none()
+        );
+        assert!(fresh.session_checkpoint_projection(Dim::Nether).is_err());
+        // Each real private family is checked independently. Include malformed
+        // map/order disagreement so neither representation can hide an owner.
+        for case in 0..17 {
+            let mut actual = Raiding::default();
+            match case {
+                0 => actual.loaded = Some(Dim::Nether),
+                1 => actual.raids.next_id = 2,
+                2 => actual.raids.tick = 1,
+                3 => actual.patrol.next_tick = 1,
+                4 => actual.siege.tonight = true,
+                5 => actual.siege.set_up = true,
+                6 => actual.siege.zombies_to_spawn = 1,
+                7 => actual.siege.next_spawn_time = 1,
+                8 => actual.siege.spot = [1, 0, 0],
+                9 => actual.omen_position = Some([0; 3]),
+                10 => {
+                    actual.bar_hurts.insert(1, 0);
+                }
+                11 => {
+                    actual.homes.insert(1, (0, std::sync::Arc::new(Vec::new())));
+                }
+                12 => {
+                    actual.raids.create_or_extend([0, 64, 0], 2, Some(0), 17);
+                }
+                13 => {
+                    actual
+                        .raids
+                        .map
+                        .insert(1, raid::Raid::new([0, 64, 0], 2, 17));
+                }
+                14 => {
+                    let (id, _) = actual.raids.create_or_extend([0, 64, 0], 2, Some(0), 17);
+                    actual.raids.map.remove(&id);
+                }
+                15 => {
+                    actual.loaded = Some(Dim::Overworld);
+                    actual.raids.next_id = 0;
+                }
+                16 => {
+                    actual.loaded = Some(Dim::Overworld);
+                    actual.raids.tick = -1;
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                actual
+                    .session_checkpoint_projection(Dim::Overworld)
+                    .is_err(),
+                "owner case {case}"
+            );
+        }
+        let inert = Raiding {
+            omen_loaded: true,
+            ..Default::default()
+        };
+        assert!(
+            inert
+                .session_checkpoint_projection(Dim::Overworld)
+                .unwrap()
+                .is_none()
+        );
+    }
+}
 
 #[cfg(test)]
 mod tests {

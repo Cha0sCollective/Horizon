@@ -1535,6 +1535,8 @@ struct Game<'a> {
     save: Arc<SaveDir>,
     level: Level,
     session_lock: Option<world_loading::host_identity::WorldSession>,
+    #[cfg(feature = "paired-packages")]
+    native_checkpoint_origin: Option<world_loading::NativeCheckpointOrigin>,
     audio: Audio,
     music: horizon_client::music::MusicManager,
     ambience: horizon_client::ambience::Ambience,
@@ -8927,6 +8929,8 @@ impl Game<'_> {
             session_lock,
             rand_sequences,
             locator,
+            #[cfg(feature = "paired-packages")]
+            native_checkpoint_origin,
         } = prepared;
         let dim = Dim::from_id(&level.dimension);
         horizon_client::crash::set_detail(
@@ -9059,6 +9063,11 @@ impl Game<'_> {
         self.streaming.sky_light = dim != Dim::Nether;
         self.streaming.nether_shading = dim == Dim::Nether;
         self.load_world_state();
+        // Publish provenance only after the corresponding native open completed.
+        #[cfg(feature = "paired-packages")]
+        {
+            self.native_checkpoint_origin = native_checkpoint_origin;
+        }
         Ok(())
     }
     /// Streaming and region storage for one dimension of a world.
@@ -13717,6 +13726,8 @@ impl<'a> Game<'a> {
             save,
             level,
             session_lock: None,
+            #[cfg(feature = "paired-packages")]
+            native_checkpoint_origin: None,
             audio,
             music: {
                 // The manager starts with the saved option (MusicManager's constructor).

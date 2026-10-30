@@ -252,7 +252,7 @@ impl Game<'_> {
     }
     /// `ServerPlayer`'s `warden_spawn_tracker` from the player data.
     fn load_warden_tracker(&mut self) {
-        if self.sculk.tracker_loaded {
+        if self.sculk.tracker_loaded || self.no_player_here() {
             return;
         }
         self.sculk.tracker_loaded = true;
@@ -267,7 +267,7 @@ impl Game<'_> {
     }
     /// Write the tracker into the player data being saved.
     pub(super) fn save_warden_tracker(&mut self) {
-        if !self.sculk.tracker_loaded {
+        if !self.sculk.tracker_loaded || self.no_player_here() {
             return;
         }
         let tag = self.sculk.tracker.to_nbt();
