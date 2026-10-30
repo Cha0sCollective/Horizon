@@ -14,7 +14,7 @@ use super::{
     Game, Options, PackResources, Resources, UiResources,
     execution_role::ExecutionRole,
     lan::{LanSettings, Owner},
-    world_loading::WorldRequest,
+    world_loading::{WorldRequest, host_identity::IdentityIntent},
 };
 use horizon_client::{
     Result,
@@ -176,6 +176,7 @@ struct Launch {
     seed: Option<i64>,
     creative: bool,
     create: Option<WorldOptions>,
+    identity_intent: IdentityIntent,
     /// The window's profile: the only one let in until the world is open to
     /// the LAN, and the world's player.
     owner: u128,
@@ -207,6 +208,25 @@ impl Game<'_> {
         creative: bool,
         create: Option<&WorldOptions>,
     ) -> Result<()> {
+        self.open_integrated_with_identity(
+            folder,
+            name,
+            seed,
+            creative,
+            create,
+            IdentityIntent::Legacy,
+        )
+    }
+
+    pub(super) fn open_integrated_with_identity(
+        &mut self,
+        folder: &str,
+        name: Option<&str>,
+        seed: Option<i64>,
+        creative: bool,
+        create: Option<&WorldOptions>,
+        identity_intent: IdentityIntent,
+    ) -> Result<()> {
         let auth = horizon_client::auth::current();
         let player = auth
             .as_ref()
@@ -217,6 +237,7 @@ impl Game<'_> {
             seed,
             creative,
             create: create.cloned(),
+            identity_intent,
             // An offline-mode server names its players by their offline profile.
             owner: offline_uuid(&player),
             player: player.clone(),
@@ -302,13 +323,16 @@ impl Game<'_> {
         }
         #[cfg(feature = "mods")]
         self.options.mod_packages.check_running(&self.mods.mods)?;
-        self.load_world(WorldRequest::new(
-            &launch.folder,
-            launch.name.as_deref(),
-            launch.seed,
-            launch.creative,
-            launch.create.as_ref(),
-        )?)?;
+        self.load_world(
+            WorldRequest::new(
+                &launch.folder,
+                launch.name.as_deref(),
+                launch.seed,
+                launch.creative,
+                launch.create.as_ref(),
+            )?
+            .with_identity_intent(launch.identity_intent),
+        )?;
         let saved = Box::new(self.level.clone());
         // IntegratedServer runs the server mods; the window the client mods.
         if !self.options.mod_packages.has_pairs() {

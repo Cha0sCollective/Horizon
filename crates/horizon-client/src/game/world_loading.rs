@@ -1,5 +1,7 @@
 //! Prepare local worlds without blocking the window's event loop.
 use super::*;
+pub(super) mod host_identity;
+use host_identity::{IdentityIntent, WorldSession};
 
 pub(super) struct WorldRequest {
     pub save_root: PathBuf,
@@ -8,6 +10,7 @@ pub(super) struct WorldRequest {
     pub seed: Option<i64>,
     pub creative: bool,
     pub create: Option<horizon_client::title::WorldOptions>,
+    identity_intent: IdentityIntent,
 }
 
 pub(super) struct PreparedWorld {
@@ -16,7 +19,7 @@ pub(super) struct PreparedWorld {
     pub world: World,
     pub streaming: Streaming,
     pub save: Arc<SaveDir>,
-    pub session_lock: horizon_client::save::SessionLock,
+    pub session_lock: WorldSession,
     pub rand_sequences: horizon_client::random_sequences::RandomSequences,
     pub locator: Option<Arc<VanillaTerrain>>,
 }
@@ -36,7 +39,13 @@ impl WorldRequest {
             seed,
             creative,
             create: create.cloned(),
+            identity_intent: IdentityIntent::Legacy,
         })
+    }
+
+    pub(super) fn with_identity_intent(mut self, intent: IdentityIntent) -> Self {
+        self.identity_intent = intent;
+        self
     }
 
     pub fn prepare(
@@ -47,6 +56,9 @@ impl WorldRequest {
         settings: &Settings,
     ) -> Result<PreparedWorld> {
         options.mod_packages.check_world(&self.save_root)?;
+        #[cfg(feature = "paired-packages")]
+        let identity_preflight =
+            host_identity::IdentityPreflight::read(&self.save_root, self.identity_intent)?;
         // Before any chunk is read: a loaded container with a loot table is rolled as its chunk
         // is decoded (`save::roll_loaded_loot`), and the spawn chunks are read while the world
         // opens. Every world opens here: in-frame, on the server thread, on a dedicated server.
@@ -58,13 +70,37 @@ impl WorldRequest {
             seed,
             creative,
             create,
+            identity_intent,
         } = self;
         let name = name.as_deref();
         let create = create.as_ref();
-        horizon_client::save::upgrade_older_world(&save_root)?;
-        horizon_client::save::migrate_legacy(&save_root)?;
-        let session_lock = horizon_client::save::SessionLock::acquire(&save_root)?;
-        options.mod_packages.record_world(&save_root)?;
+        let session_lock;
+        #[cfg(feature = "paired-packages")]
+        if let Some(preflight) = identity_preflight {
+            // Opt-in preflight ran before native acquisition could follow or
+            // truncate a lock target. The same facts are checked under lock.
+            let lock = horizon_client::save::SessionLock::acquire(&save_root)?;
+            preflight.recheck(&save_root)?;
+            options.mod_packages.check_world(&save_root)?;
+            // Package v1 FIRST: an anchor alone would make a paired new root
+            // look like an unmarked existing world. Failures retain artifacts.
+            options.mod_packages.record_world(&save_root)?;
+            session_lock = preflight.finish(&save_root, lock)?;
+        } else {
+            horizon_client::save::upgrade_older_world(&save_root)?;
+            horizon_client::save::migrate_legacy(&save_root)?;
+            let lock = horizon_client::save::SessionLock::acquire(&save_root)?;
+            options.mod_packages.record_world(&save_root)?;
+            session_lock = WorldSession::legacy(lock);
+        }
+        #[cfg(not(feature = "paired-packages"))]
+        {
+            horizon_client::save::upgrade_older_world(&save_root)?;
+            horizon_client::save::migrate_legacy(&save_root)?;
+            let lock = horizon_client::save::SessionLock::acquire(&save_root)?;
+            options.mod_packages.record_world(&save_root)?;
+            session_lock = WorldSession::legacy(lock);
+        }
         // RandomSequences: the world's data/minecraft/random_sequences.dat.
         let rand_sequences =
             horizon_client::save::read_dat(&save_root.join("data/minecraft/random_sequences.dat"))
@@ -72,6 +108,9 @@ impl WorldRequest {
                 .map(|d| horizon_client::random_sequences::RandomSequences::from_nbt(&d))
                 .unwrap_or_default();
         let existing = Level::read(&save_root);
+        if identity_intent.requires_existing() && existing.is_none() {
+            return Err("required host identity reopen: native Level could not be read; fresh-world fallback refused".into());
+        }
         let created = existing.is_none();
         let level = existing.unwrap_or_else(|| Level {
             name: name.unwrap_or(&folder).to_owned(),
@@ -154,6 +193,10 @@ impl WorldRequest {
         })
     }
 }
+
+#[cfg(all(test, feature = "paired-packages", target_os = "linux"))]
+#[path = "world_loading/host_identity_startup_tests.rs"]
+mod host_identity_startup_tests;
 
 pub(super) struct WorldLoader {
     pub cancelled: bool,

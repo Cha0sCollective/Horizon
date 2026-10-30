@@ -1534,7 +1534,7 @@ struct Game<'a> {
     message: Option<(String, Instant)>,
     save: Arc<SaveDir>,
     level: Level,
-    session_lock: Option<horizon_client::save::SessionLock>,
+    session_lock: Option<world_loading::host_identity::WorldSession>,
     audio: Audio,
     music: horizon_client::music::MusicManager,
     ambience: horizon_client::ambience::Ambience,
@@ -8819,16 +8819,48 @@ impl Game<'_> {
         creative: bool,
         create: Option<&horizon_client::title::WorldOptions>,
     ) -> Result<()> {
+        self.open_world_with_identity(
+            folder,
+            name,
+            seed,
+            creative,
+            create,
+            world_loading::host_identity::IdentityIntent::Legacy,
+        )
+    }
+
+    /// Explicit internal opt-in; ordinary UI/CLI entry always uses Legacy.
+    fn open_world_with_identity(
+        &mut self,
+        folder: &str,
+        name: Option<&str>,
+        seed: Option<i64>,
+        creative: bool,
+        create: Option<&horizon_client::title::WorldOptions>,
+        identity_intent: world_loading::host_identity::IdentityIntent,
+    ) -> Result<()> {
         world_loading::world_data_used();
         #[cfg(feature = "mods")]
         self.options.mod_packages.check_running(&self.mods.mods)?;
-        if self.defer_world_entry(PendingWorldEntry::Local {
-            folder: folder.to_owned(),
-            name: name.map(str::to_owned),
-            seed,
-            creative,
-            create: create.cloned().map(Box::new),
-        })? {
+        let pending = match identity_intent {
+            world_loading::host_identity::IdentityIntent::Legacy => PendingWorldEntry::Local {
+                folder: folder.to_owned(),
+                name: name.map(str::to_owned),
+                seed,
+                creative,
+                create: create.cloned().map(Box::new),
+            },
+            #[cfg(feature = "paired-packages")]
+            identity_intent => PendingWorldEntry::IdentifiedLocal {
+                folder: folder.to_owned(),
+                name: name.map(str::to_owned),
+                seed,
+                creative,
+                create: create.cloned().map(Box::new),
+                identity_intent,
+            },
+        };
+        if self.defer_world_entry(pending)? {
             return Ok(());
         }
         self.join_world_rest()?;
@@ -8837,9 +8869,17 @@ impl Game<'_> {
             .execution_role
             .starts_integrated_server(self.options.server_thread)
         {
-            return self.open_integrated(folder, name, seed, creative, create);
+            return self.open_integrated_with_identity(
+                folder,
+                name,
+                seed,
+                creative,
+                create,
+                identity_intent,
+            );
         }
-        let request = world_loading::WorldRequest::new(folder, name, seed, creative, create)?;
+        let request = world_loading::WorldRequest::new(folder, name, seed, creative, create)?
+            .with_identity_intent(identity_intent);
         if self.window.is_some() {
             self.perf.world_opening();
             if self.title.is_none() {
@@ -8858,6 +8898,14 @@ impl Game<'_> {
             return Ok(());
         }
         self.load_world(request)
+    }
+
+    #[cfg(feature = "paired-packages")]
+    #[allow(dead_code)]
+    fn host_world_identity(&self) -> Option<&horizon_client::world::counter_restore::WorldId> {
+        self.session_lock
+            .as_ref()
+            .and_then(|session| session.expected_world())
     }
 
     /// Load authoritative world state synchronously, without client entry or
@@ -13992,6 +14040,15 @@ enum LoaderMsg {
 }
 
 enum PendingWorldEntry {
+    #[cfg(feature = "paired-packages")]
+    IdentifiedLocal {
+        folder: String,
+        name: Option<String>,
+        seed: Option<i64>,
+        creative: bool,
+        create: Option<Box<horizon_client::title::WorldOptions>>,
+        identity_intent: world_loading::host_identity::IdentityIntent,
+    },
     Local {
         folder: String,
         name: Option<String>,
@@ -14095,6 +14152,24 @@ impl Game<'_> {
                 cookies,
             }) => {
                 self.connect_server_with_cookies(&address, &name, cookies)?;
+            }
+            #[cfg(feature = "paired-packages")]
+            Some(PendingWorldEntry::IdentifiedLocal {
+                folder,
+                name,
+                seed,
+                creative,
+                create,
+                identity_intent,
+            }) => {
+                self.open_world_with_identity(
+                    &folder,
+                    name.as_deref(),
+                    seed,
+                    creative,
+                    create.as_deref(),
+                    identity_intent,
+                )?;
             }
             None => {}
         }
