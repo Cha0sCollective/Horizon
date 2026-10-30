@@ -171,6 +171,15 @@ pub(in crate::game) struct RecoveryReceipt {
     pub counter: RuntimeCounterKey,
     pub slot: SlotKey,
 }
+/// Trusted coordinator routing, not a decoded image or an expected-UUID assertion.
+pub(in crate::game) struct ManagedRecoveryRequest {
+    pub owner_root: PathBuf,
+    pub expected_target: CounterTarget,
+    pub expected_type: String,
+    pub archive_root: PathBuf,
+    pub destination: PathBuf,
+    pub deadline: Instant,
+}
 /// A decoder cannot grant player installation authority. Only `verify_image`,
 /// after complete physical/native/package/frame/player validation, constructs this.
 pub(in crate::game) struct CheckedSessionPlayers {
@@ -2097,6 +2106,40 @@ impl<'a> Game<'a> {
     }
     /// Failure consumes and drops the entire unpublished Game. There is no
     /// rollback claim, partial Game return, reused live host, tick or as_guest.
+    /// Dormant managed entry: acquire exclusion BEFORE selecting any image and
+    /// transfer it into the recovered native session BEFORE returning that Game.
+    pub(in crate::game) fn recover_managed_session_checkpoint(
+        self,
+        namespace: &crate::game::world_loading::host_identity::session_authority::AuthorityNamespace,
+        request: ManagedRecoveryRequest,
+        host: LanHost,
+    ) -> SResult<(Self, RecoveryReceipt)> {
+        deadline(request.deadline)?;
+        let mut lease = Some(checked(namespace.acquire_recovery(
+            &request.owner_root,
+            &request.archive_root,
+            &request.destination,
+        ))?);
+        let expected_world = lease.as_ref().expect("just acquired authority").world();
+        let (mut game, receipt) = self.recover_session_checkpoint(
+            RecoveryRequest {
+                expected_world,
+                expected_target: request.expected_target,
+                expected_type: request.expected_type,
+                archive_root: request.archive_root,
+                destination: request.destination,
+                deadline: request.deadline,
+            },
+            host,
+        )?;
+        let session = game
+            .session_lock
+            .as_mut()
+            .ok_or_else(|| fail("missing recovered native session"))?;
+        checked(session.install_authority(&mut lease))?;
+        Ok((game, receipt))
+    }
+
     pub(in crate::game) fn recover_session_checkpoint(
         mut self,
         request: RecoveryRequest,

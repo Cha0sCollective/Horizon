@@ -2,6 +2,8 @@
 #[cfg(feature = "paired-packages")]
 use horizon_client::Result;
 use horizon_client::save::SessionLock;
+#[cfg(feature = "paired-packages")]
+pub(in crate::game) mod session_authority;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[allow(dead_code)] // Explicit internal entry only; ordinary startup stays Legacy.
@@ -29,6 +31,8 @@ impl IdentityIntent {
 pub(in crate::game) struct WorldSession {
     _lock: SessionLock,
     #[cfg(feature = "paired-packages")]
+    authority: Option<session_authority::WorldAuthority>,
+    #[cfg(feature = "paired-packages")]
     world: Option<horizon_client::world::counter_restore::WorldId>,
     #[cfg(feature = "paired-packages")]
     counter_bootstrap: Option<horizon_client::world::counter_restore::HostCounterBootstrap>,
@@ -37,6 +41,8 @@ impl WorldSession {
     pub(super) fn legacy(lock: SessionLock) -> Self {
         Self {
             _lock: lock,
+            #[cfg(feature = "paired-packages")]
+            authority: None,
             #[cfg(feature = "paired-packages")]
             world: None,
             #[cfg(feature = "paired-packages")]
@@ -388,6 +394,7 @@ impl IdentityPreflight {
         }
         Ok(WorldSession {
             _lock: lock,
+            authority: None,
             world: Some(self.world),
             counter_bootstrap: match self.kind {
                 PreflightKind::New { .. } => Some(horizon_client::world::counter_restore::HostCounterBootstrap::for_new_host_world(self.world)),

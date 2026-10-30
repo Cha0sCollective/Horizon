@@ -29,6 +29,189 @@ const WAIT: Duration = Duration::from_secs(120);
 const POSITION: [i32; 3] = [2, 120, 2];
 const OWNER: u128 = 0x55;
 const EXTERNAL: u128 = 0x66;
+
+#[test]
+#[ignore = "isolated pinned resources + prebuilt pair: managed new Game holds UUID authority"]
+fn session_authority_actual_new_game_retains_authority_and_refuses_native_only_reopen() {
+    use crate::game::world_loading::host_identity::session_authority::AuthorityNamespace;
+    let fixture = Fixture::new("authority-new");
+    let _retain = RetainOnPanic::new(&fixture);
+    let scratch = Scratch::new("authority-new");
+    let ns_root = scratch.0.join("authority");
+    fs::create_dir(&ns_root).unwrap();
+    let namespace = AuthorityNamespace::new(&ns_root).unwrap();
+    let root = scratch.0.join("new-world");
+    let mut game = fresh_with_role(&fixture, ExecutionRole::DedicatedServer);
+    let mut request = WorldRequest::new("unused", None, Some(17), false, None)
+        .unwrap()
+        .with_identity_intent(IdentityIntent::CreateNewIdentity)
+        .with_session_authority(namespace.clone());
+    request.save_root = root.clone();
+    let prepared = request
+        .prepare(&game.res, &game.pack, &game.options, &game.settings)
+        .unwrap();
+    assert!(prepared.session_lock.has_authority());
+    game.finish_open_world(prepared).unwrap();
+    assert!(game.session_lock.as_ref().unwrap().has_authority());
+    let anchor = scratch.0.join("copied-anchor");
+    fs::create_dir(&anchor).unwrap();
+    let identity = fs::read(root.join("horizon-world-identity.json")).unwrap();
+    fs::write(anchor.join("horizon-world-identity.json"), &identity).unwrap();
+    let archive = scratch.0.join("archive");
+    fs::create_dir(&archive).unwrap();
+    assert!(
+        namespace
+            .acquire_recovery(&anchor, &archive, &scratch.0.join("copy"))
+            .is_err()
+    );
+    assert!(!anchor.join("level.dat").exists());
+    let mut direct = WorldRequest::new("unused", None, None, false, None)
+        .unwrap()
+        .with_identity_intent(IdentityIntent::RequireExistingIdentity)
+        .with_session_authority(namespace.clone());
+    direct.save_root = anchor.clone();
+    assert!(
+        direct
+            .prepare(&game.res, &game.pack, &game.options, &game.settings)
+            .is_err()
+    );
+    assert_eq!(
+        fs::read(anchor.join("horizon-world-identity.json")).unwrap(),
+        identity
+    );
+    drop(game);
+    let lease = namespace
+        .acquire_recovery(&anchor, &archive, &scratch.0.join("copy"))
+        .unwrap();
+    assert_eq!(
+        lease.world().to_string(),
+        serde_json::from_slice::<Value>(&identity).unwrap()["world_uuid"]
+            .as_str()
+            .unwrap()
+    );
+}
+
+#[test]
+#[ignore = "isolated pinned resources + prebuilt pair: managed positive-owner recovery excludes copied worlds and releases on failure"]
+fn session_authority_actual_recovered_game_excludes_copies_and_failed_open_releases_lease() {
+    use crate::game::world_loading::host_identity::session_authority::AuthorityNamespace;
+    let fixture = Fixture::new("authority-recovery");
+    let _retain = RetainOnPanic::new(&fixture);
+    let mut source = authority_source(&fixture);
+    let archive = source.archive.clone();
+    source
+        .game
+        .checkpoint_session(&archive, 1, until())
+        .unwrap();
+    let scratch = Scratch::new("authority-recovery");
+    let ns_root = scratch.0.join("authority");
+    fs::create_dir(&ns_root).unwrap();
+    let namespace = AuthorityNamespace::new(&ns_root).unwrap();
+    let owner_root = source.game.world_root.clone();
+    let copied_anchor = scratch.0.join("copied-anchor");
+    fs::create_dir(&copied_anchor).unwrap();
+    let identity = fs::read(owner_root.join("horizon-world-identity.json")).unwrap();
+    fs::write(copied_anchor.join("horizon-world-identity.json"), &identity).unwrap();
+    let image_before = tree(&archive, &[]).unwrap();
+    let target = source.target.clone();
+    let ty = source.type_id.clone();
+    let make_request = |owner: &Path, destination: &str, type_id: &str| ManagedRecoveryRequest {
+        owner_root: owner.to_owned(),
+        expected_target: target.clone(),
+        expected_type: type_id.to_owned(),
+        archive_root: archive.clone(),
+        destination: scratch.0.join(destination),
+        deadline: until(),
+    };
+    let open = |request| authority_open(&fixture, &namespace, request);
+    // The selected owner's REAL native lock prevents opening while it is live.
+    assert!(
+        open(make_request(&owner_root, "live-refusal", &ty))
+            .0
+            .is_err()
+    );
+    assert!(!scratch.0.join("live-refusal").exists());
+    drop(source);
+    // Recovery must use the archive even if the selected native level is damaged.
+    fs::write(
+        owner_root.join("level.dat"),
+        b"damaged native-only successor",
+    )
+    .unwrap();
+    let ((mut recovered, receipt), receivers) = {
+        let (result, receivers) = open(make_request(&owner_root, "first", &ty));
+        (result.unwrap(), receivers)
+    };
+    assert_eq!(receipt.epoch, 1);
+    assert_eq!(total(&recovered, &receipt.slot), 14);
+    assert!(recovered.session_lock.as_ref().unwrap().has_authority());
+    assert!(
+        open(make_request(&copied_anchor, "concurrent-copy", &ty))
+            .0
+            .is_err()
+    );
+    assert!(!scratch.0.join("concurrent-copy").exists());
+    assert_eq!(tree(&archive, &[]).unwrap(), image_before);
+    recovered.world.game_time += 1;
+    recovered.tick_counter_trial(true);
+    assert_eq!(
+        recovered
+            .world
+            .read_persistent_counter(&receipt.counter)
+            .unwrap()
+            .counter(),
+        4
+    );
+    drop(recovered);
+    drop(receivers);
+    // Full image/type validation failure returns no Game and releases both locks.
+    assert!(
+        open(make_request(
+            &copied_anchor,
+            "failed-type",
+            "invalid:binding"
+        ))
+        .0
+        .is_err()
+    );
+    assert!(!scratch.0.join("failed-type").exists());
+    let (second, receivers) = open(make_request(&copied_anchor, "second", &ty));
+    let (second, receipt) = second.unwrap();
+    assert!(second.session_lock.as_ref().unwrap().has_authority());
+    assert_eq!(total(&second, &receipt.slot), 14);
+    assert_eq!(tree(&archive, &[]).unwrap(), image_before);
+    assert_eq!(
+        fs::read(owner_root.join("level.dat")).unwrap(),
+        b"damaged native-only successor"
+    );
+    drop(second);
+    drop(receivers);
+}
+
+// Game is large. Keep independent live owners on the heap in this multi-Game
+// fixture instead of reserving many debug return-value slots in one test frame.
+// No thread-stack override or production recovery ownership change is involved.
+#[inline(never)]
+fn authority_source(fixture: &Fixture) -> Box<Session<'_>> {
+    Box::new(session(fixture, "authority-recovery", 2, true))
+}
+#[inline(never)]
+fn authority_open<'a>(
+    fixture: &'a Fixture,
+    namespace: &crate::game::world_loading::host_identity::session_authority::AuthorityNamespace,
+    request: ManagedRecoveryRequest,
+) -> (
+    SResult<(Box<Game<'a>>, RecoveryReceipt)>,
+    Vec<mpsc::Receiver<Out>>,
+) {
+    let mut candidate = fresh_with_role(fixture, ExecutionRole::IntegratedServer);
+    let (host, receivers) = make_host(&mut candidate, true, [110, 220], false);
+    let result = candidate
+        .recover_managed_session_checkpoint(namespace, request, host)
+        .map(|(game, receipt)| (Box::new(game), receipt));
+    (result, receivers)
+}
+
 fn until() -> Instant {
     Instant::now() + WAIT
 }

@@ -12,6 +12,8 @@ pub(super) struct WorldRequest {
     pub create: Option<horizon_client::title::WorldOptions>,
     identity_intent: IdentityIntent,
     #[cfg(feature = "paired-packages")]
+    authority_namespace: Option<host_identity::session_authority::AuthorityNamespace>,
+    #[cfg(feature = "paired-packages")]
     expected_checkpoint_world: Option<horizon_client::world::counter_restore::WorldId>,
 }
 
@@ -76,12 +78,25 @@ impl WorldRequest {
             create: create.cloned(),
             identity_intent: IdentityIntent::Legacy,
             #[cfg(feature = "paired-packages")]
+            authority_namespace: None,
+            #[cfg(feature = "paired-packages")]
             expected_checkpoint_world: None,
         })
     }
 
     pub(super) fn with_identity_intent(mut self, intent: IdentityIntent) -> Self {
         self.identity_intent = intent;
+        self
+    }
+
+    /// Internal opt-in for genuinely new managed worlds. Reopen uses the archive.
+    #[cfg(feature = "paired-packages")]
+    #[allow(dead_code)]
+    pub(in crate::game) fn with_session_authority(
+        mut self,
+        namespace: host_identity::session_authority::AuthorityNamespace,
+    ) -> Self {
+        self.authority_namespace = Some(namespace);
         self
     }
 
@@ -102,6 +117,13 @@ impl WorldRequest {
         options: &Options,
         settings: &Settings,
     ) -> Result<PreparedWorld> {
+        #[cfg(feature = "paired-packages")]
+        if let Some(namespace) = &self.authority_namespace {
+            if self.identity_intent != IdentityIntent::CreateNewIdentity {
+                return Err("managed reopen requires authoritative archive recovery".into());
+            }
+            namespace.check_new_world(&self.save_root)?;
+        }
         #[cfg(feature = "paired-packages")]
         if self.expected_checkpoint_world.is_some()
             && self.identity_intent != IdentityIntent::RequireExistingIdentity
@@ -125,6 +147,8 @@ impl WorldRequest {
             create,
             identity_intent,
             #[cfg(feature = "paired-packages")]
+            authority_namespace,
+            #[cfg(feature = "paired-packages")]
             expected_checkpoint_world,
         } = self;
         let name = name.as_deref();
@@ -137,6 +161,9 @@ impl WorldRequest {
             // truncate a lock target. The same facts are checked under lock.
             let lock = horizon_client::save::SessionLock::acquire(&save_root)?;
             preflight.recheck(&save_root)?;
+            let mut authority = authority_namespace
+                .map(|namespace| preflight.acquire_authority(namespace, &save_root))
+                .transpose()?;
             if let Some(expected) = expected_checkpoint_world {
                 preflight.require_checkpoint_world(expected)?;
             }
@@ -145,6 +172,9 @@ impl WorldRequest {
             // look like an unmarked existing world. Failures retain artifacts.
             options.mod_packages.record_world(&save_root)?;
             session_lock = preflight.finish(&save_root, lock)?;
+            if authority.is_some() {
+                session_lock.install_authority(&mut authority)?;
+            }
         } else {
             horizon_client::save::upgrade_older_world(&save_root)?;
             horizon_client::save::migrate_legacy(&save_root)?;
