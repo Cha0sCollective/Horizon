@@ -13,6 +13,56 @@ use {horizon_mods::paired::catalog::Catalog, std::sync::Arc};
 const WORLD_PACKAGES: &str = "horizon-paired-packages.json";
 const MAX_WORLD_PACKAGES: u64 = 64 << 10;
 
+/// Owned capture-time data, with no admission or writable-world authority.
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct PeerSnapshot {
+    domain: &'static str,
+    protocol: i32,
+    game: String,
+    build: String,
+    package_scheme: String,
+    package: (String, String),
+    schema: (String, u32),
+    registries: horizon_client::lan::data::RegistrySnapshot,
+}
+
+#[allow(dead_code)]
+impl PeerSnapshot {
+    /// Matching data never relaxes Packages::external_network or world pins.
+    pub fn compare(&self, other: &Self) -> std::result::Result<(), &'static str> {
+        if self.domain != other.domain || self.protocol != other.protocol || self.game != other.game
+        {
+            return Err("protocol/game version");
+        }
+        if self.build != other.build {
+            return Err("exact executable");
+        }
+        if self.package_scheme != other.package_scheme || self.package != other.package {
+            return Err("captured package/content");
+        }
+        if self.schema != other.schema {
+            return Err("machine save schema");
+        }
+        if self.registries.builtin != other.registries.builtin {
+            return Err("builtin registry");
+        }
+        if self.registries.blocks != other.registries.blocks {
+            return Err("runtime block states/defaults");
+        }
+        if self.registries.synchronized != other.registries.synchronized {
+            return Err("synchronized registry data");
+        }
+        if self.registries.tags != other.registries.tags {
+            return Err("configuration tags");
+        }
+        if self.registries.features != other.registries.features {
+            return Err("enabled features");
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Default)]
 pub(super) struct Packages {
     #[cfg(feature = "paired-packages")]
@@ -31,6 +81,136 @@ struct WorldPackages {
 }
 
 impl Packages {
+    /// Dormant bounded capture. It uses retained startup identities and never
+    /// reopens a package path or accepts a caller's asserted executable digest.
+    #[allow(dead_code)]
+    pub fn peer_snapshot(
+        &self,
+        sync: &horizon_client::lan::data::SyncData,
+        blocks: &horizon_world::registry::BlockRegistry,
+    ) -> std::result::Result<Option<PeerSnapshot>, String> {
+        if self.identities.is_empty() {
+            #[cfg(feature = "paired-packages")]
+            if self
+                .catalog
+                .as_ref()
+                .is_some_and(|c| !c.prepared().is_empty())
+            {
+                return Err("snapshot missing captured package identity".into());
+            }
+            return Ok(None);
+        }
+        #[cfg(not(feature = "paired-packages"))]
+        {
+            let _ = (sync, blocks);
+            Err("snapshot requires captured paired packages".into())
+        }
+        #[cfg(feature = "paired-packages")]
+        {
+            use horizon_mods::paired::{IDENTITY_SCHEME, catalog::Kind};
+            let catalog = self
+                .catalog
+                .as_ref()
+                .ok_or("snapshot missing captured catalog")?;
+            if self.identities.len() != 1 || catalog.prepared().len() != 1 {
+                return Err("snapshot supports exactly one captured pair".into());
+            }
+            let mut enabled = catalog.entries().iter().filter(|e| e.enabled);
+            let selected = enabled.next().ok_or("snapshot missing selected pair")?;
+            if enabled.next().is_some()
+                || selected.error.is_some()
+                || !matches!(selected.kind, Some(Kind::Paired(_)))
+            {
+                return Err(
+                    "snapshot refuses enabled extra/legacy/unknown package profiles".into(),
+                );
+            }
+            let (path, prepared) = catalog
+                .prepared()
+                .first_key_value()
+                .ok_or("snapshot missing prepared pair")?;
+            if selected.path != *path || selected.content.is_none() {
+                return Err("snapshot selected/prepared package mismatch".into());
+            }
+            let (id, identity) = self
+                .identities
+                .first_key_value()
+                .ok_or("snapshot missing package identity")?;
+            if prepared.bundle().content_owner().id != *id {
+                return Err("snapshot captured package owner mismatch".into());
+            }
+            // The identity scheme binds descriptor, both captured executables,
+            // and captured content. Check its retained startup rendering too.
+            if identity.len() != 64
+                || !identity
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            {
+                return Err("snapshot invalid captured package identity".into());
+            }
+            for (index, byte) in prepared.identity().iter().enumerate() {
+                let digits = b"0123456789abcdef";
+                if identity.as_bytes()[index * 2] != digits[(byte >> 4) as usize]
+                    || identity.as_bytes()[index * 2 + 1] != digits[(byte & 15) as usize]
+                {
+                    return Err("snapshot captured package identity mismatch".into());
+                }
+            }
+            if self.build.len() != 71
+                || !self.build.starts_with("sha256:")
+                || !self.build[7..]
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            {
+                return Err("snapshot missing exact startup executable SHA256".into());
+            }
+            let machines = prepared.content().machine_types().types();
+            if machines.len() != 1 || machines[0].save_schema() != 1 {
+                return Err("snapshot requires one current machine save schema".into());
+            }
+            let machine = &machines[0];
+            // All strings are checked before clone, registry conversion or hash
+            // allocation. Fixed-width framing/domain/version fields count too.
+            for value in [
+                id.as_str(),
+                machine.id(),
+                IDENTITY_SCHEME,
+                horizon_protocol::GAME_VERSION,
+            ] {
+                if value.is_empty() || value.len() > 1_024 || value.encode_utf16().count() > 32_767
+                {
+                    return Err("snapshot package/schema identifier limit".into());
+                }
+            }
+            let reservation = [
+                "horizon-peer-snapshot-1/package",
+                horizon_protocol::GAME_VERSION,
+                self.build.as_str(),
+                IDENTITY_SCHEME,
+                id,
+                identity,
+                machine.id(),
+            ]
+            .iter()
+            .try_fold(16usize, |n, value| {
+                n.checked_add(8)?.checked_add(value.len())
+            })
+            .ok_or("snapshot package framing overflow")?;
+            // Include every retained selected/prepared/package/schema view.
+            let registries =
+                horizon_client::lan::data::RegistrySnapshot::capture(sync, blocks, reservation, 4)?;
+            Ok(Some(PeerSnapshot {
+                domain: "horizon-peer-snapshot-1/package",
+                protocol: horizon_protocol::PROTOCOL_VERSION,
+                game: horizon_protocol::GAME_VERSION.into(),
+                build: self.build.clone(),
+                package_scheme: IDENTITY_SCHEME.into(),
+                package: (id.clone(), identity.clone()),
+                schema: (machine.id().into(), machine.save_schema()),
+                registries,
+            }))
+        }
+    }
     #[cfg(not(feature = "paired-packages"))]
     pub fn read(_enabled: &BTreeSet<String>, _dev: &[PathBuf]) -> Result<Self> {
         Ok(Self::default())
@@ -200,6 +380,10 @@ impl Packages {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "peer_contract_snapshot_tests.rs"]
+mod peer_contract_snapshot_tests;
 
 #[cfg(test)]
 mod tests {
