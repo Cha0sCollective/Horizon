@@ -74,7 +74,8 @@ impl WorldRequest {
         } = self;
         let name = name.as_deref();
         let create = create.as_ref();
-        let session_lock;
+        #[allow(unused_mut)] // Binding exists only with paired-packages.
+        let mut session_lock;
         #[cfg(feature = "paired-packages")]
         if let Some(preflight) = identity_preflight {
             // Opt-in preflight ran before native acquisition could follow or
@@ -157,6 +158,8 @@ impl WorldRequest {
             make_streaming(res, pack, options, settings, &save_root, dim, level.seed)?;
         streaming.radius = settings.render_distance;
         let mut world = World::new(res.facts().air, level.seed);
+        #[cfg(feature = "paired-packages")]
+        session_lock.bind_initial_counter_world(&mut world, dim.id())?;
         world.fast_lava = dim == Dim::Nether;
         world.game_time = level.time;
         world.day_time = options.time.unwrap_or(level.day_time);

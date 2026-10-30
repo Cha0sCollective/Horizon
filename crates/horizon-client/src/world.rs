@@ -91,6 +91,10 @@ pub struct World {
     counter_trial: Option<Box<crate::counter_trial::Trial>>,
     #[cfg(feature = "paired-packages")]
     counter_domain: Option<Box<counter_restore::Domain>>,
+    /// Incarnation witness only for the explicitly created initial host World.
+    /// The session owns the strong marker; ordinary Worlds allocate none.
+    #[cfg(feature = "paired-packages")]
+    host_counter_bootstrap: Option<std::sync::Weak<counter_restore::HostCounterMarker>>,
     #[cfg(feature = "paired-packages")]
     pub(crate) world_slot_trial: Option<Box<crate::world_slot_trial::Trial>>,
     /// `ChunkAccess.inhabitedTime` of resident chunks: ticks a player spent
@@ -206,6 +210,8 @@ impl World {
             counter_trial: None,
             #[cfg(feature = "paired-packages")]
             counter_domain: None,
+            #[cfg(feature = "paired-packages")]
+            host_counter_bootstrap: None,
             #[cfg(feature = "paired-packages")]
             world_slot_trial: None,
             inhabited: HashMap::new(),

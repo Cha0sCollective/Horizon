@@ -43,6 +43,27 @@ type Result<T> = std::result::Result<T, RestoreError>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WorldId([u8; 16]);
+/// Opaque initial-World identity. This is neither a save identity nor readiness.
+pub(super) struct HostCounterMarker;
+/// One native host bootstrap, owned with its new-world session lock. The host
+/// must establish a genuinely new logical identity and exclude alternate record
+/// installation under that UUID. No serialized data can reconstruct this grant.
+pub struct HostCounterBootstrap {
+    world: WorldId,
+    marker: Arc<HostCounterMarker>,
+    bound: bool,
+    spent: bool,
+}
+impl HostCounterBootstrap {
+    pub fn for_new_host_world(world: WorldId) -> Self {
+        Self {
+            world,
+            marker: Arc::new(HostCounterMarker),
+            bound: false,
+            spent: false,
+        }
+    }
+}
 impl WorldId {
     pub fn parse(text: &str) -> Result<Self> {
         if text.len() != 36 {
@@ -576,6 +597,95 @@ impl Domain {
 }
 
 impl World {
+    /// Bind once during preparation, before publishing the actual initial World.
+    /// Supplying the actual dimension is a native-host responsibility; chunks do
+    /// not identify their World/dimension. Replacement never rebinds this grant.
+    pub fn bind_host_counter_bootstrap(
+        &mut self,
+        grant: &mut HostCounterBootstrap,
+        actual_dimension: &str,
+    ) -> Result<()> {
+        if grant.bound || grant.spent || self.host_counter_bootstrap.is_some() {
+            return Err(RestoreError::Occupied);
+        }
+        self.vacant_counter_domain()?;
+        if self.world_slot_trial.is_some() {
+            return Err(RestoreError::Occupied);
+        }
+        if actual_dimension != "minecraft:overworld" {
+            return Err(RestoreError::IdentityMismatch);
+        }
+        self.host_counter_bootstrap = Some(Arc::downgrade(&grant.marker));
+        grant.bound = true;
+        Ok(())
+    }
+
+    /// Explicit one-use bootstrap only, distinct from random-world/transient
+    /// initialization. All fallible work precedes owner publication and spending.
+    pub fn initialize_counter_domain_from_host(
+        &mut self,
+        binding: &NativeBinding,
+        target: &CounterTarget,
+        grant: &mut HostCounterBootstrap,
+    ) -> Result<RuntimeCounterKey> {
+        if grant.spent {
+            return Err(RestoreError::Occupied);
+        }
+        let marker = self
+            .host_counter_bootstrap
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .ok_or(RestoreError::IdentityMismatch)?;
+        if !grant.bound
+            || !Arc::ptr_eq(&marker, &grant.marker)
+            || target.dimension != "minecraft:overworld"
+        {
+            return Err(RestoreError::IdentityMismatch);
+        }
+        self.vacant_counter_domain()?;
+        if self.world_slot_trial.is_some() {
+            return Err(RestoreError::Occupied);
+        }
+        if self.game_time < 0 {
+            return Err(RestoreError::ClockMismatch);
+        }
+        if binding.state_id == self.air || self.restore_current(target)? != binding.state_id {
+            return Err(RestoreError::StateMismatch);
+        }
+        let (session, scope) = Self::fresh_counter_authority(target)?;
+        let configuration = binding.configuration(target, scope)?;
+        let placement = PlacementKey {
+            world: grant.world,
+            dimension: target.dimension.clone(),
+            position: target.position,
+            generation: 1,
+        };
+        let domain = Box::new(Domain {
+            world: grant.world,
+            target: target.clone(),
+            high_water: 1,
+            active_key: Some(placement.clone()),
+            retired_key: None,
+            session: session.clone(),
+            status: DomainStatus::Healthy,
+            binding: binding.clone(),
+            slot: None,
+        });
+        let trial = Box::new(
+            Trial::restore_native(configuration, Some((0, None)), None, self.game_time)
+                .map_err(|_| RestoreError::RuntimeExhausted)?,
+        );
+        let runtime = RuntimeCounterKey {
+            session,
+            placement,
+            instance: trial.snapshot().record().unwrap().instance(),
+        };
+        self.counter_domain = Some(domain);
+        self.counter_trial = Some(trial);
+        grant.spent = true;
+        Ok(runtime)
+    }
+
     pub(super) fn persistent_counter_phase_guard(&mut self) {
         let Some(domain) = self.counter_domain.as_mut() else {
             return;
@@ -1534,5 +1644,354 @@ mod tests {
                 .generation,
             1
         );
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct HostState {
+        domain: Option<DomainSnapshot>,
+        trial: Option<crate::counter_trial::Snapshot>,
+        clock: (i64, i64),
+        revision: u64,
+        random: [i32; 2],
+        marker: Option<usize>,
+        chunks: Vec<((i32, i32), usize, Vec<(usize, Vec<u32>, Vec<u8>)>)>,
+        modified: Vec<(i32, i32)>,
+    }
+    fn host_state(world: &World) -> HostState {
+        use horizon_core::random::RandomSource;
+        let mut rng = world.random.clone();
+        let mut chunks: Vec<_> = world
+            .chunks
+            .iter()
+            .map(|(at, chunk)| {
+                (
+                    *at,
+                    Arc::as_ptr(chunk) as usize,
+                    chunk
+                        .sections
+                        .iter()
+                        .map(|section| {
+                            (
+                                Arc::as_ptr(section) as usize,
+                                (0..4096).map(|i| section.get(i)).collect(),
+                                (0..4096).map(|i| section.light(i)).collect(),
+                            )
+                        })
+                        .collect(),
+                )
+            })
+            .collect();
+        chunks.sort_by_key(|row| row.0);
+        let mut modified: Vec<_> = world.modified.iter().copied().collect();
+        modified.sort_unstable();
+        HostState {
+            domain: world.counter_domain_snapshot(),
+            trial: world.counter_trial_snapshot(),
+            clock: (world.game_time, world.day_time),
+            revision: world.revision,
+            random: [rng.next_int(), rng.next_int()],
+            marker: world
+                .host_counter_bootstrap
+                .as_ref()
+                .map(|weak| weak.as_ptr() as usize),
+            chunks,
+            modified,
+        }
+    }
+    fn host_grant() -> HostCounterBootstrap {
+        HostCounterBootstrap::for_new_host_world(
+            WorldId::parse("00000000-0000-4000-8000-000000000101").unwrap(),
+        )
+    }
+    #[test]
+    fn host_counter_bootstrap_retained_uuid_one_use_and_fresh_runtime_keys() {
+        let mut world = bare(1, 3);
+        let mut grant = host_grant();
+        world
+            .bind_host_counter_bootstrap(&mut grant, "minecraft:overworld")
+            .unwrap();
+        let key = world
+            .initialize_counter_domain_from_host(&binding(), &target(), &mut grant)
+            .unwrap();
+        assert!(grant.bound && grant.spent);
+        assert_eq!(key.placement().world, grant.world);
+        assert_eq!(key.placement().generation, 1);
+        let record = world.read_persistent_counter(&key).unwrap();
+        assert_eq!(
+            (record.counter(), record.last_advanced(), record.resident()),
+            (0, None, true)
+        );
+        let metadata = world.counter_domain_snapshot().unwrap();
+        assert_eq!(
+            (metadata.world, metadata.high_water, metadata.status),
+            (grant.world, 1, DomainStatus::Healthy)
+        );
+        assert_eq!(
+            world.counter_checkpoint_frame(3).unwrap().world_uuid,
+            grant.world
+        );
+        let before = host_state(&world);
+        assert_eq!(
+            world.initialize_counter_domain_from_host(&binding(), &target(), &mut grant),
+            Err(RestoreError::Occupied)
+        );
+        assert_eq!(host_state(&world), before);
+        let mut replacement = bare(1, 3);
+        assert_eq!(
+            replacement.initialize_counter_domain_from_host(&binding(), &target(), &mut grant),
+            Err(RestoreError::Occupied)
+        );
+        assert!(replacement.counter_domain_snapshot().is_none());
+        let mut other = bare(1, 3);
+        let mut second = HostCounterBootstrap::for_new_host_world(
+            WorldId::parse("00000000-0000-4000-8000-000000000102").unwrap(),
+        );
+        other
+            .bind_host_counter_bootstrap(&mut second, "minecraft:overworld")
+            .unwrap();
+        let fresh = other
+            .initialize_counter_domain_from_host(&binding(), &target(), &mut second)
+            .unwrap();
+        assert_ne!(key.instance(), fresh.instance());
+        assert_ne!(key.session_nonce(), fresh.session_nonce());
+        assert_eq!(
+            other.read_persistent_counter(&key),
+            Err(RestoreError::IdentityMismatch)
+        );
+        assert_eq!(
+            world.read_persistent_counter(&fresh),
+            Err(RestoreError::IdentityMismatch)
+        );
+    }
+    #[test]
+    fn host_counter_bootstrap_live_marker_move_and_replacement_refusals() {
+        let mut initial = bare(1, 3);
+        let mut grant = host_grant();
+        let before = host_state(&initial);
+        assert_eq!(
+            initial.bind_host_counter_bootstrap(&mut grant, "minecraft:the_nether"),
+            Err(RestoreError::IdentityMismatch)
+        );
+        assert!(!grant.bound && !grant.spent);
+        assert_eq!(host_state(&initial), before);
+        assert_eq!(
+            initial.initialize_counter_domain_from_host(&binding(), &target(), &mut grant),
+            Err(RestoreError::IdentityMismatch)
+        );
+        initial
+            .bind_host_counter_bootstrap(&mut grant, "minecraft:overworld")
+            .unwrap();
+        let marker = grant.marker.clone();
+        assert!(Arc::ptr_eq(
+            &initial
+                .host_counter_bootstrap
+                .as_ref()
+                .unwrap()
+                .upgrade()
+                .unwrap(),
+            &marker
+        ));
+        let mut moved = initial;
+        let mut replacement = bare(1, 3);
+        let before = host_state(&replacement);
+        assert_eq!(
+            replacement.initialize_counter_domain_from_host(&binding(), &target(), &mut grant),
+            Err(RestoreError::IdentityMismatch)
+        );
+        assert_eq!(
+            replacement.bind_host_counter_bootstrap(&mut grant, "minecraft:overworld"),
+            Err(RestoreError::Occupied)
+        );
+        assert!(!grant.spent);
+        assert_eq!(host_state(&replacement), before);
+        let mut parked = bare(2, 3);
+        std::mem::swap(&mut moved, &mut parked);
+        assert_eq!(
+            moved.initialize_counter_domain_from_host(&binding(), &target(), &mut grant),
+            Err(RestoreError::IdentityMismatch)
+        );
+        std::mem::swap(&mut moved, &mut parked);
+        let key = moved
+            .initialize_counter_domain_from_host(&binding(), &target(), &mut grant)
+            .unwrap();
+        assert_eq!(key.placement().world, grant.world);
+        let mut expired = bare(1, 3);
+        let mut old = host_grant();
+        expired
+            .bind_host_counter_bootstrap(&mut old, "minecraft:overworld")
+            .unwrap();
+        drop(old);
+        assert!(
+            expired
+                .host_counter_bootstrap
+                .as_ref()
+                .unwrap()
+                .upgrade()
+                .is_none()
+        );
+        let mut new = host_grant();
+        let before = host_state(&expired);
+        assert_eq!(
+            expired.bind_host_counter_bootstrap(&mut new, "minecraft:overworld"),
+            Err(RestoreError::Occupied)
+        );
+        assert_eq!(
+            expired.initialize_counter_domain_from_host(&binding(), &target(), &mut new),
+            Err(RestoreError::IdentityMismatch)
+        );
+        assert_eq!(host_state(&expired), before);
+        assert!(!new.bound && !new.spent);
+    }
+    #[test]
+    fn host_counter_bootstrap_invalid_inputs_preserve_unused_grant_and_world() {
+        for case in [
+            "clock",
+            "state",
+            "absent",
+            "position",
+            "dimension",
+            "air-binding",
+            "invalid-binding",
+        ] {
+            let mut world = bare(1, 3);
+            let mut grant = host_grant();
+            world
+                .bind_host_counter_bootstrap(&mut grant, "minecraft:overworld")
+                .unwrap();
+            let mut binding = binding();
+            let mut target = target();
+            let expected = match case {
+                "clock" => {
+                    world.game_time = -1;
+                    RestoreError::ClockMismatch
+                }
+                "state" => {
+                    write(&mut world, 2);
+                    RestoreError::StateMismatch
+                }
+                "absent" => {
+                    world.chunks.remove(&(0, 0));
+                    RestoreError::NotResident
+                }
+                "position" => {
+                    target.position[1] = 500;
+                    RestoreError::InvalidFrame
+                }
+                "dimension" => {
+                    target.dimension = "minecraft:the_nether".into();
+                    RestoreError::IdentityMismatch
+                }
+                "air-binding" => {
+                    binding.state_id = world.air;
+                    RestoreError::StateMismatch
+                }
+                "invalid-binding" => {
+                    binding.block_id = "bad".into();
+                    RestoreError::BindingMismatch
+                }
+                _ => unreachable!(),
+            };
+            let before = host_state(&world);
+            let strong = Arc::strong_count(&grant.marker);
+            assert_eq!(
+                world.initialize_counter_domain_from_host(&binding, &target, &mut grant),
+                Err(expected),
+                "{case}"
+            );
+            assert_eq!(host_state(&world), before, "{case}");
+            assert!(!grant.spent && grant.bound);
+            assert_eq!(Arc::strong_count(&grant.marker), strong);
+        }
+    }
+    #[test]
+    fn host_counter_bootstrap_existing_owners_and_heads_refuse_unchanged() {
+        for mode in [
+            "matching",
+            "different",
+            "dormant",
+            "faulted",
+            "detached",
+            "transient",
+        ] {
+            let mut world = bare(if mode == "dormant" { 2 } else { 1 }, 3);
+            let mut grant = host_grant();
+            world
+                .bind_host_counter_bootstrap(&mut grant, "minecraft:overworld")
+                .unwrap();
+            let mut held = None;
+            if mode == "transient" {
+                let config = binding()
+                    .configuration(
+                        &target(),
+                        AuthorityScope::new(17, "minecraft:overworld").unwrap(),
+                    )
+                    .unwrap();
+                world.enable_counter_trial(config).unwrap();
+            } else {
+                let (source, _) = active();
+                let mut frame = source.counter_checkpoint_frame(3).unwrap();
+                if mode != "different" {
+                    frame.world_uuid = grant.world;
+                }
+                if mode == "dormant" {
+                    frame.placement = Placement::Dormant;
+                    frame.observed_state.name = "minecraft:stone".into();
+                }
+                world
+                    .restore_counter_frame(&binding(), frame.world_uuid, &target(), &frame)
+                    .unwrap();
+                if mode == "faulted" {
+                    world.game_time = 2;
+                    world.advance_counter_trial(true, true);
+                }
+                if mode == "detached" {
+                    held = world.take_counter_trial();
+                }
+            }
+            let before = host_state(&world);
+            let held_before = held.clone();
+            assert_eq!(
+                world.initialize_counter_domain_from_host(&binding(), &target(), &mut grant),
+                Err(RestoreError::Occupied),
+                "{mode}"
+            );
+            assert_eq!(host_state(&world), before, "{mode}");
+            assert_eq!(held, held_before);
+            assert!(!grant.spent);
+        }
+    }
+    #[test]
+    fn host_counter_bootstrap_random_and_transient_defaults_stay_distinct() {
+        let mut random = bare(1, 3);
+        assert!(random.host_counter_bootstrap.is_none());
+        let key = random
+            .initialize_counter_domain(&binding(), &target())
+            .unwrap();
+        assert!(random.host_counter_bootstrap.is_none());
+        assert_eq!(
+            random.counter_checkpoint_frame(3).unwrap().world_uuid,
+            key.placement().world
+        );
+        let mut transient = bare(1, 3);
+        let config = binding()
+            .configuration(
+                &target(),
+                AuthorityScope::new(27, "minecraft:overworld").unwrap(),
+            )
+            .unwrap();
+        let snapshot = transient.enable_counter_trial(config).unwrap();
+        assert_eq!(snapshot.record().unwrap().counter(), 0);
+        assert!(
+            transient.counter_domain_snapshot().is_none()
+                && transient.host_counter_bootstrap.is_none()
+        );
+        let mut grant = host_grant();
+        let before = host_state(&transient);
+        assert_eq!(
+            transient.bind_host_counter_bootstrap(&mut grant, "minecraft:overworld"),
+            Err(RestoreError::Occupied)
+        );
+        assert_eq!(host_state(&transient), before);
+        assert!(!grant.bound && !grant.spent);
     }
 }

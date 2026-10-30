@@ -30,6 +30,8 @@ pub(in crate::game) struct WorldSession {
     _lock: SessionLock,
     #[cfg(feature = "paired-packages")]
     world: Option<horizon_client::world::counter_restore::WorldId>,
+    #[cfg(feature = "paired-packages")]
+    counter_bootstrap: Option<horizon_client::world::counter_restore::HostCounterBootstrap>,
 }
 impl WorldSession {
     pub(super) fn legacy(lock: SessionLock) -> Self {
@@ -37,6 +39,8 @@ impl WorldSession {
             _lock: lock,
             #[cfg(feature = "paired-packages")]
             world: None,
+            #[cfg(feature = "paired-packages")]
+            counter_bootstrap: None,
         }
     }
     #[cfg(feature = "paired-packages")]
@@ -45,6 +49,29 @@ impl WorldSession {
         &self,
     ) -> Option<&horizon_client::world::counter_restore::WorldId> {
         self.world.as_ref()
+    }
+    #[cfg(feature = "paired-packages")]
+    pub(super) fn bind_initial_counter_world(
+        &mut self,
+        world: &mut horizon_client::world::World,
+        actual_dimension: &str,
+    ) -> Result<()> {
+        if actual_dimension != "minecraft:overworld" {
+            // An initially different dimension can never gain this eligibility
+            // by returning later. There is no grant reconstruction from UUID.
+            self.counter_bootstrap = None;
+            return Ok(());
+        }
+        if let Some(grant) = &mut self.counter_bootstrap {
+            world.bind_host_counter_bootstrap(grant, actual_dimension)?;
+        }
+        Ok(())
+    }
+    #[cfg(feature = "paired-packages")]
+    pub(in crate::game) fn counter_bootstrap(
+        &mut self,
+    ) -> Option<&mut horizon_client::world::counter_restore::HostCounterBootstrap> {
+        self.counter_bootstrap.as_mut()
     }
 }
 #[cfg(feature = "paired-packages")]
@@ -353,6 +380,10 @@ impl IdentityPreflight {
         Ok(WorldSession {
             _lock: lock,
             world: Some(self.world),
+            counter_bootstrap: match self.kind {
+                PreflightKind::New { .. } => Some(horizon_client::world::counter_restore::HostCounterBootstrap::for_new_host_world(self.world)),
+                PreflightKind::Existing { .. } => None,
+            },
         })
     }
 }

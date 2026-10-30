@@ -8,7 +8,10 @@ use horizon_client::{
         Backend, Completion, Configuration, GuestFailure, PhaseError, Proposal, Record, Snapshot,
     },
     mutation_observer::AuthorityScope,
-    world::World,
+    world::{
+        World,
+        counter_restore::{CounterTarget, NativeBinding, RuntimeCounterKey},
+    },
 };
 use horizon_mods::content::machines::MachineType;
 #[cfg(feature = "mods")]
@@ -150,6 +153,51 @@ pub(super) fn retire_world_counter(world: &mut World, boundary: &str) {
 }
 
 impl Game<'_> {
+    /// Dormant native bootstrap only. This is not a command, block placement,
+    /// guest callback or checkpoint admission. Physical vanilla iron is the
+    /// native prototype contract; the captured registered alias is different.
+    #[allow(dead_code)]
+    pub(super) fn bootstrap_host_counter(
+        &mut self,
+        type_id: &str,
+        position: [i32; 3],
+    ) -> Result<RuntimeCounterKey> {
+        if self.remote.is_some()
+            || self.integrated.is_some()
+            || self.lan_acting.is_some()
+            || self.dim != super::Dim::Overworld
+        {
+            return Err(
+                "host counter bootstrap requires the actual authoritative initial Overworld".into(),
+            );
+        }
+        let catalog = self
+            .options
+            .mod_packages
+            .catalog()
+            .ok_or("host counter bootstrap needs an admitted captured catalog")?;
+        let mut selected = catalog
+            .prepared()
+            .values()
+            .filter(|prepared| prepared.content().machine_types().get(type_id).is_some());
+        let prepared = selected
+            .next()
+            .ok_or("host counter bootstrap type is absent from the captured catalog")?;
+        if selected.next().is_some() {
+            return Err("host counter bootstrap type has multiple owners".into());
+        }
+        let binding = NativeBinding::from_prepared(prepared, type_id, self.pack.assets.registry)?;
+        let target = CounterTarget::new(self.dim.id(), position)?;
+        let session = self
+            .session_lock
+            .as_mut()
+            .ok_or("host counter bootstrap requires an owned identified session")?;
+        let grant = session.counter_bootstrap().ok_or("host counter bootstrap is unavailable for Legacy, reopened, or initially non-Overworld sessions")?;
+        Ok(self
+            .world
+            .initialize_counter_domain_from_host(&binding, &target, grant)?)
+    }
+
     fn counter_position_eligibility(&self, position: [i32; 3]) -> (bool, bool) {
         let (x, z) = (position[0] >> 4, position[2] >> 4);
         (
@@ -401,6 +449,10 @@ impl Game<'_> {
         }
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "host_counter_bootstrap_tests.rs"]
+mod host_counter_bootstrap_tests;
 
 #[cfg(all(test, feature = "mods"))]
 mod tests {
