@@ -343,6 +343,11 @@ struct Options {
     /// What this Game executes; independent of its current server connection.
     execution_role: execution_role::ExecutionRole,
 }
+struct ParsedLaunch {
+    options: Options,
+    #[cfg(feature = "paired-packages")]
+    frozen: Option<integrated::managed_application::ManagedLaunch>,
+}
 impl Options {
     /// The name to join servers with: the one given, else the offline name kept
     /// next to options.txt (created on first use).
@@ -354,7 +359,27 @@ impl Options {
             )
         })
     }
-    fn read() -> Result<Option<Self>> {
+    fn read() -> Result<Option<ParsedLaunch>> {
+        let raw_args: Vec<String> = std::env::args().skip(1).collect();
+        Self::read_from(raw_args)
+    }
+    fn read_from(raw_args: Vec<String>) -> Result<Option<ParsedLaunch>> {
+        #[cfg(feature = "paired-packages")]
+        let frozen = integrated::managed_application::ManagedLaunch::parse(&raw_args)?;
+        #[cfg(feature = "paired-packages")]
+        let parsed_args = match frozen.as_ref() {
+            Some(launch) => launch.ordinary_args(),
+            None => raw_args,
+        };
+        #[cfg(not(feature = "paired-packages"))]
+        let parsed_args = {
+            if raw_args.iter().any(|arg| {
+                arg == "--managed-frozen-recovery" || arg.starts_with("--managed-frozen-recovery=")
+            }) {
+                return Err("managed frozen recovery requires paired-packages".into());
+            }
+            raw_args
+        };
         let sibling = std::env::current_exe()?
             .parent()
             .ok_or("missing executable directory")?
@@ -399,13 +424,17 @@ impl Options {
             execution_role: execution_role::ExecutionRole::Client,
         };
         let mut session_file = std::env::var("HORIZON_SESSION_FILE").ok();
-        let mut args = std::env::args().skip(1);
+        let mut args = parsed_args.into_iter();
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--help" | "-h" => {
                     println!(
                         "Horizon — Minecraft Java Edition {} in Rust\n\n  --resources PATH        Prepared resources (horizon-prepare)\n  --render-distance N     Chunks, 2..64 (default 12)\n  --world NAME            World folder under saves/ (default \"New World\")\n  --seed N                World seed for new worlds (default 0)\n  --width N, --height N   Window size (default 1280 x 720)\n  --creative              Creative mode (default survival)\n  --test-terrain          Simple test terrain instead of vanilla generation\n  --frames N              Exit after N frames (testing)\n  --world-frames N        Exit after N frames drawn in the world (testing)\n  --smoke-report PATH     Write a JSON report on exit\n  --benchmark SCENARIO    Run a benchmark (standard, village, forest, ocean, mountain), write its report to benchmarks/ and quit\n  --control               Accept horizon-ctl commands on a local socket\n  --control-socket PATH   Control socket path (default $XDG_RUNTIME_DIR/horizon-control.sock)\n  --server HOST[:PORT]    Join a multiplayer server (offline mode) at start\n  --quickPlaySingleplayer WORLD  Open this world of saves/ at start, only if it exists (vanilla's)\n  --quickPlayMultiplayer HOST[:PORT]  The same as --server (vanilla's name)\n  --name NAME             Player name for multiplayer (default: generated once, kept in horizon-player.txt)\n  --session-file PATH     Signed-in account from the launcher (read once, then deleted)\n  --dev-mod PATH          A Horizon mod (.hmod or folder) to develop: always on, reloaded when rebuilt\n  --in-frame              Run single player's world in the frame, not on its server thread\n  --pregen                Add Horizon's /pregen command (docs/pregeneration.md)\n\nControls: mouse look, WASD move, Space jump, Left Shift sneak, Left Ctrl sprint,\nleft click break, right click place/use, 1-9/scroll hotbar, E inventory,\nQ drop, F3 debug, Esc pause.",
                         horizon_core::VANILLA_VERSION
+                    );
+                    #[cfg(feature = "paired-packages")]
+                    println!(
+                        "\nExperimental: --managed-frozen-recovery ROOT opens only the isolated fixed-profile frozen test application."
                     );
                     return Ok(None);
                 }
@@ -501,6 +530,10 @@ impl Options {
                 }
             }
         }
+        #[cfg(feature = "paired-packages")]
+        if let Some(launch) = &frozen {
+            launch.configure(&mut o);
+        }
         // The launcher's account: online-mode servers need it. A bad file
         // only leaves the game offline.
         if let Some(path) = session_file.filter(|p| !p.is_empty()) {
@@ -512,7 +545,11 @@ impl Options {
                 Err(e) => eprintln!("Horizon: not signed in: {e}"),
             }
         }
-        Ok(Some(o))
+        Ok(Some(ParsedLaunch {
+            options: o,
+            #[cfg(feature = "paired-packages")]
+            frozen,
+        }))
     }
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -15324,10 +15361,68 @@ fn run_loading(
     Ok(())
 }
 
+#[cfg(feature = "paired-packages")]
+fn run_managed_frozen(
+    mut options: Options,
+    launch: integrated::managed_application::ManagedLaunch,
+) -> Result<()> {
+    // Offline/root preflight ran before ordinary argument/authentication handling.
+    // This branch never installs the ordinary second-signal hard-exit policy.
+    horizon_threads::catch_retained_stop_signals();
+    horizon_threads::put_helpers_behind();
+    horizon_threads::favour_current();
+    let started = Instant::now();
+    let vanilla_root = options.resources.clone();
+    let settings = Settings::load(&std::env::current_dir()?.join("options.txt"));
+    options.mod_packages = mod_packages::Packages::read(&settings.mods.enabled, &options.dev_mods)?;
+    Behaviours::set_cache_dir(std::env::current_dir()?.join(".horizon-cache"));
+    options.resources = packs::startup_root(&vanilla_root, &settings.resource_packs, &[])?;
+    options.resources = mods::content_root(
+        &options.resources,
+        &settings.mods.enabled,
+        &options.dev_mods,
+        &options.mod_packages,
+    )?;
+    let expected_root = std::fs::canonicalize(&options.resources)?;
+    let loaded = load_resources(
+        options.resources.clone(),
+        &vanilla_root,
+        &settings,
+        started,
+        false,
+        &Progress::new(),
+        &mut |_, _| {},
+    )?;
+    if loaded.pack_error.is_some()
+        || loaded.rest_loader.is_some()
+        || std::fs::canonicalize(&loaded.root)? != expected_root
+    {
+        return Err(
+            "managed frozen recovery refuses resource fallback or incomplete synchronous loading"
+                .into(),
+        );
+    }
+    let gui = loaded
+        .gui
+        .ok_or("managed frozen recovery requires the full GUI bundle")?;
+    options.resources = expected_root;
+    let resources = loaded.resources;
+    integrated::managed_application::run(options, settings, &resources, loaded.pack, gui, launch)
+}
+
 pub fn run() -> Result<()> {
-    let Some(mut options) = Options::read()? else {
+    let Some(parsed) = Options::read()? else {
         return Ok(());
     };
+    let ParsedLaunch {
+        mut options,
+        #[cfg(feature = "paired-packages")]
+        frozen,
+    } = parsed;
+    #[cfg(feature = "paired-packages")]
+    if let Some(launch) = frozen {
+        return run_managed_frozen(options, launch);
+    }
     if options.execution_role == execution_role::ExecutionRole::DedicatedServer
         && !dedicated::preflight(&mut options)?
     {

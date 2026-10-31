@@ -108,7 +108,7 @@ fn check_owned(
     }
 }
 
-fn validate_continuation(
+pub(in crate::game::integrated) fn validate_continuation(
     fixture: &Fixture,
     source: &Source,
     scratch: &Scratch,

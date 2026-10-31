@@ -11,6 +11,8 @@
 //! escape hatch. LAN guests and dedicated servers use the same code either
 //! way.
 #[cfg(feature = "paired-packages")]
+pub(super) mod managed_application;
+#[cfg(feature = "paired-packages")]
 mod managed_stop;
 use super::{
     Game, Options, PackResources, Resources, UiResources,

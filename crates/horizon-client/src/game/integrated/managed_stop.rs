@@ -51,17 +51,18 @@ struct ManagedStart {
     first_stop_fault: Option<crate::game::levels::session_checkpoint::CheckpointTestFault>,
 }
 
-struct ManagedConnectedStart {
-    resources: Arc<Resources>,
-    pack: PackResources,
-    options: Options,
-    settings: Settings,
-    namespace: PathBuf,
-    request: ManagedRecoveryRequest,
-    continuation: PathBuf,
-    attempt_timeout: Duration,
+pub(super) struct ManagedConnectedStart {
+    pub(super) resources: Arc<Resources>,
+    pub(super) pack: PackResources,
+    pub(super) options: Options,
+    pub(super) settings: Settings,
+    pub(super) namespace: PathBuf,
+    pub(super) request: ManagedRecoveryRequest,
+    pub(super) continuation: PathBuf,
+    pub(super) attempt_timeout: Duration,
     #[cfg(test)]
-    first_stop_fault: Option<crate::game::levels::session_checkpoint::CheckpointTestFault>,
+    pub(super) first_stop_fault:
+        Option<crate::game::levels::session_checkpoint::CheckpointTestFault>,
 }
 enum WorkerStart {
     NewClosed(ManagedStart),
@@ -69,7 +70,7 @@ enum WorkerStart {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ConnectedPhase {
+pub(super) enum ConnectedPhase {
     Joining,
     Admitted,
     Loading,
@@ -80,20 +81,20 @@ enum ConnectedPhase {
     Closing,
 }
 #[derive(Clone, Debug)]
-struct ConnectedStatus {
-    phase: ConnectedPhase,
-    world_time: i64,
-    day_time: i64,
-    hub_ticks: u64,
-    guests: usize,
-    play_entries: usize,
-    pending_transport_bytes: usize,
-    attempts: usize,
-    detail: String,
+pub(super) struct ConnectedStatus {
+    pub(super) phase: ConnectedPhase,
+    pub(super) world_time: i64,
+    pub(super) day_time: i64,
+    pub(super) hub_ticks: u64,
+    pub(super) guests: usize,
+    pub(super) play_entries: usize,
+    pub(super) pending_transport_bytes: usize,
+    pub(super) attempts: usize,
+    pub(super) detail: String,
 }
 
 #[derive(Clone, Debug)]
-enum State {
+pub(super) enum State {
     Preparing,
     Connected(ConnectedPhase),
     Ready,
@@ -116,14 +117,14 @@ enum State {
     FatalWorkerFailure(String),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Refusal {
+pub(super) enum Refusal {
     State,
     StaleAttempt,
     InFlight,
     Disconnected,
 }
 #[derive(Clone, Copy, Debug)]
-enum Command {
+pub(super) enum Command {
     RequestStop { attempt: u64 },
     RetryStop { attempt: u64, failed_attempt: u64 },
 }
@@ -141,31 +142,31 @@ enum DriverCommand {
     RetryStop { attempt: u64, failed_attempt: u64 },
 }
 #[derive(Clone, Debug)]
-struct SupervisorView {
-    state: State,
-    last_admitted: u64,
-    last_refusal: Option<Refusal>,
-    connected: Option<ConnectedStatus>,
+pub(super) struct SupervisorView {
+    pub(super) state: State,
+    pub(super) last_admitted: u64,
+    pub(super) last_refusal: Option<Refusal>,
+    pub(super) connected: Option<ConnectedStatus>,
     #[cfg(test)]
     observation: Option<Observation>,
     #[cfg(test)]
-    connected_observation: Option<connected::Observation>,
+    pub(super) connected_observation: Option<connected::Observation>,
 }
 
 /// Observers own no Game or JoinHandle. Their loss cannot stop or detach a worker.
 #[derive(Clone)]
-struct ManagedStopControl {
+pub(super) struct ManagedStopControl {
     shared: Arc<Mutex<SupervisorView>>,
     command: SyncSender<Command>,
 }
 impl ManagedStopControl {
-    fn view(&self) -> SupervisorView {
+    pub(super) fn view(&self) -> SupervisorView {
         self.shared
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
     }
-    fn request(&self, command: Command) -> Result<(), Refusal> {
+    pub(super) fn request(&self, command: Command) -> Result<(), Refusal> {
         let mut view = self.shared.lock().unwrap_or_else(|e| e.into_inner());
         let refusal = if command.attempt() == 0 || command.attempt() <= view.last_admitted {
             Some(Refusal::StaleAttempt)
@@ -229,7 +230,7 @@ enum WorkerEnd {
 
 /// A process-scope lifetime owner. Its first field keeps the existing fatal
 /// guard ahead of the channels during destruction; observers never own it.
-struct ManagedWorker {
+pub(super) struct ManagedWorker {
     worker: AbortUnresolvedWorker,
     control: ManagedStopControl,
     offers: Receiver<[Pipe; 2]>,
@@ -237,17 +238,17 @@ struct ManagedWorker {
     completed: bool,
     completion: Option<Result<CheckpointReceipt, String>>,
 }
-struct WorkerPoll {
-    view: SupervisorView,
-    pipes: Option<[Pipe; 2]>,
-    completed: bool,
+pub(super) struct WorkerPoll {
+    pub(super) view: SupervisorView,
+    pub(super) pipes: Option<[Pipe; 2]>,
+    pub(super) completed: bool,
 }
 impl ManagedWorker {
     fn start_closed(start: ManagedStart) -> Result<Self, String> {
         checked_start_paths(&start.paths)?;
         Self::start(WorkerStart::NewClosed(start))
     }
-    fn start_connected(start: ManagedConnectedStart) -> Result<Self, String> {
+    pub(super) fn start_connected(start: ManagedConnectedStart) -> Result<Self, String> {
         Self::start(WorkerStart::Connected(start))
     }
     fn start(start: WorkerStart) -> Result<Self, String> {
@@ -289,12 +290,12 @@ impl ManagedWorker {
             completion: None,
         })
     }
-    fn control(&self) -> ManagedStopControl {
+    pub(super) fn control(&self) -> ManagedStopControl {
         self.control.clone()
     }
     /// Never wait for an unfinished worker. Only its actual completion permits
     /// explicit join and terminal classification; there is no joining in Drop.
-    fn poll(&mut self) -> WorkerPoll {
+    pub(super) fn poll(&mut self) -> WorkerPoll {
         if self.worker.0.as_ref().is_some_and(JoinHandle::is_finished) {
             let end = self
                 .worker
@@ -350,7 +351,7 @@ impl ManagedWorker {
     }
     /// Taking a result never joins, consumes a live handle, or requests a stop.
     /// Even a published Stopped view is insufficient until poll has joined it.
-    fn take_completion(&mut self) -> Option<Result<CheckpointReceipt, String>> {
+    pub(super) fn take_completion(&mut self) -> Option<Result<CheckpointReceipt, String>> {
         if self.completed {
             self.completion.take()
         } else {
@@ -1051,4 +1052,4 @@ mod tests;
 
 #[cfg(all(test, target_os = "linux"))]
 #[path = "managed_connected_tests.rs"]
-mod connected_tests;
+pub(super) mod connected_tests;

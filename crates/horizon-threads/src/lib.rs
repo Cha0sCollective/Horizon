@@ -163,28 +163,70 @@ fn idle() -> bool {
     false
 }
 
-/// How many stop requests (Ctrl-C, SIGTERM, SIGHUP) arrived since `catch_stop_signals`.
+/// How many caught stop requests (Ctrl-C, SIGTERM, SIGHUP) arrived in this process,
+/// saturating at `u32::MAX`. Installing a handler does not clear pending requests.
 pub fn stop_requests() -> u32 {
     STOP_REQUESTS.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 static STOP_REQUESTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+#[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+static RETAINED_STOP_SIGNALS: AtomicBool = AtomicBool::new(false);
+
+/// Count one request without allowing overflow to erase a pending stop intent.
+/// Return whether the ordinary policy requires immediate process exit.
+#[cfg(any(
+    test,
+    target_vendor = "apple",
+    target_os = "linux",
+    target_os = "android"
+))]
+fn record_stop_request(requests: &std::sync::atomic::AtomicU32, retained: bool) -> bool {
+    let mut previous = requests.load(Ordering::SeqCst);
+    loop {
+        let next = previous.saturating_add(1);
+        match requests.compare_exchange_weak(previous, next, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return !retained && previous >= 1,
+            Err(actual) => previous = actual,
+        }
+    }
+}
+
 /// Count stop requests from outside instead of dying on them: vanilla's "Client Shutdown Thread"
 /// (`Main.java`) halts the integrated server when the JVM shuts down, and the JVM does that on
 /// these signals, so a killed game still saves. The caller's event loop turns the first request
 /// into a normal quit; a second one (the save is stuck) ends the process at once.
+/// A process that opted into [`catch_retained_stop_signals`] keeps that retained
+/// policy even if this legacy entry reinstalls the handlers later.
 #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
 pub fn catch_stop_signals() {
+    install_stop_signals();
+}
+
+/// Catch repeated stop signals as pending intents only, for a process that must
+/// retain managed owners until explicit completion. Select this before starting
+/// those owners. The choice is process-wide and sticky: a later legacy handler
+/// installation cannot restore its second-signal hard exit. This neither stops
+/// nor retries an owner; the application must supervise and classify completion.
+#[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+pub fn catch_retained_stop_signals() {
+    RETAINED_STOP_SIGNALS.store(true, Ordering::SeqCst);
+    install_stop_signals();
+}
+
+#[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+fn install_stop_signals() {
     extern "C" fn handle(_: libc::c_int) {
-        if STOP_REQUESTS.fetch_add(1, Ordering::SeqCst) >= 1 {
+        if record_stop_request(&STOP_REQUESTS, RETAINED_STOP_SIGNALS.load(Ordering::SeqCst)) {
             // SAFETY: _exit is async-signal-safe; 130 is the shell's code for a Ctrl-C death.
             unsafe { libc::_exit(130) }
         }
     }
     let handler = handle as extern "C" fn(libc::c_int);
     for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
-        // SAFETY: the handler only touches an atomic and calls _exit, both async-signal-safe.
+        // SAFETY: the handler only accesses atomics and, for the ordinary
+        // policy, calls _exit. There is no allocation, locking or owner access.
         unsafe {
             libc::signal(signal, handler as libc::sighandler_t);
         }
@@ -194,6 +236,10 @@ pub fn catch_stop_signals() {
 /// Windows and the other systems keep their default: a closed window is a `CloseRequested`.
 #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
 pub fn catch_stop_signals() {}
+
+/// No extra caught-signal guarantee on systems where [`catch_stop_signals`] is a no-op.
+#[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
+pub fn catch_retained_stop_signals() {}
 
 /// Give back to the OS the memory the allocator holds free, after something
 /// large was dropped: glibc keeps freed pages in the arena of the thread that
@@ -299,5 +345,67 @@ mod tests {
         })
         .join()
         .unwrap();
+    }
+
+    #[test]
+    fn ordinary_stop_policy_exits_only_from_the_second_request() {
+        let requests = std::sync::atomic::AtomicU32::new(0);
+        assert!(!super::record_stop_request(&requests, false));
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(super::record_stop_request(&requests, false));
+        assert!(super::record_stop_request(&requests, false));
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn retained_stop_policy_keeps_every_request_as_an_intent() {
+        let requests = std::sync::atomic::AtomicU32::new(0);
+        for expected in 1..=8 {
+            assert!(!super::record_stop_request(&requests, true));
+            assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), expected);
+        }
+    }
+
+    #[test]
+    fn saturated_stop_count_never_wraps_or_clears_pending_intent() {
+        let requests = std::sync::atomic::AtomicU32::new(u32::MAX - 1);
+        assert!(!super::record_stop_request(&requests, true));
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), u32::MAX);
+        assert!(!super::record_stop_request(&requests, true));
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), u32::MAX);
+        assert!(super::record_stop_request(&requests, false));
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), u32::MAX);
+    }
+
+    #[test]
+    fn concurrent_retained_requests_are_counted_without_lost_updates() {
+        let requests = std::sync::atomic::AtomicU32::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                let requests = &requests;
+                scope.spawn(move || {
+                    for _ in 0..1000 {
+                        assert!(!super::record_stop_request(requests, true));
+                    }
+                });
+            }
+        });
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 4000);
+    }
+
+    #[test]
+    fn concurrent_saturating_requests_preserve_the_pending_intent() {
+        let requests = std::sync::atomic::AtomicU32::new(u32::MAX - 3);
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                let requests = &requests;
+                scope.spawn(move || {
+                    for _ in 0..1000 {
+                        assert!(!super::record_stop_request(requests, true));
+                    }
+                });
+            }
+        });
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), u32::MAX);
     }
 }
