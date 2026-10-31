@@ -110,6 +110,115 @@ impl Portals {
     }
 }
 
+/// Immutable, session-only observations. An explicit default entry and a
+/// previous-move sample survive capture without being normalized by a tick.
+#[cfg(feature = "paired-packages")]
+#[derive(Debug, PartialEq, Eq)]
+pub(in crate::game) struct SessionItemPortalProjection {
+    explicit: std::collections::BTreeSet<u32>,
+    before: std::collections::BTreeMap<u32, [u64; 3]>,
+}
+#[cfg(feature = "paired-packages")]
+#[derive(Debug)]
+pub(in crate::game) struct SessionItemPortalError(&'static str);
+#[cfg(feature = "paired-packages")]
+impl std::fmt::Display for SessionItemPortalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+#[cfg(feature = "paired-packages")]
+impl Portals {
+    pub(in crate::game) fn project_session_item_portal_owners(
+        &self,
+        live_items: &[horizon_client::entities::ItemEntity],
+    ) -> std::result::Result<SessionItemPortalProjection, SessionItemPortalError> {
+        let invalid =
+            || SessionItemPortalError("session checkpoint unsupported live item portal owner");
+        if live_items.len() > 1024
+            || self.entities.len() > live_items.len()
+            || self.before.len() > live_items.len()
+        {
+            return Err(invalid());
+        }
+        let mut ids = std::collections::BTreeSet::new();
+        for item in live_items {
+            if !ids.insert(item.id) {
+                return Err(invalid());
+            }
+        }
+        let mut explicit = std::collections::BTreeSet::new();
+        for (id, state) in &self.entities {
+            if !ids.contains(id) || state.cooldown != 0 || state.process.is_some() {
+                return Err(invalid());
+            }
+            explicit.insert(*id);
+        }
+        let mut before = std::collections::BTreeMap::new();
+        for (id, position) in &self.before {
+            if !ids.contains(id)
+                || ![position.x, position.y, position.z]
+                    .into_iter()
+                    .all(f64::is_finite)
+            {
+                return Err(invalid());
+            }
+            before.insert(
+                *id,
+                [
+                    position.x.to_bits(),
+                    position.y.to_bits(),
+                    position.z.to_bits(),
+                ],
+            );
+        }
+        Ok(SessionItemPortalProjection { explicit, before })
+    }
+}
+
+#[cfg(all(test, feature = "paired-packages"))]
+impl Game<'_> {
+    pub(in crate::game) fn set_session_item_portal_for_test(
+        &mut self,
+        id: u32,
+        state: Option<PortalState>,
+        before: Option<Vec3>,
+    ) {
+        self.portals.entities.remove(&id);
+        self.portals.before.remove(&id);
+        if let Some(state) = state {
+            self.portals.entities.insert(id, state);
+        }
+        if let Some(before) = before {
+            self.portals.before.insert(id, before);
+        }
+    }
+    pub(in crate::game) fn session_item_portal_bytes_for_test(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let entities: std::collections::BTreeMap<_, _> = self.portals.entities.iter().collect();
+        for (id, state) in entities {
+            bytes.extend_from_slice(&id.to_be_bytes());
+            bytes.extend_from_slice(&state.cooldown.to_be_bytes());
+            bytes.push(u8::from(state.process.is_some()));
+            if let Some(p) = state.process {
+                for v in [p.entry.x, p.entry.y, p.entry.z, p.time] {
+                    bytes.extend_from_slice(&v.to_be_bytes());
+                }
+                bytes.push(u8::from(p.inside));
+            }
+        }
+        bytes.push(0xff);
+        let before: std::collections::BTreeMap<_, _> = self.portals.before.iter().collect();
+        for (id, p) in before {
+            bytes.extend_from_slice(&id.to_be_bytes());
+            for v in [p.x, p.y, p.z] {
+                bytes.extend_from_slice(&v.to_bits().to_be_bytes());
+            }
+        }
+        bytes
+    }
+}
+
 fn rotate_y(v: Vec3, degrees: f32) -> Vec3 {
     // Vec3.yRot((float)Math.toRadians(degrees))
     let angle = f64::from(degrees.to_radians());

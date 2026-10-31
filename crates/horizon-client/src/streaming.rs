@@ -442,12 +442,106 @@ struct Shared {
     ownership: Arc<Mutex<OwnershipBook>>,
     returned: Mutex<VecDeque<(ResultStamp, WorkLease)>>,
     queued_owners: Mutex<FxHashMap<u64, WorkLease>>,
+    #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+    native_column_load_gate: Mutex<Option<Arc<NativeColumnLoadGate>>>,
     #[cfg(test)]
     work_gate: Mutex<Option<WorkGate>>,
     #[cfg(test)]
     idle_wait_gate: Mutex<Option<IdleWaitGate>>,
     #[cfg(test)]
     shutdown_events: Mutex<Option<mpsc::Sender<ShutdownEvent>>>,
+}
+/// One closed developer control at the real native Generate/load seam. The
+/// actual work lease remains worker-held throughout the pause.
+#[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+struct NativeColumnLoadGate {
+    column: (i32, i32),
+    entered: mpsc::Sender<()>,
+    entered_once: AtomicBool,
+    resumed: AtomicBool,
+    released: Mutex<bool>,
+    ready: Condvar,
+}
+#[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+impl NativeColumnLoadGate {
+    fn release(&self) {
+        *self.released.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        self.ready.notify_all();
+    }
+    fn wait(&self) {
+        let mut released = self.released.lock().unwrap_or_else(|e| e.into_inner());
+        if !self.entered_once.swap(true, Ordering::AcqRel) {
+            let _ = self.entered.send(());
+        }
+        while !*released {
+            released = self.ready.wait(released).unwrap_or_else(|e| e.into_inner());
+        }
+        self.resumed.store(true, Ordering::Release);
+    }
+}
+/// A diagnostic observer, never an arrival or provider capability.
+#[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+#[doc(hidden)]
+pub struct NativeColumnLoadTestObservation {
+    gate: Arc<NativeColumnLoadGate>,
+}
+#[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+impl NativeColumnLoadTestObservation {
+    pub fn entered(&self) -> bool {
+        self.gate.entered_once.load(Ordering::Acquire)
+    }
+    pub fn resumed(&self) -> bool {
+        self.gate.resumed.load(Ordering::Acquire)
+    }
+}
+/// Owned release-on-drop receipt. Neither timeout nor observation cancels work.
+#[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+#[doc(hidden)]
+pub struct NativeColumnLoadTestControl {
+    shared: std::sync::Weak<Shared>,
+    gate: Arc<NativeColumnLoadGate>,
+    entered: mpsc::Receiver<()>,
+    entered_seen: bool,
+}
+#[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+impl NativeColumnLoadTestControl {
+    pub fn observer(&self) -> NativeColumnLoadTestObservation {
+        NativeColumnLoadTestObservation {
+            gate: self.gate.clone(),
+        }
+    }
+    pub fn wait_entered(&mut self, timeout: std::time::Duration) -> crate::Result<()> {
+        if !self.entered_seen {
+            self.entered
+                .recv_timeout(timeout)
+                .map_err(|e| format!("native column load entry: {e}"))?;
+            self.entered_seen = true;
+        }
+        Ok(())
+    }
+    pub fn release(&mut self) {
+        // Cancellation before entry removes only this receipt's slot. An older
+        // worker resuming later cannot remove a newly armed gate.
+        if let Some(shared) = self.shared.upgrade() {
+            let mut slot = shared
+                .native_column_load_gate
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if slot
+                .as_ref()
+                .is_some_and(|gate| Arc::ptr_eq(gate, &self.gate))
+            {
+                drop(slot.take());
+            }
+        }
+        self.gate.release();
+    }
+}
+#[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+impl Drop for NativeColumnLoadTestControl {
+    fn drop(&mut self) {
+        self.release();
+    }
 }
 #[cfg(test)]
 struct WorkGate {
@@ -720,6 +814,8 @@ impl Streaming {
             ownership: Arc::new(Mutex::new(OwnershipBook::default())),
             returned: Mutex::new(VecDeque::new()),
             queued_owners: Mutex::new(FxHashMap::default()),
+            #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+            native_column_load_gate: Mutex::new(None),
             #[cfg(test)]
             work_gate: Mutex::new(None),
             #[cfg(test)]
@@ -800,6 +896,21 @@ impl Streaming {
                                     gate.release
                                         .recv_timeout(std::time::Duration::from_secs(5))
                                         .unwrap();
+                                }
+                            }
+                            #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+                            {
+                                let gate = {
+                                    let slot = shared.native_column_load_gate.lock().unwrap_or_else(|e| e.into_inner());
+                                    slot.as_ref().filter(|gate| {
+                                        owner.as_ref().is_some_and(|owner| owner.origin == NativeWorkOrigin::Generate)
+                                            && matches!(&job, Job::Generate(x, z) if (*x, *z) == gate.column)
+                                    }).cloned()
+                                };
+                                if let Some(gate) = gate {
+                                    gate.wait(); // queue and slot locks are both released.
+                                    let mut slot = shared.native_column_load_gate.lock().unwrap_or_else(|e| e.into_inner());
+                                    if slot.as_ref().is_some_and(|current| Arc::ptr_eq(current, &gate)) { drop(slot.take()); }
                                 }
                             }
                             let done = match job {
@@ -2561,6 +2672,20 @@ impl Ranges<'_> {
 }
 impl Drop for Streaming {
     fn drop(&mut self) {
+        #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+        {
+            // Release even if a receipt remains externally owned. Do this before
+            // save draining or joining: a paused worker may be needed by either.
+            let gate = self
+                .shared
+                .native_column_load_gate
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+            if let Some(gate) = gate {
+                gate.release();
+            }
+        }
         // Saves in flight hold proto chunks nothing else would save.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         while self.saving > 0 {
@@ -2622,6 +2747,39 @@ impl Drop for Streaming {
             .unwrap_or_else(|e| e.into_inner())
             .clear();
         self.deferred_owners.clear();
+    }
+}
+#[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+impl Streaming {
+    #[doc(hidden)]
+    pub fn arm_native_column_load_test_control(
+        &self,
+        column: (i32, i32),
+    ) -> crate::Result<NativeColumnLoadTestControl> {
+        let mut slot = self
+            .shared
+            .native_column_load_gate
+            .lock()
+            .map_err(|_| "native column gate poisoned")?;
+        if slot.is_some() {
+            return Err("native column gate occupied".into());
+        }
+        let (entered, receiver) = mpsc::channel();
+        let gate = Arc::new(NativeColumnLoadGate {
+            column,
+            entered,
+            entered_once: AtomicBool::new(false),
+            resumed: AtomicBool::new(false),
+            released: Mutex::new(false),
+            ready: Condvar::new(),
+        });
+        *slot = Some(gate.clone());
+        Ok(NativeColumnLoadTestControl {
+            shared: Arc::downgrade(&self.shared),
+            gate,
+            entered: receiver,
+            entered_seen: false,
+        })
     }
 }
 /// The section indexes set in a column's bits, lowest first.
@@ -4310,6 +4468,103 @@ mod capture_pristine_tests {
                 })
             })
             .clone()
+    }
+
+    #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+    #[test]
+    #[ignore = "owned prepared resources: real worker column gate cancellation, occupied slot, stream-drop release and complete worker join"]
+    fn native_column_load_control_drop_before_entry_and_stream_drop_release_actual_workers() {
+        for cancel_before_entry in [false, true] {
+            let context = context();
+            let generator = Arc::new(
+                crate::testgen::TestTerrain::new(context.assets.registry, &context.biomes).unwrap(),
+            );
+            let mut streaming = Streaming::new(generator, context, 1);
+            let mut control = streaming
+                .arm_native_column_load_test_control((0, 0))
+                .unwrap();
+            let observer = control.observer();
+            assert!(
+                streaming
+                    .arm_native_column_load_test_control((1, 0))
+                    .is_err()
+            );
+            let book = streaming.shared.ownership.clone();
+            if cancel_before_entry {
+                control.release();
+            }
+            streaming.submit(Some((0, 0)), 0, Job::Generate(0, 0));
+            if !cancel_before_entry {
+                control.wait_entered(Duration::from_secs(5)).unwrap();
+                assert_eq!(
+                    book.lock().unwrap().counts[NativeWorkOrigin::Generate as usize].worker_held,
+                    1
+                );
+                // The external receipt deliberately remains alive during Drop.
+                drop(streaming);
+                assert!(observer.entered() && observer.resumed());
+            } else {
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                while book.lock().unwrap().counts[NativeWorkOrigin::Generate as usize].returned == 0
+                {
+                    assert!(std::time::Instant::now() < deadline);
+                    std::thread::yield_now();
+                }
+                drop(streaming);
+                assert!(!observer.entered());
+            }
+            drop(control);
+            let book = book.lock().unwrap();
+            assert_eq!(
+                book.counts[NativeWorkOrigin::Generate as usize].worker_held,
+                0
+            );
+            assert!(
+                !book.worker_initialization_fault
+                    && !book.worker_exit_fault
+                    && !book.accounting_fault
+            );
+        }
+    }
+
+    #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+    #[test]
+    #[ignore = "owned prepared resources: old native worker/receipt cleanup cannot remove a newer column gate"]
+    fn native_column_load_control_old_receipt_and_worker_preserve_new_gate_identity() {
+        let context = context();
+        let generator = Arc::new(
+            crate::testgen::TestTerrain::new(context.assets.registry, &context.biomes).unwrap(),
+        );
+        let mut streaming = Streaming::new(generator, context, 1);
+        let mut old = streaming
+            .arm_native_column_load_test_control((0, 0))
+            .unwrap();
+        streaming.submit(Some((0, 0)), 0, Job::Generate(0, 0));
+        old.wait_entered(Duration::from_secs(5)).unwrap();
+        old.release();
+        let newer = streaming
+            .arm_native_column_load_test_control((99, 99))
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while streaming.shared.ownership.lock().unwrap().counts[NativeWorkOrigin::Generate as usize]
+            .returned
+            == 0
+        {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        drop(old);
+        assert!(
+            streaming
+                .arm_native_column_load_test_control((1, 0))
+                .is_err()
+        );
+        drop(newer);
+        let cancelled = streaming
+            .arm_native_column_load_test_control((1, 0))
+            .unwrap();
+        drop(cancelled);
+        drop(streaming);
     }
 
     #[test]

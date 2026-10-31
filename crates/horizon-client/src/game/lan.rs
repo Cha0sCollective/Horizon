@@ -577,7 +577,7 @@ pub(in crate::game) fn session_player_tags_equal(
 }
 
 #[cfg(feature = "paired-packages")]
-fn session_player_payload_supported(root: &horizon_world::nbt::Tag) -> bool {
+pub(in crate::game) fn session_player_payload_supported(root: &horizon_world::nbt::Tag) -> bool {
     use horizon_world::nbt::Tag;
     let mut work = vec![(root, 0usize)];
     let mut nodes = 0usize;
@@ -971,6 +971,9 @@ impl Game<'_> {
                     return Err("unsupported live session item graph".into());
                 }
                 if let Some(data) = stack.data() {
+                    if data.bundle_selected.0 != -1 {
+                        return Err("unsupported live session runtime bundle selection".into());
+                    }
                     if data.container.iter().enumerate().any(|(index, (slot, _))| {
                         data.container[..index]
                             .iter()

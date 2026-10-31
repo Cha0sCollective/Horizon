@@ -51,7 +51,10 @@ const MANIFEST_LIMIT: usize = 256 << 10;
 const STRUCTURED_LIMIT: usize = 1 << 20;
 const NODES: usize = 16_384;
 
-type SResult<T> = std::result::Result<T, SessionCheckpointError>;
+pub(in crate::game) type SResult<T> = std::result::Result<T, SessionCheckpointError>;
+#[path = "session_checkpoint_items.rs"]
+pub(in crate::game) mod items;
+use items::{CheckedSessionItems, ItemProjection, read_session_checkpoint_items};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::game) enum Publication {
     NotPublished,
@@ -61,27 +64,30 @@ pub(in crate::game) enum Publication {
 pub(in crate::game) struct SessionCheckpointError {
     pub publication: Publication,
     pub detail: String,
+    /// Explicit UUID preparation can remain after a later failed capture.
+    pub item_identities_assigned: usize,
 }
 impl fmt::Display for SessionCheckpointError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "session checkpoint {:?}: {}",
-            self.publication, self.detail
+            "session checkpoint {:?} ({} item identities assigned): {}",
+            self.publication, self.item_identities_assigned, self.detail
         )
     }
 }
 impl std::error::Error for SessionCheckpointError {}
-fn fail(detail: impl fmt::Display) -> SessionCheckpointError {
+pub(in crate::game) fn fail(detail: impl fmt::Display) -> SessionCheckpointError {
     SessionCheckpointError {
         publication: Publication::NotPublished,
         detail: detail.to_string(),
+        item_identities_assigned: 0,
     }
 }
-fn checked<T>(value: std::result::Result<T, impl fmt::Display>) -> SResult<T> {
+pub(in crate::game) fn checked<T>(value: std::result::Result<T, impl fmt::Display>) -> SResult<T> {
     value.map_err(fail)
 }
-fn require(ok: bool, detail: &str) -> SResult<()> {
+pub(in crate::game) fn require(ok: bool, detail: &str) -> SResult<()> {
     if ok { Ok(()) } else { Err(fail(detail)) }
 }
 fn deadline(until: Instant) -> SResult<()> {
@@ -532,6 +538,8 @@ struct NbtScan<'a> {
     bytes: &'a [u8],
     at: usize,
     nodes: usize,
+    exact_items: bool,
+    entity_list_depth: Option<usize>,
 }
 impl NbtScan<'_> {
     fn take(&mut self, n: usize) -> SResult<&[u8]> {
@@ -554,18 +562,27 @@ impl NbtScan<'_> {
     }
     fn string(&mut self) -> SResult<nbt::JavaString> {
         let len = u16::from_be_bytes(self.take(2)?.try_into().unwrap()) as usize;
-        require(len <= 4096, "NBT string bound")?;
+        require(
+            len <= if self.exact_items { 4096 * 3 } else { 4096 },
+            "NBT string bound",
+        )?;
         let value = self.take(len)?;
         let mut encoded = vec![8, 0, 0];
         encoded.extend_from_slice(&(len as u16).to_be_bytes());
         encoded.extend_from_slice(value);
         let (named, used) = checked(nbt::read_named(&encoded, limits()))?;
         require(used == encoded.len(), "NBT string trailing bytes")?;
+        if self.exact_items {
+            require(
+                checked(nbt::write_named(&named, limits()))? == encoded,
+                "noncanonical/malformed native item modified UTF-8",
+            )?;
+        }
         let Tag::String(value) = named.tag else {
             return Err(fail("NBT string"));
         };
         require(
-            char::decode_utf16(value.0.iter().copied()).all(|v| v.is_ok()),
+            value.0.len() <= 4096 && char::decode_utf16(value.0.iter().copied()).all(|v| v.is_ok()),
             "invalid UTF16",
         )?;
         Ok(value)
@@ -589,10 +606,18 @@ impl NbtScan<'_> {
             5 => {
                 let bits = u32::from_be_bytes(self.take(4)?.try_into().unwrap());
                 require(f32::from_bits(bits).is_finite(), "nonfinite NBT float")?;
+                require(
+                    !self.exact_items || bits != (-0.0f32).to_bits(),
+                    "native item float signed-zero coercion",
+                )?;
             }
             6 => {
                 let bits = u64::from_be_bytes(self.take(8)?.try_into().unwrap());
                 require(f64::from_bits(bits).is_finite(), "nonfinite NBT double")?;
+                require(
+                    !self.exact_items || bits != (-0.0f64).to_bits(),
+                    "native item double signed-zero coercion",
+                )?;
             }
             7 | 11 | 12 => {
                 let n = self.count()?;
@@ -611,6 +636,12 @@ impl NbtScan<'_> {
                 let kind = self.byte()?;
                 let n = self.count()?;
                 require(kind <= 12 && (kind != 0 || n == 0), "NBT list type")?;
+                if self.entity_list_depth == Some(depth) {
+                    require(
+                        kind == 10 || (n == 0 && kind == 0),
+                        "native entity compound list type",
+                    )?;
+                }
                 for _ in 0..n {
                     self.payload(kind, depth + 1)?;
                 }
@@ -623,8 +654,23 @@ impl NbtScan<'_> {
                         break;
                     }
                     let key = self.string()?;
+                    if self.entity_list_depth == depth.checked_sub(1)
+                        && self.entity_list_depth.is_some()
+                    {
+                        require(
+                            items::native_item_field(&key),
+                            "unknown raw native entity field/wrapper",
+                        )?;
+                    }
+                    let entity_list =
+                        self.exact_items && depth == 0 && key == nbt::JavaString::from("Entities");
                     require(names.insert(key), "duplicate NBT key")?;
+                    let previous = self.entity_list_depth;
+                    if entity_list {
+                        self.entity_list_depth = Some(depth + 1);
+                    }
                     self.payload(kind, depth + 1)?;
+                    self.entity_list_depth = previous;
                 }
             }
             _ => return Err(fail("invalid NBT tag type")),
@@ -633,6 +679,12 @@ impl NbtScan<'_> {
     }
 }
 fn raw_nbt(raw: &[u8]) -> SResult<NamedTag> {
+    raw_nbt_profile(raw, false)
+}
+fn raw_item_nbt(raw: &[u8]) -> SResult<NamedTag> {
+    raw_nbt_profile(raw, true)
+}
+fn raw_nbt_profile(raw: &[u8], exact_items: bool) -> SResult<NamedTag> {
     require(
         !raw.is_empty() && raw.len() <= STRUCTURED_LIMIT,
         "NBT byte bound",
@@ -641,6 +693,8 @@ fn raw_nbt(raw: &[u8]) -> SResult<NamedTag> {
         bytes: raw,
         at: 0,
         nodes: 0,
+        exact_items,
+        entity_list_depth: None,
     };
     let kind = scanner.byte()?;
     require(kind == 10, "NBT compound root required")?;
@@ -1060,16 +1114,13 @@ fn columns(game: &Game<'_>, root: &Path, clock: i64) -> SResult<BTreeMap<(i32, i
         if !row.path.ends_with(".mca") {
             continue;
         }
-        require(
-            row.path
-                .starts_with("dimensions/minecraft/overworld/region/")
-                && row.path.matches('/').count() == 4,
-            "unsupported native region owner/dimension",
-        )?;
+        let (entities, region_position) = items::native_region(&row.path)?;
+        if entities {
+            continue;
+        } // The complete item reader validates this family.
         let path = root.join(&row.path);
         let bytes = read(&path, FILE_LIMIT)?;
         let entries = raw_region(&bytes)?;
-        let region_position = checked(horizon_world::region::position_from_path(&path))?;
         // Only NOW may the native constructor/enumerator see this file.
         let mut region = checked(RegionFile::open(&path))?;
         let native: Vec<_> = region.chunks().map(|(at, _)| at).collect();
@@ -1414,6 +1465,7 @@ struct Verified {
     players: CheckedSessionPlayers,
     columns: BTreeMap<(i32, i32), Arc<Chunk>>,
     raids: Option<Tag>,
+    items: CheckedSessionItems,
 }
 fn manifest_shape(manifest: &Manifest, epoch: u64) -> SResult<()> {
     require(
@@ -1550,6 +1602,13 @@ fn verify_image(
             "resident native full record missing",
         )?;
     }
+    let items = read_session_checkpoint_items(
+        game,
+        &world,
+        &manifest.resident.iter().copied().collect(),
+        &columns,
+    )?;
+    check_item_player_identities(&items.projection, &rows)?;
     let at = (
         expected_target.position[0] >> 4,
         expected_target.position[2] >> 4,
@@ -1575,6 +1634,7 @@ fn verify_image(
         players: CheckedSessionPlayers { rows },
         columns,
         raids,
+        items,
     })
 }
 
@@ -1602,6 +1662,34 @@ struct Snapshot {
     columns: BTreeMap<(i32, i32), NamedTag>,
     residents: Vec<(i32, i32)>,
     raids: Option<Tag>,
+    items: ItemProjection,
+    item_memory: crate::game::persist::SessionItemMemoryProjection,
+    item_portals: crate::game::nether_portal::SessionItemPortalProjection,
+    clocks: (i64, i64),
+    random: u64,
+    entity_head: u32,
+}
+fn player_item_reserved_identities(rows: &[SessionPlayerRow]) -> Vec<[i32; 4]> {
+    rows.iter()
+        .flat_map(|r| {
+            let bytes = r.profile_uuid.to_be_bytes();
+            let profile = std::array::from_fn(|i| {
+                i32::from_be_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap())
+            });
+            [profile, r.record_uuid]
+        })
+        .collect()
+}
+fn check_item_player_identities(
+    items: &ItemProjection,
+    players: &[SessionPlayerRow],
+) -> SResult<()> {
+    require(
+        player_item_reserved_identities(players)
+            .iter()
+            .all(|uuid| !items.rows.contains_key(uuid)),
+        "item UUID collides with participant identity",
+    )
 }
 fn same_players(a: &[SessionPlayerRow], b: &[SessionPlayerRow]) -> bool {
     a.len() == b.len()
@@ -1617,6 +1705,63 @@ fn same_players(a: &[SessionPlayerRow], b: &[SessionPlayerRow]) -> bool {
         })
 }
 impl Game<'_> {
+    /// Full owner/player/profile preflight precedes the explicit UUID stage.
+    pub(in crate::game) fn session_checkpoint_identity_preflight(&self) -> SResult<Vec<[i32; 4]>> {
+        let world = self.session_context()?;
+        let counter = checked(self.world.counter_checkpoint_frame(self.world.game_time))?;
+        let _ = binding(self, &counter)?;
+        let slot = checked(
+            self.world
+                .slot_checkpoint_bytes(self.res.items(), self.world.game_time),
+        )?;
+        let parsed = checked(decode_slot_frame(&slot, self.res.items()))?;
+        let roster = checked(
+            self.observe_checkpoint_participants()
+                .map_err(|e| format!("{e:?}")),
+        )?;
+        let players = checked(self.project_session_participant_rows(&roster))?;
+        checked(self.inspect_session_checkpoint_owners())?;
+        let descriptors = players.iter().map(descriptor).collect::<Vec<_>>();
+        require(
+            self.level.player_uuid
+                == Some(validate_native_local_player(
+                    &self.world_root,
+                    &descriptors,
+                )?),
+            "live/native singleplayer UUID mismatch",
+        )?;
+        if descriptors.iter().all(|row| !row.integrated_owner) {
+            require(
+                lan::session_empty_native_player(&self.level.player_tag()),
+                "dedicated cached local player authority",
+            )?;
+        }
+        let manifest = Manifest {
+            format: 1,
+            kind: KIND.into(),
+            epoch: 1,
+            world_uuid: world,
+            dimension: self.dim.id().into(),
+            saved_clock: self.world.game_time,
+            target: checked(CounterTarget::new(&counter.dimension, counter.position))?,
+            type_id: counter.type_id.clone(),
+            counter: COUNTER.into(),
+            slot: SLOT.into(),
+            resident: self.world.chunks.keys().copied().collect(),
+            players: descriptors,
+            directories: Vec::new(),
+            files: Vec::new(),
+        };
+        correlate(&manifest, &counter, &parsed)?;
+        for row in &players {
+            checked(lan::validate_session_player_tag(&row.player))?;
+            let _ = nbt_bytes(&row.player)?;
+            let _ = json_bytes(&row.advancements, STRUCTURED_LIMIT)?;
+            let _ = json_bytes(&row.stats, STRUCTURED_LIMIT)?;
+        }
+        let _ = self.effective_session_raids()?;
+        Ok(player_item_reserved_identities(&players))
+    }
     fn effective_session_raids(&self) -> SResult<Option<Tag>> {
         let live = checked(self.session_checkpoint_raids())?;
         let disk = raid_metadata(&self.world_root)?;
@@ -1707,6 +1852,13 @@ impl Game<'_> {
         )?;
         let players = checked(self.project_session_participant_rows(&roster))?;
         checked(self.inspect_session_checkpoint_owners())?;
+        let items = self.project_session_checkpoint_items()?;
+        check_item_player_identities(&items, &players)?;
+        let item_memory = self.session_checkpoint_item_memory()?;
+        let item_portals = checked(
+            self.portals
+                .project_session_item_portal_owners(&self.dropped),
+        )?;
         let raids = self.effective_session_raids()?;
         let descriptors = players.iter().map(descriptor).collect::<Vec<_>>();
         let local_uuid = validate_native_local_player(&self.world_root, &descriptors)?;
@@ -1770,10 +1922,18 @@ impl Game<'_> {
             columns,
             residents,
             raids,
+            items,
+            item_memory,
+            item_portals,
+            clocks: (self.world.game_time, self.world.day_time),
+            random: self.world.random.state(),
+            entity_head: self.next_entity,
         })
     }
     /// One continuous exclusive Game borrow spans both producer fences, native
     /// save(false), complete physical copying, semantic validation and promotion.
+    /// UUID preparation is explicit: newly assigned identities survive a later
+    /// failure and are reported separately from publication uncertainty.
     pub(in crate::game) fn checkpoint_session(
         &mut self,
         archive_root: &Path,
@@ -1810,6 +1970,7 @@ impl Game<'_> {
         mut step: impl FnMut(Step) -> SResult<()>,
     ) -> SResult<CheckpointReceipt> {
         let mut publication = Publication::NotPublished;
+        let mut item_identities_assigned = 0;
         let result = (|| {
             deadline(until)?;
             let world = self.session_context()?;
@@ -1837,7 +1998,21 @@ impl Game<'_> {
             // Preflight every old source record before this checkpoint submits
             // writes through native constructors that can normalize bad headers.
             // Dirty target/frame equality is checked only after its real save.
-            let _ = columns(self, &source, self.world.game_time)?;
+            let old_columns = columns(self, &source, self.world.game_time)?;
+            let old_items = read_session_checkpoint_items(
+                self,
+                &source,
+                &self.world.chunks.keys().copied().collect(),
+                &old_columns,
+            )?;
+            let reserved = self.session_checkpoint_identity_preflight()?;
+            require(
+                reserved
+                    .iter()
+                    .all(|uuid| !old_items.projection.rows.contains_key(uuid)),
+                "saved source item/player UUID collision",
+            )?;
+            item_identities_assigned = self.prepare_session_checkpoint_item_identities()?;
             let before = self.session_snapshot()?;
             checked(self.save_game_with(false))?;
             deadline(until)?;
@@ -1868,6 +2043,15 @@ impl Game<'_> {
                 "native save changed session semantic owners/residency",
             )?;
             require(
+                before.items == after.items
+                    && before.item_memory == after.item_memory
+                    && before.item_portals == after.item_portals
+                    && before.clocks == after.clocks
+                    && before.random == after.random
+                    && before.entity_head == after.entity_head,
+                "native save changed item/memory/portal/clock/RNG projection",
+            )?;
+            require(
                 before.raids == after.raids,
                 "native save changed empty raid metadata",
             )?;
@@ -1876,6 +2060,17 @@ impl Game<'_> {
                 "native save changed full resident saved projection",
             )?;
             require(self.session_context()? == world, "native context changed")?;
+            let saved_columns = columns(self, &source, self.world.game_time)?;
+            let saved_items = read_session_checkpoint_items(
+                self,
+                &source,
+                &before.residents.iter().copied().collect(),
+                &saved_columns,
+            )?;
+            require(
+                saved_items.projection == before.items,
+                "saved native item projection mismatch",
+            )?;
             let source_inventory = tree(&source, &["session.lock"])?;
             checked(fs::create_dir(&pending))?;
             copy_tree(&source, &pending.join("world"), &source_inventory, until)?;
@@ -1945,6 +2140,11 @@ impl Game<'_> {
                 "detached player image changed",
             )?;
             require(
+                before.items == verified.items.projection
+                    && saved_items.projection == verified.items.projection,
+                "copied native item projection mismatch",
+            )?;
+            require(
                 before.raids == verified.raids && self.effective_session_raids()? == before.raids,
                 "copied/current native raid metadata mismatch",
             )?;
@@ -1989,6 +2189,7 @@ impl Game<'_> {
         })();
         result.map_err(|mut error: SessionCheckpointError| {
             error.publication = publication;
+            error.item_identities_assigned = item_identities_assigned;
             error
         })
     }
@@ -2107,6 +2308,18 @@ fn player_centers(
     }
     Ok(centers)
 }
+#[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+enum SessionItemLoadTestMode {
+    HoldToDeadline,
+    ReleaseAfterEntry,
+    DropBeforeEntry,
+}
+#[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+struct SessionItemLoadTest {
+    column: (i32, i32),
+    mode: SessionItemLoadTestMode,
+    observer: Option<horizon_client::streaming::NativeColumnLoadTestObservation>,
+}
 impl<'a> Game<'a> {
     fn fresh_session_candidate(&self) -> SResult<()> {
         self.session_warden_tracker()?;
@@ -2219,8 +2432,31 @@ impl<'a> Game<'a> {
     /// Own the unpublished native candidate before admitting any transport.
     /// Participant installation and the final correlation remain separate gates.
     pub(in crate::game) fn prepare_session_checkpoint(
+        self: Box<Self>,
+        request: RecoveryRequest,
+    ) -> SResult<NativeRecoveryParts<'a>> {
+        self.prepare_session_checkpoint_before_items(request, |_, _| Ok(()))
+    }
+    // Private defining-test seam, before item staging/publication. No callback
+    // runs in the concrete infallible installer commit.
+    fn prepare_session_checkpoint_before_items(
+        self: Box<Self>,
+        request: RecoveryRequest,
+        before_items: impl FnOnce(&mut Game<'a>, &CheckedSessionItems) -> SResult<()>,
+    ) -> SResult<NativeRecoveryParts<'a>> {
+        self.prepare_session_checkpoint_steps(
+            request,
+            before_items,
+            #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+            None,
+        )
+    }
+    fn prepare_session_checkpoint_steps(
         mut self: Box<Self>,
         request: RecoveryRequest,
+        before_items: impl FnOnce(&mut Game<'a>, &CheckedSessionItems) -> SResult<()>,
+        #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+        mut item_load_test: Option<&mut SessionItemLoadTest>,
     ) -> SResult<NativeRecoveryParts<'a>> {
         self.fresh_session_candidate()?;
         deadline(request.deadline)?;
@@ -2254,7 +2490,7 @@ impl<'a> Game<'a> {
             &request.expected_target,
             &request.expected_type,
         )?;
-        let centers = player_centers(verified.players.rows(), &request.expected_target)?;
+        let mut centers = player_centers(verified.players.rows(), &request.expected_target)?;
         let coverage = required_coverage(&centers)?;
         for at in &coverage {
             require(
@@ -2262,6 +2498,8 @@ impl<'a> Game<'a> {
                 "recovery required native full coverage missing before loader",
             )?;
         }
+        centers.extend(verified.items.columns());
+        require(centers.len() <= NODES, "recovery load center union bound")?;
         let world_inventory = tree(&selected.join("world"), &[])?;
         copy_tree(
             &selected.join("world"),
@@ -2303,6 +2541,16 @@ impl<'a> Game<'a> {
         )?;
         checked(self.options.mod_packages.check_world(&request.destination))?;
         let under_lock = columns(&self, &request.destination, verified.manifest.saved_clock)?;
+        let locked_items = read_session_checkpoint_items(
+            &self,
+            &request.destination,
+            &verified.manifest.resident.iter().copied().collect(),
+            &under_lock,
+        )?;
+        require(
+            locked_items.projection == verified.items.projection,
+            "locked native entity projection changed",
+        )?;
         for at in &coverage {
             require(
                 under_lock.contains_key(at),
@@ -2317,7 +2565,33 @@ impl<'a> Game<'a> {
             prepared.world.game_time == verified.manifest.saved_clock,
             "prepared native clock",
         )?;
+        // Declared after `prepared`: on any failure the owned receipt releases
+        // BEFORE prepared Streaming is dropped and its actual workers are joined.
+        #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+        let mut item_load_receipt = None;
+        #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+        if let Some(test) = item_load_test.as_deref_mut() {
+            require(
+                verified.items.columns().contains(&test.column)
+                    && !player_centers(verified.players.rows(), &request.expected_target)?
+                        .contains(&test.column)
+                    && !prepared.world.chunks.contains_key(&test.column),
+                "item load test requires an unarrived verified distant item column",
+            )?;
+            let receipt = checked(
+                prepared
+                    .streaming
+                    .arm_native_column_load_test_control(test.column),
+            )?;
+            test.observer = Some(receipt.observer());
+            if matches!(test.mode, SessionItemLoadTestMode::DropBeforeEntry) {
+                drop(receipt);
+            } else {
+                item_load_receipt = Some(receipt);
+            }
+        }
         let clocks = (prepared.world.game_time, prepared.world.day_time);
+        let recovery_random = prepared.world.random.state();
         prepared.streaming.radius = 0;
         prepared.streaming.extra = centers.iter().copied().map(|at| (at, 0)).collect();
         require(
@@ -2333,9 +2607,29 @@ impl<'a> Game<'a> {
             loop {
                 deadline(request.deadline)?;
                 let _ = prepared.streaming.update(&mut prepared.world);
+                #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+                if item_load_test.as_ref().is_some_and(|test| {
+                    matches!(test.mode, SessionItemLoadTestMode::ReleaseAfterEntry)
+                        && test
+                            .observer
+                            .as_ref()
+                            .is_some_and(|observer| observer.entered())
+                }) && let Some(mut receipt) = item_load_receipt.take()
+                {
+                    checked(
+                        receipt.wait_entered(
+                            request.deadline.saturating_duration_since(Instant::now()),
+                        ),
+                    )?;
+                    receipt.release();
+                }
                 require(
                     (prepared.world.game_time, prepared.world.day_time) == clocks,
                     "streaming advanced native clocks",
+                )?;
+                require(
+                    prepared.world.random.state() == recovery_random,
+                    "streaming drew from native world random",
                 )?;
                 if prepared.world.chunks.contains_key(&center) {
                     break;
@@ -2355,6 +2649,10 @@ impl<'a> Game<'a> {
             (prepared.world.game_time, prepared.world.day_time) == clocks,
             "fence advanced native clocks",
         )?;
+        require(
+            prepared.world.random.state() == recovery_random,
+            "recovery fence drew from native world random",
+        )?;
         for (at, chunk) in &prepared.world.chunks {
             let expected = under_lock
                 .get(at)
@@ -2366,6 +2664,11 @@ impl<'a> Game<'a> {
                 "native arrival changed saved semantics",
             )?;
         }
+        verified.items.check_arrivals(
+            &self,
+            &prepared.world.chunks.keys().copied().collect(),
+            &prepared.world.loaded_entities,
+        )?;
         let binding = binding(&self, &verified.counter)?;
         let counter = checked(prepared.world.restore_counter_frame(
             &binding,
@@ -2387,6 +2690,12 @@ impl<'a> Game<'a> {
             .ok_or_else(|| fail("restored active slot key absent"))?;
         checked(self.finish_open_world(prepared))?;
         let random = self.world.random.state();
+        require(
+            random == recovery_random,
+            "native opening drew from world random",
+        )?;
+        before_items(&mut self, &verified.items)?;
+        self.install_session_checkpoint_items(&verified.items)?;
         checked(self.install_session_checkpoint_raids(verified.raids.as_ref()))?;
         require(
             self.world.random.state() == random,
@@ -2403,9 +2712,11 @@ impl<'a> Game<'a> {
                 counter: verified.counter,
                 players: verified.players,
                 raids: verified.raids,
+                items: verified.items,
             },
             selected,
             clocks,
+            random: recovery_random,
             receipt: RecoveryReceipt {
                 epoch,
                 counter,
@@ -2421,6 +2732,7 @@ struct NativeRecoveryImage {
     counter: CounterFrameV2,
     players: CheckedSessionPlayers,
     raids: Option<Tag>,
+    items: CheckedSessionItems,
 }
 pub(in crate::game) struct NativeRecoveryParts<'a> {
     game: Box<Game<'a>>,
@@ -2428,6 +2740,7 @@ pub(in crate::game) struct NativeRecoveryParts<'a> {
     verified: NativeRecoveryImage,
     selected: PathBuf,
     clocks: (i64, i64),
+    random: u64,
     receipt: RecoveryReceipt,
 }
 impl<'a> NativeRecoveryParts<'a> {
@@ -2478,6 +2791,7 @@ impl<'a> NativeRecoveryParts<'a> {
             verified,
             selected,
             clocks,
+            random,
             ..
         } = self;
         game.session_fence(request.deadline)?;
@@ -2485,11 +2799,16 @@ impl<'a> NativeRecoveryParts<'a> {
             (game.world.game_time, game.world.day_time) == *clocks,
             "recovery advanced native clocks",
         )?;
+        require(
+            game.world.random.state() == *random,
+            "recovery drew from world random",
+        )?;
         let snapshot = game.session_snapshot()?;
         require(
             snapshot.counter == verified.counter
                 && same_players(&snapshot.players, verified.players.rows())
                 && snapshot.raids == verified.raids
+                && snapshot.items == verified.items.projection
                 && raid_metadata(&game.world_root)? == verified.raids,
             "final restored counter/player mismatch",
         )?;
@@ -2712,7 +3031,11 @@ fn validate_player_items(game: &Game<'_>, tag: &Tag) -> SResult<()> {
                         "unresolved player item ID",
                     )?;
                     require(
-                        matches!(value.get("count"),Some(Tag::Int(v)) if *v>0),
+                        // Nested native ItemStackTemplate omits count==1. The
+                        // enclosing native item/player roundtrip still requires
+                        // exactly the canonical spelling at every location.
+                        value.get("count").is_none()
+                            || matches!(value.get("count"),Some(Tag::Int(v)) if *v>0),
                         "native player item count type/range",
                     )?;
                 }

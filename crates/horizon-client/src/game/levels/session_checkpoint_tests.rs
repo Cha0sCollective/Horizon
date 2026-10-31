@@ -3517,3 +3517,1328 @@ fn session_actual_persistent_retirement_empty_reconcile_checkpoint_roundtrip() {
         assert_eq!(retirement_total(&recovered), 14);
     }
 }
+
+fn session_items_rich() -> ItemStack {
+    let mut stack = ItemStack::new("minecraft:stone", 7);
+    stack.damage = 7;
+    let data = stack.data_mut();
+    data.custom_name = Some("native durable dropped owner".into());
+    data.set_other(
+        "example:opaque",
+        Some(Tag::compound([("value", Tag::Long(-73))])),
+    );
+    let mut child = ItemStack::new("minecraft:dirt", 2);
+    child.data_mut().custom_name = Some("nested original".into());
+    data.container.push((2, child.clone()));
+    data.charged.push(child.clone());
+    data.bundle_contents.push(child.clone());
+    let mut decoration = child;
+    decoration.count = 1; // The native ItemStackTemplate omits this default.
+    data.pot_decorations = Some(Box::new([Some(decoration), None, None, None]));
+    stack
+}
+#[inline(never)]
+fn session_items_delivered<'a>(
+    fixture: &'a Fixture,
+    label: &str,
+    owner: bool,
+    rich: bool,
+) -> Box<Session<'a>> {
+    use crate::game::slot_retirement::Delivery;
+    let mut session = retirement_session(fixture, label, owner);
+    session
+        .game
+        .checkpoint_session(&session.archive, 1, until())
+        .unwrap();
+    if rich {
+        let slot = session.slot.clone();
+        transfer(&mut session.game, &slot, 10, Direction::IntoPlayer, 7);
+        session.game.lan.as_mut().unwrap().hub.guests[0].inventory[1] = Some(session_items_rich());
+        let mut host = session.game.lan.take().unwrap();
+        let moved = session
+            .game
+            .as_guest(&mut host, 10, |game| {
+                game.transfer_world_slot_inventory_cell(&slot, 1, Direction::IntoMachine, 7)
+            })
+            .unwrap()
+            .unwrap();
+        assert!(matches!(moved, TransferOutcome::Committed(row) if row.moved == 7));
+        session.game.lan = Some(host);
+    }
+    retirement_replace(&mut session.game, 3);
+    let original = session.slot.clone();
+    assert!(matches!(
+        session
+            .game
+            .deliver_pending_persistent_world_slot(&original),
+        Ok(Delivery::Delivered { .. })
+    ));
+    session.slot = session
+        .game
+        .world
+        .reconcile_persistent_world_slot()
+        .unwrap()
+        .unwrap();
+    session.counter = session
+        .game
+        .world
+        .persistent_counter_key()
+        .unwrap()
+        .unwrap();
+    let entity = &mut session.game.dropped[0];
+    entity.health = 4;
+    entity.fire_ticks = -7;
+    entity.age = 201;
+    entity.pickup_delay = 17;
+    entity.on_ground = true;
+    entity.velocity = Vec3::new(0.125, -0.25, 0.0);
+    entity.thrower = Some([7, 6, 5, 4]);
+    entity.target = Some([3, 2, 1, 0]);
+    assert!(session.game.persist.uuids.is_empty());
+    assert!(session.game.persist.raw.is_empty());
+    session
+}
+fn session_items_stack_count(stack: &ItemStack) -> u64 {
+    u64::from(stack.count)
+        + stack.data().map_or(0, |d| {
+            d.container
+                .iter()
+                .map(|(_, s)| session_items_stack_count(s))
+                .sum::<u64>()
+                + d.charged
+                    .iter()
+                    .chain(&d.bundle_contents)
+                    .map(session_items_stack_count)
+                    .sum::<u64>()
+                + d.pot_decorations.as_ref().map_or(0, |p| {
+                    p.iter()
+                        .flatten()
+                        .map(session_items_stack_count)
+                        .sum::<u64>()
+                })
+        })
+}
+fn session_items_total(game: &Game<'_>, slot: &SlotKey) -> u64 {
+    let machine = game.world.read_world_slot(slot).unwrap();
+    machine.slot.stack().map_or(0, session_items_stack_count)
+        + game
+            .dropped
+            .iter()
+            .map(|e| session_items_stack_count(&e.stack))
+            .sum::<u64>()
+        + game
+            .lan
+            .as_ref()
+            .unwrap()
+            .hub
+            .guests
+            .iter()
+            .flat_map(|g| {
+                g.inventory
+                    .iter()
+                    .chain(&g.armor)
+                    .chain(std::iter::once(&g.offhand))
+                    .chain(&g.ender_items)
+                    .flatten()
+            })
+            .map(session_items_stack_count)
+            .sum::<u64>()
+}
+fn session_items_assert_refusal_retains(session: &mut Session<'_>, epoch: u64) {
+    let items = session.game.dropped.clone();
+    let uuids = session.game.persist.uuids.clone();
+    let raw = session.game.persist.raw.clone();
+    let unmodelled = session.game.persist.session_unmodelled_memory_for_test();
+    let portals = session.game.session_item_portal_bytes_for_test();
+    let id = session.game.next_entity;
+    let clock = (session.game.world.game_time, session.game.world.day_time);
+    let random = session.game.world.random.state();
+    let files = tree(&session.game.world_root, &["session.lock"]).unwrap();
+    let error = session
+        .game
+        .checkpoint_session(&session.archive, epoch, until())
+        .unwrap_err();
+    assert_eq!(error.item_identities_assigned, 0, "{error}");
+    assert_eq!(error.publication, Publication::NotPublished);
+    assert_eq!(session.game.dropped.len(), items.len());
+    for (a, b) in session.game.dropped.iter().zip(items) {
+        retirement_raw_equal(&a.stack, &b.stack);
+        let bits = |p: Vec3| [p.x.to_bits(), p.y.to_bits(), p.z.to_bits()];
+        assert_eq!(
+            (
+                a.id,
+                bits(a.position),
+                bits(a.previous),
+                bits(a.velocity),
+                a.health,
+                a.fire_ticks,
+                a.age,
+                a.pickup_delay,
+                a.ticks,
+                a.bob_offset.to_bits()
+            ),
+            (
+                b.id,
+                bits(b.position),
+                bits(b.previous),
+                bits(b.velocity),
+                b.health,
+                b.fire_ticks,
+                b.age,
+                b.pickup_delay,
+                b.ticks,
+                b.bob_offset.to_bits()
+            )
+        );
+    }
+    assert_eq!(session.game.persist.uuids, uuids);
+    assert_eq!(session.game.persist.raw, raw);
+    assert_eq!(
+        session.game.persist.session_unmodelled_memory_for_test(),
+        unmodelled
+    );
+    assert_eq!(session.game.session_item_portal_bytes_for_test(), portals);
+    assert_eq!(session.game.next_entity, id);
+    assert_eq!(
+        (session.game.world.game_time, session.game.world.day_time),
+        clock
+    );
+    assert_eq!(session.game.world.random.state(), random);
+    assert_eq!(
+        tree(&session.game.world_root, &["session.lock"]).unwrap(),
+        files
+    );
+    assert!(!published(session, epoch).exists());
+}
+
+#[test]
+#[ignore = "isolated pinned resources + prebuilt pair: genuine retirement drop, native entity writer, both owner roles, rich/plain roundtrip and distant item arrival"]
+fn session_items_actual_retirement_native_capture_restore_recapture_both_roles() {
+    let fixture = Fixture::new("session-items-native");
+    let _retain = RetainOnPanic::new(&fixture);
+    for (index, owner, rich) in [
+        (0, true, false),
+        (1, false, false),
+        (2, true, true),
+        (3, false, true),
+    ] {
+        let mut s = session_items_delivered(&fixture, &format!("items-{index}"), owner, rich);
+        let total = session_items_total(&s.game, &s.slot);
+        assert_eq!(total, if rich { 28 } else { 14 });
+        if index == 3 {
+            let far = (40, 40);
+            s.game.streaming.extra = s
+                .game
+                .world
+                .chunks
+                .keys()
+                .copied()
+                .map(|at| (at, 0))
+                .chain([(far, 0)])
+                .collect();
+            residency(&mut s.game, 0, far);
+            s.game.dropped[0].position = Vec3::new(640.5, 120.5, 640.5);
+            assert!(s.game.world.chunks.contains_key(&far));
+        }
+        let id = s.game.dropped[0].id;
+        let stack = s.game.dropped[0].stack.clone();
+        let random = s.game.world.random.state();
+        let clocks = (s.game.world.game_time, s.game.world.day_time);
+        let previous = tree(&published(&s, 1), &[]).unwrap();
+        let error = s
+            .game
+            .checkpoint_session_with_test_fault(&s.archive, 2, until(), CheckpointTestFault::Copied)
+            .unwrap_err();
+        assert_eq!(
+            (error.item_identities_assigned, error.publication),
+            (1, Publication::NotPublished)
+        );
+        assert!(error.to_string().contains("1 item identities assigned"));
+        let before = s.game.project_session_checkpoint_items().unwrap();
+        let memory = s.game.session_checkpoint_item_memory().unwrap();
+        let uuid = s.game.persist.uuids[&id];
+        assert_eq!(tree(&published(&s, 1), &[]).unwrap(), previous);
+        assert_eq!(s.game.dropped[0].id, id);
+        retirement_raw_equal(&s.game.dropped[0].stack, &stack);
+        s.game.checkpoint_session(&s.archive, 3, until()).unwrap();
+        assert_eq!(s.game.project_session_checkpoint_items().unwrap(), before);
+        assert_eq!(s.game.session_checkpoint_item_memory().unwrap(), memory);
+        assert_eq!(s.game.world.random.state(), random);
+        assert_eq!((s.game.world.game_time, s.game.world.day_time), clocks);
+        let image = published(&s, 3);
+        let manifest: Manifest = json(
+            &read(&image.join("manifest.json"), MANIFEST_LIMIT).unwrap(),
+            MANIFEST_LIMIT,
+        )
+        .unwrap();
+        assert_eq!(manifest.format, 1);
+        assert!(manifest.files.iter().any(|r| {
+            r.path
+                .starts_with("world/dimensions/minecraft/overworld/entities/")
+                && r.path.ends_with(".mca")
+        }));
+        assert!(
+            !manifest
+                .files
+                .iter()
+                .any(|r| r.path.contains("drops") || r.path.contains("journal"))
+        );
+        let (mut recovered, receipt, receivers) =
+            retirement_restored(&fixture, &s, &format!("items-restored-{index}"), owner);
+        assert_eq!(
+            recovered.project_session_checkpoint_items().unwrap(),
+            before
+        );
+        assert_eq!(session_items_total(&recovered, &receipt.slot), total);
+        assert_eq!(
+            recovered
+                .persist
+                .uuids
+                .values()
+                .filter(|u| **u == uuid)
+                .count(),
+            1
+        );
+        assert!(recovered.world.loaded_entities.is_empty());
+        let e = &recovered.dropped[0];
+        assert_eq!(
+            (e.previous, e.ticks, e.bob_offset.to_bits()),
+            (e.position, 0, 0)
+        );
+        retirement_raw_equal(&e.stack, &stack);
+        recovered
+            .checkpoint_session(&s.archive, 4, until())
+            .unwrap();
+        assert_eq!(
+            recovered.project_session_checkpoint_items().unwrap(),
+            before
+        );
+        drop(recovered);
+        drop(receivers);
+        let (again, receipt, _receivers) =
+            retirement_restored(&fixture, &s, &format!("items-again-{index}"), owner);
+        assert_eq!(again.project_session_checkpoint_items().unwrap(), before);
+        assert_eq!(session_items_total(&again, &receipt.slot), total);
+        assert_eq!(s.game.project_session_checkpoint_items().unwrap(), before);
+    }
+}
+
+#[test]
+#[ignore = "isolated pinned resources + prebuilt pair: actual private portal cooldown/process/orphan/sample refusal and matched-default roundtrip without cleanup ticks"]
+fn session_items_actual_private_portal_owners_before_uuid_and_after_native_save() {
+    use horizon_client::nether_portal::{PortalState, Process};
+    use horizon_core::position::BlockPos;
+    let fixture = Fixture::new("session-items-portals");
+    let _retain = RetainOnPanic::new(&fixture);
+    let mut s = session_items_delivered(&fixture, "item-portals", true, true);
+    let id = s.game.dropped[0].id;
+    // This writes the real private map. The native Base projection still emits 0.
+    s.game.set_portal_cooldown(id);
+    let native =
+        horizon_client::entity_nbt::item_entity_to_nbt(&s.game.dropped[0], [1, 2, 3, 4], None);
+    assert_eq!(native.get("PortalCooldown"), Some(&Tag::Int(0)));
+    session_items_assert_refusal_retains(&mut s, 2);
+    s.game.set_session_item_portal_for_test(id, None, None);
+    let mut states = vec![PortalState {
+        cooldown: -1,
+        process: None,
+    }];
+    for inside in [false, true] {
+        for time in [0, 7] {
+            states.push(PortalState {
+                cooldown: 0,
+                process: Some(Process {
+                    entry: BlockPos::new(2, 120, 2),
+                    time,
+                    inside,
+                }),
+            });
+        }
+    }
+    for state in states {
+        s.game
+            .set_session_item_portal_for_test(id, Some(state), None);
+        session_items_assert_refusal_retains(&mut s, 2);
+    }
+    s.game.set_session_item_portal_for_test(id, None, None);
+    for state in [
+        PortalState::default(),
+        PortalState {
+            cooldown: 1,
+            process: None,
+        },
+    ] {
+        s.game
+            .set_session_item_portal_for_test(id + 99, Some(state), None);
+        session_items_assert_refusal_retains(&mut s, 2);
+        s.game.set_session_item_portal_for_test(id + 99, None, None);
+    }
+    for (key, position) in [(id + 99, Vec3::ZERO), (id, Vec3::new(f64::NAN, 0.0, 0.0))] {
+        s.game
+            .set_session_item_portal_for_test(key, None, Some(position));
+        session_items_assert_refusal_retains(&mut s, 2);
+        s.game.set_session_item_portal_for_test(key, None, None);
+    }
+    s.game.set_session_item_portal_for_test(
+        id,
+        Some(PortalState::default()),
+        Some(Vec3::new(-0.0, 119.25, 2.0)),
+    );
+    let before = s.game.session_item_portal_bytes_for_test();
+    s.game.checkpoint_session(&s.archive, 2, until()).unwrap();
+    assert_eq!(s.game.session_item_portal_bytes_for_test(), before);
+    let projection = s.game.project_session_checkpoint_items().unwrap();
+    let (mut recovered, _, _receivers) =
+        retirement_restored(&fixture, &s, "item-portal-recovery", true);
+    assert_eq!(
+        recovered.project_session_checkpoint_items().unwrap(),
+        projection
+    );
+    assert!(
+        recovered
+            .portals
+            .project_session_item_portal_owners(&recovered.dropped)
+            .is_ok()
+    );
+    recovered
+        .checkpoint_session(&s.archive, 3, until())
+        .unwrap();
+    assert_eq!(s.game.session_item_portal_bytes_for_test(), before);
+}
+
+#[test]
+#[ignore = "isolated pinned resources + prebuilt pair: recursive drop and each participant owner selection refusal without item/map/file mutation"]
+fn session_items_actual_runtime_bundle_selection_refuses_each_owner_graph() {
+    let fixture = Fixture::new("session-items-selection");
+    let _retain = RetainOnPanic::new(&fixture);
+    let mut s = session_items_delivered(&fixture, "item-selection", true, true);
+    let original = s.game.dropped[0].stack.clone();
+    for nested in [false, true] {
+        if nested {
+            s.game.dropped[0].stack.data_mut().container[0]
+                .1
+                .data_mut()
+                .bundle_selected
+                .0 = 3;
+        } else {
+            s.game.dropped[0].stack.data_mut().bundle_selected.0 = 3;
+        }
+        session_items_assert_refusal_retains(&mut s, 2);
+        s.game.dropped[0].stack = original.clone();
+    }
+    for player in 0..2 {
+        for location in 0..4 {
+            for nested in [false, true] {
+                let guest = &mut s.game.lan.as_mut().unwrap().hub.guests[player];
+                let cell = match location {
+                    0 => &mut guest.inventory[8],
+                    1 => &mut guest.armor[0],
+                    2 => &mut guest.offhand,
+                    _ => &mut guest.ender_items[0],
+                };
+                let mut stack = session_items_rich();
+                if nested {
+                    stack.data_mut().bundle_contents[0]
+                        .data_mut()
+                        .bundle_selected
+                        .0 = 9;
+                } else {
+                    stack.data_mut().bundle_selected.0 = 9;
+                }
+                *cell = Some(stack.clone());
+                session_items_assert_refusal_retains(&mut s, 2);
+                let guest = &mut s.game.lan.as_mut().unwrap().hub.guests[player];
+                let cell = match location {
+                    0 => &mut guest.inventory[8],
+                    1 => &mut guest.armor[0],
+                    2 => &mut guest.offhand,
+                    _ => &mut guest.ender_items[0],
+                };
+                retirement_raw_equal(cell.as_ref().unwrap(), &stack);
+                *cell = None;
+            }
+        }
+    }
+    s.game.checkpoint_session(&s.archive, 2, until()).unwrap();
+}
+
+#[test]
+#[ignore = "isolated pinned resources + prebuilt pair: canonical nested template count1 survives all actual player owner locations and native dropped graph"]
+fn session_items_actual_template_one_defaults_survive_player_and_drop_roundtrip() {
+    let fixture = Fixture::new("session-items-template-one");
+    let _retain = RetainOnPanic::new(&fixture);
+    let mut s = session_items_delivered(&fixture, "item-template-one", true, true);
+    let mut stack = ItemStack::new("minecraft:stone", 2);
+    let child = ItemStack::new("minecraft:dirt", 1);
+    let data = stack.data_mut();
+    data.container.push((4, child.clone()));
+    data.charged.push(child.clone());
+    data.bundle_contents.push(child.clone());
+    data.pot_decorations = Some(Box::new([Some(child), None, None, None]));
+    for guest in &mut s.game.lan.as_mut().unwrap().hub.guests {
+        guest.inventory[8] = Some(stack.clone());
+        guest.armor[0] = Some(stack.clone());
+        guest.offhand = Some(stack.clone());
+        guest.ender_items[0] = Some(stack.clone());
+    }
+    let total = session_items_total(&s.game, &s.slot);
+    assert_eq!(total, 28 + 8 * 6);
+    s.game.checkpoint_session(&s.archive, 2, until()).unwrap();
+    let (game, receipt, _receivers) =
+        retirement_restored(&fixture, &s, "item-template-one-recovery", true);
+    assert_eq!(session_items_total(&game, &receipt.slot), total);
+    for guest in &game.lan.as_ref().unwrap().hub.guests {
+        for actual in [
+            &guest.inventory[8],
+            &guest.armor[0],
+            &guest.offhand,
+            &guest.ender_items[0],
+        ] {
+            retirement_raw_equal(actual.as_ref().unwrap(), &stack);
+        }
+    }
+    assert_eq!(
+        game.project_session_checkpoint_items().unwrap(),
+        s.game.project_session_checkpoint_items().unwrap()
+    );
+}
+
+fn session_items_second_delivery(s: &mut Session<'_>) {
+    use crate::game::slot_retirement::Delivery;
+    let slot = s.slot.clone();
+    transfer(&mut s.game, &slot, 10, Direction::IntoMachine, 1);
+    retirement_replace(&mut s.game, 1);
+    assert!(matches!(
+        s.game.deliver_pending_persistent_world_slot(&slot),
+        Ok(Delivery::Delivered { .. })
+    ));
+    s.slot = s
+        .game
+        .world
+        .reconcile_persistent_world_slot()
+        .unwrap()
+        .unwrap();
+    s.counter = s.game.world.persistent_counter_key().unwrap().unwrap();
+    assert_eq!(s.game.dropped.len(), 2);
+}
+
+#[test]
+#[ignore = "isolated pinned resources + prebuilt pair: staged UUID collision exhaustion, duplicate/orphan/raw/unknown/anonymous ownership and exact refusal retention"]
+fn session_items_actual_identity_and_memory_preflight_is_all_or_nothing() {
+    let fixture = Fixture::new("session-items-identities");
+    let _retain = RetainOnPanic::new(&fixture);
+    let mut s = session_items_delivered(&fixture, "item-identities", true, false);
+    session_items_second_delivery(&mut s);
+    let reserved = s.game.session_checkpoint_identity_preflight().unwrap();
+    let random = s.game.world.random.state();
+    let mut calls = 0;
+    let error = s
+        .game
+        .prepare_session_item_identities_with_test_entropy(|| {
+            calls += 1;
+            [31, 32, 33, 34]
+        })
+        .unwrap_err();
+    assert!(error.detail.contains("collision exhaustion"));
+    assert_eq!(calls, 33);
+    assert!(s.game.persist.uuids.is_empty());
+    calls = 0;
+    assert!(
+        s.game
+            .prepare_session_item_identities_with_test_entropy(|| {
+                calls += 1;
+                reserved[0]
+            })
+            .is_err()
+    );
+    assert_eq!(calls, 32);
+    assert!(s.game.persist.uuids.is_empty());
+    assert_eq!(s.game.world.random.state(), random);
+    let ids = [s.game.dropped[0].id, s.game.dropped[1].id];
+    s.game.dropped[1].id = ids[0];
+    session_items_assert_refusal_retains(&mut s, 2);
+    s.game.dropped[1].id = ids[1];
+    for anonymous in [false, true] {
+        s.game
+            .persist
+            .set_session_unmodelled_memory_for_test(anonymous, true);
+        session_items_assert_refusal_retains(&mut s, 2);
+        s.game
+            .persist
+            .set_session_unmodelled_memory_for_test(anonymous, false);
+    }
+    s.game.persist.uuids.insert(ids[0] + 100, [1, 2, 3, 4]);
+    session_items_assert_refusal_retains(&mut s, 2);
+    s.game.persist.uuids.remove(&(ids[0] + 100));
+    s.game.persist.raw.insert(
+        ids[0],
+        Tag::compound([("id", Tag::String("minecraft:item".into()))]),
+    );
+    session_items_assert_refusal_retains(&mut s, 2);
+    s.game.persist.raw.clear();
+    assert_eq!(
+        s.game.prepare_session_checkpoint_item_identities().unwrap(),
+        2
+    );
+    let uuids = [s.game.persist.uuids[&ids[0]], s.game.persist.uuids[&ids[1]]];
+    for collision in [uuids[0], reserved[0]] {
+        s.game.persist.uuids.insert(ids[1], collision);
+        session_items_assert_refusal_retains(&mut s, 2);
+    }
+    s.game.persist.uuids.insert(ids[1], uuids[1]);
+    let mut raw =
+        horizon_client::entity_nbt::item_entity_to_nbt(&s.game.dropped[0], uuids[0], None);
+    if let Tag::Compound(fields) = &mut raw {
+        fields.insert("UUID".into(), Tag::IntArray(vec![0, 0, 0, 0]));
+    }
+    s.game.persist.raw.insert(ids[0], raw);
+    session_items_assert_refusal_retains(&mut s, 2);
+    s.game.persist.raw.clear();
+    // Supported raw modelled fields may legitimately be stale after live edits.
+    let stale = horizon_client::entity_nbt::item_entity_to_nbt(&s.game.dropped[0], uuids[0], None);
+    s.game.persist.raw.insert(ids[0], stale);
+    s.game.dropped[0].position.x += 0.25;
+    s.game.dropped[0].stack.count += 1;
+    s.game.checkpoint_session(&s.archive, 2, until()).unwrap();
+    assert_eq!(s.game.persist.uuids[&ids[0]], uuids[0]);
+    assert_eq!(s.game.persist.uuids[&ids[1]], uuids[1]);
+}
+
+#[test]
+#[ignore = "isolated pinned resources + prebuilt pair: live item scalar/graph/component/count/entity limits refuse before identity preparation"]
+fn session_items_actual_live_profile_bounds_and_codec_coercions_refuse_without_writes() {
+    let fixture = Fixture::new("session-items-bounds");
+    let _retain = RetainOnPanic::new(&fixture);
+    let mut s = session_items_delivered(&fixture, "item-bounds", true, true);
+    let original = s.game.dropped[0].clone();
+    for case in 0..18 {
+        match case {
+            0 => s.game.dropped[0].health = i32::from(i16::MAX) + 1,
+            1 => s.game.dropped[0].fire_ticks = i32::from(i16::MIN) - 1,
+            2 => s.game.dropped[0].age = 32768,
+            3 => s.game.dropped[0].pickup_delay = 32768,
+            4 => s.game.dropped[0].velocity.x = f64::INFINITY,
+            5 => s.game.dropped[0].position.z = f64::NAN,
+            6 => s.game.dropped[0].stack.count = 0,
+            7 => s.game.dropped[0].stack.damage = u32::MAX,
+            8 => s.game.dropped[0].stack.item = Arc::from("fixture:missing"),
+            9 => {
+                let d = s.game.dropped[0].stack.data_mut();
+                d.container.push(d.container[0].clone());
+            }
+            10 => {
+                let d = s.game.dropped[0].stack.data_mut();
+                d.other.push(d.other[0].clone());
+            }
+            11 => s.game.dropped[0]
+                .stack
+                .data_mut()
+                .set_other("minecraft:attribute_modifiers", Some(Tag::List(vec![]))),
+            12 => s.game.dropped[0].stack.data_mut().custom_name = Some("x".repeat(4097)),
+            13 => {
+                let mut stack = ItemStack::new("minecraft:stone", 1);
+                for _ in 0..33 {
+                    let mut parent = ItemStack::new("minecraft:stone", 1);
+                    parent.data_mut().bundle_contents.push(stack);
+                    stack = parent;
+                }
+                s.game.dropped[0].stack = stack;
+            }
+            14 => {
+                s.game.dropped[0].stack.data_mut().bundle_contents =
+                    vec![ItemStack::new("minecraft:dirt", 1); 16_385]
+            }
+            15 => s.game.dropped.extend(vec![original.clone(); 1024]),
+            16 => s.game.dropped[0].velocity.z = -0.0,
+            _ => s.game.dropped[0]
+                .stack
+                .data_mut()
+                .set_other("example:zero", Some(Tag::Double((-0.0f64).to_bits()))),
+        }
+        session_items_assert_refusal_retains(&mut s, 2);
+        s.game.dropped.truncate(1);
+        s.game.dropped[0] = original.clone();
+    }
+    s.game.checkpoint_session(&s.archive, 2, until()).unwrap();
+}
+
+#[test]
+#[ignore = "isolated pinned resources + prebuilt pair: actual recovery queue missing/extra/duplicate/reordered owners, missing resident and checked ID exhaustion before publication"]
+fn session_items_actual_fresh_installer_refusals_retain_queue_ids_and_random() {
+    let fixture = Fixture::new("session-items-installer");
+    let _retain = RetainOnPanic::new(&fixture);
+    let mut s = session_items_delivered(&fixture, "item-installer", true, true);
+    session_items_second_delivery(&mut s);
+    s.game.checkpoint_session(&s.archive, 2, until()).unwrap();
+    let expected = s.game.project_session_checkpoint_items().unwrap();
+    let candidate = Box::new(fresh(&fixture));
+    let destination = s.archive.parent().unwrap().join("item-installer-recovery");
+    let mut parts = candidate
+        .prepare_session_checkpoint_before_items(request(&s, destination), |game, image| {
+            let original = game.world.loaded_entities.clone();
+            assert_eq!(original.iter().map(|(_, v)| v.len()).sum::<usize>(), 2);
+            let head = game.next_entity;
+            let random = game.world.random.state();
+            assert!(
+                game.check_session_item_install_reservation_for_test(image, usize::MAX)
+                    .is_err()
+            );
+            assert_eq!(game.world.loaded_entities, original);
+            assert_eq!(game.next_entity, head);
+            assert!(
+                game.dropped.is_empty()
+                    && game.persist.uuids.is_empty()
+                    && game.persist.raw.is_empty()
+            );
+            for case in 0..6 {
+                game.world.loaded_entities = original.clone();
+                match case {
+                    0 => {
+                        game.world.loaded_entities[0].1.pop();
+                    }
+                    1 => {
+                        let extra = game.world.loaded_entities[0].1[0].clone();
+                        game.world.loaded_entities[0].1.push(extra);
+                    }
+                    2 => {
+                        let mut extra = game.world.loaded_entities[0].1[0].clone();
+                        if let Tag::Compound(fields) = &mut extra {
+                            fields.insert("UUID".into(), Tag::IntArray(vec![9, 8, 7, 6]));
+                        }
+                        game.world.loaded_entities[0].1.push(extra);
+                    }
+                    3 => game.next_entity = u32::MAX,
+                    4 => {
+                        let extra = game.world.loaded_entities[0].clone();
+                        game.world.loaded_entities.push(extra);
+                    }
+                    _ => {
+                        let item = game.world.loaded_entities[0].1[0].clone();
+                        game.persist.raw.insert(77, item);
+                    }
+                }
+                let queue = game.world.loaded_entities.clone();
+                let id = game.next_entity;
+                let raw = game.persist.raw.clone();
+                assert!(
+                    game.install_session_checkpoint_items(image).is_err(),
+                    "case {case}"
+                );
+                assert!(game.dropped.is_empty());
+                assert!(game.persist.uuids.is_empty());
+                assert_eq!(game.persist.raw, raw);
+                assert_eq!(game.world.loaded_entities, queue);
+                assert_eq!(game.next_entity, id);
+                assert_eq!(game.world.random.state(), random);
+                game.next_entity = head;
+                game.persist.raw.clear();
+            }
+            game.world.loaded_entities = original;
+            let key = *image.columns().iter().next().unwrap();
+            let chunk = game.world.chunks.remove(&key).unwrap();
+            let queue = game.world.loaded_entities.clone();
+            assert!(game.install_session_checkpoint_items(image).is_err());
+            assert!(game.dropped.is_empty());
+            assert_eq!(game.world.loaded_entities, queue);
+            assert_eq!(game.next_entity, head);
+            game.world.chunks.insert(key, chunk);
+            game.world.loaded_entities.reverse();
+            for (_, tags) in &mut game.world.loaded_entities {
+                tags.reverse();
+            }
+            image.check_arrivals(
+                game,
+                &game.world.chunks.keys().copied().collect(),
+                &game.world.loaded_entities,
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        parts.game.project_session_checkpoint_items().unwrap(),
+        expected
+    );
+    assert!(parts.game.world.loaded_entities.is_empty());
+    let (host, _receivers) = make_host(&mut parts.game, true, [110, 220], false);
+    parts
+        .game
+        .install_session_checkpoint_participants(host, &parts.verified.players)
+        .unwrap();
+    let (mut game, _) = parts.finish().unwrap();
+    let before = game.project_session_checkpoint_items().unwrap();
+    // A second attempt cannot install the image into an already-owning Game.
+    let image = verify_image(
+        &game,
+        &published(&s, 2),
+        2,
+        s.counter.placement().world,
+        &s.target,
+        &s.type_id,
+    )
+    .unwrap();
+    assert!(game.install_session_checkpoint_items(&image.items).is_err());
+    assert_eq!(game.project_session_checkpoint_items().unwrap(), before);
+}
+
+fn session_items_edit_native_record(path: &Path, change: impl FnOnce(&mut NamedTag, ChunkPos)) {
+    let mut region = RegionFile::open_writable(path, false).unwrap();
+    let coordinate = region.chunks().next().unwrap().0;
+    let original = region.read(coordinate).unwrap().unwrap();
+    let mut named = raw_nbt(
+        &original
+            .compression
+            .decode(&original.compressed, STRUCTURED_LIMIT)
+            .unwrap(),
+    )
+    .unwrap();
+    change(&mut named, coordinate);
+    let record =
+        horizon_world::region::ChunkRecord::from_nbt(&named, Compression::Zlib, 0, limits())
+            .unwrap();
+    region.write(coordinate, &record).unwrap();
+}
+fn session_items_mutate_record(named: &mut NamedTag, at: ChunkPos, case: usize) {
+    let Tag::Compound(root) = &mut named.tag else {
+        panic!("record compound")
+    };
+    match case {
+        0 => {
+            root.insert("DataVersion".into(), Tag::Int(DATA_VERSION - 1));
+        }
+        1 => {
+            root.insert("Position".into(), Tag::IntArray(vec![at.x + 1, at.z]));
+        }
+        2 => {
+            root.insert("unmodelled_owner".into(), Tag::Byte(0));
+        }
+        _ => {
+            let Some(Tag::List(entities)) = root.get_mut(&"Entities".into()) else {
+                panic!("record list")
+            };
+            if case == 3 {
+                entities.push(entities[0].clone());
+                return;
+            }
+            let Tag::Compound(item) = &mut entities[0] else {
+                panic!("item compound")
+            };
+            match case {
+                4 => {
+                    item.insert("id".into(), Tag::String("minecraft:pig".into()));
+                }
+                5 => {
+                    item.insert("Passengers".into(), Tag::List(vec![]));
+                }
+                6 => {
+                    item.insert("PortalCooldown".into(), Tag::Int(1));
+                }
+                7 => {
+                    item.insert("Health".into(), Tag::Int(5));
+                }
+                8 => {
+                    item.insert("UUID".into(), Tag::IntArray(vec![1, 2, 3]));
+                }
+                9 => {
+                    item.insert(
+                        "Pos".into(),
+                        Tag::List(vec![
+                            Tag::Double(1024f64.to_bits()),
+                            Tag::Double(120f64.to_bits()),
+                            Tag::Double(0),
+                        ]),
+                    );
+                }
+                10 => {
+                    item.remove(&"Motion".into());
+                }
+                11 => {
+                    item.insert("fall_distance".into(), Tag::Double((-0.0f64).to_bits()));
+                }
+                _ => {
+                    let child = item
+                        .get_mut(&"Item".into())
+                        .and_then(|v| v.get_mut("components"))
+                        .and_then(|v| v.get_mut("minecraft:pot_decorations"))
+                        .and_then(|v| v.get_mut("back"))
+                        .unwrap();
+                    let Tag::Compound(child) = child else {
+                        unreachable!()
+                    };
+                    child.insert(
+                        "count".into(),
+                        if case == 12 {
+                            Tag::Byte(1)
+                        } else {
+                            Tag::Int(0)
+                        },
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "isolated pinned resources + prebuilt pair: every source entity record and resealed image strictly validated before writer normalization or native opening"]
+fn session_items_actual_source_and_resealed_entity_schema_refuse_before_normalization() {
+    let fixture = Fixture::new("session-items-records");
+    let _retain = RetainOnPanic::new(&fixture);
+    let mut s = session_items_delivered(&fixture, "item-records", true, true);
+    s.game.checkpoint_session(&s.archive, 2, until()).unwrap();
+    let native = s.game.save.root.join("entities/r.0.0.mca");
+    let bytes = fs::read(&native).unwrap();
+    let image = published(&s, 2);
+    let inventory = tree(&image, &[]).unwrap();
+    for case in 0..14 {
+        session_items_edit_native_record(&native, |tag, at| {
+            session_items_mutate_record(tag, at, case)
+        });
+        session_items_assert_refusal_retains(&mut s, 3);
+        fs::write(&native, &bytes).unwrap();
+        let copied = s
+            .archive
+            .parent()
+            .unwrap()
+            .join(format!("items-invalid-image-{case}"));
+        copy_tree(&image, &copied, &inventory, until()).unwrap();
+        let path = copied.join("world/dimensions/minecraft/overworld/entities/r.0.0.mca");
+        session_items_edit_native_record(&path, |tag, at| {
+            session_items_mutate_record(tag, at, case)
+        });
+        reseal(&copied, 2);
+        assert!(
+            verify_image(
+                &s.game,
+                &copied,
+                2,
+                s.counter.placement().world,
+                &s.target,
+                &s.type_id
+            )
+            .is_err(),
+            "resealed {case}"
+        );
+    }
+    let live = s.game.project_session_checkpoint_items().unwrap();
+    // Use the actual native writer for valid stale disk history, including a
+    // resident column with no current live owner. Capture must overwrite/delete
+    // these records through that same writer rather than filtering its copy.
+    let mut stale = live.rows.values().next().unwrap().tag.clone();
+    let Some(Tag::Compound(item)) = stale.get_mut("Item") else {
+        unreachable!()
+    };
+    item.insert("count".into(), Tag::Int(99));
+    let mut orphan = stale.clone();
+    if let Tag::Compound(fields) = &mut orphan {
+        fields.insert("UUID".into(), Tag::IntArray(vec![97, 98, 99, 100]));
+        fields.insert(
+            "Pos".into(),
+            Tag::List(vec![
+                Tag::Double(16.5f64.to_bits()),
+                Tag::Double(120.5f64.to_bits()),
+                Tag::Double(2.5f64.to_bits()),
+            ]),
+        );
+    }
+    assert!(s.game.world.chunks.contains_key(&(1, 0)));
+    s.game
+        .save
+        .save_entities(vec![((0, 0), vec![stale]), ((1, 0), vec![orphan])])
+        .unwrap();
+    s.game.checkpoint_session(&s.archive, 3, until()).unwrap();
+    assert_eq!(s.game.project_session_checkpoint_items().unwrap(), live);
+    assert_eq!(
+        verify_image(
+            &s.game,
+            &published(&s, 3),
+            3,
+            s.counter.placement().world,
+            &s.target,
+            &s.type_id
+        )
+        .unwrap()
+        .items
+        .projection,
+        live
+    );
+    assert!(s.game.save.load_entities(1, 0).is_empty());
+    assert_eq!(tree(&image, &[]).unwrap(), inventory);
+}
+
+#[test]
+#[ignore = "isolated pinned resources + prebuilt pair: raw entity sectors/compression/length/trailing data and off-resident records refuse in source and resealed images"]
+fn session_items_actual_raw_regions_and_off_resident_records_are_never_skipped() {
+    let fixture = Fixture::new("session-items-physical");
+    let _retain = RetainOnPanic::new(&fixture);
+    let mut s = session_items_delivered(&fixture, "item-physical", true, false);
+    s.game.checkpoint_session(&s.archive, 2, until()).unwrap();
+    let native = s.game.save.root.join("entities/r.0.0.mca");
+    let original = fs::read(&native).unwrap();
+    let location = u32::from_be_bytes(original[..4].try_into().unwrap());
+    let offset = (location >> 8) as usize * 4096;
+    let image = published(&s, 2);
+    let inventory = tree(&image, &[]).unwrap();
+    for case in 0..8 {
+        let mut bytes = original.clone();
+        match case {
+            0 => bytes.truncate(4096),
+            1 => bytes[..4].copy_from_slice(&0x101u32.to_be_bytes()),
+            2 => bytes[..4].copy_from_slice(&(location & !255).to_be_bytes()),
+            3 => bytes[4000..4004].copy_from_slice(&location.to_be_bytes()),
+            4 => bytes[offset + 4] |= 128,
+            5 => bytes[offset + 4] = 99,
+            6 => bytes[offset..offset + 4].copy_from_slice(&u32::MAX.to_be_bytes()),
+            _ => bytes[offset..offset + 4].copy_from_slice(&0u32.to_be_bytes()),
+        }
+        fs::write(&native, &bytes).unwrap();
+        session_items_assert_refusal_retains(&mut s, 3);
+        fs::write(&native, &original).unwrap();
+        let copy = s
+            .archive
+            .parent()
+            .unwrap()
+            .join(format!("items-physical-image-{case}"));
+        copy_tree(&image, &copy, &inventory, until()).unwrap();
+        fs::write(
+            copy.join("world/dimensions/minecraft/overworld/entities/r.0.0.mca"),
+            &bytes,
+        )
+        .unwrap();
+        reseal(&copy, 2);
+        assert!(
+            verify_image(
+                &s.game,
+                &copy,
+                2,
+                s.counter.placement().world,
+                &s.target,
+                &s.type_id
+            )
+            .is_err()
+        );
+    }
+    // A bounded but trailing native NBT payload is not repaired by a decoder.
+    {
+        let mut region = RegionFile::open_writable(&native, false).unwrap();
+        let at = region.chunks().next().unwrap().0;
+        let record = region.read(at).unwrap().unwrap();
+        let mut raw = record
+            .compression
+            .decode(&record.compressed, STRUCTURED_LIMIT)
+            .unwrap();
+        raw.push(0);
+        region
+            .write(
+                at,
+                &horizon_world::region::ChunkRecord {
+                    compression: Compression::None,
+                    compressed: raw,
+                    timestamp: 0,
+                },
+            )
+            .unwrap();
+    }
+    session_items_assert_refusal_retains(&mut s, 3);
+    fs::write(&native, &original).unwrap();
+    let projection = s.game.project_session_checkpoint_items().unwrap();
+    for malformed in [false, true] {
+        let mut tag = projection.rows.values().next().unwrap().tag.clone();
+        if let Tag::Compound(fields) = &mut tag {
+            fields.insert(
+                "Pos".into(),
+                Tag::List(vec![
+                    Tag::Double(3200.5f64.to_bits()),
+                    Tag::Double(120.5f64.to_bits()),
+                    Tag::Double(3200.5f64.to_bits()),
+                ]),
+            );
+            fields.insert("UUID".into(), Tag::IntArray(vec![91, 92, 93, 94]));
+            if malformed {
+                fields.insert("Health".into(), Tag::Int(5));
+            }
+        }
+        s.game
+            .save
+            .save_entities(vec![((200, 200), vec![tag])])
+            .unwrap();
+        session_items_assert_refusal_retains(&mut s, 3);
+        let copy = s
+            .archive
+            .parent()
+            .unwrap()
+            .join(format!("items-offresident-image-{malformed}"));
+        copy_tree(&image, &copy, &inventory, until()).unwrap();
+        fs::copy(
+            s.game.save.root.join("entities/r.6.6.mca"),
+            copy.join("world/dimensions/minecraft/overworld/entities/r.6.6.mca"),
+        )
+        .unwrap();
+        reseal(&copy, 2);
+        assert!(
+            verify_image(
+                &s.game,
+                &copy,
+                2,
+                s.counter.placement().world,
+                &s.target,
+                &s.type_id
+            )
+            .is_err()
+        );
+        s.game
+            .save
+            .save_entities(vec![((200, 200), Vec::new())])
+            .unwrap();
+    }
+    s.game.checkpoint_session(&s.archive, 3, until()).unwrap();
+    assert_eq!(
+        s.game.project_session_checkpoint_items().unwrap(),
+        projection
+    );
+}
+
+#[test]
+#[ignore = "isolated pinned resources + prebuilt pair: promoted uncertainty retains genuine original owner and UUID; fresh-epoch retry restores one owner"]
+fn session_items_actual_promoted_uncertainty_and_new_epoch_retry_preserve_uuid() {
+    let fixture = Fixture::new("session-items-promoted");
+    let _retain = RetainOnPanic::new(&fixture);
+    let mut s = session_items_delivered(&fixture, "item-promoted", false, true);
+    let previous = tree(&published(&s, 1), &[]).unwrap();
+    let error = s
+        .game
+        .checkpoint_session_with_test_fault(&s.archive, 2, until(), CheckpointTestFault::Promoted)
+        .unwrap_err();
+    assert_eq!(
+        (error.publication, error.item_identities_assigned),
+        (Publication::Uncertain, 1)
+    );
+    let projection = s.game.project_session_checkpoint_items().unwrap();
+    let memory = s.game.session_checkpoint_item_memory().unwrap();
+    assert!(published(&s, 2).exists());
+    assert_eq!(tree(&published(&s, 1), &[]).unwrap(), previous);
+    s.game.checkpoint_session(&s.archive, 3, until()).unwrap();
+    assert_eq!(
+        s.game.project_session_checkpoint_items().unwrap(),
+        projection
+    );
+    assert_eq!(s.game.session_checkpoint_item_memory().unwrap(), memory);
+    let (game, receipt, _receivers) =
+        retirement_restored(&fixture, &s, "item-promoted-recovery", false);
+    assert_eq!(receipt.epoch, 3);
+    assert_eq!(game.project_session_checkpoint_items().unwrap(), projection);
+    assert_eq!(game.dropped.len(), 1);
+}
+
+#[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+#[test]
+#[ignore = "isolated pinned resources + prebuilt pair: actual writer block after UUID preparation, total deadline, release and fresh-epoch retry retain rich dropped owner"]
+fn session_items_actual_writer_deadline_release_and_retry_retain_original_owner() {
+    use horizon_client::save::NativeWriterTestAction;
+    let fixture = Fixture::new("session-items-writer");
+    let _retain = RetainOnPanic::new(&fixture);
+    let mut s = session_items_delivered(&fixture, "item-writer", true, true);
+    let stack = s.game.dropped[0].stack.clone();
+    let id = s.game.dropped[0].id;
+    let mut gate = s
+        .game
+        .save
+        .arm_native_writer_test_control(NativeWriterTestAction::Block)
+        .unwrap();
+    let error = s
+        .game
+        .checkpoint_session(&s.archive, 2, Instant::now() + Duration::from_secs(10))
+        .unwrap_err();
+    gate.wait_entered(WAIT).unwrap();
+    assert_eq!(
+        (error.publication, error.item_identities_assigned),
+        (Publication::NotPublished, 1)
+    );
+    assert!(!published(&s, 2).exists());
+    let projection = s.game.project_session_checkpoint_items().unwrap();
+    let memory = s.game.session_checkpoint_item_memory().unwrap();
+    assert_eq!(s.game.dropped[0].id, id);
+    retirement_raw_equal(&s.game.dropped[0].stack, &stack);
+    gate.trigger().unwrap();
+    drop(gate);
+    native_fence(&mut s.game, until());
+    s.game.checkpoint_session(&s.archive, 3, until()).unwrap();
+    assert_eq!(
+        s.game.project_session_checkpoint_items().unwrap(),
+        projection
+    );
+    assert_eq!(s.game.session_checkpoint_item_memory().unwrap(), memory);
+    let (game, _, _receivers) = retirement_restored(&fixture, &s, "item-writer-recovery", true);
+    assert_eq!(game.project_session_checkpoint_items().unwrap(), projection);
+}
+
+#[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+#[test]
+#[ignore = "isolated pinned resources + prebuilt pair: real sticky native entity-region writer error preserves original delivered owner and previous accepted epoch"]
+fn session_items_actual_entity_writer_filesystem_error_retains_drop_and_prior_image() {
+    let fixture = Fixture::new("session-items-writer-error");
+    let _retain = RetainOnPanic::new(&fixture);
+    let mut s = session_items_delivered(&fixture, "item-writer-error", false, true);
+    let far = (40, 40);
+    s.game.streaming.extra = s
+        .game
+        .world
+        .chunks
+        .keys()
+        .copied()
+        .map(|at| (at, 0))
+        .chain([(far, 0)])
+        .collect();
+    residency(&mut s.game, 0, far);
+    s.game.dropped[0].position = Vec3::new(640.5, 120.5, 640.5);
+    let blocked = s.game.save.root.join("entities/r.1.1.mca");
+    assert!(!blocked.exists());
+    fs::create_dir_all(blocked.parent().unwrap()).unwrap();
+    fs::create_dir(&blocked).unwrap();
+    let prior = tree(&published(&s, 1), &[]).unwrap();
+    let stack = s.game.dropped[0].stack.clone();
+    let id = s.game.dropped[0].id;
+    let random = s.game.world.random.state();
+    let error = s
+        .game
+        .checkpoint_session(&s.archive, 2, until())
+        .unwrap_err();
+    assert_eq!(
+        (error.publication, error.item_identities_assigned),
+        (Publication::NotPublished, 1)
+    );
+    assert!(
+        s.game
+            .save
+            .observe_native_writer_for_test()
+            .unwrap()
+            .sticky_error()
+            .is_some()
+    );
+    assert!(!published(&s, 2).exists());
+    assert_eq!(tree(&published(&s, 1), &[]).unwrap(), prior);
+    assert_eq!(s.game.dropped[0].id, id);
+    retirement_raw_equal(&s.game.dropped[0].stack, &stack);
+    assert!(s.game.persist.uuids.contains_key(&id));
+    assert_eq!(s.game.world.random.state(), random);
+    // The sticky writer cannot be relabeled healthy or reset here. Its actual
+    // owning SaveDir is dropped after source ownership assertions and joins it.
+}
+
+#[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+#[test]
+#[ignore = "isolated pinned resources + prebuilt pair: verified distant item paused in actual native worker, original recovery deadline, owned release and real recapture"]
+fn session_items_actual_delayed_native_item_column_deadline_release_and_cancellation() {
+    let fixture = Fixture::new("session-items-delayed-column");
+    let _retain = RetainOnPanic::new(&fixture);
+    let mut s = session_items_delivered(&fixture, "item-delayed-column", true, true);
+    let far = (40, 40);
+    s.game.streaming.extra = s
+        .game
+        .world
+        .chunks
+        .keys()
+        .copied()
+        .map(|at| (at, 0))
+        .chain([(far, 0)])
+        .collect();
+    residency(&mut s.game, 0, far);
+    s.game.dropped[0].position = Vec3::new(640.5, 120.5, 640.5);
+    s.game.checkpoint_session(&s.archive, 2, until()).unwrap();
+    let projection = s.game.project_session_checkpoint_items().unwrap();
+    let memory = s.game.session_checkpoint_item_memory().unwrap();
+    let archive = tree(&s.archive, &[]).unwrap();
+    let source = tree(&s.game.world_root, &["session.lock"]).unwrap();
+    let staging = std::cell::Cell::new(false);
+    let mut control = SessionItemLoadTest {
+        column: far,
+        mode: SessionItemLoadTestMode::HoldToDeadline,
+        observer: None,
+    };
+    let candidate = Box::new(fresh(&fixture));
+    let mut recovery = request(
+        &s,
+        s.archive.parent().unwrap().join("item-delayed-deadline"),
+    );
+    let original_deadline = Instant::now() + Duration::from_secs(20);
+    recovery.deadline = original_deadline;
+    let result = candidate.prepare_session_checkpoint_steps(
+        recovery,
+        |_, _| {
+            staging.set(true);
+            Ok(())
+        },
+        Some(&mut control),
+    );
+    let error = match result {
+        Err(error) => error,
+        Ok(parts) => {
+            drop(parts);
+            panic!("paused item column returned a recovery owner")
+        }
+    };
+    // On Err, the locally owned receipt already released before PreparedWorld
+    // destruction, and Streaming already joined every real worker. Assert only
+    // after that cleanup; no detached helper thread or fake provider exists.
+    let observer = control.observer.as_ref().unwrap();
+    assert!(
+        observer.entered() && observer.resumed(),
+        "actual target Generate worker must have entered and been reaped"
+    );
+    assert!(error.detail.contains("deadline"), "{error}");
+    assert!(Instant::now() >= original_deadline);
+    assert!(!staging.get());
+    assert_eq!(error.item_identities_assigned, 0);
+    assert_eq!(
+        s.game.project_session_checkpoint_items().unwrap(),
+        projection
+    );
+    assert_eq!(s.game.session_checkpoint_item_memory().unwrap(), memory);
+    assert_eq!(tree(&s.archive, &[]).unwrap(), archive);
+    assert_eq!(tree(&s.game.world_root, &["session.lock"]).unwrap(), source);
+    for (name, mode) in [
+        ("released", SessionItemLoadTestMode::ReleaseAfterEntry),
+        ("cancelled", SessionItemLoadTestMode::DropBeforeEntry),
+    ] {
+        let candidate = Box::new(fresh(&fixture));
+        let mut control = SessionItemLoadTest {
+            column: far,
+            mode,
+            observer: None,
+        };
+        let recovery = request(
+            &s,
+            s.archive
+                .parent()
+                .unwrap()
+                .join(format!("item-delayed-{name}")),
+        );
+        let mut parts = candidate
+            .prepare_session_checkpoint_steps(recovery, |_, _| Ok(()), Some(&mut control))
+            .unwrap();
+        let observer = control.observer.as_ref().unwrap();
+        if name == "released" {
+            assert!(observer.entered() && observer.resumed());
+        } else {
+            assert!(!observer.entered());
+        }
+        assert!(parts.game.world.chunks.contains_key(&far));
+        assert!(parts.game.world.loaded_entities.is_empty());
+        assert_eq!(
+            parts.game.project_session_checkpoint_items().unwrap(),
+            projection
+        );
+        let (host, _receivers) = make_host(&mut parts.game, true, [110, 220], false);
+        parts
+            .game
+            .install_session_checkpoint_participants(host, &parts.verified.players)
+            .unwrap();
+        let (mut game, _) = parts.finish().unwrap();
+        let epoch = if name == "released" { 3 } else { 4 };
+        game.checkpoint_session(&s.archive, epoch, until()).unwrap();
+        assert_eq!(game.project_session_checkpoint_items().unwrap(), projection);
+        assert_eq!(
+            s.game.project_session_checkpoint_items().unwrap(),
+            projection
+        );
+    }
+}

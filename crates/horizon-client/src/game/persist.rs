@@ -1069,7 +1069,282 @@ impl EntityMemory {
             None
         }
     }
+    #[cfg(test)]
+    pub(in crate::game) fn set_session_unmodelled_memory_for_test(
+        &mut self,
+        anonymous: bool,
+        present: bool,
+    ) {
+        let tag = Tag::compound([("id", Tag::String("fixture:unmodelled".into()))]);
+        if anonymous {
+            let key = anon_key("fixture:unmodelled", Vec3::ZERO);
+            self.anon.remove(&key);
+            if present {
+                self.anon.insert(key, (Vec3::ZERO, None, tag));
+            }
+        } else {
+            self.unknown.remove(&(0, 0));
+            if present {
+                self.unknown.insert((0, 0), vec![tag]);
+            }
+        }
+    }
+    #[cfg(test)]
+    pub(in crate::game) fn session_unmodelled_memory_for_test(&self) -> Vec<Tag> {
+        self.unknown
+            .values()
+            .flatten()
+            .chain(self.anon.values().map(|(_, _, t)| t))
+            .cloned()
+            .collect()
+    }
 }
 
 #[cfg(all(test, feature = "paired-packages"))]
 mod entity_owner_tests;
+
+#[cfg(feature = "paired-packages")]
+#[derive(Debug, PartialEq)]
+pub(in crate::game) struct SessionItemMemoryProjection {
+    uuids: std::collections::BTreeMap<u32, [i32; 4]>,
+    raw: std::collections::BTreeMap<u32, Tag>,
+}
+
+#[cfg(feature = "paired-packages")]
+struct PreparedSessionItems {
+    items: Vec<horizon_client::entities::ItemEntity>,
+    uuids: HashMap<u32, [i32; 4]>,
+    raw: HashMap<u32, Tag>,
+    next_entity: u32,
+}
+
+#[cfg(feature = "paired-packages")]
+impl Game<'_> {
+    /// Inspect every native-memory category, even when there are zero drops.
+    /// Raw modelled values may be stale; syntax and identity must still be exact.
+    pub(in crate::game) fn preflight_session_checkpoint_item_memory(
+        &self,
+    ) -> super::levels::session_checkpoint::SResult<()> {
+        use super::levels::session_checkpoint::{checked, fail, items, require};
+        require(
+            self.dropped.len() <= items::ITEM_LIMIT,
+            "session dropped item bound",
+        )?;
+        require(
+            self.persist.unknown.is_empty() && self.persist.anon.is_empty(),
+            "unknown/anonymous item memory owner",
+        )?;
+        let mut ids = HashSet::new();
+        let mut uuids = HashSet::new();
+        checked(ids.try_reserve(self.dropped.len()))?;
+        checked(uuids.try_reserve(self.dropped.len()))?;
+        let mut bytes = 0usize;
+        for item in &self.dropped {
+            require(ids.insert(item.id), "duplicate live item ID")?;
+            let (_, item_bytes) = items::validate_live_item(self, item)?;
+            bytes = bytes
+                .checked_add(item_bytes)
+                .ok_or_else(|| fail("item image byte overflow"))?;
+            require(bytes <= 64 << 20, "item aggregate image bound")?;
+            if let Some(uuid) = self.persist.uuids.get(&item.id) {
+                require(uuids.insert(*uuid), "duplicate live item UUID")?;
+            }
+        }
+        require(
+            self.persist.uuids.keys().all(|id| ids.contains(id))
+                && self.persist.raw.keys().all(|id| ids.contains(id)),
+            "orphan item UUID/raw memory",
+        )?;
+        let mut raw_bytes = 0usize;
+        for (id, raw) in &self.persist.raw {
+            let expected = self
+                .persist
+                .uuids
+                .get(id)
+                .ok_or_else(|| fail("raw item without UUID"))?;
+            let (uuid, _) = items::validate_item_tag(self, raw)?;
+            require(uuid == *expected, "raw/live item UUID mismatch")?;
+            raw_bytes = raw_bytes
+                .checked_add(items::exact_item_encoding(raw)?)
+                .ok_or_else(|| fail("raw item memory byte overflow"))?;
+            require(raw_bytes <= 64 << 20, "raw item memory aggregate bound")?;
+        }
+        Ok(())
+    }
+
+    pub(in crate::game) fn session_checkpoint_item_memory(
+        &self,
+    ) -> super::levels::session_checkpoint::SResult<SessionItemMemoryProjection> {
+        use super::levels::session_checkpoint::{items::ITEM_LIMIT, require};
+        self.preflight_session_checkpoint_item_memory()?;
+        require(
+            self.persist.uuids.len() == self.dropped.len() && self.dropped.len() <= ITEM_LIMIT,
+            "missing prepared item UUID",
+        )?;
+        Ok(SessionItemMemoryProjection {
+            uuids: self.persist.uuids.iter().map(|(k, v)| (*k, *v)).collect(),
+            raw: self
+                .persist
+                .raw
+                .iter()
+                .map(|(k, v)| (*k, v.clone()))
+                .collect(),
+        })
+    }
+
+    /// Explicit preparation mutation: assignments survive a later capture error.
+    /// All missing assignments and capacity are staged before the first insert.
+    pub(in crate::game) fn prepare_session_checkpoint_item_identities(
+        &mut self,
+    ) -> super::levels::session_checkpoint::SResult<usize> {
+        let reserved = self.session_checkpoint_identity_preflight()?;
+        self.stage_session_item_identities(&reserved, random_uuid)
+    }
+    fn stage_session_item_identities(
+        &mut self,
+        reserved: &[[i32; 4]],
+        mut entropy: impl FnMut() -> [i32; 4],
+    ) -> super::levels::session_checkpoint::SResult<usize> {
+        use super::levels::session_checkpoint::{checked, fail, require};
+        self.preflight_session_checkpoint_item_memory()?;
+        let mut used = HashSet::new();
+        checked(used.try_reserve(reserved.len() + self.dropped.len()))?;
+        used.extend(reserved.iter().copied());
+        for uuid in self.persist.uuids.values() {
+            require(
+                used.insert(*uuid),
+                "item/player or item/item UUID collision",
+            )?;
+        }
+        let mut staged = Vec::new();
+        checked(staged.try_reserve(self.dropped.len() - self.persist.uuids.len()))?;
+        for item in &self.dropped {
+            if self.persist.uuids.contains_key(&item.id) {
+                continue;
+            }
+            let uuid = (0..32)
+                .find_map(|_| {
+                    let uuid = entropy();
+                    used.insert(uuid).then_some(uuid)
+                })
+                .ok_or_else(|| fail("item UUID entropy collision exhaustion"))?;
+            staged.push((item.id, uuid));
+        }
+        checked(self.persist.uuids.try_reserve(staged.len()))?;
+        let assigned = staged.len();
+        for (id, uuid) in staged {
+            self.persist.uuids.insert(id, uuid);
+        }
+        Ok(assigned)
+    }
+    #[cfg(test)]
+    pub(in crate::game) fn prepare_session_item_identities_with_test_entropy(
+        &mut self,
+        entropy: impl FnMut() -> [i32; 4],
+    ) -> super::levels::session_checkpoint::SResult<usize> {
+        let reserved = self.session_checkpoint_identity_preflight()?;
+        self.stage_session_item_identities(&reserved, entropy)
+    }
+
+    pub(in crate::game) fn project_session_checkpoint_items(
+        &self,
+    ) -> super::levels::session_checkpoint::SResult<
+        super::levels::session_checkpoint::items::ItemProjection,
+    > {
+        use super::levels::session_checkpoint::{items, require};
+        let _ = self.session_checkpoint_item_memory()?;
+        let mut out = items::ItemProjection::default();
+        for item in &self.dropped {
+            let uuid = self.persist.uuids[&item.id];
+            let tag = entity_nbt::item_entity_to_nbt(item, uuid, self.persist.raw.get(&item.id));
+            let (actual, row) = items::validate_item_tag(self, &tag)?;
+            require(
+                actual == uuid && row.column == items::item_column(item)?,
+                "item native projection identity",
+            )?;
+            require(
+                out.rows.insert(uuid, row).is_none(),
+                "duplicate item projection UUID",
+            )?;
+        }
+        Ok(out)
+    }
+
+    fn prepare_session_checkpoint_item_install(
+        &self,
+        image: &super::levels::session_checkpoint::items::CheckedSessionItems,
+        reservation: usize,
+    ) -> super::levels::session_checkpoint::SResult<PreparedSessionItems> {
+        use super::levels::session_checkpoint::{checked, fail, require};
+        require(
+            self.dropped.is_empty() && self.persist.checkpoint_entity_memory().is_none(),
+            "fresh item installer already owns items/memory",
+        )?;
+        checked(self.inspect_session_checkpoint_item_install_owners())?;
+        // Check the actual private portal maps, including orphan defaults/samples.
+        checked(self.portals.project_session_item_portal_owners(&[]))?;
+        image.check_arrivals(
+            self,
+            &self.world.chunks.keys().copied().collect(),
+            &self.world.loaded_entities,
+        )?;
+        let count = u32::try_from(image.projection().rows.len()).map_err(fail)?;
+        let head = self
+            .next_entity
+            .checked_add(count)
+            .ok_or_else(|| fail("item installer entity ID exhaustion"))?;
+        let mut items = Vec::new();
+        let mut uuids = HashMap::new();
+        let mut raw = HashMap::new();
+        checked(items.try_reserve(reservation.max(count as usize)))?;
+        checked(uuids.try_reserve(count as usize))?;
+        checked(raw.try_reserve(count as usize))?;
+        let mut id = self.next_entity;
+        for (uuid, row) in &image.projection().rows {
+            id = id
+                .checked_add(1)
+                .ok_or_else(|| fail("item installer entity ID exhaustion"))?;
+            // The full session-specific fresh census above excludes every
+            // runtime entity family, including IDs not present in UUID memory.
+            let item = entity_nbt::item_entity_from_nbt(&row.tag, id, 0.0)
+                .ok_or_else(|| fail("checked item decode changed"))?;
+            require(
+                item.previous == item.position && item.ticks == 0 && item.bob_offset.to_bits() == 0,
+                "native item transient load profile",
+            )?;
+            items.push(item);
+            uuids.insert(id, *uuid);
+            raw.insert(id, row.tag.clone());
+        }
+        Ok(PreparedSessionItems {
+            items,
+            uuids,
+            raw,
+            next_entity: head,
+        })
+    }
+    /// Only this fresh checked path can consume the staged installer. There is
+    /// no public token or fallible work after concrete publication begins.
+    pub(in crate::game) fn install_session_checkpoint_items(
+        &mut self,
+        image: &super::levels::session_checkpoint::items::CheckedSessionItems,
+    ) -> super::levels::session_checkpoint::SResult<()> {
+        let prepared =
+            self.prepare_session_checkpoint_item_install(image, image.projection().rows.len())?;
+        self.world.loaded_entities.clear();
+        self.dropped = prepared.items;
+        self.persist.uuids = prepared.uuids;
+        self.persist.raw = prepared.raw;
+        self.next_entity = prepared.next_entity;
+        Ok(())
+    }
+    #[cfg(test)]
+    pub(in crate::game) fn check_session_item_install_reservation_for_test(
+        &self,
+        image: &super::levels::session_checkpoint::items::CheckedSessionItems,
+        reservation: usize,
+    ) -> super::levels::session_checkpoint::SResult<()> {
+        let _ = self.prepare_session_checkpoint_item_install(image, reservation)?;
+        Ok(())
+    }
+}

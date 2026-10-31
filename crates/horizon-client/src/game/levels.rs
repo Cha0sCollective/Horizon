@@ -1091,6 +1091,23 @@ fn session_native_metadata(extras: &horizon_client::chunk::ChunkExtras, clock: i
 
 #[cfg(feature = "paired-packages")]
 impl Game<'_> {
+    /// The fresh recovery route retains a verified native arrival queue while
+    /// staging items; all existing simulated entity families must still be empty.
+    pub(in crate::game) fn inspect_session_checkpoint_item_install_owners(&self) -> Result<()> {
+        if unsupported_entities!(self, self.creatures.projectiles).is_some()
+            || !self.dropped.is_empty()
+            || self.hook.is_some()
+            || self.end_portal_travel
+            || self.portals.checkpoint_entity_owner().is_some()
+            || self.persist.checkpoint_entity_memory().is_some()
+        {
+            return Err("fresh item installer already owns ENTITY state".into());
+        }
+        self.portals
+            .project_session_item_portal_owners(&[])
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
     /// Full named WORLD/ENTITY census for one native session. The caller must
     /// independently project the checked persistent counter and slot before
     /// accounting the sole supported slot. No research profile is enabled here.
@@ -1182,22 +1199,23 @@ impl Game<'_> {
         {
             return Err("session checkpoint pending WORLD owner or producer".into());
         }
-        // Deliberately omit only the slot-trial check: capture must already have
-        // checked its persistent frame, health, target and current schema.
-        inspect_entity_level_owners(
-            self.dim,
-            &self.world,
-            &self.persist,
-            &self.dropped,
-            unsupported_entities!(self, self.creatures.projectiles),
-        )
-        .map_err(|error| format!("session checkpoint unsupported ENTITY owner: {error:?}"))?;
-        if !self.dropped.is_empty()
-            || self.hook.is_some()
+        // Session-only item accounting; the ordinary conservative census above
+        // continues to refuse all native memory categories.
+        if !self.world.loaded_entities.is_empty()
+            || unsupported_entities!(self, self.creatures.projectiles).is_some()
+        {
+            return Err("session checkpoint unsupported ENTITY owner or arrival".into());
+        }
+        self.preflight_session_checkpoint_item_memory()
+            .map_err(|error| format!("session checkpoint unsupported ENTITY owner: {error}"))?;
+        self.portals
+            .project_session_item_portal_owners(&self.dropped)
+            .map_err(|error| error.to_string())?;
+        if self.hook.is_some()
             || self.end_portal_travel
             || self.portals.checkpoint_entity_owner().is_some()
         {
-            return Err("session checkpoint dropped, fishing or portal ENTITY owner".into());
+            return Err("session checkpoint fishing or portal ENTITY owner".into());
         }
         Ok(())
     }
