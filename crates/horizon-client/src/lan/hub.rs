@@ -163,6 +163,43 @@ pub enum HostEvent {
     Error(String),
 }
 
+/// Evidence of two genuine, fresh staged admissions. This is not authority to
+/// restore rows: the game must still check its completely verified image.
+#[cfg(feature = "paired-packages")]
+pub struct StagedRoster {
+    origin: Arc<()>,
+    connections: [u32; 2],
+}
+
+#[cfg(feature = "paired-packages")]
+impl StagedRoster {
+    /// Owner first, then guest, in the sealed transport profile order.
+    pub fn connections(&self) -> [u32; 2] {
+        self.connections
+    }
+}
+
+#[cfg(feature = "paired-packages")]
+struct StagedPeer {
+    conn: u32,
+    uuid: u128,
+    name: String,
+    sender: super::PlayerSender,
+    teleport: Option<(i32, [f64; 3], f32, f32)>,
+    teleport_acked: bool,
+    information_acked: bool,
+    terrain_sent: bool,
+    loaded_acked: bool,
+}
+
+#[cfg(feature = "paired-packages")]
+struct StagedHub {
+    origin: Arc<()>,
+    peers: Vec<StagedPeer>,
+    placed: bool,
+    refused: Option<&'static str>,
+}
+
 pub struct Hub {
     pub lan: Lan,
     pub config: HubConfig,
@@ -214,6 +251,8 @@ pub struct Hub {
     /// Server mods' commands, a root in the commands report's format, sent
     /// after vanilla's; the key the game last set them for.
     mod_commands: (serde_json::Value, Option<u64>),
+    #[cfg(feature = "paired-packages")]
+    staged: Option<StagedHub>,
 }
 
 fn string(s: &str) -> Tag {
@@ -384,6 +423,8 @@ impl Hub {
             entity_out: Vec::new(),
             mod_commands: (serde_json::Value::Null, None),
             teams: Vec::new(),
+            #[cfg(feature = "paired-packages")]
+            staged: None,
         }
     }
 
@@ -1171,6 +1212,486 @@ impl Hub {
         events
     }
 
+    /// Enable the closed recovery route on a fresh, genuine staged transport.
+    /// Ordinary `poll`/`tick_level` are never part of this route.
+    #[cfg(feature = "paired-packages")]
+    pub fn begin_staged_recovery(&mut self) -> Result<(), &'static str> {
+        let status = self
+            .lan
+            .staged_status()
+            .map_err(|_| "not a staged transport")?;
+        if self.staged.is_some()
+            || !self.guests.is_empty()
+            || self.ticks != 0
+            || !self.config.integrated
+            || self.config.dimension != "minecraft:overworld"
+            || self.config.view_distance != 2
+            || self.config.max_players != 2
+            || status.attempts != 0
+            || status.terminal_count != 0
+            || status.closed
+        {
+            return Err("staged recovery requires a fresh bounded integrated hub");
+        }
+        self.staged = Some(StagedHub {
+            origin: Arc::new(()),
+            peers: Vec::with_capacity(2),
+            placed: false,
+            refused: None,
+        });
+        Ok(())
+    }
+
+    #[cfg(feature = "paired-packages")]
+    fn check_staged_recovery(&self) -> Result<(), &'static str> {
+        let stage = self.staged.as_ref().ok_or("staged recovery not begun")?;
+        if let Some(reason) = stage.refused {
+            return Err(reason);
+        }
+        let status = self
+            .lan
+            .staged_status()
+            .map_err(|_| "staged transport failure")?;
+        if self.lan.staged_failure().is_some() || status.terminal_count != 0 || status.closed {
+            return Err("staged transport terminated");
+        }
+        if self.ticks != 0
+            || self.config.dimension != "minecraft:overworld"
+            || self.config.view_distance != 2
+            || !self.config.integrated
+            || self.config.max_players != 2
+            || self.guests.len() != stage.peers.len()
+        {
+            return Err("staged hub changed outside its recovery route");
+        }
+        for peer in &stage.peers {
+            let g = self.guest(peer.conn).ok_or("staged guest missing")?;
+            if g.uuid != peer.uuid
+                || g.name != peer.name
+                || !g.sender.same_connection(&peer.sender)
+                || g.sender.staged_identity() != Some(peer.conn)
+                || g.dimension != "minecraft:overworld"
+                || g.view_distance != 2
+                || !g.inbox.is_empty()
+                || !g.left_reason.is_empty()
+            {
+                return Err("staged guest identity or custody changed");
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "paired-packages")]
+    fn staged_result<T>(&mut self, result: Result<T, &'static str>) -> Result<T, &'static str> {
+        if let Err(reason) = &result
+            && let Some(stage) = &mut self.staged
+        {
+            stage.refused.get_or_insert(*reason);
+        }
+        result
+    }
+
+    /// Consume at most sixteen genuine raw events, without ordinary leave,
+    /// movement, action or tick dispatch. A refusal retains every admitted guest.
+    #[cfg(feature = "paired-packages")]
+    pub fn poll_staged_recovery(&mut self, ctx: &mut TickCtx) -> Result<Vec<u32>, &'static str> {
+        let result = self.poll_staged_recovery_inner(ctx);
+        self.staged_result(result)
+    }
+
+    #[cfg(feature = "paired-packages")]
+    fn poll_staged_recovery_inner(&mut self, ctx: &mut TickCtx) -> Result<Vec<u32>, &'static str> {
+        self.check_staged_recovery()?;
+        let events = self
+            .lan
+            .poll_staged(16)
+            .map_err(|_| "staged transport failure")?;
+        let mut joined = Vec::with_capacity(2);
+        for event in events {
+            // A terminal arriving while data was dequeued wins before dispatch.
+            self.check_staged_recovery()?;
+            match event {
+                NetEvent::Joined(j) => {
+                    let stage = self.staged.as_ref().ok_or("staged recovery not begun")?;
+                    if stage.placed
+                        || stage.peers.len() >= 2
+                        || !self.lan.validate_staged_join(&j)
+                        || j.info.view_distance != 2
+                        || stage
+                            .peers
+                            .iter()
+                            .any(|p| p.conn == j.conn || p.uuid == j.uuid)
+                        || *ctx.next_entity >= i32::MAX as u32
+                        || !ctx.spawn.iter().all(|v| v.is_finite())
+                    {
+                        return Err("staged admission differs from the exact fresh roster");
+                    }
+                    let peer = StagedPeer {
+                        conn: j.conn,
+                        uuid: j.uuid,
+                        name: j.name.clone(),
+                        sender: j.sender.clone(),
+                        teleport: None,
+                        teleport_acked: false,
+                        information_acked: false,
+                        terrain_sent: false,
+                        loaded_acked: false,
+                    };
+                    let conn = self.admit(*j, ctx);
+                    self.staged
+                        .as_mut()
+                        .ok_or("staged recovery not begun")?
+                        .peers
+                        .push(peer);
+                    joined.push(conn);
+                }
+                NetEvent::Packet(conn, packet) => self.process_staged_packet(conn, *packet)?,
+                NetEvent::Left(_, _) | NetEvent::Duplicate(_) => {
+                    return Err("staged departure or duplicate admission");
+                }
+            }
+        }
+        self.check_staged_recovery()?;
+        Ok(joined)
+    }
+
+    /// Mint the non-clone admission capability only while both native guests
+    /// still have their untouched initial state. The game checks all row/body
+    /// and GuestPlay invariants again immediately before installation.
+    #[cfg(feature = "paired-packages")]
+    pub fn staged_fresh_roster(&self) -> Result<StagedRoster, &'static str> {
+        self.check_staged_recovery()?;
+        let stage = self.staged.as_ref().ok_or("staged recovery not begun")?;
+        if stage.placed || stage.peers.len() != 2 {
+            return Err("staged roster is not complete and unplaced");
+        }
+        let profiles = super::StagedProfiles::memory_pair().profiles();
+        let mut connections = [0; 2];
+        for (index, (uuid, name)) in profiles.into_iter().enumerate() {
+            let peer = stage
+                .peers
+                .iter()
+                .find(|p| p.uuid == uuid && p.name == name)
+                .ok_or("staged profile missing")?;
+            connections[index] = peer.conn;
+        }
+        let roster = StagedRoster {
+            origin: stage.origin.clone(),
+            connections,
+        };
+        self.validate_staged_roster(&roster)?;
+        Ok(roster)
+    }
+
+    #[cfg(feature = "paired-packages")]
+    fn check_staged_roster_identity(&self, roster: &StagedRoster) -> Result<(), &'static str> {
+        self.check_staged_recovery()?;
+        let stage = self.staged.as_ref().ok_or("staged recovery not begun")?;
+        if !Arc::ptr_eq(&stage.origin, &roster.origin)
+            || stage.peers.len() != 2
+            || roster.connections[0] == roster.connections[1]
+            || !roster
+                .connections
+                .iter()
+                .all(|conn| stage.peers.iter().any(|p| p.conn == *conn))
+        {
+            return Err("staged admission capability belongs to another roster");
+        }
+        Ok(())
+    }
+
+    /// Revalidate the admission capability before the game's sealed installer.
+    #[cfg(feature = "paired-packages")]
+    pub fn validate_staged_roster(&self, roster: &StagedRoster) -> Result<(), &'static str> {
+        self.check_staged_roster_identity(roster)?;
+        if self.staged.as_ref().is_none_or(|s| s.placed) {
+            return Err("staged roster was already placed");
+        }
+        let status = self
+            .lan
+            .staged_status()
+            .map_err(|_| "staged transport failure")?;
+        if status.queued_events != 0 || status.queued_bytes != 0 || status.pending_outbound != 0 {
+            return Err("staged admission transport is not drained");
+        }
+        for g in &self.guests {
+            if g.placed
+                || g.loaded
+                || g.motion.is_some()
+                || g.loaded_body.is_some()
+                || g.saved.is_some()
+                || g.logs_kept.is_some()
+                || g.saved_absorption.is_some()
+                || g.awaiting_teleport.is_some()
+                || g.teleport_counter != 0
+                || g.inventory.len() != 36
+                || g.ender_items.len() != 27
+                || g.inventory.iter().any(Option::is_some)
+                || g.armor.iter().any(Option::is_some)
+                || g.offhand.is_some()
+                || g.ender_items.iter().any(Option::is_some)
+                || g.carried.is_some()
+                || g.craft_grid.iter().any(Option::is_some)
+                || g.craft_result.is_some()
+                || g.menu.is_some()
+                || g.drag.is_some()
+                || !g.moves.is_empty()
+                || g.ticks != 0
+                || g.received_moves != 0
+                || g.known_moves != 0
+                || g.position_this_tick
+                || g.moved
+                || g.center.is_some()
+                || g.center_sent.is_some()
+                || !g.sent_chunks.is_empty()
+                || !g.chunk_queue.is_empty()
+                || g.unacknowledged != 0
+                || g.sender.staged_pending() != Some(0)
+            {
+                return Err("staged admitted guest is no longer fresh and empty");
+            }
+        }
+        Ok(())
+    }
+
+    /// Send normal placement only after the game's verified row installation.
+    /// The roster proves admission, while native row authority remains in Game.
+    #[cfg(feature = "paired-packages")]
+    pub fn place_staged_recovery(
+        &mut self,
+        roster: &StagedRoster,
+        ctx: &mut TickCtx,
+    ) -> Result<(), &'static str> {
+        let result = self.place_staged_recovery_inner(roster, ctx);
+        self.staged_result(result)
+    }
+
+    #[cfg(feature = "paired-packages")]
+    fn place_staged_recovery_inner(
+        &mut self,
+        roster: &StagedRoster,
+        ctx: &mut TickCtx,
+    ) -> Result<(), &'static str> {
+        self.check_staged_roster_identity(roster)?;
+        if self.staged.as_ref().is_none_or(|s| s.placed) {
+            return Err("staged roster was already placed");
+        }
+        for g in &self.guests {
+            if g.placed
+                || g.loaded
+                || g.motion.is_none()
+                || g.saved.is_none()
+                || g.loaded_body.is_some()
+                || g.awaiting_teleport.is_some()
+                || !g.position.iter().all(|v| v.is_finite())
+                || !g.yaw.is_finite()
+                || !g.pitch.is_finite()
+                || !(-90.0..=90.0).contains(&g.pitch)
+            {
+                return Err("staged placement requires installed native bodies");
+            }
+        }
+        for conn in roster.connections {
+            self.check_staged_recovery()?;
+            self.place_new_player(conn, ctx);
+            let g = self
+                .guest(conn)
+                .ok_or("staged guest missing after placement")?;
+            let (id, at) = g
+                .awaiting_teleport
+                .ok_or("staged placement did not send teleport")?;
+            let teleport = (id, at, g.yaw, g.pitch);
+            let peer = self
+                .staged
+                .as_mut()
+                .ok_or("staged recovery not begun")?
+                .peers
+                .iter_mut()
+                .find(|p| p.conn == conn)
+                .ok_or("staged peer missing")?;
+            peer.teleport = Some(teleport);
+        }
+        self.staged
+            .as_mut()
+            .ok_or("staged recovery not begun")?
+            .placed = true;
+        self.check_staged_recovery()
+    }
+
+    #[cfg(feature = "paired-packages")]
+    fn process_staged_packet(&mut self, conn: u32, packet: S) -> Result<(), &'static str> {
+        let stage = self.staged.as_mut().ok_or("staged recovery not begun")?;
+        if !stage.placed {
+            return Err("staged play packet arrived before native placement");
+        }
+        let peer = stage
+            .peers
+            .iter_mut()
+            .find(|p| p.conn == conn)
+            .ok_or("unknown staged connection")?;
+        let g = self
+            .guests
+            .iter_mut()
+            .find(|g| g.conn == conn)
+            .ok_or("staged guest missing")?;
+        let (id, at, yaw, pitch) = peer.teleport.ok_or("staged teleport was not sent")?;
+        match packet {
+            S::ClientInformation(info) => {
+                if info.view_distance != 2 {
+                    return Err("staged client view differs from configured bound");
+                }
+                g.info = info;
+                peer.information_acked = true;
+            }
+            S::AcceptTeleportation(p) => {
+                let position = [p.x, p.y, p.z];
+                if peer.teleport_acked
+                    || g.awaiting_teleport != Some((id, at))
+                    || p.id != id
+                    || !position.iter().all(|v| v.is_finite())
+                    || position != at
+                    || !p.yaw.is_finite()
+                    || !p.pitch.is_finite()
+                    || p.yaw != yaw
+                    || p.pitch != pitch
+                    || g.position != at
+                    || g.yaw != yaw
+                    || g.pitch != pitch
+                {
+                    return Err("staged teleport acknowledgment differs from recovered teleport");
+                }
+                // Do not route through the ordinary movement handler or change
+                // any body/position field in response to this packet.
+                g.awaiting_teleport = None;
+                peer.teleport_acked = true;
+            }
+            S::ChunkBatchReceived(p) => {
+                if !peer.terrain_sent
+                    || g.unacknowledged != 1
+                    || !p.chunks_per_tick.is_finite()
+                    || !(0.01..=64.0).contains(&p.chunks_per_tick)
+                {
+                    return Err("invalid staged chunk batch acknowledgment");
+                }
+                g.unacknowledged = 0;
+                g.chunks_per_tick = p.chunks_per_tick;
+                g.batch_quota = 1.0;
+                g.max_unacknowledged = 10;
+            }
+            S::PlayerLoaded(_) => {
+                if peer.loaded_acked
+                    || !peer.terrain_sent
+                    || !peer.teleport_acked
+                    || !g.placed
+                    || g.awaiting_teleport.is_some()
+                    || !g.sent_chunks.contains(&g.chunk())
+                {
+                    return Err("staged loaded acknowledgment preceded terrain or teleport");
+                }
+                // Only this actual packet establishes readiness.
+                g.loaded = true;
+                peer.loaded_acked = true;
+            }
+            // The stationary native client emits neither movement nor tick-end
+            // packets. No generic protocol fallback is allowed here.
+            _ => return Err("packet is outside the staged recovery allowlist"),
+        }
+        Ok(())
+    }
+
+    /// Encode one initial batch per client from actual resident lit terrain.
+    /// This bypasses only the ordinary tick delay; it never advances a clock.
+    /// Subsequent polls process the closed acknowledgments above, then observe
+    /// drained transport and genuine readiness without another terrain batch.
+    #[cfg(feature = "paired-packages")]
+    pub fn pump_staged_recovery(&mut self, world: &World) -> Result<bool, &'static str> {
+        let result = self.pump_staged_recovery_inner(world);
+        self.staged_result(result)
+    }
+
+    #[cfg(feature = "paired-packages")]
+    fn pump_staged_recovery_inner(&mut self, world: &World) -> Result<bool, &'static str> {
+        self.check_staged_recovery()?;
+        if self.staged.as_ref().is_none_or(|s| !s.placed) {
+            return Err("staged terrain requested before native placement");
+        }
+        let mut batches = Vec::with_capacity(2);
+        for i in 0..self.guests.len() {
+            let g = &self.guests[i];
+            let peer = self
+                .staged
+                .as_ref()
+                .ok_or("staged recovery not begun")?
+                .peers
+                .iter()
+                .find(|p| p.conn == g.conn)
+                .ok_or("staged peer missing")?;
+            if !g.placed || g.loaded != peer.loaded_acked {
+                return Err("staged placement or loaded state changed outside protocol");
+            }
+            if peer.terrain_sent {
+                continue;
+            }
+            // An initial batch must include the actual home column. Waiting
+            // for it does not generate, light, tick or otherwise mutate World.
+            if !world.chunks.get(&g.chunk()).is_some_and(|c| c.lit) {
+                continue;
+            }
+            self.update_view(i);
+            if let Some(batch) = self.next_ready_batch(i, world) {
+                batches.push((i, batch));
+            }
+        }
+        self.send_chunk_batches(world, batches);
+        for peer in &mut self
+            .staged
+            .as_mut()
+            .ok_or("staged recovery not begun")?
+            .peers
+        {
+            let g = self
+                .guests
+                .iter()
+                .find(|g| g.conn == peer.conn)
+                .ok_or("staged guest missing")?;
+            if g.sent_chunks.contains(&g.chunk()) {
+                peer.terrain_sent = true;
+            }
+        }
+        // Terminal slots are checked again after encoding and before any
+        // readiness result. They never dispatch Left or surrender guest custody.
+        self.check_staged_recovery()?;
+        let status = self
+            .lan
+            .staged_status()
+            .map_err(|_| "staged transport failure")?;
+        let stage = self.staged.as_ref().ok_or("staged recovery not begun")?;
+        let ready = stage.peers.len() == 2
+            && stage.peers.iter().all(|peer| {
+                self.guest(peer.conn).is_some_and(|g| {
+                    peer.terrain_sent
+                        && peer.information_acked
+                        && peer.teleport_acked
+                        && peer.loaded_acked
+                        && g.placed
+                        && g.loaded
+                        && g.awaiting_teleport.is_none()
+                        && g.unacknowledged == 0
+                        && g.inbox.is_empty()
+                        && g.sender.staged_pending() == Some(0)
+                        && peer.teleport.is_some_and(|(_, at, yaw, pitch)| {
+                            g.position == at && g.yaw == yaw && g.pitch == pitch
+                        })
+                })
+            })
+            && status.queued_events == 0
+            && status.queued_bytes == 0
+            && status.pending_outbound == 0
+            && status.terminal_count == 0;
+        self.check_staged_recovery()?;
+        Ok(ready)
+    }
+
     /// The level in place's part of the tick (`ServerLevel.tick`'s chunk
     /// map and the connections of the players in it): their packets, then
     /// the chunks, block changes, containers and entities they see.
@@ -1368,6 +1889,12 @@ impl Hub {
                 }
             }
         }
+        self.send_chunk_batches(world, batches);
+    }
+
+    /// The common native encoder and ordered chunk-batch writer. Selecting a
+    /// staged initial batch does not change the ordinary tick's eligibility.
+    fn send_chunk_batches(&mut self, world: &World, batches: Vec<(usize, Vec<(usize, &Chunk)>)>) {
         if batches.is_empty() {
             return;
         }
@@ -1456,8 +1983,21 @@ impl Hub {
     /// as many as the batch quota the client's acknowledgements pace allows,
     /// with their places in the queue.
     fn next_batch<'w>(&mut self, i: usize, world: &'w World) -> Option<Vec<(usize, &'w Chunk)>> {
+        if self.ticks <= self.guests[i].placed_at + 1 {
+            return None;
+        }
+        self.next_ready_batch(i, world)
+    }
+
+    /// Shared batch pacing and resident/lit selection. Only the staged initial
+    /// terrain route calls this without the normal placement tick delay.
+    fn next_ready_batch<'w>(
+        &mut self,
+        i: usize,
+        world: &'w World,
+    ) -> Option<Vec<(usize, &'w Chunk)>> {
         let g = &mut self.guests[i];
-        if self.ticks <= g.placed_at + 1 || g.unacknowledged >= g.max_unacknowledged {
+        if g.unacknowledged >= g.max_unacknowledged {
             return None;
         }
         g.batch_quota = (g.batch_quota + g.chunks_per_tick).min(g.chunks_per_tick.max(1.0));

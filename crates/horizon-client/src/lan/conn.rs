@@ -234,6 +234,8 @@ pub struct PlayerSender {
     held: Arc<Mutex<Vec<Vec<u8>>>>,
     /// What [`flush_all`] gave the post thread and it hasn't passed on yet.
     posted: Arc<AtomicUsize>,
+    #[cfg(feature = "paired-packages")]
+    staged: Option<StagedSender>,
 }
 impl PlayerSender {
     pub fn new(tx: Sender<Out>, pending: Arc<AtomicUsize>) -> Self {
@@ -242,12 +244,19 @@ impl PlayerSender {
             pending,
             held: Arc::default(),
             posted: Arc::default(),
+            #[cfg(feature = "paired-packages")]
+            staged: None,
         }
     }
     fn held(&self) -> std::sync::MutexGuard<'_, Vec<Vec<u8>>> {
         self.held.lock().unwrap_or_else(PoisonError::into_inner)
     }
     pub fn send(&self, body: Vec<u8>) {
+        #[cfg(feature = "paired-packages")]
+        if let Some(staged) = &self.staged {
+            staged.send(body);
+            return;
+        }
         self.pending.fetch_add(body.len(), Ordering::Relaxed);
         if HOLDING.get() {
             self.held().push(body);
@@ -259,6 +268,11 @@ impl PlayerSender {
     /// Several packets in order, as [`Self::send`] each: under one lock
     /// while the tick holds them.
     pub fn send_many(&self, bodies: impl IntoIterator<Item = Vec<u8>>) {
+        #[cfg(feature = "paired-packages")]
+        if self.staged.is_some() {
+            bodies.into_iter().for_each(|body| self.send(body));
+            return;
+        }
         if !HOLDING.get() {
             bodies.into_iter().for_each(|body| self.send(body));
             return;
@@ -278,6 +292,13 @@ impl PlayerSender {
     }
     /// Send a play disconnect with this reason after what was sent before.
     pub fn disconnect(&self, reason: horizon_world::nbt::Tag) {
+        #[cfg(feature = "paired-packages")]
+        if let Some(staged) = &self.staged {
+            if let Some(stage) = staged.stage.upgrade() {
+                stage.fail(super::StagedFailure::ConnectionEnded);
+            }
+            return;
+        }
         self.flush();
         self.deliver(Out::Disconnect(reason));
     }
@@ -296,6 +317,90 @@ impl PlayerSender {
             out,
             posted: self.posted.clone(),
         }
+    }
+
+    #[cfg(feature = "paired-packages")]
+    pub fn staged_identity(&self) -> Option<u32> {
+        self.staged.as_ref().map(|s| s.conn)
+    }
+    #[cfg(feature = "paired-packages")]
+    pub fn staged_pending(&self) -> Option<usize> {
+        self.staged
+            .as_ref()
+            .map(|_| self.pending.load(Ordering::Acquire))
+    }
+    #[cfg(feature = "paired-packages")]
+    pub fn same_connection(&self, other: &Self) -> bool {
+        self.staged_identity().is_some()
+            && self.staged_identity() == other.staged_identity()
+            && Arc::ptr_eq(&self.pending, &other.pending)
+    }
+}
+
+#[cfg(feature = "paired-packages")]
+#[derive(Clone)]
+struct StagedSender {
+    tx: Sender<StagedBody>,
+    stage: std::sync::Weak<super::StagedState>,
+    pending: Arc<AtomicUsize>,
+    conn: u32,
+}
+#[cfg(feature = "paired-packages")]
+impl StagedSender {
+    fn send(&self, body: Vec<u8>) {
+        let Some(stage) = self.stage.upgrade() else {
+            return;
+        };
+        if stage.closing.load(Ordering::Acquire) {
+            return;
+        }
+        // Reservation precedes retention in every staged queue. A body remains
+        // charged while the native write is active, including on writer errors.
+        let Some(charged) = StagedBody::reserve(body, self.pending.clone(), stage.outbound.clone())
+        else {
+            stage.fail(super::StagedFailure::OutboundOverflow);
+            return;
+        };
+        if self.tx.send(charged).is_err() {
+            stage.fail(super::StagedFailure::Writer);
+        }
+    }
+}
+#[cfg(feature = "paired-packages")]
+struct StagedBody {
+    body: Vec<u8>,
+    pending: Arc<AtomicUsize>,
+    host: Arc<AtomicUsize>,
+}
+#[cfg(feature = "paired-packages")]
+impl StagedBody {
+    fn reserve(body: Vec<u8>, pending: Arc<AtomicUsize>, host: Arc<AtomicUsize>) -> Option<Self> {
+        let bytes = body.len();
+        // Keep the crate's Rust 1.90 floor: fetch_update is deprecated in the
+        // pinned compiler, while its renamed replacement requires Rust 1.95.
+        let mut current = host.load(Ordering::Acquire);
+        loop {
+            let next = current
+                .checked_add(bytes)
+                .filter(|n| *n <= super::STAGED_OUT_BYTES)?;
+            match host.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
+        pending.fetch_add(bytes, Ordering::AcqRel);
+        Some(Self {
+            body,
+            pending,
+            host,
+        })
+    }
+}
+#[cfg(feature = "paired-packages")]
+impl Drop for StagedBody {
+    fn drop(&mut self) {
+        self.pending.fetch_sub(self.body.len(), Ordering::AcqRel);
+        self.host.fetch_sub(self.body.len(), Ordering::AcqRel);
     }
 }
 
@@ -451,6 +556,88 @@ pub fn serve_local(
     serve_connection(Connection::local(pipe), address, shared)
 }
 
+#[cfg(feature = "paired-packages")]
+thread_local! {
+    static STAGED_CONN: Cell<Option<u32>> = const { Cell::new(None) };
+}
+
+#[cfg(feature = "paired-packages")]
+pub(super) fn serve_local_staged(
+    pipe: horizon_protocol::connection::Pipe,
+    shared: Arc<Shared>,
+    conn: u32,
+) {
+    let Some(stage) = shared.stage.clone() else {
+        return;
+    };
+    let mut terminal = StagedAttemptTerminal {
+        stage,
+        conn,
+        reason: super::StagedFailure::ConnectionEnded,
+    };
+    STAGED_CONN.set(Some(conn));
+    if serve_local(pipe, shared).is_err() {
+        terminal.reason = super::StagedFailure::Decode;
+    }
+}
+
+/// A terminal slot cannot be lost to an outer reader panic before Joined. This
+/// guard only records bounded evidence; it does not join, detach or discard owners.
+#[cfg(feature = "paired-packages")]
+struct StagedAttemptTerminal {
+    stage: Arc<super::StagedState>,
+    conn: u32,
+    reason: super::StagedFailure,
+}
+#[cfg(feature = "paired-packages")]
+impl Drop for StagedAttemptTerminal {
+    fn drop(&mut self) {
+        self.stage.terminal(
+            self.conn,
+            if std::thread::panicking() {
+                super::StagedFailure::ThreadPanic
+            } else {
+                self.reason
+            },
+        );
+    }
+}
+
+/// Ordinary receives retain their existing behavior. Staged receives use the
+/// same decoder; a separately registered close-only capability wakes native IO.
+fn recv_connection(
+    c: &mut Connection,
+    shared: &Shared,
+) -> horizon_protocol::Result<(i32, Vec<u8>)> {
+    #[cfg(feature = "paired-packages")]
+    if let Some(stage) = &shared.stage {
+        let result = recv_staged(&mut c.reader, stage);
+        if result.is_err() {
+            c.writer.shutdown();
+        }
+        return result;
+    }
+    let _ = shared;
+    c.recv()
+}
+
+#[cfg(feature = "paired-packages")]
+fn recv_staged(
+    reader: &mut ConnReader,
+    stage: &super::StagedState,
+) -> horizon_protocol::Result<(i32, Vec<u8>)> {
+    if stage.closing.load(Ordering::Acquire) {
+        return Err(horizon_protocol::Error::new("staged connection closed"));
+    }
+    let result = reader.recv();
+    // Native close may return a complete buffered frame first, or drain a
+    // finite incomplete prefix before EOF. Never dispatch it after closure.
+    if stage.closing.load(Ordering::Acquire) {
+        return Err(horizon_protocol::Error::new("staged connection closed"));
+    }
+    result
+}
+
 fn serve_connection(
     mut c: Connection,
     address: std::net::SocketAddr,
@@ -460,11 +647,15 @@ fn serve_connection(
     c.reader
         .set_read_timeout(Some(Duration::from_secs(30)))
         .map_err(e)?;
-    let (id, payload) = c.recv().map_err(e)?;
+    let (id, payload) = recv_connection(&mut c, &shared).map_err(e)?;
     let intention = match handshake::Serverbound::decode(id, &payload).map_err(e)? {
         handshake::Serverbound::Intention(i) => i,
         _ => return Err("expected a handshake".into()),
     };
+    #[cfg(feature = "paired-packages")]
+    if shared.stage.is_some() && intention.intent != handshake::LOGIN {
+        return Err("staged connection requires offline login".into());
+    }
     match intention.intent {
         // ServerHandshakePacketListenerImpl: a server that does not reply
         // to status requests closes the connection.
@@ -504,7 +695,7 @@ fn serve_status(c: &mut Connection, shared: &Shared) -> Result<(), String> {
     let e = |e: horizon_protocol::Error| e.to_string();
     let mut requested = false;
     loop {
-        let (id, payload) = c.recv().map_err(e)?;
+        let (id, payload) = recv_connection(c, shared).map_err(e)?;
         match status::Serverbound::decode(id, &payload).map_err(e)? {
             // ServerStatusPacketListenerImpl: a second request disconnects.
             status::Serverbound::StatusRequest(_) if requested => return Ok(()),
@@ -598,7 +789,7 @@ fn authenticate(
         .encode(),
     )
     .map_err(e)?;
-    let (id, payload) = c.recv().map_err(e)?;
+    let (id, payload) = recv_connection(c, shared).map_err(e)?;
     let key = match login::Serverbound::decode(id, &payload).map_err(e)? {
         login::Serverbound::Key(k) => k,
         _ => return Err("Unexpected packet during login".into()),
@@ -671,7 +862,7 @@ fn serve_login(
     shared: &Arc<Shared>,
 ) -> Result<(), String> {
     let e = |e: horizon_protocol::Error| e.to_string();
-    let (id, payload) = c.recv().map_err(e)?;
+    let (id, payload) = recv_connection(&mut c, shared).map_err(e)?;
     let hello = match login::Serverbound::decode(id, &payload).map_err(e)? {
         login::Serverbound::Hello(h) => h,
         _ => return Err("expected a login hello".into()),
@@ -769,7 +960,7 @@ fn login_and_configure(
     .map_err(e)?;
     // The client may send its settings before acknowledging the login.
     loop {
-        let (id, payload) = c.recv().map_err(e)?;
+        let (id, payload) = recv_connection(c, shared).map_err(e)?;
         match login::Serverbound::decode(id, &payload).map_err(e)? {
             login::Serverbound::LoginAcknowledged(_) => break,
             login::Serverbound::CustomQueryAnswer(_) | login::Serverbound::CookieResponse(_) => {}
@@ -821,7 +1012,7 @@ fn login_and_configure(
     let mut info = ClientInformation::new(10);
     let mut brand = String::from("vanilla");
     let known_pack = loop {
-        let (id, payload) = c.recv().map_err(e)?;
+        let (id, payload) = recv_connection(c, shared).map_err(e)?;
         match cfg::Serverbound::decode(id, &payload).map_err(e)? {
             cfg::Serverbound::ClientInformation(i) => info = i,
             cfg::Serverbound::CustomPayload(p) if p.channel == "minecraft:brand" => {
@@ -858,7 +1049,7 @@ fn login_and_configure(
     }
     send(c, cfg::Clientbound::FinishConfiguration(Empty))?;
     loop {
-        let (id, payload) = c.recv().map_err(e)?;
+        let (id, payload) = recv_connection(c, shared).map_err(e)?;
         match cfg::Serverbound::decode(id, &payload).map_err(e)? {
             cfg::Serverbound::FinishConfiguration(_) => break,
             cfg::Serverbound::ClientInformation(i) => info = i,
@@ -948,6 +1139,15 @@ fn offer_pack(
 }
 
 fn play(c: Connection, shared: &Arc<Shared>, parts: Parts, address: std::net::SocketAddr) {
+    #[cfg(feature = "paired-packages")]
+    if let Some(stage) = &shared.stage {
+        let Some(conn) = STAGED_CONN.get() else {
+            stage.fail(super::StagedFailure::Identity);
+            return;
+        };
+        play_staged(c, shared, parts, address, conn, stage.clone());
+        return;
+    }
     let conn_id = shared.next_id();
     let events = shared.events.clone();
     let _ = c.reader.set_read_timeout(Some(KEEP_ALIVE_TIMEOUT));
@@ -1003,6 +1203,217 @@ fn play(c: Connection, shared: &Arc<Shared>, parts: Parts, address: std::net::So
         let _ = t.join();
     }
     shared.release(parts.uuid);
+}
+
+#[cfg(feature = "paired-packages")]
+struct StagedWriterOwner(Option<std::thread::JoinHandle<()>>);
+#[cfg(feature = "paired-packages")]
+impl Drop for StagedWriterOwner {
+    fn drop(&mut self) {
+        if self.0.is_some() {
+            let _ = std::io::Write::write_all(
+                &mut std::io::stderr(),
+                b"fatal: unresolved staged LAN writer owner\n",
+            );
+            std::process::abort();
+        }
+    }
+}
+
+#[cfg(feature = "paired-packages")]
+fn play_staged(
+    c: Connection,
+    shared: &Arc<Shared>,
+    parts: Parts,
+    address: std::net::SocketAddr,
+    conn: u32,
+    stage: Arc<super::StagedState>,
+) {
+    use super::StagedFailure;
+    let pending = {
+        let inner = stage.inner();
+        let Some(attempt) = inner.attempts.iter().find(|a| a.conn == conn) else {
+            drop(inner);
+            stage.fail(StagedFailure::Identity);
+            return;
+        };
+        attempt.pending.clone()
+    };
+    if !stage.bind_sender(conn, parts.uuid, &pending) {
+        stage.fail(StagedFailure::Identity);
+        return;
+    }
+    let (mut reader, writer) = c.split();
+    let (tx, rx) = channel();
+    // Keep the legacy public channel disconnected: it cannot bypass the staged
+    // reservation path or inject an uncharged body into this writer.
+    let (legacy, legacy_rx) = channel();
+    drop(legacy_rx);
+    let sender = PlayerSender {
+        tx: legacy,
+        pending: pending.clone(),
+        held: Arc::default(),
+        posted: Arc::default(),
+        staged: Some(StagedSender {
+            tx,
+            stage: Arc::downgrade(&stage),
+            pending: pending.clone(),
+            conn,
+        }),
+    };
+    let latency = Arc::new(AtomicI32::new(0));
+    let alive = Arc::new(AtomicI64::new(-1));
+    let worker = {
+        let stage = stage.clone();
+        let alive = alive.clone();
+        let latency = latency.clone();
+        std::thread::Builder::new()
+            .name(format!("horizon-staged-out-{conn}"))
+            .spawn(move || {
+                horizon_threads::behind_server();
+                write_staged(writer, rx, alive, latency, pending, &stage);
+            })
+    };
+    let Ok(worker) = worker else {
+        stage.fail(StagedFailure::Writer);
+        return;
+    };
+    let mut worker = StagedWriterOwner(Some(worker));
+    #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+    if std::env::var("HORIZON_STAGED_WRITER_FATAL_CHILD").as_deref() == Ok("1") {
+        panic!("intentional staged reader unwind with actual owned writer");
+    }
+    let joined = Joined {
+        conn,
+        uuid: parts.uuid,
+        name: parts.name,
+        properties: parts.properties,
+        info: parts.info,
+        brand: parts.brand,
+        sender,
+        latency,
+        address,
+    };
+    if stage.emit(conn, NetEvent::Joined(Box::new(joined)), 0) {
+        loop {
+            let (id, payload) = match recv_staged(&mut reader, &stage) {
+                Ok(packet) => packet,
+                Err(_) => {
+                    if !stage.closing.load(Ordering::Acquire) {
+                        stage.fail(StagedFailure::ConnectionEnded);
+                    }
+                    break;
+                }
+            };
+            // The native frame allocation has already occurred. This limit is
+            // checked before play decoding and mailbox retention, not before IO.
+            if payload.len() > 64 << 10 {
+                stage.fail(StagedFailure::PayloadTooLarge);
+                break;
+            }
+            let bytes = payload.len();
+            match play::Serverbound::decode(id, &payload) {
+                Ok(play::Serverbound::KeepAlive(k)) => alive.store(k.id, Ordering::Relaxed),
+                Ok(packet) => {
+                    if !stage.emit(conn, NetEvent::Packet(conn, Box::new(packet)), bytes) {
+                        break;
+                    }
+                }
+                Err(_) => {
+                    stage.fail(StagedFailure::Decode);
+                    break;
+                }
+            }
+        }
+    }
+    // Force native close before waiting for writer completion. This closes all
+    // attempts, including readers still inside login/configuration frames.
+    stage.close();
+    while !worker
+        .0
+        .as_ref()
+        .expect("owned staged writer")
+        .is_finished()
+    {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    if worker
+        .0
+        .take()
+        .expect("finished staged writer")
+        .join()
+        .is_err()
+    {
+        stage.fail(StagedFailure::ThreadPanic);
+    }
+    shared.release(parts.uuid);
+}
+
+#[cfg(feature = "paired-packages")]
+fn write_staged(
+    mut writer: ConnWriter,
+    rx: Receiver<StagedBody>,
+    alive: Arc<AtomicI64>,
+    latency: Arc<AtomicI32>,
+    pending: Arc<AtomicUsize>,
+    stage: &super::StagedState,
+) {
+    use super::StagedFailure;
+    let start = Instant::now();
+    let mut sent_at: Option<(i64, Instant)> = None;
+    let mut next = Instant::now() + KEEP_ALIVE_EVERY;
+    while !stage.closing.load(Ordering::Acquire) {
+        match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(body) => {
+                let result = send_body(&mut writer, &body.body);
+                // Drop releases the queue AND active-write reservation together.
+                drop(body);
+                if result.is_err() {
+                    stage.fail(StagedFailure::Writer);
+                    break;
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                stage.fail(StagedFailure::Writer);
+                break;
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+        let now = Instant::now();
+        if let Some((id, at)) = sent_at {
+            if alive.load(Ordering::Relaxed) == id {
+                latency.store(
+                    i32::try_from(at.elapsed().as_millis()).unwrap_or(i32::MAX),
+                    Ordering::Relaxed,
+                );
+                sent_at = None;
+            } else if at.elapsed() > KEEP_ALIVE_TIMEOUT {
+                stage.fail(StagedFailure::ConnectionEnded);
+                break;
+            }
+        }
+        if sent_at.is_none() && now >= next {
+            let id = i64::try_from(start.elapsed().as_millis()).unwrap_or(0);
+            let Some(body) = StagedBody::reserve(
+                play::Clientbound::KeepAlive(cfg::KeepAlive { id }).encode(),
+                pending.clone(),
+                stage.outbound.clone(),
+            ) else {
+                stage.fail(StagedFailure::OutboundOverflow);
+                break;
+            };
+            let result = writer.send(&body.body);
+            drop(body);
+            if result.is_err() {
+                stage.fail(StagedFailure::Writer);
+                break;
+            }
+            sent_at = Some((id, now));
+            next = now + KEEP_ALIVE_EVERY;
+        }
+    }
+    writer.shutdown();
+    drop(rx);
 }
 
 /// Forward the player's packets until the connection ends: why it did, or
@@ -1319,5 +1730,245 @@ mod tests {
         sender.flush();
         assert_eq!(bodies(&rx), [vec![vec![5]], vec![b"disconnect".to_vec()]]);
         assert_eq!(sender.pending.load(Ordering::Relaxed), 5);
+    }
+}
+
+#[cfg(all(test, feature = "paired-packages"))]
+mod staged_transport_tests {
+    use super::super::{StagedAttempt, StagedFailure, StagedInner, StagedProfiles, StagedState};
+    use super::*;
+    use horizon_protocol::connection::Pipe;
+    use std::sync::atomic::AtomicBool;
+
+    struct BudgetFixture {
+        stage: Arc<StagedState>,
+        sender: PlayerSender,
+        rx: Receiver<StagedBody>,
+        client: Connection,
+        server: Connection,
+    }
+
+    fn sender_for(
+        stage: &Arc<StagedState>,
+        conn: u32,
+        pending: Arc<AtomicUsize>,
+    ) -> (PlayerSender, Receiver<StagedBody>) {
+        let (tx, rx) = channel();
+        let (legacy, legacy_rx) = channel();
+        drop(legacy_rx);
+        (
+            PlayerSender {
+                tx: legacy,
+                pending: pending.clone(),
+                held: Arc::default(),
+                posted: Arc::default(),
+                staged: Some(StagedSender {
+                    tx,
+                    stage: Arc::downgrade(stage),
+                    pending,
+                    conn,
+                }),
+            },
+            rx,
+        )
+    }
+
+    fn budget() -> BudgetFixture {
+        let (client, server) = Pipe::pair();
+        let pending = Arc::new(AtomicUsize::new(0));
+        let stage = Arc::new(StagedState {
+            profiles: StagedProfiles::memory_pair(),
+            inner: Mutex::new(StagedInner {
+                attempts: vec![StagedAttempt {
+                    conn: 1,
+                    shutdown: server.shutdown_handle(),
+                    profile: None,
+                    joined: false,
+                    pending: pending.clone(),
+                    terminal: None,
+                }],
+                ..Default::default()
+            }),
+            closing: AtomicBool::new(false),
+            outbound: Arc::default(),
+        });
+        let (sender, rx) = sender_for(&stage, 1, pending);
+        let client = Connection::local(client);
+        client
+            .reader
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        BudgetFixture {
+            stage,
+            sender,
+            rx,
+            client,
+            server: Connection::local(server),
+        }
+    }
+
+    #[test]
+    fn send_many_bypasses_holding_and_posting_without_losing_order_or_charges() {
+        let fixture = budget();
+        let holding = Holding::start();
+        fixture
+            .sender
+            .send_many([vec![0, 1], vec![0, 2, 3], vec![0, 4, 5, 6]]);
+        assert_eq!(fixture.sender.staged_pending(), Some(9));
+        assert_eq!(fixture.stage.outbound.load(Ordering::Acquire), 9);
+        assert!(fixture.sender.held().is_empty());
+        assert_eq!(fixture.sender.posted.load(Ordering::Acquire), 0);
+        assert!(fixture.sender.tx.send(Out::Packet(vec![0, 99])).is_err());
+        drop(holding);
+        flush_all([&fixture.sender]);
+        let mut remaining = 9;
+        for expected in [vec![0, 1], vec![0, 2, 3], vec![0, 4, 5, 6]] {
+            let body = fixture.rx.try_recv().unwrap();
+            assert_eq!(body.body, expected);
+            assert_eq!(fixture.sender.staged_pending(), Some(remaining));
+            remaining -= body.body.len();
+            drop(body);
+            assert_eq!(fixture.sender.staged_pending(), Some(remaining));
+            assert_eq!(fixture.stage.outbound.load(Ordering::Acquire), remaining);
+        }
+        assert!(fixture.rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn active_body_stays_charged_through_native_write_success_error_and_drop() {
+        let mut fixture = budget();
+        fixture.sender.send(vec![0, 21, 22, 23]);
+        let active = fixture.rx.try_recv().unwrap();
+        assert_eq!(fixture.sender.staged_pending(), Some(4));
+        assert_eq!(fixture.stage.outbound.load(Ordering::Acquire), 4);
+        send_body(&mut fixture.server.writer, &active.body).unwrap();
+        assert_eq!(fixture.client.recv().unwrap(), (0, vec![21, 22, 23]));
+        assert_eq!(fixture.sender.staged_pending(), Some(4));
+        assert_eq!(fixture.stage.outbound.load(Ordering::Acquire), 4);
+        drop(active);
+        assert_eq!(fixture.sender.staged_pending(), Some(0));
+        fixture.client.writer.shutdown();
+        fixture.sender.send(vec![0, 31, 32]);
+        let failed = fixture.rx.try_recv().unwrap();
+        assert!(send_body(&mut fixture.server.writer, &failed.body).is_err());
+        assert_eq!(fixture.sender.staged_pending(), Some(3));
+        assert_eq!(fixture.stage.outbound.load(Ordering::Acquire), 3);
+        drop(failed);
+        assert_eq!(fixture.sender.staged_pending(), Some(0));
+        assert_eq!(fixture.stage.outbound.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn native_writer_delivers_queued_bodies_and_releases_every_charge() {
+        let BudgetFixture {
+            stage,
+            sender,
+            rx,
+            mut client,
+            server,
+        } = budget();
+        sender.send_many([vec![0, 41], vec![0, 42, 43], vec![0, 44]]);
+        let pending = sender.pending.clone();
+        assert_eq!(pending.load(Ordering::Acquire), 7);
+        drop(sender);
+        let (_, writer) = server.split();
+        write_staged(
+            writer,
+            rx,
+            Arc::new(AtomicI64::new(-1)),
+            Arc::default(),
+            pending.clone(),
+            &stage,
+        );
+        assert_eq!(client.recv().unwrap(), (0, vec![41]));
+        assert_eq!(client.recv().unwrap(), (0, vec![42, 43]));
+        assert_eq!(client.recv().unwrap(), (0, vec![44]));
+        assert!(client.recv().is_err());
+        assert_eq!(pending.load(Ordering::Acquire), 0);
+        assert_eq!(stage.outbound.load(Ordering::Acquire), 0);
+        // This is a producer-channel termination/accounting case, not normal
+        // session close evidence: dropping the producer deliberately refuses.
+        assert_eq!(stage.inner().failure, Some(StagedFailure::Writer));
+    }
+
+    #[test]
+    fn native_write_error_drops_active_and_queued_bodies_and_later_sends_charge_zero() {
+        let BudgetFixture {
+            stage,
+            sender,
+            rx,
+            client,
+            server,
+        } = budget();
+        sender.send_many([vec![0, 51], vec![0, 52, 53], vec![0, 54, 55, 56]]);
+        assert_eq!(sender.staged_pending(), Some(9));
+        client.writer.shutdown();
+        let (_, writer) = server.split();
+        write_staged(
+            writer,
+            rx,
+            Arc::new(AtomicI64::new(-1)),
+            Arc::default(),
+            sender.pending.clone(),
+            &stage,
+        );
+        assert_eq!(stage.inner().failure, Some(StagedFailure::Writer));
+        assert_eq!(sender.staged_pending(), Some(0));
+        assert_eq!(stage.outbound.load(Ordering::Acquire), 0);
+        sender.send_many([vec![0, 61], vec![0, 62]]);
+        assert_eq!(sender.staged_pending(), Some(0));
+        assert_eq!(stage.outbound.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn disconnected_writer_channel_refuses_without_leaking_current_or_later_charges() {
+        let BudgetFixture {
+            stage,
+            sender,
+            rx,
+            mut client,
+            server: _server,
+        } = budget();
+        drop(rx);
+        sender.send_many([vec![0, 71], vec![0, 72, 73]]);
+        assert_eq!(stage.inner().failure, Some(StagedFailure::Writer));
+        assert_eq!(sender.staged_pending(), Some(0));
+        assert_eq!(stage.outbound.load(Ordering::Acquire), 0);
+        assert!(client.recv().is_err());
+        sender.send(vec![0, 74]);
+        assert_eq!(sender.staged_pending(), Some(0));
+    }
+
+    #[test]
+    fn shared_budget_overflow_preserves_active_and_queued_charges_until_drop() {
+        let fixture = budget();
+        let second_pending = Arc::new(AtomicUsize::new(0));
+        let (second, second_rx) = sender_for(&fixture.stage, 2, second_pending);
+        fixture.sender.send_many((0..8).map(|_| vec![0; 1 << 20]));
+        second.send_many((0..8).map(|_| vec![0; 1 << 20]));
+        assert_eq!(fixture.sender.staged_pending(), Some(8 << 20));
+        assert_eq!(second.staged_pending(), Some(8 << 20));
+        assert_eq!(fixture.stage.outbound.load(Ordering::Acquire), 16 << 20);
+        let active = fixture.rx.try_recv().unwrap();
+        // Dequeue alone cannot create capacity while the body is still active.
+        second.send_many([vec![0], vec![0, 81]]);
+        assert_eq!(
+            fixture.stage.inner().failure,
+            Some(StagedFailure::OutboundOverflow)
+        );
+        assert_eq!(fixture.stage.outbound.load(Ordering::Acquire), 16 << 20);
+        assert_eq!(second.staged_pending(), Some(8 << 20));
+        fixture.sender.send(vec![0, 82]);
+        assert_eq!(fixture.sender.staged_pending(), Some(8 << 20));
+        drop(fixture.rx);
+        assert_eq!(fixture.sender.staged_pending(), Some(1 << 20));
+        drop(second_rx);
+        assert_eq!(second.staged_pending(), Some(0));
+        assert_eq!(fixture.stage.outbound.load(Ordering::Acquire), 1 << 20);
+        drop(active);
+        assert_eq!(fixture.sender.staged_pending(), Some(0));
+        assert_eq!(fixture.stage.outbound.load(Ordering::Acquire), 0);
+        second.send(vec![0, 83]);
+        assert_eq!(second.staged_pending(), Some(0));
     }
 }

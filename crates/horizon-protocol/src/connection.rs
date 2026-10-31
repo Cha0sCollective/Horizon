@@ -45,7 +45,27 @@ pub struct Pipe {
     /// The read timeout (`set_read_timeout`).
     timeout: Mutex<Option<Duration>>,
 }
+/// A close-only capability. Keeping it does not keep an endpoint alive or allow
+/// sending/reading bytes. Dropping it does not change endpoint close semantics.
+#[derive(Clone)]
+pub struct PipeShutdown {
+    incoming: Arc<Channel>,
+    outgoing: Arc<Channel>,
+}
+impl PipeShutdown {
+    /// Close both directions, including a reader blocked inside a partial frame.
+    pub fn shutdown(&self) {
+        self.incoming.close();
+        self.outgoing.close();
+    }
+}
 impl Pipe {
+    pub fn shutdown_handle(&self) -> PipeShutdown {
+        PipeShutdown {
+            incoming: self.end.incoming.clone(),
+            outgoing: self.end.outgoing.clone(),
+        }
+    }
     /// Two connected ends.
     pub fn pair() -> (Self, Self) {
         let (a, b) = (Arc::new(Channel::default()), Arc::new(Channel::default()));
@@ -462,6 +482,45 @@ mod tests {
         drop(b);
         assert!(c.recv().is_err());
         assert!(c.send(&[1]).is_err());
+    }
+
+    #[test]
+    fn shutdown_capability_does_not_keep_a_dropped_endpoint_alive() {
+        let (a, b) = Pipe::pair();
+        let close = b.shutdown_handle();
+        let mut c = Connection::local(a);
+        drop(b);
+        assert!(c.recv().is_err());
+        assert!(c.send(&[1]).is_err());
+        drop(close);
+    }
+
+    #[test]
+    fn dropping_shutdown_capabilities_does_not_close_live_endpoints() {
+        let (a, b) = Pipe::pair();
+        let close = a.shutdown_handle();
+        let other = close.clone();
+        drop(close);
+        drop(other);
+        let mut a = Connection::local(a);
+        let mut b = Connection::local(b);
+        a.send(&[3, 7]).unwrap();
+        assert_eq!(b.recv().unwrap(), (3, vec![7]));
+        b.send(&[4, 8]).unwrap();
+        assert_eq!(a.recv().unwrap(), (4, vec![8]));
+    }
+
+    #[test]
+    fn shutdown_capability_ends_partial_frame_and_rejects_future_writes() {
+        let (a, mut b) = Pipe::pair();
+        let close = a.shutdown_handle();
+        // Declared frame length 5, but only one body byte has arrived.
+        b.write_all(&[5, 1]).unwrap();
+        close.shutdown();
+        let mut a = Connection::local(a);
+        assert!(a.recv().is_err());
+        assert!(b.write_all(&[2, 3, 4, 5]).is_err());
+        assert!(a.send(&[1]).is_err());
     }
 
     #[test]

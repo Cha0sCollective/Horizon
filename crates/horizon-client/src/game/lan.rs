@@ -3,6 +3,8 @@
 //! tick and turns what the guests do into gameplay. A world that is not open
 //! costs one `Option` check per tick.
 use super::{Game, shield::OFFHAND_SLOT};
+#[cfg(feature = "paired-packages")]
+mod connected_recovery;
 use horizon_client::{
     Result,
     items::ItemStack,
@@ -1065,6 +1067,26 @@ impl Game<'_> {
         mut host: LanHost,
         checked: &super::levels::session_checkpoint::CheckedSessionPlayers,
     ) -> Result<()> {
+        if host
+            .hub
+            .guests
+            .iter()
+            .any(|guest| !guest.placed || !guest.loaded)
+        {
+            return Err("session recovery requires placed and loaded participants".into());
+        }
+        self.install_session_participant_rows(&mut host, checked)?;
+        self.lan = Some(host);
+        self.check_installed_session_participants(checked)
+    }
+
+    /// The staged route has a distinct sealed transport/roster eligibility gate.
+    /// This shared implementation never manufactures readiness or placement.
+    fn install_session_participant_rows(
+        &mut self,
+        host: &mut LanHost,
+        checked: &super::levels::session_checkpoint::CheckedSessionPlayers,
+    ) -> Result<()> {
         use horizon_client::{motion::PlayerMotion, save::Level};
         use std::sync::atomic::Ordering;
         let rows = checked.rows();
@@ -1170,8 +1192,6 @@ impl Game<'_> {
             if host.hub.guests[..index]
                 .iter()
                 .any(|g| g.uuid == guest.uuid || g.conn == guest.conn)
-                || !guest.placed
-                || !guest.loaded
                 || guest.inventory.len() != 36
                 || guest.ender_items.len() != 27
                 || guest.inventory.iter().any(Option::is_some)
@@ -1329,7 +1349,6 @@ impl Game<'_> {
             }
         }
         let dedicated_cache = host.owner.is_none();
-        self.lan = Some(host);
         self.inventory.fill(None);
         self.armor.fill(None);
         self.offhand = None;
@@ -1373,6 +1392,32 @@ impl Game<'_> {
         self.stats = Default::default();
         self.spawn = None;
         self.respawn_config = None;
+        Ok(())
+    }
+
+    fn install_staged_session_participants(
+        &mut self,
+        host: &mut LanHost,
+        checked: &super::levels::session_checkpoint::CheckedSessionPlayers,
+        roster: &horizon_client::lan::hub::StagedRoster,
+    ) -> Result<()> {
+        host.hub.validate_staged_roster(roster)?;
+        if host
+            .hub
+            .guests
+            .iter()
+            .any(|guest| guest.placed || guest.loaded)
+        {
+            return Err("staged recovery participants must be genuinely unplaced".into());
+        }
+        self.install_session_participant_rows(host, checked)
+    }
+
+    fn check_installed_session_participants(
+        &self,
+        checked: &super::levels::session_checkpoint::CheckedSessionPlayers,
+    ) -> Result<()> {
+        let rows = checked.rows();
         let roster = self
             .observe_checkpoint_participants()
             .map_err(|error| format!("restored session roster: {error:?}"))?;
@@ -2439,6 +2484,19 @@ impl Game<'_> {
         config: HubConfig,
         host: Option<u128>,
     ) -> Result<()> {
+        let host = self.build_detached_lan_host(settings, net, config, host, Lan::start_with)?;
+        self.lan = Some(host);
+        Ok(())
+    }
+
+    fn build_detached_lan_host(
+        &mut self,
+        settings: LanSettings,
+        net: NetConfig,
+        config: HubConfig,
+        host: Option<u128>,
+        start: impl FnOnce(Arc<SyncData>, NetConfig) -> std::io::Result<Lan>,
+    ) -> Result<LanHost> {
         if net.listen {
             self.options.mod_packages.external_network()?;
         }
@@ -2472,7 +2530,7 @@ impl Game<'_> {
                 .get_or_init(|| Arc::new(horizon_client::save::SaveTables::new(&self.pack.assets)))
                 .clone(),
         );
-        let lan = Lan::start_with(sync.clone(), net)?;
+        let lan = start(sync.clone(), net)?;
         if let Some(uuid) = host {
             lan.reserve(uuid);
         }
@@ -2484,7 +2542,7 @@ impl Game<'_> {
         let port = hub.lan.port;
         self.world.block_log = Some(Vec::new());
         self.world.light_log = Some(Default::default());
-        self.lan = Some(LanHost {
+        let host = LanHost {
             hub,
             settings: LanSettings { port, ..settings },
             host_entity,
@@ -2505,9 +2563,9 @@ impl Game<'_> {
             commands: Vec::new(),
             quiet: std::collections::VecDeque::new(),
             states: Default::default(),
-        });
+        };
         self.audio.capture = Some(Vec::new());
-        Ok(())
+        Ok(host)
     }
 
     /// IntegratedServer.unpublishServer: the guests are sent away.
