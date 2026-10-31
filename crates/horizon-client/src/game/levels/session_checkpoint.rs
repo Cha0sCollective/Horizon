@@ -1574,6 +1574,13 @@ fn verify_image(
     })
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::game) enum CheckpointTestFault {
+    Copied,
+    Promoted,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Step {
     Copied,
@@ -1770,6 +1777,26 @@ impl Game<'_> {
         until: Instant,
     ) -> SResult<CheckpointReceipt> {
         self.checkpoint_session_steps(archive_root, epoch, until, |_| Ok(()))
+    }
+    #[cfg(test)]
+    pub(in crate::game) fn checkpoint_session_with_test_fault(
+        &mut self,
+        archive: &Path,
+        epoch: u64,
+        until: Instant,
+        fault: CheckpointTestFault,
+    ) -> SResult<CheckpointReceipt> {
+        self.checkpoint_session_steps(archive, epoch, until, |step| {
+            if matches!(
+                (fault, step),
+                (CheckpointTestFault::Copied, Step::Copied)
+                    | (CheckpointTestFault::Promoted, Step::Promoted)
+            ) {
+                Err(fail("injected checkpoint post-phase failure"))
+            } else {
+                Ok(())
+            }
+        })
     }
     fn checkpoint_session_steps(
         &mut self,
@@ -1972,6 +1999,36 @@ fn epoch_name(name: &str, prefix: &str) -> SResult<u64> {
         "epoch spelling",
     )?;
     Ok(number)
+}
+/// Inspect every published and pending epoch without reserving or changing it.
+/// Keep one archive entry available for the next checkpoint's pending image.
+pub(in crate::game) fn next_session_checkpoint_epoch(archive: &Path) -> SResult<u64> {
+    let archive = directory(archive)?;
+    let mut count = 0;
+    let mut latest = 0;
+    for entry in checked(fs::read_dir(&archive))? {
+        count += 1;
+        require(count < ENTRY_LIMIT, "archive entry capacity exhausted")?;
+        let entry = checked(entry)?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| fail("non-UTF8 epoch"))?;
+        let meta = checked(fs::symlink_metadata(entry.path()))?;
+        require(
+            meta.is_dir() && !meta.file_type().is_symlink(),
+            "non-directory/linked archive entry",
+        )?;
+        let prefix = if name.starts_with(".pending-") {
+            ".pending-"
+        } else {
+            "epoch-"
+        };
+        latest = latest.max(epoch_name(&name, prefix)?);
+    }
+    latest
+        .checked_add(1)
+        .ok_or_else(|| fail("checkpoint epoch overflow"))
 }
 fn epochs(archive: &Path) -> SResult<Vec<(u64, PathBuf)>> {
     let mut result = Vec::new();
