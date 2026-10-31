@@ -18,6 +18,7 @@ pub mod discovery;
 pub mod entity;
 pub mod guest;
 pub mod hub;
+pub mod login_negotiation;
 pub mod menu;
 pub mod peer_contract;
 pub mod playerdata;
@@ -494,6 +495,7 @@ pub struct Shared {
     next: AtomicU32,
     stop: AtomicBool,
     random: Mutex<u64>,
+    required_negotiation: Option<login_negotiation::RequiredNegotiation>,
     #[cfg(feature = "paired-packages")]
     stage: Option<Arc<StagedState>>,
 }
@@ -684,6 +686,28 @@ impl Lan {
     }
     /// ServerConnectionListener.startTcpServerListener with a configuration.
     pub fn start_with(sync: Arc<data::SyncData>, config: NetConfig) -> io::Result<Self> {
+        Self::start_policy(sync, config, None)
+    }
+    /// Explicit compatibility-only TCP path. Matching peers are still refused
+    /// before reservation/configuration; ordinary launch constructors stay off.
+    pub fn start_with_required_negotiation(
+        sync: Arc<data::SyncData>,
+        config: NetConfig,
+        required: login_negotiation::RequiredNegotiation,
+    ) -> io::Result<Self> {
+        if !required.expectation.retains_sync(&sync) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "required negotiation SyncData owner differs",
+            ));
+        }
+        Self::start_policy(sync, config, Some(required))
+    }
+    fn start_policy(
+        sync: Arc<data::SyncData>,
+        config: NetConfig,
+        required_negotiation: Option<login_negotiation::RequiredNegotiation>,
+    ) -> io::Result<Self> {
         let (tx, events) = channel();
         let (listen, port, announce) = (config.listen, config.port, config.announce);
         let shared = Arc::new(Shared {
@@ -697,6 +721,7 @@ impl Lan {
             stop: AtomicBool::new(false),
             random: Mutex::new(crate::server::java_properties::now_millis() as u64 | 1),
             config,
+            required_negotiation,
             #[cfg(feature = "paired-packages")]
             stage: None,
         });
@@ -1072,6 +1097,9 @@ impl Lan {
         self.shared.reserved.lock().unwrap().insert(uuid);
     }
     pub fn stop(&mut self) {
+        if let Some(required) = &self.shared.required_negotiation {
+            required.close();
+        }
         #[cfg(feature = "paired-packages")]
         if self.shared.stage.is_some() {
             let _ = self.close_staged();

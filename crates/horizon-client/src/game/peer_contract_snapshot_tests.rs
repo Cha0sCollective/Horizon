@@ -237,6 +237,157 @@ mod resource {
         // not activate a runtime or invoke any counter evaluator.
         Packages::read(&BTreeSet::new(), &[path.into()]).unwrap()
     }
+    fn actual_tcp_refuses_inputs(
+        a: &FrozenHostInputs,
+        b: &FrozenHostInputs,
+        mismatch: horizon_client::lan::peer_contract::ContractMismatch,
+    ) {
+        use horizon_client::lan::login_negotiation::{
+            NegotiationConnection, Refusal, negotiate_client, negotiate_server,
+        };
+        use horizon_protocol::connection::Connection;
+        use std::{
+            net::{TcpListener, TcpStream},
+            time::{Duration, Instant},
+        };
+        let expected_a = a.negotiation_expectation().unwrap();
+        let expected_b = b.negotiation_expectation().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut s = NegotiationConnection::new(
+                Connection::from_stream(server).unwrap(),
+                Instant::now() + Duration::from_secs(2),
+            )
+            .unwrap();
+            negotiate_server(&mut s, expected_a, 42).err().unwrap()
+        });
+        let mut client = NegotiationConnection::new(
+            Connection::from_stream(client).unwrap(),
+            Instant::now() + Duration::from_secs(2),
+        )
+        .unwrap();
+        let result = negotiate_client(&mut client, expected_b, 42).err().unwrap();
+        let terminal = server.join().unwrap();
+        assert_eq!(result, Refusal::Mismatch(mismatch));
+        assert!(matches!(terminal, Refusal::Io(_)));
+    }
+
+    #[test]
+    #[ignore = "isolated pinned resources and prebuilt Rust pair; owned loopback TCP"]
+    fn frozen_cached_transport_owners_and_actual_tcp_agreement_refuse_configuration() {
+        use horizon_client::lan::login_negotiation::{
+            Endpoint, NegotiationConnection, NegotiationExpectation, negotiate_client,
+            negotiate_server,
+        };
+        use horizon_protocol::connection::Connection;
+        use std::{
+            net::{TcpListener, TcpStream},
+            time::{Duration, Instant},
+        };
+        let base = PathBuf::from(
+            std::env::var_os("HORIZON_TEST_RESOURCES").expect("pinned resources required"),
+        );
+        let pair = PathBuf::from(
+            std::env::var_os("HORIZON_COUNTER_PAIR_FIXTURE").expect("prebuilt pair required"),
+        );
+        let before = tree(&pair);
+        let scratch = Scratch::new();
+        let a = captured(&pair);
+        let b = captured(&pair);
+        let root_a = materialize(&a, &base, &scratch.0.join("transport-a"));
+        let root_b = materialize(&b, &base, &scratch.0.join("transport-b"));
+        let (sync_a, blocks_a) = load(&root_a);
+        let (sync_b, blocks_b) = load(&root_b);
+        let sync_a = Arc::new(sync_a);
+        let sync_b = Arc::new(sync_b);
+        let blocks_a = Box::leak(Box::new(blocks_a));
+        let blocks_b = Box::leak(Box::new(blocks_b));
+        let frozen_a = a
+            .freeze_peer_inputs(sync_a.clone(), blocks_a)
+            .unwrap()
+            .unwrap();
+        let frozen_b = b
+            .freeze_peer_inputs(sync_b.clone(), blocks_b)
+            .unwrap()
+            .unwrap();
+        let expected_a = frozen_a.negotiation_expectation().unwrap();
+        let expected_b = frozen_b.negotiation_expectation().unwrap();
+        assert!(Arc::ptr_eq(
+            &expected_a,
+            &frozen_a.negotiation_expectation().unwrap()
+        ));
+        assert!(Arc::ptr_eq(
+            &expected_b,
+            &frozen_b.negotiation_expectation().unwrap()
+        ));
+        assert!(!Arc::ptr_eq(&expected_a, &expected_b));
+        assert_eq!(expected_a.contract(), expected_b.contract());
+        assert!(expected_a.retains_sync(&sync_a) && expected_b.retains_sync(&sync_b));
+        assert!(!expected_a.retains_sync(&sync_b));
+        assert!(expected_a.retains_blocks(blocks_a));
+        let prepared_a = a
+            .catalog
+            .as_ref()
+            .unwrap()
+            .prepared()
+            .values()
+            .next()
+            .unwrap();
+        let prepared_b = b
+            .catalog
+            .as_ref()
+            .unwrap()
+            .prepared()
+            .values()
+            .next()
+            .unwrap();
+        assert!(expected_a.retains_prepared(prepared_a));
+        assert!(!expected_a.retains_prepared(prepared_b));
+        let mut changed = SyncData::load(&root_a).unwrap();
+        changed.features.push("example:other".into());
+        assert!(
+            NegotiationExpectation::from_retained(
+                Arc::new(changed),
+                blocks_a,
+                prepared_a.clone(),
+                frozen_a.wire.clone()
+            )
+            .is_err()
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let server_expected = expected_a.clone();
+        let server = std::thread::spawn(move || {
+            let mut scope = NegotiationConnection::new(
+                Connection::from_stream(server).unwrap(),
+                Instant::now() + Duration::from_secs(3),
+            )
+            .unwrap();
+            let receipt = negotiate_server(&mut scope, server_expected, 42).unwrap();
+            (scope, receipt)
+        });
+        let mut client = NegotiationConnection::new(
+            Connection::from_stream(client).unwrap(),
+            Instant::now() + Duration::from_secs(3),
+        )
+        .unwrap();
+        let receipt = negotiate_client(&mut client, expected_b.clone(), 42).unwrap();
+        let (mut server, server_receipt) = server.join().unwrap();
+        assert!(receipt.is_live(&client, Endpoint::Client, &expected_b, 42));
+        assert!(server_receipt.is_live(&server, Endpoint::Server, &expected_a, 42));
+        assert!(!receipt.is_live(&client, Endpoint::Client, &expected_a, 42));
+        server.refuse_configuration().unwrap();
+        client.observe_configuration_refusal().unwrap();
+        assert!(!receipt.is_live(&client, Endpoint::Client, &expected_b, 42));
+        assert!(!server_receipt.is_live(&server, Endpoint::Server, &expected_a, 42));
+        assert!(a.external_network().is_err() && b.external_network().is_err());
+        assert_eq!(tree(&pair), before);
+        drop(frozen_a);
+        drop(frozen_b);
+    }
 
     #[test]
     #[ignore = "isolated pinned HORIZON_TEST_RESOURCES and prebuilt HORIZON_COUNTER_PAIR_FIXTURE"]
@@ -535,6 +686,7 @@ mod resource {
             first.wire_contract().compare(changed.wire_contract()),
             Err(ContractMismatch::Features)
         );
+        actual_tcp_refuses_inputs(&first, &changed, ContractMismatch::Features);
         drop(changed);
         Arc::get_mut(&mut controls).unwrap().features.pop();
         let (registry_index, tag_index) = controls
@@ -563,6 +715,7 @@ mod resource {
             first.wire_contract().compare(changed.wire_contract()),
             Err(ContractMismatch::Tags)
         );
+        actual_tcp_refuses_inputs(&first, &changed, ContractMismatch::Tags);
         drop(changed);
         Arc::get_mut(&mut controls).unwrap().tags.registries[registry_index].tags[tag_index]
             .ids
@@ -586,6 +739,7 @@ mod resource {
             first.wire_contract().compare(changed.wire_contract()),
             Err(ContractMismatch::Builtin)
         );
+        actual_tcp_refuses_inputs(&first, &changed, ContractMismatch::Builtin);
         drop(changed);
         let ids = Arc::get_mut(&mut controls)
             .unwrap()
@@ -664,6 +818,40 @@ mod resource {
             first.wire_contract().compare(changed.wire_contract()),
             Err(ContractMismatch::Blocks)
         );
+        actual_tcp_refuses_inputs(&first, &changed, ContractMismatch::Blocks);
+        drop(changed);
+
+        // Independent actual synchronized data, in a new scratch root. No
+        // mutation follows a materialized link back into prepared resources.
+        let sync_root = scratch.0.join("changed-synchronized-input");
+        fs::create_dir_all(sync_root.join("data/minecraft/worldgen/biome")).unwrap();
+        fs::copy(
+            root_b.join("registries.json"),
+            sync_root.join("registries.json"),
+        )
+        .unwrap();
+        let mut biome: serde_json::Value = serde_json::from_slice(
+            &fs::read(root_b.join("data/minecraft/worldgen/biome/plains.json")).unwrap(),
+        )
+        .unwrap();
+        let temperature = biome["temperature"]
+            .as_f64()
+            .expect("actual biome temperature");
+        biome["temperature"] = serde_json::json!(temperature + 0.125);
+        fs::write(
+            sync_root.join("data/minecraft/worldgen/biome/plains.json"),
+            serde_json::to_vec(&biome).unwrap(),
+        )
+        .unwrap();
+        let changed = b
+            .freeze_peer_inputs(Arc::new(SyncData::load(&sync_root).unwrap()), blocks_b)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            first.wire_contract().compare(changed.wire_contract()),
+            Err(ContractMismatch::Synchronized)
+        );
+        actual_tcp_refuses_inputs(&first, &changed, ContractMismatch::Synchronized);
         drop(changed);
 
         let machine_file = b
@@ -691,6 +879,7 @@ mod resource {
             first.wire_contract().compare(changed.wire_contract()),
             Err(ContractMismatch::PackageContent)
         );
+        actual_tcp_refuses_inputs(&first, &changed, ContractMismatch::PackageContent);
         drop(changed);
         assert_eq!(first.wire_contract().encode().unwrap(), encoded);
         assert_eq!(second.wire_contract().encode().unwrap(), encoded);

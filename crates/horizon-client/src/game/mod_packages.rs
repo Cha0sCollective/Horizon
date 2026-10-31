@@ -43,10 +43,55 @@ pub(super) struct FrozenHostInputs {
     blocks: &'static BlockRegistry,
     snapshot: PeerSnapshot,
     wire: WireContract,
+    expectation:
+        std::sync::OnceLock<Arc<horizon_client::lan::login_negotiation::NegotiationExpectation>>,
 }
 
 #[allow(dead_code)]
 impl FrozenHostInputs {
+    /// Cache the one transport instance from this holder's actual retained owners.
+    #[cfg(feature = "paired-packages")]
+    pub(super) fn negotiation_expectation(
+        &self,
+    ) -> std::result::Result<
+        Arc<horizon_client::lan::login_negotiation::NegotiationExpectation>,
+        String,
+    > {
+        if let Some(expectation) = self.expectation.get() {
+            return Ok(expectation.clone());
+        }
+        let actual = self
+            .packages
+            .peer_snapshot(&self.sync, self.blocks)?
+            .ok_or("negotiation holder lost captured package")?;
+        if actual != self.snapshot || actual.to_wire_contract()? != self.wire {
+            return Err("negotiation frozen startup projections differ".into());
+        }
+        let prepared = self
+            .packages
+            .catalog
+            .as_ref()
+            .ok_or("negotiation missing catalog")?
+            .prepared()
+            .values()
+            .next()
+            .ok_or("negotiation missing prepared pair")?
+            .clone();
+        let expectation =
+            horizon_client::lan::login_negotiation::NegotiationExpectation::from_retained(
+                self.sync.clone(),
+                self.blocks,
+                prepared,
+                self.wire.clone(),
+            )?;
+        // Concurrent immutable callers converge on the holder's single identity.
+        let _ = self.expectation.set(expectation);
+        Ok(self
+            .expectation
+            .get()
+            .expect("expectation just initialized")
+            .clone())
+    }
     pub(super) fn wire_contract(&self) -> &WireContract {
         &self.wire
     }
@@ -175,6 +220,7 @@ impl Packages {
             blocks,
             snapshot,
             wire,
+            expectation: std::sync::OnceLock::new(),
         }))
     }
 
@@ -376,8 +422,8 @@ impl Packages {
         })
     }
 
-    /// No packet negotiation exists yet. The in-process memory connection shares
-    /// these same captured Arcs; external peers cannot establish that property.
+    /// External paired configuration and receipt consumption remain disabled.
+    /// Compatibility agreement alone cannot authorize an external connection.
     pub fn external_network(&self) -> Result<()> {
         if self.identities.is_empty() {
             Ok(())

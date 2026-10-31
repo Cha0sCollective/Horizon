@@ -131,6 +131,25 @@ enum Stream {
     Memory(Pipe),
 }
 impl Stream {
+    fn read_timeout(&self) -> std::io::Result<Option<Duration>> {
+        match self {
+            Self::Tcp(s) => s.read_timeout(),
+            Self::Memory(p) => Ok(*p.timeout.lock().unwrap()),
+        }
+    }
+    fn write_timeout(&self) -> std::io::Result<Option<Duration>> {
+        match self {
+            Self::Tcp(s) => s.write_timeout(),
+            Self::Memory(_) => Ok(None),
+        }
+    }
+    fn set_write_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        match self {
+            Self::Tcp(s) => s.set_write_timeout(timeout),
+            // Pipe writes never wait for peer capacity.
+            Self::Memory(_) => Ok(()),
+        }
+    }
     fn try_clone(&self) -> std::io::Result<Self> {
         Ok(match self {
             Self::Tcp(s) => Self::Tcp(s.try_clone()?),
@@ -291,11 +310,83 @@ impl Connection {
     pub fn recv(&mut self) -> Result<(i32, Vec<u8>)> {
         self.reader.recv()
     }
+    /// Receive with one total I/O deadline, including every partial frame read.
+    /// Ordinary receive timeouts are restored even on a failed attempt.
+    pub fn recv_until(&mut self, deadline: Instant) -> Result<(i32, Vec<u8>)> {
+        let prior = match self.reader.stream.read_timeout() {
+            Ok(prior) => prior,
+            Err(error) => {
+                self.writer.shutdown();
+                return Err(error.into());
+            }
+        };
+        let result = self.reader.recv_deadline(deadline);
+        if let Err(error) = self.reader.stream.set_read_timeout(prior) {
+            self.writer.shutdown();
+            return Err(error.into());
+        }
+        if result.is_err() {
+            self.writer.shutdown();
+        }
+        result
+    }
+    /// Send with one total I/O deadline, including every partial native write.
+    pub fn send_until(&mut self, deadline: Instant, body: &[u8]) -> Result<()> {
+        let prior = match self.writer.stream.write_timeout() {
+            Ok(prior) => prior,
+            Err(error) => {
+                self.writer.shutdown();
+                return Err(error.into());
+            }
+        };
+        let result = self.writer.send_deadline(deadline, body);
+        if let Err(error) = self.writer.stream.set_write_timeout(prior) {
+            self.writer.shutdown();
+            return Err(error.into());
+        }
+        if result.is_err() {
+            self.writer.shutdown();
+        }
+        result
+    }
     pub fn split(self) -> (ConnReader, ConnWriter) {
         (self.reader, self.writer)
     }
 }
 impl ConnReader {
+    fn recv_deadline(&mut self, deadline: Instant) -> Result<(i32, Vec<u8>)> {
+        loop {
+            remaining(deadline)?;
+            if let Some(frame) = frame::split(&mut self.buffer)? {
+                let body = frame::decompress(frame, self.threshold)?;
+                let mut r = Reader::new(&body);
+                let id = r.varint()?;
+                let start = r.position();
+                let payload = body[start..].to_vec();
+                remaining(deadline)?;
+                self.counters.received.fetch_add(1, Ordering::Relaxed);
+                return Ok((id, payload));
+            }
+            self.stream.set_read_timeout(Some(remaining(deadline)?))?;
+            let mut chunk = [0u8; 16384];
+            let n = match self.stream.read(&mut chunk) {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                other => other?,
+            };
+            remaining(deadline)?;
+            if n == 0 {
+                return Err(Error::new("Connection closed during bounded receive"));
+            }
+            self.counters
+                .bytes_in
+                .fetch_add(n as i64, Ordering::Relaxed);
+            let data = &mut chunk[..n];
+            if let Some(c) = &mut self.decrypt {
+                c.decrypt(data);
+            }
+            self.buffer.extend_from_slice(data);
+        }
+    }
     /// Block until a whole packet arrives: (id, payload).
     pub fn recv(&mut self) -> Result<(i32, Vec<u8>)> {
         loop {
@@ -327,6 +418,32 @@ impl ConnReader {
     }
 }
 impl ConnWriter {
+    fn send_deadline(&mut self, deadline: Instant, body: &[u8]) -> Result<()> {
+        remaining(deadline)?;
+        let mut framed = frame::prefixed(&frame::contents(body, self.threshold)?);
+        if let Some(c) = &mut self.encrypt {
+            c.encrypt(&mut framed);
+        }
+        let mut offset = 0;
+        while offset < framed.len() {
+            self.stream.set_write_timeout(Some(remaining(deadline)?))?;
+            let n = match self.stream.write(&framed[offset..]) {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                other => other?,
+            };
+            remaining(deadline)?;
+            if n == 0 {
+                return Err(Error::new("Connection closed during bounded send"));
+            }
+            offset += n;
+            self.counters
+                .bytes_out
+                .fetch_add(n as i64, Ordering::Relaxed);
+        }
+        remaining(deadline)?;
+        self.counters.sent.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
     /// Send one packet body (VarInt id + payload).
     pub fn send(&mut self, body: &[u8]) -> Result<()> {
         self.send_contents(&frame::contents(body, self.threshold)?)
@@ -350,10 +467,177 @@ impl ConnWriter {
     }
 }
 
+fn remaining(deadline: Instant) -> Result<Duration> {
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        Err(Error::new("Connection total I/O deadline expired"))
+    } else {
+        Ok(left)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::net::TcpListener;
+
+    #[test]
+    fn total_read_deadline_stalled_partial_prefix_body_and_trickle_restore_timeout() {
+        for bytes in [
+            vec![],
+            vec![0x80],
+            vec![10, 1],
+            vec![10, 1, 2, 3, 4, 5, 6, 7, 8],
+        ] {
+            let length = bytes.len();
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let mut peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let (stream, _) = listener.accept().unwrap();
+            let mut c = Connection::from_stream(stream).unwrap();
+            c.reader
+                .set_read_timeout(Some(Duration::from_secs(7)))
+                .unwrap();
+            let (release, wait) = std::sync::mpsc::channel();
+            let (started, ready) = std::sync::mpsc::channel();
+            let peer = std::thread::spawn(move || {
+                let mut written = 0;
+                if bytes.is_empty() {
+                    started.send(()).unwrap();
+                }
+                for byte in bytes {
+                    if peer.write_all(&[byte]).is_err() {
+                        break;
+                    }
+                    written += 1;
+                    if written == 1 {
+                        started.send(()).unwrap();
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                let _ = wait.recv();
+                let _ = peer.shutdown(Shutdown::Both);
+                written
+            });
+            ready.recv_timeout(Duration::from_secs(2)).unwrap();
+            let start = Instant::now();
+            let outcome = c.recv_until(start + Duration::from_millis(75));
+            let elapsed = start.elapsed();
+            let prior = c.reader.stream.read_timeout().unwrap();
+            let _ = release.send(());
+            let written = peer.join().unwrap();
+            assert!(outcome.is_err());
+            assert!(elapsed < Duration::from_secs(2));
+            assert!(elapsed >= Duration::from_millis(40));
+            assert_eq!(prior, Some(Duration::from_secs(7)));
+            assert!(written <= 9);
+            let read = c.reader.counters.bytes_in.load(Ordering::Relaxed);
+            if length == 9 {
+                assert!(
+                    read >= 3,
+                    "actual trickled bytes must arrive before the deadline"
+                );
+            } else {
+                assert_eq!(read, length as i64);
+            }
+        }
+    }
+
+    #[test]
+    fn total_write_deadline_on_observed_full_tcp_send_queue_restores_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (peer, _) = listener.accept().unwrap();
+        // Observe native WouldBlock first. The peer owns its socket throughout
+        // and deliberately never reads; this is a blocked-write control.
+        stream.set_nonblocking(true).unwrap();
+        let mut filled = 0usize;
+        let mut blocked = false;
+        while filled < (64 << 20) {
+            match stream.write(&[0; 65536]) {
+                Ok(0) => panic!("unexpected closed send queue"),
+                Ok(n) => filled += n,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    blocked = true;
+                    break;
+                }
+                Err(e) => panic!("queue filling failed: {e}"),
+            }
+        }
+        stream.set_nonblocking(false).unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(7)))
+            .unwrap();
+        let mut c = Connection::from_stream(stream).unwrap();
+        let start = Instant::now();
+        let outcome = c.send_until(
+            start + Duration::from_millis(100),
+            &vec![0; frame::MAX_FRAME],
+        );
+        let elapsed = start.elapsed();
+        let prior = c.writer.stream.write_timeout().unwrap();
+        let _ = peer.shutdown(Shutdown::Both);
+        drop(peer);
+        assert!(
+            blocked && filled > 0,
+            "native full queue must actually be observed"
+        );
+        assert!(outcome.is_err());
+        assert!(elapsed < Duration::from_secs(2));
+        assert_eq!(prior, Some(Duration::from_secs(7)));
+    }
+
+    #[test]
+    fn bounded_io_preserves_encryption_compression_and_prior_timeout_on_success() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut c = Connection::from_stream(server).unwrap();
+            c.enable_encryption(&[7; 16]);
+            c.set_compression(64);
+            let packet = c.recv_until(Instant::now() + Duration::from_secs(2));
+            let sent = c.send_until(Instant::now() + Duration::from_secs(2), &[9, 8, 7]);
+            (packet, sent)
+        });
+        stream
+            .set_read_timeout(Some(Duration::from_secs(7)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(9)))
+            .unwrap();
+        let mut c = Connection::from_stream(stream).unwrap();
+        c.enable_encryption(&[7; 16]);
+        c.set_compression(64);
+        let mut packet = vec![5];
+        packet.extend([3; 1000]);
+        let sent = c.send_until(Instant::now() + Duration::from_secs(2), &packet);
+        let received = c.recv_until(Instant::now() + Duration::from_secs(2));
+        let (server_received, server_sent) = server.join().unwrap();
+        assert!(sent.is_ok() && server_sent.is_ok());
+        assert_eq!(server_received.unwrap(), (5, vec![3; 1000]));
+        assert_eq!(received.unwrap(), (9, vec![8, 7]));
+        assert_eq!(
+            c.reader.stream.read_timeout().unwrap(),
+            Some(Duration::from_secs(7))
+        );
+        assert_eq!(
+            c.writer.stream.write_timeout().unwrap(),
+            Some(Duration::from_secs(9))
+        );
+    }
+
+    #[test]
+    fn expired_deadline_refuses_already_buffered_frame_and_send() {
+        let (a, b) = Pipe::pair();
+        let mut a = Connection::local(a);
+        let mut b = Connection::local(b);
+        b.send(&[1, 2]).unwrap();
+        b.send(&[3, 4]).unwrap();
+        assert_eq!(a.recv().unwrap(), (1, vec![2]));
+        assert!(!a.reader.buffer.is_empty());
+        assert!(a.recv_until(Instant::now()).is_err());
+        assert!(a.send_until(Instant::now(), &[1]).is_err());
+    }
 
     #[test]
     fn ipv4_first_keeps_each_familys_order() {

@@ -94,6 +94,7 @@ pub struct Session {
     pub cookies: Cookies,
     /// HORIZON_NET_DEBUG=1 logs every packet sent from the game thread.
     debug: bool,
+    required: Option<crate::lan::login_negotiation::RequiredNegotiation>,
 }
 impl Session {
     /// Start connecting in the background, as `auth`'s account when there is one.
@@ -104,7 +105,7 @@ impl Session {
         view_distance: i8,
         lang: Arc<Language>,
     ) -> Self {
-        Self::start(address, name, auth, view_distance, lang, None, None)
+        Self::start(address, name, auth, view_distance, lang, None, None, None)
     }
     /// `ConnectScreen.startConnecting` for a `transfer`: the cookies the
     /// server stored carry to the new connection (`TransferState`).
@@ -124,6 +125,7 @@ impl Session {
             lang,
             None,
             Some(cookies),
+            None,
         )
     }
     /// Join an integrated server through memory (`Connection.connectToLocalServer`).
@@ -133,7 +135,37 @@ impl Session {
         view_distance: i8,
         lang: Arc<Language>,
     ) -> Self {
-        Self::start("local", name, None, view_distance, lang, Some(pipe), None)
+        Self::start(
+            "local",
+            name,
+            None,
+            view_distance,
+            lang,
+            Some(pipe),
+            None,
+            None,
+        )
+    }
+    /// Explicit bounded compatibility attempt. It never publishes Joined or
+    /// client registries, including when an unsupported peer stays silent.
+    pub fn connect_required_negotiation(
+        address: &str,
+        name: &str,
+        auth: Option<Arc<AuthSession>>,
+        view_distance: i8,
+        lang: Arc<Language>,
+        required: crate::lan::login_negotiation::RequiredNegotiation,
+    ) -> Self {
+        Self::start(
+            address,
+            name,
+            auth,
+            view_distance,
+            lang,
+            None,
+            None,
+            Some(required),
+        )
     }
     fn start(
         address: &str,
@@ -143,6 +175,7 @@ impl Session {
         lang: Arc<Language>,
         local: Option<horizon_protocol::connection::Pipe>,
         cookies: Option<Cookies>,
+        required: Option<crate::lan::login_negotiation::RequiredNegotiation>,
     ) -> Self {
         let (send, events) = channel();
         let writer = Arc::new(Mutex::new(None));
@@ -156,6 +189,7 @@ impl Session {
             (writer.clone(), counters.clone(), cookies.clone());
         let thread_configuring = configuring.clone();
         let (address_owned, name_owned) = (address.to_owned(), name.to_owned());
+        let thread_required = required.clone();
         let thread = std::thread::Builder::new()
             .name("horizon-net".into())
             .spawn(move || {
@@ -172,6 +206,7 @@ impl Session {
                     &thread_counters,
                     &thread_cookies,
                     transferred,
+                    thread_required,
                 );
                 let from_server = result.is_ok();
                 let reason = result.unwrap_or_else(|e| e);
@@ -195,6 +230,7 @@ impl Session {
             counters,
             cookies,
             debug,
+            required,
         }
     }
     /// Everything received since the last poll.
@@ -263,6 +299,9 @@ impl Session {
         }
     }
     pub fn disconnect(&mut self) {
+        if let Some(required) = &self.required {
+            required.close();
+        }
         if let Some(w) = self.writer.lock().unwrap().take() {
             w.shutdown();
         }
@@ -366,6 +405,7 @@ fn run(
     shared_counters: &Mutex<Option<Arc<Counters>>>,
     cookies: &Cookies,
     transferred: bool,
+    required: Option<crate::lan::login_negotiation::RequiredNegotiation>,
 ) -> Result<String, String> {
     let (host, port, mut c) = if let Some(pipe) = local {
         (address.to_owned(), 0, Connection::local(pipe))
@@ -391,7 +431,13 @@ fn run(
     };
     *shared_counters.lock().unwrap() = Some(c.reader.counters.clone());
     let e = |e: horizon_protocol::Error| e.to_string();
-    c.send(
+    let required_deadline = required.as_ref().map(|r| r.deadline());
+    let send_login = |c: &mut Connection, body: &[u8]| match required_deadline {
+        Some(deadline) => c.send_until(deadline, body),
+        None => c.send(body),
+    };
+    send_login(
+        &mut c,
         &handshake::Serverbound::Intention(handshake::Intention {
             protocol: PROTOCOL_VERSION,
             host: host.clone(),
@@ -407,7 +453,8 @@ fn run(
     .map_err(e)?;
     // Vanilla's login sends the account's profile id, or the offline one.
     let uuid = auth.map_or_else(|| offline_uuid(name), |a| a.uuid);
-    c.send(
+    send_login(
+        &mut c,
         &login::Serverbound::Hello(login::ServerHello {
             name: name.to_owned(),
             uuid,
@@ -415,11 +462,24 @@ fn run(
         .encode(),
     )
     .map_err(e)?;
+    let mut required_auth_seen = false;
     let profile = loop {
-        let (id, payload) = c.recv().map_err(e)?;
+        let (id, payload) = match required_deadline {
+            Some(deadline) => c.recv_until(deadline),
+            None => c.recv(),
+        }
+        .map_err(e)?;
         match login::Clientbound::decode(id, &payload).map_err(e)? {
-            login::Clientbound::Compression(p) => c.set_compression(p.threshold),
+            login::Clientbound::Compression(p) => {
+                if required.is_some() {
+                    return Err("paired login: compression before agreement".into());
+                }
+                c.set_compression(p.threshold);
+            }
             login::Clientbound::LoginFinished(p) => {
+                if required.is_some() {
+                    return Err("paired login: LoginFinished before agreement".into());
+                }
                 c.send(&login::Serverbound::LoginAcknowledged(Empty).encode())
                     .map_err(e)?;
                 break p.profile;
@@ -431,6 +491,10 @@ fn run(
                 return Ok(reason);
             }
             login::Clientbound::Hello(hello) => {
+                if required.is_some() && required_auth_seen {
+                    return Err("paired login: repeated authentication hello".into());
+                }
+                required_auth_seen = true;
                 status(send, &tr(lang, "connect.authorizing"));
                 let key = RsaPublicKey::from_der(&hello.public_key)
                     .map_err(|err| format!("Protocol error: {err}"))?;
@@ -450,7 +514,8 @@ fn run(
                     }
                 }
                 status(send, &tr(lang, "connect.encrypting"));
-                c.send(
+                send_login(
+                    &mut c,
                     &login::Serverbound::Key(login::Key {
                         key: key.encrypt(&secret).map_err(e)?,
                         challenge: key.encrypt(&hello.challenge).map_err(e)?,
@@ -461,6 +526,30 @@ fn run(
                 c.enable_encryption(&secret);
             }
             login::Clientbound::CustomQuery(q) => {
+                if let Some(required) = &required {
+                    use crate::lan::login_negotiation::{
+                        CONFIGURATION_DISABLED, NegotiationConnection, negotiate_client_from_query,
+                    };
+                    let mut scope = NegotiationConnection::for_required(
+                        c,
+                        required,
+                        required_deadline.expect("required deadline"),
+                    )
+                    .map_err(|e| e.to_string())?;
+                    let receipt = negotiate_client_from_query(
+                        &mut scope,
+                        required.expectation.clone(),
+                        uuid,
+                        q,
+                    )
+                    .map_err(|e| e.to_string())?;
+                    let observed = scope
+                        .observe_configuration_refusal()
+                        .map_err(|e| e.to_string());
+                    drop(receipt);
+                    observed?;
+                    return Ok(CONFIGURATION_DISABLED.into());
+                }
                 c.send(
                     &login::Serverbound::CustomQueryAnswer(login::CustomQueryAnswer {
                         transaction: q.transaction,
@@ -473,6 +562,9 @@ fn run(
             // ClientHandshakePacketListenerImpl.handleRequestCookie: the
             // cookies a transfer carried over (none on a plain join).
             login::Clientbound::CookieRequest(q) => {
+                if required.is_some() {
+                    return Err("paired login: cookie request before agreement".into());
+                }
                 let payload = cookies.lock().unwrap().get(&q.key).cloned();
                 c.send(
                     &login::Serverbound::CookieResponse(login::CookieResponse {
@@ -483,7 +575,11 @@ fn run(
                 )
                 .map_err(e)?;
             }
-            login::Clientbound::Unknown(..) => {}
+            login::Clientbound::Unknown(..) => {
+                if required.is_some() {
+                    return Err("paired login: unexpected login packet".into());
+                }
+            }
         }
     };
     status(send, "Joining world...");
@@ -849,6 +945,7 @@ mod tests {
             counters: Arc::new(Mutex::new(None)),
             cookies: Cookies::default(),
             debug: false,
+            required: None,
         };
         let (thread_writer, thread_configuring) =
             (session.writer.clone(), session.configuring.clone());
@@ -888,6 +985,109 @@ mod tests {
         assert_eq!(play::Serverbound::decode(id, &body).unwrap(), tick_end);
         drop(session);
         assert!(thread.join().unwrap().is_err());
+    }
+
+    #[test]
+    fn default_login_keeps_query_none_compression_known_packs_join_and_reconfiguration() {
+        let (client, server) = horizon_protocol::connection::Pipe::pair();
+        let server = std::thread::spawn(move || {
+            let mut c = Connection::local(server);
+            c.reader
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            c.recv().unwrap();
+            c.recv().unwrap();
+            c.send(
+                &login::Clientbound::CustomQuery(login::CustomQuery {
+                    transaction: 17,
+                    channel: crate::lan::login_negotiation::CHANNEL.into(),
+                    data: vec![1, 2, 3],
+                })
+                .encode(),
+            )
+            .unwrap();
+            let (id, body) = c.recv().unwrap();
+            assert_eq!(
+                login::Serverbound::decode(id, &body).unwrap(),
+                login::Serverbound::CustomQueryAnswer(login::CustomQueryAnswer {
+                    transaction: 17,
+                    payload: None
+                })
+            );
+            c.send(&login::Clientbound::Compression(login::Compression { threshold: 64 }).encode())
+                .unwrap();
+            c.set_compression(64);
+            c.send(
+                &login::Clientbound::LoginFinished(login::LoginFinished {
+                    profile: login::GameProfile {
+                        uuid: 42,
+                        name: "DefaultGuest".into(),
+                        properties: vec![],
+                    },
+                    session: 42,
+                })
+                .encode(),
+            )
+            .unwrap();
+            let (id, body) = c.recv().unwrap();
+            assert!(matches!(
+                login::Serverbound::decode(id, &body).unwrap(),
+                login::Serverbound::LoginAcknowledged(_)
+            ));
+            c.recv().unwrap();
+            c.recv().unwrap();
+            c.send(
+                &cfg::Clientbound::SelectKnownPacks(cfg::SelectKnownPacks { packs: vec![] })
+                    .encode(),
+            )
+            .unwrap();
+            let (id, body) = c.recv().unwrap();
+            assert!(
+                matches!(cfg::Serverbound::decode(id,&body).unwrap(),cfg::Serverbound::SelectKnownPacks(p) if p.packs.is_empty())
+            );
+            c.send(&cfg::Clientbound::FinishConfiguration(Empty).encode())
+                .unwrap();
+            let (id, body) = c.recv().unwrap();
+            assert!(matches!(
+                cfg::Serverbound::decode(id, &body).unwrap(),
+                cfg::Serverbound::FinishConfiguration(_)
+            ));
+            c.send(&play::Clientbound::StartConfiguration(Empty).encode())
+                .unwrap();
+            let (id, body) = c.recv().unwrap();
+            assert!(matches!(
+                play::Serverbound::decode(id, &body).unwrap(),
+                play::Serverbound::ConfigurationAcknowledged(_)
+            ));
+            c.send(&cfg::Clientbound::FinishConfiguration(Empty).encode())
+                .unwrap();
+            let (id, body) = c.recv().unwrap();
+            assert!(matches!(
+                cfg::Serverbound::decode(id, &body).unwrap(),
+                cfg::Serverbound::FinishConfiguration(_)
+            ));
+            c.writer.shutdown();
+        });
+        let mut session =
+            Session::connect_local(client, "DefaultGuest", 2, Arc::new(Language::new()));
+        let mut joined = false;
+        let mut reconfigured = false;
+        let mut ended = false;
+        while !ended {
+            match session.events.recv_timeout(Duration::from_secs(4)).unwrap() {
+                Event::Joined { uuid, name, .. } => {
+                    assert_eq!(uuid, 42);
+                    assert_eq!(name, "DefaultGuest");
+                    joined = true;
+                }
+                Event::Reconfigured(_) => reconfigured = true,
+                Event::Disconnected { .. } => ended = true,
+                _ => {}
+            }
+        }
+        session.disconnect();
+        server.join().unwrap();
+        assert!(joined && reconfigured);
     }
 
     #[test]

@@ -898,6 +898,22 @@ fn serve_login(
     };
     // verifyLoginAndFinishConnectionSetup: PlayerList.canPlayerLogin, then
     // duplicates and a full server.
+    if let Some(required) = &shared.required_negotiation {
+        use super::login_negotiation::{NegotiationConnection, negotiate_server};
+        let mut scope = NegotiationConnection::for_required(c, required, required.deadline())
+            .map_err(|e| e.to_string())?;
+        let result = negotiate_server(&mut scope, required.expectation.clone(), uuid);
+        match result {
+            Ok(receipt) => {
+                // No reservation exists. Never try_admit or release this UUID:
+                // an existing genuine player may already own the same profile.
+                let result = scope.refuse_configuration().map_err(|e| e.to_string());
+                drop(receipt);
+                return result;
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
     if let Some(reason) = shared.try_admit(address, uuid, &hello.name) {
         let text = refuse(&mut c, shared, "Server thread", &user, &reason);
         lost(shared, &user, &text);
