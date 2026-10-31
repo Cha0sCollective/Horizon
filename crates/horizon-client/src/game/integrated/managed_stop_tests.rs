@@ -418,3 +418,210 @@ fn managed_supervisor_panic_is_actual_process_fatal_with_retained_native_game() 
     });
     panic!("expected fatal child unexpectedly returned: {result:?}");
 }
+
+#[test]
+#[ignore = "isolated resources/prebuilt pair: direct closed pollable owner retains copied failure until explicit retry"]
+fn managed_actual_closed_pollable_owner_retries_and_completes_once() {
+    let mut scratch = Scratch::new("pollable-closed");
+    scratch.1 = true;
+    let paths = scratch.paths();
+    let anchor = scratch.dir("pollable-copied-anchor");
+    let namespace = AuthorityNamespace::new(&paths.namespace).unwrap();
+    let mut worker =
+        ManagedWorker::start_closed(start(paths.clone(), CheckpointTestFault::Copied)).unwrap();
+    let control = worker.control();
+    let mut observer = Some(worker.control());
+    let mut errors = Vec::new();
+    let mut premature = worker.take_completion();
+    if premature.is_some() {
+        errors.push("completion available before first explicit closed poll".to_owned());
+    }
+    let began = Instant::now();
+    let mut ready = None;
+    let mut retained = None;
+    let mut ready_polls = 0;
+    let mut failure_polls = 0;
+    let mut pending_polls = 0;
+    let mut close_sent = false;
+    let mut retry_sent = false;
+    let mut stopped_before_poll = false;
+    loop {
+        if began.elapsed() > Duration::from_secs(400) {
+            panic!(
+                "pollable closed owner did not resolve: {:?}",
+                control.view()
+            );
+        }
+        let snapshot = control.view();
+        if retry_sent && matches!(snapshot.state, State::Stopping { .. }) {
+            if let Some(early) = worker.take_completion() {
+                errors.push("in-flight retry made completion consumable".to_owned());
+                premature.get_or_insert(early);
+            }
+            thread::sleep(Duration::from_millis(1));
+            continue;
+        }
+        if retry_sent && matches!(snapshot.state, State::Stopped { .. }) {
+            stopped_before_poll = true;
+            if let Some(early) = worker.take_completion() {
+                errors.push("Stopped status classified closed completion without poll".to_owned());
+                premature.get_or_insert(early);
+            }
+        }
+        let polled = worker.poll();
+        if polled.pipes.is_some() {
+            errors.push("closed-profile owner exposed a connection offer".to_owned());
+        }
+        if polled.completed {
+            break;
+        }
+        pending_polls += 1;
+        if let Some(early) = worker.take_completion() {
+            errors.push("unfinished closed poll made completion consumable".to_owned());
+            premature.get_or_insert(early);
+        }
+        let view = polled.view;
+        match &view.state {
+            State::Ready if !close_sent => {
+                ready_polls += 1;
+                if let Some(previous) = &ready
+                    && view.observation.as_ref() != Some(previous)
+                {
+                    errors
+                        .push("native closed owner changed across pending Ready polls".to_owned());
+                }
+                if let Some(observation) = &view.observation {
+                    ready.get_or_insert_with(|| observation.clone());
+                } else {
+                    errors.push("Ready lacks actual native closed observation".to_owned());
+                }
+                if ready_polls >= 3 {
+                    if let Err(error) = fs::copy(
+                        paths.world.join("horizon-world-identity.json"),
+                        anchor.join("horizon-world-identity.json"),
+                    ) {
+                        errors.push(format!("copy explicit UUID anchor: {error}"));
+                    }
+                    match control.request(Command::RequestStop { attempt: 1 }) {
+                        Ok(()) => close_sent = true,
+                        Err(error) => errors.push(format!("direct closed stop refused: {error:?}")),
+                    }
+                }
+            }
+            State::RetainedFailure {
+                attempt,
+                epoch,
+                publication,
+                ..
+            } if !retry_sent => {
+                failure_polls += 1;
+                retained = view.observation.clone();
+                if *attempt != 1 || *epoch != Some(2) || *publication != Publication::NotPublished {
+                    errors.push(
+                        "direct closed copied fault has wrong attempt/epoch/publication".to_owned(),
+                    );
+                }
+                if retained != ready {
+                    errors.push("direct closed retained owner/keys/clock/frame changed".to_owned());
+                }
+                if SessionLock::acquire(&paths.world).is_ok() {
+                    errors.push("direct closed retained native lock was released".to_owned());
+                }
+                if namespace
+                    .acquire_recovery(&anchor, &paths.archive, &scratch.0.join("pollable-blocked"))
+                    .is_ok()
+                {
+                    errors.push("direct closed retained UUID exclusion was released".to_owned());
+                }
+                if !paths.archive.join(".pending-00000000000000000002").is_dir() {
+                    errors.push("direct closed copied evidence missing".to_owned());
+                }
+                if failure_polls == 1 {
+                    drop(observer.take());
+                    observer = Some(worker.control());
+                    if control.request(Command::RetryStop {
+                        attempt: 2,
+                        failed_attempt: 99,
+                    }) != Err(Refusal::State)
+                    {
+                        errors.push("direct closed mismatched retry was admitted".to_owned());
+                    }
+                }
+                if failure_polls >= 3 {
+                    match control.request(Command::RetryStop {
+                        attempt: 2,
+                        failed_attempt: 1,
+                    }) {
+                        Ok(()) => retry_sent = true,
+                        Err(error) => {
+                            errors.push(format!("direct closed explicit retry refused: {error:?}"))
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    let receipt = worker
+        .take_completion()
+        .or(premature)
+        .expect("completed closed poll yields one classification")
+        .unwrap();
+    let consumed_once = worker.take_completion().is_none();
+    for _ in 0..3 {
+        let polled = worker.poll();
+        if !polled.completed || polled.pipes.is_some() {
+            errors.push("post-completion closed poll changed completion/offer state".to_owned());
+        }
+        if !matches!(&polled.view.state, State::Stopped { attempt: 2, receipt: published }
+            if published.epoch == receipt.epoch && published.root == receipt.root)
+        {
+            errors.push("post-completion closed poll changed stopped receipt".to_owned());
+        }
+        if worker.take_completion().is_some() {
+            errors.push("closed completion replayed after consumption".to_owned());
+        }
+    }
+    assert!(errors.is_empty(), "{errors:?}");
+    assert!(close_sent && retry_sent && stopped_before_poll && consumed_once);
+    assert!(ready_polls >= 3 && failure_polls >= 3 && pending_polls >= 6);
+    assert_eq!(ready, retained);
+    let ready = ready.unwrap();
+    assert_eq!(ready.guests, 0);
+    assert!(ready.empty_slot);
+    assert_eq!(receipt.epoch, 3);
+    assert!(matches!(
+        observer.unwrap().view().state,
+        State::Stopped { attempt: 2, .. }
+    ));
+    assert!(paths.archive.join("epoch-00000000000000000001").is_dir());
+    assert!(paths.archive.join(".pending-00000000000000000002").is_dir());
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(receipt.root.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(manifest["epoch"], 3);
+    assert_eq!(manifest["saved_clock"], ready.clock);
+    let saved_frame: serde_json::Value =
+        serde_json::from_slice(&fs::read(receipt.root.join("host/counter.json")).unwrap()).unwrap();
+    assert_eq!(saved_frame, serde_json::to_value(&ready.frame).unwrap());
+    drop(SessionLock::acquire(&paths.world).unwrap());
+    let lease = namespace
+        .acquire_recovery(
+            &anchor,
+            &paths.archive,
+            &scratch.0.join("pollable-after-join"),
+        )
+        .unwrap();
+    assert_eq!(lease.world(), ready.world);
+    drop(lease);
+    eprintln!(
+        "MANAGED_POLLABLE_RESULT {}",
+        serde_json::json!({
+            "kind":"closed-copied-retry","world":paths.world,"archive":paths.archive,
+            "namespace":paths.namespace,"ready_polls":ready_polls,"failure_polls":failure_polls,
+            "pending_polls":pending_polls,"early_take_after_stopped":stopped_before_poll,
+            "completion_consumed_once":consumed_once,"post_completion_polls":3,
+            "failed_attempt":1,"successful_attempt":2,"receipt_epoch":receipt.epoch,"worker_joined":true
+        })
+    );
+}

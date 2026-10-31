@@ -743,3 +743,199 @@ fn managed_connected_actual_late_departure_retains_until_external_termination_ch
     });
     panic!("retained departure child unexpectedly returned");
 }
+
+#[test]
+#[ignore = "isolated resources/prebuilt pair: direct pollable owner, actual two clients, explicit completion"]
+fn managed_connected_actual_pollable_owner_moves_one_offer_and_completes_once() {
+    let scratch = Scratch::new("pollable-connected");
+    let fixture = Fixture::new("pollable-connected");
+    let source = source(&fixture, &scratch);
+    let before = inventory_tree(&source.archive);
+    let configured = start(&fixture, &source, &scratch, None);
+    let destination = configured.request.destination.clone();
+    let continuation = configured.continuation.clone();
+    let blocked = source.root.parent().unwrap().join("pollable-blocked-copy");
+    let released = source.root.parent().unwrap().join("pollable-after-join");
+    let mut clients = [
+        Box::new(fresh(&fixture, ExecutionRole::Client)),
+        Box::new(fresh(&fixture, ExecutionRole::Client)),
+    ];
+    let mut worker = ManagedWorker::start_connected(configured).unwrap();
+    let control = worker.control();
+    let mut observer = Some(worker.control());
+    let mut errors = Vec::new();
+    let mut premature = worker.take_completion();
+    if premature.is_some() {
+        record(
+            &mut errors,
+            "completion available before the first explicit poll",
+        );
+    }
+    let began = Instant::now();
+    let mut offers = 0;
+    let mut ready = 0;
+    let mut pending_polls = 0;
+    let mut keys = None;
+    let mut close_sent = false;
+    let mut retry_sent = false;
+    let mut stopped_before_poll = false;
+    loop {
+        if began.elapsed() > Duration::from_secs(400) {
+            panic!(
+                "pollable connected owner did not resolve: {:?}",
+                control.view()
+            );
+        }
+        // Once close is admitted, deliberately observe terminal shared status
+        // without polling the owner. Status cannot itself classify/join it.
+        let snapshot = control.view();
+        if close_sent && matches!(snapshot.state, State::Stopping { .. }) {
+            if let Some(early) = worker.take_completion() {
+                record(&mut errors, "in-flight status made completion consumable");
+                premature.get_or_insert(early);
+            }
+            thread::sleep(Duration::from_millis(1));
+            continue;
+        }
+        if close_sent && matches!(snapshot.state, State::Stopped { .. }) {
+            stopped_before_poll = true;
+            if let Some(early) = worker.take_completion() {
+                record(
+                    &mut errors,
+                    "Stopped status classified completion without an explicit poll",
+                );
+                premature.get_or_insert(early);
+            }
+        }
+        let polled = worker.poll();
+        if polled.completed {
+            if polled.pipes.is_some() {
+                record(&mut errors, "completed owner delivered an endpoint offer");
+            }
+            break;
+        }
+        pending_polls += 1;
+        if let Some(early) = worker.take_completion() {
+            record(&mut errors, "unfinished poll made completion consumable");
+            premature.get_or_insert(early);
+        }
+        let view = polled.view;
+        let closing = matches!(view.state, State::Stopping { .. } | State::Stopped { .. })
+            || view
+                .connected
+                .as_ref()
+                .is_some_and(|status| status.phase == ConnectedPhase::Closing);
+        if closing {
+            if polled.pipes.is_some() {
+                record(&mut errors, "endpoint offer repeated while closing");
+            }
+        } else {
+            drive_clients(&mut clients, polled.pipes, &mut offers, &mut errors);
+        }
+        if matches!(view.state, State::Ready)
+            && let Some(observation) = &view.connected_observation
+        {
+            check_owned(observation, &source, &destination, &blocked, &mut errors);
+            let current = (
+                observation.counter_key.clone(),
+                observation.slot_key.clone(),
+            );
+            if keys.as_ref().is_some_and(|keys| keys != &current) {
+                record(&mut errors, "pollable Ready changed native runtime keys");
+            }
+            keys.get_or_insert(current);
+            if clients_match(&clients, &source) && !close_sent {
+                ready += 1;
+                if ready >= 3 {
+                    drop(observer.take());
+                    observer = Some(worker.control());
+                    match control.request(Command::RequestStop { attempt: 1 }) {
+                        Ok(()) => close_sent = true,
+                        Err(error) => record(
+                            &mut errors,
+                            format!("pollable first close refused: {error:?}"),
+                        ),
+                    }
+                }
+            }
+        }
+        // An unexpected publication failure is still resolved through the
+        // existing explicit retry before positive-case discrepancies assert.
+        if let State::RetainedFailure { attempt, .. } = view.state
+            && !retry_sent
+        {
+            record(
+                &mut errors,
+                "fault-free pollable close unexpectedly retained",
+            );
+            match control.request(Command::RetryStop {
+                attempt: 2,
+                failed_attempt: attempt,
+            }) {
+                Ok(()) => retry_sent = true,
+                Err(error) => record(&mut errors, format!("cleanup retry refused: {error:?}")),
+            }
+        }
+        if matches!(view.state, State::Connected(ConnectedPhase::CleanupBlocked)) {
+            panic!("pollable positive unexpectedly retains unresolved native owner: {view:?}");
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+    let completion = worker.take_completion().or(premature);
+    for client in &mut clients {
+        disconnect(client);
+    }
+    let receipt = completion
+        .expect("explicit completed poll yields one classification")
+        .unwrap();
+    let consumed_once = worker.take_completion().is_none();
+    for _ in 0..3 {
+        let polled = worker.poll();
+        if !polled.completed || polled.pipes.is_some() {
+            record(
+                &mut errors,
+                "post-completion poll changed completion/offer state",
+            );
+        }
+        if !matches!(&polled.view.state, State::Stopped { attempt: 1, receipt: published }
+            if published.epoch == receipt.epoch && published.root == receipt.root)
+        {
+            record(
+                &mut errors,
+                "post-completion poll changed the matching stopped receipt",
+            );
+        }
+        if worker.take_completion().is_some() {
+            record(&mut errors, "completion replayed after consumption");
+        }
+    }
+    // All ordinary assertions occur after explicit owner completion and join.
+    assert!(errors.is_empty(), "{errors:?}");
+    assert!(consumed_once && close_sent && stopped_before_poll && !retry_sent);
+    assert!(pending_polls >= 3 && ready >= 3 && keys.is_some());
+    assert_eq!(offers, 1);
+    assert_eq!(inventory_tree(&source.archive), before);
+    assert!(matches!(
+        observer.unwrap().view().state,
+        State::Stopped { attempt: 1, .. }
+    ));
+    drop(SessionLock::acquire(&destination).unwrap());
+    drop(
+        source
+            .namespace
+            .acquire_recovery(&source.root, &source.archive, &released)
+            .unwrap(),
+    );
+    validate_continuation(&fixture, &source, &scratch, &receipt, &continuation, 1);
+    eprintln!(
+        "MANAGED_POLLABLE_RESULT {}",
+        serde_json::json!({
+            "kind":"connected-positive","source":source.root,"archive":source.archive,
+            "destination":destination,"continuation":continuation,"offers":offers,
+            "ready_observations":ready,"pending_polls":pending_polls,"player_counts":[3,5],
+            "recovery_ticks":0,"early_take_after_stopped":stopped_before_poll,
+            "completion_consumed_once":consumed_once,"post_completion_polls":3,
+            "receipt_epoch":receipt.epoch,"continuation_native_verified":true,"worker_joined":true
+        })
+    );
+}

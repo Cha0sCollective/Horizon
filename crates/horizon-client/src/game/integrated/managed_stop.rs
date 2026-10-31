@@ -227,13 +227,144 @@ enum WorkerEnd {
     StartupRefused(String),
 }
 
+/// A process-scope lifetime owner. Its first field keeps the existing fatal
+/// guard ahead of the channels during destruction; observers never own it.
+struct ManagedWorker {
+    worker: AbortUnresolvedWorker,
+    control: ManagedStopControl,
+    offers: Receiver<[Pipe; 2]>,
+    changes: Receiver<()>,
+    completed: bool,
+    completion: Option<Result<CheckpointReceipt, String>>,
+}
+struct WorkerPoll {
+    view: SupervisorView,
+    pipes: Option<[Pipe; 2]>,
+    completed: bool,
+}
+impl ManagedWorker {
+    fn start_closed(start: ManagedStart) -> Result<Self, String> {
+        checked_start_paths(&start.paths)?;
+        Self::start(WorkerStart::NewClosed(start))
+    }
+    fn start_connected(start: ManagedConnectedStart) -> Result<Self, String> {
+        Self::start(WorkerStart::Connected(start))
+    }
+    fn start(start: WorkerStart) -> Result<Self, String> {
+        let (command, commands) = mpsc::sync_channel(1);
+        let (changed, changes) = mpsc::sync_channel(1);
+        let (offer, offers) = mpsc::sync_channel(1);
+        let shared = Arc::new(Mutex::new(SupervisorView {
+            state: State::Preparing,
+            last_admitted: 0,
+            last_refusal: None,
+            connected: None,
+            #[cfg(test)]
+            observation: None,
+            #[cfg(test)]
+            connected_observation: None,
+        }));
+        let control = ManagedStopControl {
+            shared: shared.clone(),
+            command,
+        };
+        // Install the guard immediately, before any return or owner construction.
+        let worker = AbortUnresolvedWorker(Some(
+            thread::Builder::new()
+                .name("Managed stop worker".into())
+                .spawn(move || match start {
+                    WorkerStart::NewClosed(start) => owned_worker(start, shared, changed, commands),
+                    WorkerStart::Connected(start) => {
+                        connected_worker(start, shared, changed, commands, offer)
+                    }
+                })
+                .map_err(|error| error.to_string())?,
+        ));
+        Ok(Self {
+            worker,
+            control,
+            offers,
+            changes,
+            completed: false,
+            completion: None,
+        })
+    }
+    fn control(&self) -> ManagedStopControl {
+        self.control.clone()
+    }
+    /// Never wait for an unfinished worker. Only its actual completion permits
+    /// explicit join and terminal classification; there is no joining in Drop.
+    fn poll(&mut self) -> WorkerPoll {
+        if self.worker.0.as_ref().is_some_and(JoinHandle::is_finished) {
+            let end = self
+                .worker
+                .0
+                .take()
+                .expect("finished worker retained")
+                .join();
+            let result = match end {
+                Ok(WorkerEnd::Stopped { attempt, receipt }) => {
+                    if matches!(&self.control.view().state, State::Stopped { attempt: current, receipt: published } if *current == attempt && published.epoch == receipt.epoch && published.root == receipt.root)
+                    {
+                        Ok(receipt)
+                    } else {
+                        Err("finished worker lacks matching stopped receipt".into())
+                    }
+                }
+                Ok(WorkerEnd::StartupFailed(detail)) => Err(detail),
+                Ok(WorkerEnd::StartupRefused(detail)) => {
+                    if matches!(&self.control.view().state, State::StartupRefused(current) if *current == detail)
+                    {
+                        Err(format!("connected startup refused: {detail}"))
+                    } else {
+                        Err("finished worker lacks matching startup refusal".into())
+                    }
+                }
+                Err(_) => {
+                    let detail = "managed worker panicked; no shutdown receipt".to_owned();
+                    self.control
+                        .shared
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .state = State::FatalWorkerFailure(detail.clone());
+                    Err(detail)
+                }
+            };
+            self.completion = Some(result);
+            self.completed = true;
+        }
+        let offered = self.offers.try_recv().ok();
+        let pipes = if self.completed {
+            // A finite startup refusal can finish before the caller polls. Do
+            // not deliver a now-closed connection bundle as a new admission.
+            drop(offered);
+            None
+        } else {
+            offered
+        };
+        WorkerPoll {
+            view: self.control.view(),
+            pipes,
+            completed: self.completed,
+        }
+    }
+    /// Taking a result never joins, consumes a live handle, or requests a stop.
+    /// Even a published Stopped view is insufficient until poll has joined it.
+    fn take_completion(&mut self) -> Option<Result<CheckpointReceipt, String>> {
+        if self.completed {
+            self.completion.take()
+        } else {
+            None
+        }
+    }
+}
+
 /// The driver is owned by this synchronous supervisor scope, never by a detached
 /// task. Its callback sees status/typed controls, not a mutable Game.
 fn run_owned_managed_stop(
     start: ManagedStart,
     mut driver: impl FnMut(&SupervisorView, &ManagedStopControl) -> DriverCommand,
 ) -> Result<CheckpointReceipt, String> {
-    checked_start_paths(&start.paths)?;
     run_owned_supervisor(WorkerStart::NewClosed(start), |view, control, pipes| {
         assert!(pipes.is_none(), "closed-profile worker offered connections");
         driver(view, control)
@@ -251,76 +382,26 @@ fn run_owned_supervisor(
     start: WorkerStart,
     mut driver: impl FnMut(&SupervisorView, &ManagedStopControl, Option<[Pipe; 2]>) -> DriverCommand,
 ) -> Result<CheckpointReceipt, String> {
-    let (command, commands) = mpsc::sync_channel(1);
-    let (changed, changes) = mpsc::sync_channel(1);
-    let (offer, offers) = mpsc::sync_channel(1);
-    let shared = Arc::new(Mutex::new(SupervisorView {
-        state: State::Preparing,
-        last_admitted: 0,
-        last_refusal: None,
-        connected: None,
-        #[cfg(test)]
-        observation: None,
-        #[cfg(test)]
-        connected_observation: None,
-    }));
-    let control = ManagedStopControl {
-        shared: shared.clone(),
-        command,
-    };
-    // Install the private guard immediately; no fallible code between spawn and it.
-    let mut worker = AbortUnresolvedWorker(Some(
-        thread::Builder::new()
-            .name("Managed stop worker".into())
-            .spawn(move || match start {
-                WorkerStart::NewClosed(start) => owned_worker(start, shared, changed, commands),
-                WorkerStart::Connected(start) => {
-                    connected_worker(start, shared, changed, commands, offer)
-                }
-            })
-            .map_err(|e| e.to_string())?,
-    ));
+    let mut worker = match start {
+        WorkerStart::NewClosed(start) => ManagedWorker::start_closed(start),
+        WorkerStart::Connected(start) => ManagedWorker::start_connected(start),
+    }?;
+    let control = worker.control();
     let mut previous = String::new();
     loop {
-        let view = control.view();
+        let polled = worker.poll();
+        let view = polled.view;
         let display = format!("{:?}", view.state);
         if display != previous {
             log::info!("managed stop: {display}");
             previous = display;
         }
-        if worker.0.as_ref().is_some_and(JoinHandle::is_finished) {
-            // Only this positive completion check permits removing/joining the handle.
-            let end = worker.0.take().expect("finished worker retained").join();
-            return match end {
-                Ok(WorkerEnd::Stopped { attempt, receipt }) => {
-                    if matches!(&control.view().state, State::Stopped { attempt: current, receipt: published } if *current == attempt && published.epoch == receipt.epoch && published.root == receipt.root)
-                    {
-                        Ok(receipt)
-                    } else {
-                        Err("finished worker lacks matching stopped receipt".into())
-                    }
-                }
-                Ok(WorkerEnd::StartupFailed(detail)) => Err(detail),
-                Ok(WorkerEnd::StartupRefused(detail)) => {
-                    if matches!(&control.view().state, State::StartupRefused(current) if *current == detail)
-                    {
-                        Err(format!("connected startup refused: {detail}"))
-                    } else {
-                        Err("finished worker lacks matching startup refusal".into())
-                    }
-                }
-                Err(_) => {
-                    let detail = "managed worker panicked; no shutdown receipt".to_owned();
-                    control
-                        .shared
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .state = State::FatalWorkerFailure(detail.clone());
-                    Err(detail)
-                }
-            };
+        if polled.completed {
+            return worker
+                .take_completion()
+                .expect("joined worker has one completion");
         }
-        let request = driver(&view, &control, offers.try_recv().ok());
+        let request = driver(&view, &control, polled.pipes);
         let command = match request {
             DriverCommand::Wait => None,
             DriverCommand::RequestStop(attempt) => Some(Command::RequestStop { attempt }),
@@ -337,7 +418,7 @@ fn run_owned_supervisor(
         }
         // A disconnected status notification is not permission to drop a live worker.
         // Keep supervising and checking actual completion; the driver remains visible.
-        let _ = changes.recv_timeout(Duration::from_millis(20));
+        let _ = worker.changes.recv_timeout(Duration::from_millis(20));
     }
 }
 
