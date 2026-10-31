@@ -163,6 +163,11 @@ pub(crate) struct TrialView<'a> {
     pub pending: bool,
     pub fault: Option<Fault>,
 }
+pub(crate) struct PendingView<'a> {
+    pub allocation: AllocationView<'a>,
+    pub reason: RetirementReason,
+    pub game_time: i64,
+}
 impl Trial {
     pub(crate) fn restore_checked(
         configuration: Configuration,
@@ -220,8 +225,66 @@ impl Trial {
             self.fault = Some(Fault::PersistentDomain);
         }
     }
-    pub(crate) fn persistent_admit(&mut self) {
-        self.admit();
+    pub(crate) fn persistent_keys_valid(&self) -> bool {
+        let valid = |allocation: &OwnedSlot| {
+            allocation.key.scope == *self.configuration.scope()
+                && Arc::ptr_eq(&allocation.key.trial, &self.identity)
+                && allocation.key.incarnation > 0
+                && allocation.key.incarnation <= self.last_incarnation
+        };
+        self.active.as_ref().is_none_or(valid)
+            && self
+                .pending
+                .as_ref()
+                .is_none_or(|pending| valid(&pending.allocation))
+    }
+    pub(crate) fn persistent_pending(&self) -> Option<PendingView<'_>> {
+        let pending = self.pending.as_ref()?;
+        let (revision, stack) = pending.allocation.slot.borrowed();
+        Some(PendingView {
+            allocation: AllocationView {
+                key: &pending.allocation.key,
+                revision,
+                stack,
+                resident: pending.allocation.resident,
+            },
+            reason: pending.reason,
+            game_time: pending.game_time,
+        })
+    }
+    /// The World validates the borrowed owner and every refusal before calling.
+    pub(crate) fn persistent_take_pending(&mut self) -> PendingRetirement {
+        self.pending
+            .take()
+            .expect("validated persistent pending owner")
+    }
+    /// Stage the fresh key and projection before the World publishes either head.
+    pub(crate) fn persistent_prepare_admission(&self) -> Result<OwnedSlot, Error> {
+        self.available()?;
+        if self.active.is_some() {
+            return Err(Error::StaleKey);
+        }
+        let incarnation = self
+            .last_incarnation
+            .checked_add(1)
+            .ok_or(Error::Fault(Fault::IncarnationExhausted))?;
+        Ok(OwnedSlot {
+            key: SlotKey {
+                scope: self.configuration.scope().clone(),
+                trial: self.identity.clone(),
+                incarnation,
+            },
+            slot: SlotProjection::new(None),
+            resident: true,
+        })
+    }
+    /// Commit only the immediately staged allocation, after all World checks.
+    pub(crate) fn persistent_publish_admission(&mut self, allocation: OwnedSlot) {
+        self.last_incarnation = allocation.key.incarnation;
+        self.active = Some(allocation);
+    }
+    pub(crate) fn persistent_admission_key(allocation: &OwnedSlot) -> SlotKey {
+        allocation.key.clone()
     }
     fn new(configuration: Configuration, current: BlockStateId) -> Self {
         let mut trial = Self {

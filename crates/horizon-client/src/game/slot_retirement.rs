@@ -1,6 +1,9 @@
 //! Dormant native retirement sink. No Game path enables World slot trials yet.
 use super::Game;
-use horizon_client::{entities::ItemEntity, items::ItemStack, world_slot_trial::SlotKey};
+use horizon_client::{
+    entities::ItemEntity, items::ItemStack, world::slot_restore::SlotLifecycleError,
+    world_slot_trial::SlotKey,
+};
 use horizon_core::{geometry::Vec3, random::RandomSource};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -17,6 +20,7 @@ pub(super) enum DeliveryError {
     UnsupportedStack,
     EntityIdExhausted,
     Reservation,
+    Persistent(SlotLifecycleError),
 }
 
 /// Only the known count encoding boundary, not a general component/NBT validator.
@@ -61,6 +65,33 @@ impl Game<'_> {
         &mut self,
         expected: &SlotKey,
     ) -> Result<Delivery, DeliveryError> {
+        self.deliver_world_slot_retirement(expected, false, 1)
+    }
+
+    /// Retains persistent allocation identity and generation heads after delivery.
+    /// This native key is not player authorization. Readmission is a separate call.
+    pub(super) fn deliver_pending_persistent_world_slot(
+        &mut self,
+        expected: &SlotKey,
+    ) -> Result<Delivery, DeliveryError> {
+        self.deliver_world_slot_retirement(expected, true, 1)
+    }
+
+    #[cfg(test)]
+    pub(super) fn deliver_pending_persistent_world_slot_with_reservation(
+        &mut self,
+        expected: &SlotKey,
+        reserve: usize,
+    ) -> Result<Delivery, DeliveryError> {
+        self.deliver_world_slot_retirement(expected, true, reserve)
+    }
+
+    fn deliver_world_slot_retirement(
+        &mut self,
+        expected: &SlotKey,
+        persistent: bool,
+        reserve: usize,
+    ) -> Result<Delivery, DeliveryError> {
         if self.remote.is_some() || self.integrated.is_some() {
             return Err(DeliveryError::NotAuthoritative);
         }
@@ -83,9 +114,7 @@ impl Game<'_> {
         }
         let Some(stack) = pending.allocation.slot.stack() else {
             let result = Delivery::EmptyAcknowledged;
-            self.world
-                .take_world_slot_retirement()
-                .ok_or(DeliveryError::NoPending)?;
+            self.take_slot_retirement(expected, persistent)?;
             return Ok(result);
         };
         if &*stack.item == "minecraft:air" || self.res.items().get(&stack.item).is_none() {
@@ -97,7 +126,7 @@ impl Game<'_> {
             .checked_add(1)
             .ok_or(DeliveryError::EntityIdExhausted)?;
         self.dropped
-            .try_reserve(1)
+            .try_reserve(reserve.max(1))
             .map_err(|_| DeliveryError::Reservation)?;
         let mut random = self.particles.random().clone();
         let bob_offset = random.next_float() * std::f32::consts::PI * 2.0;
@@ -107,10 +136,7 @@ impl Game<'_> {
 
         // Exclusive Game access and no callbacks preserve the inspected pending
         // value. Nothing fallible follows a successful take of its owned slot.
-        let pending = self
-            .world
-            .take_world_slot_retirement()
-            .ok_or(DeliveryError::NoPending)?;
+        let pending = self.take_slot_retirement(expected, persistent)?;
         let (allocation, _, _) = pending.into_parts();
         let (_, projection, _) = allocation.into_parts();
         let stack = projection
@@ -136,5 +162,21 @@ impl Game<'_> {
         *self.particles.random() = random;
         self.dropped.push(entity);
         Ok(result)
+    }
+
+    fn take_slot_retirement(
+        &mut self,
+        expected: &SlotKey,
+        persistent: bool,
+    ) -> Result<horizon_client::world_slot_trial::PendingRetirement, DeliveryError> {
+        if persistent {
+            self.world
+                .take_persistent_world_slot_retirement(expected)
+                .map_err(DeliveryError::Persistent)
+        } else {
+            self.world
+                .take_world_slot_retirement()
+                .ok_or(DeliveryError::NoPending)
+        }
     }
 }

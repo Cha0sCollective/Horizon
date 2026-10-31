@@ -3028,3 +3028,492 @@ fn session_actual_region_backups_refuse_capture_and_resealed_complete_images() {
         assert_eq!(tree(&previous, &[]).unwrap(), previous_tree);
     }
 }
+
+// These tests exercise the actual Game receiver. Pointer preservation of the
+// original pending payload is separately checked through World's borrowed tests;
+// public diagnostic snapshots here intentionally clone their item data.
+#[inline(never)]
+fn retirement_session<'a>(fixture: &'a Fixture, label: &str, owner: bool) -> Box<Session<'a>> {
+    Box::new(session(fixture, label, 2, owner))
+}
+
+#[inline(never)]
+fn retirement_restored<'a>(
+    fixture: &'a Fixture,
+    session: &Session<'_>,
+    label: &str,
+    owner: bool,
+) -> (Box<Game<'a>>, RecoveryReceipt, Vec<mpsc::Receiver<Out>>) {
+    let (game, receipt, receivers) = restored(fixture, session, label, owner);
+    (Box::new(game), receipt, receivers)
+}
+
+fn retirement_rich(count: u32) -> ItemStack {
+    let mut value = ItemStack::new("minecraft:stone", count);
+    value.damage = 7;
+    let data = value.data_mut();
+    data.custom_name = Some("persistent original owner".into());
+    data.bundle_selected.0 = 4;
+    data.set_other(
+        "example:opaque",
+        Some(Tag::compound([("value", Tag::Int(-73))])),
+    );
+    let mut child = ItemStack::new("minecraft:dirt", 2);
+    child.data_mut().bundle_selected.0 = 8;
+    data.container.push((2, child.clone()));
+    data.charged.push(child.clone());
+    data.bundle_contents.push(child.clone());
+    data.pot_decorations = Some(Box::new([Some(child), None, None, None]));
+    value
+}
+
+fn retirement_raw_equal(actual: &ItemStack, expected: &ItemStack) {
+    assert_eq!(actual, expected);
+    match (actual.data(), expected.data()) {
+        (Some(a), Some(b)) => {
+            assert_eq!(a.bundle_selected.0, b.bundle_selected.0);
+            for ((_, a), (_, b)) in a.container.iter().zip(&b.container) {
+                retirement_raw_equal(a, b);
+            }
+            for (a, b) in a.charged.iter().zip(&b.charged) {
+                retirement_raw_equal(a, b);
+            }
+            for (a, b) in a.bundle_contents.iter().zip(&b.bundle_contents) {
+                retirement_raw_equal(a, b);
+            }
+            if let (Some(a), Some(b)) = (&a.pot_decorations, &b.pot_decorations) {
+                for (a, b) in a.iter().flatten().zip(b.iter().flatten()) {
+                    retirement_raw_equal(a, b);
+                }
+            }
+        }
+        (None, None) => {}
+        _ => panic!("raw retirement metadata presence changed"),
+    }
+}
+
+fn retirement_random(game: &mut Game<'_>) -> [u32; 3] {
+    use horizon_core::random::RandomSource;
+    let mut random = game.particles.random().clone();
+    std::array::from_fn(|_| random.next_float().to_bits())
+}
+
+fn retirement_total(game: &Game<'_>) -> u32 {
+    let snapshot = game.world.world_slot_snapshot().unwrap();
+    snapshot
+        .active
+        .as_ref()
+        .or_else(|| snapshot.pending.as_ref().map(|p| &p.allocation))
+        .and_then(|a| a.slot.stack())
+        .map_or(0, |s| s.count)
+        + game
+            .dropped
+            .iter()
+            .map(|entity| entity.stack.count)
+            .sum::<u32>()
+        + game
+            .lan
+            .as_ref()
+            .unwrap()
+            .hub
+            .guests
+            .iter()
+            .flat_map(|guest| guest.inventory.iter().flatten())
+            .map(|s| s.count)
+            .sum::<u32>()
+}
+
+struct RetirementBefore {
+    pending: horizon_client::world_slot_trial::RetirementSnapshot,
+    metadata: horizon_client::world::slot_restore::SlotMetadataSnapshot,
+    counter: horizon_client::world::counter_restore::DomainSnapshot,
+    id: u32,
+    random: [u32; 3],
+    clock: i64,
+    total: u32,
+}
+impl RetirementBefore {
+    fn capture(game: &mut Game<'_>) -> Self {
+        Self {
+            pending: game.world.world_slot_snapshot().unwrap().pending.unwrap(),
+            metadata: game.world.persistent_world_slot_metadata().unwrap(),
+            counter: game.world.counter_domain_snapshot().unwrap(),
+            id: game.next_entity,
+            random: retirement_random(game),
+            clock: game.world.game_time,
+            total: retirement_total(game),
+        }
+    }
+    fn assert_retained(&self, game: &mut Game<'_>) {
+        let pending = game.world.world_slot_snapshot().unwrap().pending.unwrap();
+        assert_eq!(pending.allocation.key, self.pending.allocation.key);
+        assert_eq!(
+            pending.allocation.slot.revision(),
+            self.pending.allocation.slot.revision()
+        );
+        assert_eq!(
+            pending.allocation.resident,
+            self.pending.allocation.resident
+        );
+        assert_eq!(
+            (pending.reason, pending.game_time),
+            (self.pending.reason, self.pending.game_time)
+        );
+        retirement_raw_equal(
+            pending.allocation.slot.stack().unwrap(),
+            self.pending.allocation.slot.stack().unwrap(),
+        );
+        assert_eq!(
+            game.world.persistent_world_slot_metadata(),
+            Some(self.metadata)
+        );
+        assert_eq!(
+            game.world.counter_domain_snapshot(),
+            Some(self.counter.clone())
+        );
+        assert_eq!(game.next_entity, self.id);
+        assert_eq!(retirement_random(game), self.random);
+        assert_eq!(game.world.game_time, self.clock);
+        assert_eq!(retirement_total(game), self.total);
+        assert!(game.dropped.is_empty());
+    }
+}
+
+fn retirement_replace(game: &mut Game<'_>, rounds: usize) {
+    let iron = game
+        .pack
+        .assets
+        .registry
+        .default_state("minecraft:iron_block")
+        .unwrap();
+    for _ in 0..rounds {
+        game.world
+            .set(POSITION[0], POSITION[1], POSITION[2], game.world.air)
+            .unwrap();
+        game.world
+            .set(POSITION[0], POSITION[1], POSITION[2], iron)
+            .unwrap();
+    }
+}
+
+#[test]
+#[ignore = "isolated pinned resources + prebuilt pair: actual persistent Game retirement, rich nested ownership, sink failures and retained dropped owner"]
+fn session_actual_persistent_retirement_rich_delivery_and_sink_refusals() {
+    use crate::game::slot_retirement::{Delivery, DeliveryError};
+    use horizon_client::world::slot_restore::{SlotLifecycleError, SlotStatus};
+    let fixture = Fixture::new("persistent-retirement-rich");
+    let _retain = RetainOnPanic::new(&fixture);
+    for owner in [true, false] {
+        let mut boxed = retirement_session(
+            &fixture,
+            if owner {
+                "rich-integrated"
+            } else {
+                "rich-dedicated"
+            },
+            owner,
+        );
+        let session = boxed.as_mut();
+        // The fixture's fourteen plain items stay represented. Add one owned
+        // seven-item rich stack, then move that WHOLE cell into the machine:
+        // no unsupported rich remainder may mask the later ENTITY refusal.
+        let slot = session.slot.clone();
+        transfer(&mut session.game, &slot, 10, Direction::IntoPlayer, 7);
+        assert!(session.game.lan.as_ref().unwrap().hub.guests[0].inventory[1].is_none());
+        session.game.lan.as_mut().unwrap().hub.guests[0].inventory[1] = Some(retirement_rich(7));
+        let mut host = session.game.lan.take().unwrap();
+        let moved = session
+            .game
+            .as_guest(&mut host, 10, |game| {
+                game.transfer_world_slot_inventory_cell(&slot, 1, Direction::IntoMachine, 7)
+            })
+            .unwrap()
+            .unwrap();
+        assert!(matches!(moved, TransferOutcome::Committed(row) if row.moved == 7));
+        session.game.lan = Some(host);
+        assert!(session.game.lan.as_ref().unwrap().hub.guests[0].inventory[1].is_none());
+        let expected = session
+            .game
+            .world
+            .read_world_slot(&slot)
+            .unwrap()
+            .slot
+            .stack()
+            .unwrap()
+            .clone();
+        assert_eq!(retirement_total(&session.game), 21);
+        retirement_replace(&mut session.game, 3);
+        assert_eq!(
+            session
+                .game
+                .world
+                .counter_domain_snapshot()
+                .unwrap()
+                .high_water,
+            4
+        );
+        assert_eq!(
+            session
+                .game
+                .world
+                .persistent_world_slot_metadata()
+                .unwrap()
+                .high_water,
+            1
+        );
+        let before = RetirementBefore::capture(&mut session.game);
+        assert_eq!(
+            session
+                .game
+                .deliver_pending_persistent_world_slot_with_reservation(&slot, usize::MAX),
+            Err(DeliveryError::Reservation)
+        );
+        before.assert_retained(&mut session.game);
+        let id = session.game.next_entity;
+        session.game.next_entity = u32::MAX;
+        let exhausted = RetirementBefore::capture(&mut session.game);
+        assert_eq!(
+            session.game.deliver_pending_persistent_world_slot(&slot),
+            Err(DeliveryError::EntityIdExhausted)
+        );
+        exhausted.assert_retained(&mut session.game);
+        session.game.next_entity = id;
+        session.game.dim = Dim::Nether;
+        assert_eq!(
+            session.game.deliver_pending_persistent_world_slot(&slot),
+            Err(DeliveryError::WrongContext)
+        );
+        session.game.dim = Dim::Overworld;
+        before.assert_retained(&mut session.game);
+        let time = session.game.world.game_time;
+        session.game.world.game_time = -1;
+        let clock = RetirementBefore::capture(&mut session.game);
+        assert_eq!(
+            session.game.deliver_pending_persistent_world_slot(&slot),
+            Err(DeliveryError::Persistent(SlotLifecycleError::ClockMismatch))
+        );
+        clock.assert_retained(&mut session.game);
+        session.game.world.game_time = time;
+        before.assert_retained(&mut session.game);
+
+        assert_eq!(
+            session.game.deliver_pending_persistent_world_slot(&slot),
+            Ok(Delivery::Delivered { entity_id: id + 1 })
+        );
+        assert_eq!(session.game.dropped.len(), 1);
+        let entity = &session.game.dropped[0];
+        assert_eq!(entity.id, id + 1);
+        retirement_raw_equal(&entity.stack, &expected);
+        assert_eq!(entity.position, Vec3::new(2.5, 120.5, 2.5));
+        assert_eq!(retirement_total(&session.game), 21);
+        assert_eq!(
+            session
+                .game
+                .world
+                .persistent_world_slot_metadata()
+                .unwrap()
+                .status,
+            SlotStatus::Healthy
+        );
+        assert_eq!(
+            session.game.deliver_pending_persistent_world_slot(&slot),
+            Err(DeliveryError::NoPending)
+        );
+        let fresh = session
+            .game
+            .world
+            .reconcile_persistent_world_slot()
+            .unwrap()
+            .unwrap();
+        assert_eq!(fresh.incarnation(), 2);
+        let error = session
+            .game
+            .checkpoint_session(&session.archive, 1, until())
+            .unwrap_err();
+        assert!(error.detail.contains("ENTITY"), "{error}");
+        assert!(!published(session, 1).exists());
+        assert_eq!(session.game.dropped.len(), 1);
+        retirement_raw_equal(&session.game.dropped[0].stack, &expected);
+        assert_eq!(retirement_total(&session.game), 21);
+        // Keep the genuine ItemEntity in its owning Game through test teardown.
+    }
+}
+
+#[test]
+#[ignore = "isolated pinned resources + prebuilt pair: empty persistent retirement, independent heads, real checkpoint restore recapture and corrupt history refusals"]
+fn session_actual_persistent_retirement_empty_reconcile_checkpoint_roundtrip() {
+    use crate::game::slot_retirement::Delivery;
+    let fixture = Fixture::new("persistent-retirement-empty");
+    let _retain = RetainOnPanic::new(&fixture);
+    for owner in [true, false] {
+        let mut boxed = retirement_session(
+            &fixture,
+            if owner {
+                "empty-integrated"
+            } else {
+                "empty-dedicated"
+            },
+            owner,
+        );
+        let session = boxed.as_mut();
+        let old_slot = session.slot.clone();
+        let old_counter = session.counter.clone();
+        transfer(&mut session.game, &old_slot, 10, Direction::IntoPlayer, 7);
+        retirement_replace(&mut session.game, 3);
+        assert!(
+            session
+                .game
+                .checkpoint_session(&session.archive, 1, until())
+                .is_err()
+        );
+        let id = session.game.next_entity;
+        let random = retirement_random(&mut session.game);
+        assert_eq!(
+            session
+                .game
+                .deliver_pending_persistent_world_slot(&old_slot),
+            Ok(Delivery::EmptyAcknowledged)
+        );
+        assert_eq!(session.game.next_entity, id);
+        assert_eq!(retirement_random(&mut session.game), random);
+        assert!(session.game.dropped.is_empty());
+        assert!(
+            session
+                .game
+                .checkpoint_session(&session.archive, 1, until())
+                .is_err()
+        );
+        session.slot = session
+            .game
+            .world
+            .reconcile_persistent_world_slot()
+            .unwrap()
+            .unwrap();
+        session.counter = session
+            .game
+            .world
+            .persistent_counter_key()
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.slot.incarnation(), 2);
+        assert!(session.game.world.read_world_slot(&old_slot).is_err());
+        assert!(
+            session
+                .game
+                .world
+                .read_persistent_counter(&old_counter)
+                .is_err()
+        );
+        let frame = session
+            .game
+            .world
+            .counter_checkpoint_frame(session.game.world.game_time)
+            .unwrap();
+        assert_eq!(frame.allocation_high_water, 4);
+        assert_eq!(frame.last_retired.as_ref().unwrap().generation, 3);
+        assert_eq!(
+            frame.last_retired.as_ref().unwrap().reason,
+            NativeRetirementReason::BlockChanged
+        );
+        assert_eq!(retirement_total(&session.game), 14);
+        session
+            .game
+            .checkpoint_session(&session.archive, 1, until())
+            .unwrap();
+        let image = published(session, 1);
+        let original_tree = tree(&image, &[]).unwrap();
+        for invalid in 0..6 {
+            let copy = session
+                .archive
+                .parent()
+                .unwrap()
+                .join(format!("invalid-retirement-{owner}-{invalid}"));
+            copy_tree(&image, &copy, &original_tree, until()).unwrap();
+            let mut changed = frame.clone();
+            let retired = changed.last_retired.as_mut().unwrap();
+            match invalid {
+                0 => retired.reason = NativeRetirementReason::Explicit,
+                1 => retired.reason = NativeRetirementReason::ChunkReplaced,
+                2 => retired.generation = changed.allocation_high_water,
+                3 => retired.game_time = changed.saved_game_time + 1,
+                4 => retired.generation = 0,
+                _ => {
+                    retired.counter = 1;
+                    retired.last_advanced = None;
+                }
+            }
+            fs::write(copy.join(COUNTER), serde_json::to_vec(&changed).unwrap()).unwrap();
+            reseal(&copy, 1);
+            assert!(
+                verify_image(
+                    &session.game,
+                    &copy,
+                    1,
+                    session.counter.placement().world,
+                    &session.target,
+                    &session.type_id
+                )
+                .is_err()
+            );
+            assert_eq!(tree(&image, &[]).unwrap(), original_tree);
+        }
+        let (mut recovered, receipt, _receivers) = retirement_restored(
+            &fixture,
+            session,
+            if owner {
+                "recovered-empty-integrated"
+            } else {
+                "recovered-empty-dedicated"
+            },
+            owner,
+        );
+        assert_ne!(receipt.slot, session.slot);
+        assert_eq!(receipt.slot.incarnation(), 2);
+        assert_eq!(
+            recovered
+                .world
+                .counter_domain_snapshot()
+                .unwrap()
+                .high_water,
+            4
+        );
+        assert_eq!(
+            recovered
+                .world
+                .persistent_world_slot_metadata()
+                .unwrap()
+                .high_water,
+            2
+        );
+        assert_eq!(
+            recovered
+                .world
+                .counter_checkpoint_frame(recovered.world.game_time)
+                .unwrap(),
+            frame
+        );
+        assert!(recovered.world.read_world_slot(&old_slot).is_err());
+        assert!(
+            recovered
+                .world
+                .read_persistent_counter(&old_counter)
+                .is_err()
+        );
+        assert_eq!(retirement_total(&recovered), 14);
+        recovered.world.game_time += 1;
+        recovered.tick_counter_trial(true);
+        assert_eq!(
+            recovered
+                .world
+                .read_persistent_counter(&receipt.counter)
+                .unwrap()
+                .counter(),
+            1
+        );
+        recovered
+            .checkpoint_session(&session.archive, 2, until())
+            .unwrap();
+        assert!(published(session, 2).exists());
+        assert_eq!(retirement_total(&recovered), 14);
+    }
+}

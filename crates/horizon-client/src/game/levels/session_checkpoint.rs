@@ -10,7 +10,8 @@ use horizon_client::{
     chunk::Chunk,
     save::{self, LevelShape},
     world::counter_restore::{
-        CounterFrameV2, CounterTarget, NativeBinding, Placement, RuntimeCounterKey, WorldId,
+        CounterFrameV2, CounterTarget, NativeBinding, NativeRetirementReason, Placement,
+        RuntimeCounterKey, WorldId,
     },
     world::slot_restore::{DecodedSlotFrame, SlotFrameAllocation, decode_slot_frame},
     world_slot_trial::SlotKey,
@@ -1153,7 +1154,10 @@ fn correlate(
         return Err(fail("healthy active slot required"));
     };
     require(
-        counter.last_retired.is_none()
+        counter
+            .last_retired
+            .as_ref()
+            .is_none_or(|retired| retired.reason == NativeRetirementReason::BlockChanged)
             && counter.world_uuid == manifest.world_uuid
             && counter.dimension == manifest.dimension
             && counter.position == manifest.target.position

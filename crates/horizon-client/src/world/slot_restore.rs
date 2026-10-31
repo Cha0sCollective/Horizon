@@ -5,7 +5,7 @@ use super::{
 };
 use crate::{
     items::{ItemStack, Items},
-    world_slot_trial::{self, RestoreAllocation, SlotKey, Trial},
+    world_slot_trial::{self, PendingRetirement, RestoreAllocation, SlotKey, Trial},
 };
 use horizon_world::{
     nbt::{self, Compound, JavaString, Limits, NamedTag, Tag},
@@ -41,6 +41,37 @@ impl fmt::Display for SlotRestoreError {
     }
 }
 impl std::error::Error for SlotRestoreError {}
+/// Refusals preserve the retained owner, allocation heads, metadata and clock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SlotLifecycleError {
+    Disabled,
+    MissingPending,
+    StaleKey,
+    PendingRetirement,
+    NotResident,
+    BindingMismatch,
+    StateMismatch,
+    ClockMismatch,
+    Faulted,
+    Detached,
+    GenerationExhausted,
+}
+impl fmt::Display for SlotLifecycleError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "native slot lifecycle: {self:?}")
+    }
+}
+impl std::error::Error for SlotLifecycleError {}
+fn lifecycle_error(error: SlotRestoreError) -> SlotLifecycleError {
+    match error {
+        SlotRestoreError::NotResident => SlotLifecycleError::NotResident,
+        SlotRestoreError::StateMismatch => SlotLifecycleError::StateMismatch,
+        SlotRestoreError::ClockMismatch => SlotLifecycleError::ClockMismatch,
+        SlotRestoreError::Faulted => SlotLifecycleError::Faulted,
+        SlotRestoreError::Detached => SlotLifecycleError::Detached,
+        _ => SlotLifecycleError::BindingMismatch,
+    }
+}
 type Result<T> = std::result::Result<T, SlotRestoreError>;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SlotStatus {
@@ -1028,6 +1059,157 @@ impl World {
         }
         Ok(anchor)
     }
+    fn checked_slot_lifecycle(
+        &self,
+    ) -> std::result::Result<
+        (SlotMetadataSnapshot, super::counter_restore::SlotAnchor<'_>),
+        SlotLifecycleError,
+    > {
+        let metadata = self
+            .persistent_world_slot_metadata()
+            .ok_or(SlotLifecycleError::Disabled)?;
+        match metadata.status {
+            SlotStatus::Detached => return Err(SlotLifecycleError::Detached),
+            SlotStatus::Faulted => return Err(SlotLifecycleError::Faulted),
+            SlotStatus::Healthy => {}
+        }
+        // The ordinary guard deliberately refuses Pending and the temporary
+        // Dormant/active-counter gap. Lifecycle operations validate those here.
+        let anchor = self.checked_slot_anchor().map_err(lifecycle_error)?;
+        let trial = self
+            .world_slot_trial
+            .as_ref()
+            .ok_or(SlotLifecycleError::Detached)?;
+        let view = trial.borrowed();
+        if view.fault.is_some() {
+            return Err(SlotLifecycleError::Faulted);
+        }
+        if view.high_water != metadata.high_water
+            || view.configuration != self.counter_trial.as_ref().unwrap().configuration()
+            || !self
+                .counter_domain
+                .as_ref()
+                .unwrap()
+                .configuration_matches(view.configuration)
+            || !trial.persistent_keys_valid()
+            || anchor
+                .generation
+                .is_some_and(|generation| generation == 0 || generation > anchor.high_water)
+        {
+            return Err(SlotLifecycleError::BindingMismatch);
+        }
+        Ok((metadata, anchor))
+    }
+    /// Move the exact original BlockChanged owner, preserving persistent heads.
+    /// This does not admit a replacement or provide player authorization.
+    pub fn take_persistent_world_slot_retirement(
+        &mut self,
+        expected: &SlotKey,
+    ) -> std::result::Result<PendingRetirement, SlotLifecycleError> {
+        let (metadata, anchor) = self.checked_slot_lifecycle()?;
+        let trial = self.world_slot_trial.as_ref().unwrap();
+        let pending = trial
+            .persistent_pending()
+            .ok_or(SlotLifecycleError::MissingPending)?;
+        if pending.allocation.key != expected {
+            return Err(SlotLifecycleError::StaleKey);
+        }
+        let SlotAllocation::Pending {
+            slot_generation,
+            machine_generation,
+        } = metadata.allocation
+        else {
+            return Err(SlotLifecycleError::BindingMismatch);
+        };
+        if trial.borrowed().active.is_some()
+            || slot_generation != pending.allocation.key.incarnation()
+            || slot_generation == 0
+            || slot_generation > metadata.high_water
+            || machine_generation == 0
+            || machine_generation > anchor.high_water
+            || pending.reason != world_slot_trial::RetirementReason::BlockChanged
+        {
+            return Err(SlotLifecycleError::BindingMismatch);
+        }
+        if !pending.allocation.resident {
+            return Err(SlotLifecycleError::NotResident);
+        }
+        if pending.game_time < 0 || pending.game_time > self.game_time {
+            return Err(SlotLifecycleError::ClockMismatch);
+        }
+        // No allocation or fallible operation remains after the owner moves.
+        let pending = self
+            .world_slot_trial
+            .as_mut()
+            .unwrap()
+            .persistent_take_pending();
+        self.counter_domain
+            .as_mut()
+            .unwrap()
+            .slot
+            .as_mut()
+            .unwrap()
+            .allocation = SlotAllocation::Dormant;
+        Ok(pending)
+    }
+    /// Explicitly admit one empty slot at the current machine generation.
+    /// Matching changed writes alone leave a healthy Dormant slot untouched.
+    pub fn reconcile_persistent_world_slot(
+        &mut self,
+    ) -> std::result::Result<Option<SlotKey>, SlotLifecycleError> {
+        let (metadata, anchor) = self.checked_slot_lifecycle()?;
+        let trial = self.world_slot_trial.as_ref().unwrap();
+        let view = trial.borrowed();
+        if view.pending || matches!(metadata.allocation, SlotAllocation::Pending { .. }) {
+            return Err(SlotLifecycleError::PendingRetirement);
+        }
+        if let SlotAllocation::Active {
+            slot_generation,
+            machine_generation,
+        } = metadata.allocation
+        {
+            let active = view.active.ok_or(SlotLifecycleError::BindingMismatch)?;
+            if active.key.incarnation() != slot_generation
+                || anchor.generation != Some(machine_generation)
+            {
+                return Err(SlotLifecycleError::BindingMismatch);
+            }
+            if !active.resident {
+                return Err(SlotLifecycleError::NotResident);
+            }
+            return Ok(Some(active.key.clone()));
+        }
+        if view.active.is_some() {
+            return Err(SlotLifecycleError::BindingMismatch);
+        }
+        let Some(machine_generation) = anchor.generation else {
+            return Ok(None);
+        };
+        let next = metadata
+            .high_water
+            .checked_add(1)
+            .ok_or(SlotLifecycleError::GenerationExhausted)?;
+        let staged = trial
+            .persistent_prepare_admission()
+            .map_err(|error| match error {
+                world_slot_trial::Error::Fault(world_slot_trial::Fault::IncarnationExhausted) => {
+                    SlotLifecycleError::GenerationExhausted
+                }
+                _ => SlotLifecycleError::BindingMismatch,
+            })?;
+        let key = Trial::persistent_admission_key(&staged);
+        self.world_slot_trial
+            .as_mut()
+            .unwrap()
+            .persistent_publish_admission(staged);
+        let slot = self.counter_domain.as_mut().unwrap().slot.as_mut().unwrap();
+        slot.high_water = next;
+        slot.allocation = SlotAllocation::Active {
+            slot_generation: next,
+            machine_generation,
+        };
+        Ok(Some(key))
+    }
     pub fn initialize_persistent_world_slot(
         &mut self,
         binding: &NativeBinding,
@@ -1222,7 +1404,7 @@ impl World {
             trial.persistent_fault();
         }
     }
-    pub(super) fn persistent_slot_changed(&mut self, position: [i32; 3], state: BlockStateId) {
+    pub(super) fn persistent_slot_changed(&mut self, position: [i32; 3], _state: BlockStateId) {
         let Some(metadata) = self.persistent_world_slot_metadata() else {
             return;
         };
@@ -1258,43 +1440,8 @@ impl World {
                 slot_generation,
                 machine_generation,
             };
-            return;
         }
-        if state != trial.borrowed().configuration.state_id() {
-            return;
-        }
-        let machine = match self.checked_slot_anchor() {
-            Ok(anchor) => anchor.generation,
-            Err(_) => {
-                self.slot_fault();
-                return;
-            }
-        };
-        let Some(machine) = machine else {
-            self.slot_fault();
-            return;
-        };
-        let Some(next) = metadata.high_water.checked_add(1) else {
-            self.slot_fault();
-            return;
-        };
-        let trial = self.world_slot_trial.as_mut().unwrap();
-        trial.persistent_admit();
-        if trial
-            .borrowed()
-            .active
-            .as_ref()
-            .is_none_or(|value| value.key.incarnation() != next)
-        {
-            self.slot_fault();
-            return;
-        }
-        let slot = self.counter_domain.as_mut().unwrap().slot.as_mut().unwrap();
-        slot.high_water = next;
-        slot.allocation = SlotAllocation::Active {
-            slot_generation: next,
-            machine_generation: machine,
-        };
+        // Dormant readmission is explicit, including writes after delivery.
     }
     pub(super) fn persistent_slot_inserted(&mut self, replaced: bool, state: BlockStateId) {
         let Some(metadata) = self.persistent_world_slot_metadata() else {

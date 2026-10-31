@@ -1097,7 +1097,31 @@ fn native_slot_restore_dormant_heads_and_exhaustion() {
         20
     );
     write(&mut destination, 1);
-    let key = slot_key(&destination);
+    assert_eq!(
+        destination
+            .persistent_world_slot_metadata()
+            .unwrap()
+            .allocation,
+        SlotAllocation::Dormant
+    );
+    assert!(
+        destination
+            .world_slot_trial
+            .as_ref()
+            .unwrap()
+            .borrowed()
+            .active
+            .is_none()
+    );
+    assert!(
+        destination
+            .slot_checkpoint_bytes(fixture().1, TIME)
+            .is_err()
+    );
+    let key = destination
+        .reconcile_persistent_world_slot()
+        .unwrap()
+        .unwrap();
     assert_eq!(key.incarnation(), 21);
     assert_eq!(
         destination
@@ -1122,6 +1146,16 @@ fn native_slot_restore_dormant_heads_and_exhaustion() {
         )
         .unwrap();
     write(&mut exhausted, 1);
+    let before_counter = exhausted.counter_trial_snapshot();
+    let before_domain = exhausted.counter_domain_snapshot();
+    let before_slot = exhausted.persistent_world_slot_metadata();
+    assert_eq!(
+        exhausted.reconcile_persistent_world_slot(),
+        Err(SlotLifecycleError::GenerationExhausted)
+    );
+    assert_eq!(exhausted.counter_trial_snapshot(), before_counter);
+    assert_eq!(exhausted.counter_domain_snapshot(), before_domain);
+    assert_eq!(exhausted.persistent_world_slot_metadata(), before_slot);
     assert!(
         exhausted
             .world_slot_trial
@@ -1141,7 +1175,7 @@ fn native_slot_restore_dormant_heads_and_exhaustion() {
     );
     assert_eq!(
         exhausted.persistent_world_slot_metadata().unwrap().status,
-        SlotStatus::Faulted
+        SlotStatus::Healthy
     );
     retained_presence_without_trial(&mut exhausted);
     let held = exhausted.take_world_slot_trial().unwrap();
@@ -1189,5 +1223,475 @@ fn native_slot_restore_dormant_heads_and_exhaustion() {
             .unwrap()
             .revision,
         u64::MAX
+    );
+}
+
+fn pending_address(world: &World) -> *const crate::item_data::StackData {
+    world
+        .world_slot_trial
+        .as_ref()
+        .unwrap()
+        .persistent_pending()
+        .unwrap()
+        .allocation
+        .stack
+        .unwrap()
+        .extra
+        .as_deref()
+        .unwrap() as *const _
+}
+fn refused_take(world: &mut World, expected: &SlotKey, error: SlotLifecycleError) {
+    let metadata = world.persistent_world_slot_metadata();
+    let domain = world.counter_domain_snapshot();
+    let counter = world.counter_trial_snapshot();
+    let snapshot = format!("{:?}", world.world_slot_snapshot());
+    let ptr = pending_address(world);
+    let trial = world.world_slot_trial.as_ref().unwrap().as_ref() as *const _;
+    let rng = world.random.state();
+    let clock = world.game_time;
+    assert_eq!(
+        world
+            .take_persistent_world_slot_retirement(expected)
+            .unwrap_err(),
+        error
+    );
+    assert_eq!(world.persistent_world_slot_metadata(), metadata);
+    assert_eq!(world.counter_domain_snapshot(), domain);
+    assert_eq!(world.counter_trial_snapshot(), counter);
+    assert_eq!(format!("{:?}", world.world_slot_snapshot()), snapshot);
+    assert_eq!(pending_address(world), ptr);
+    assert_eq!(
+        world.world_slot_trial.as_ref().unwrap().as_ref() as *const _,
+        trial
+    );
+    assert_eq!(world.random.state(), rng);
+    assert_eq!(world.game_time, clock);
+}
+
+#[test]
+fn persistent_slot_retirement_keeps_original_owner_and_independent_heads() {
+    let mut world = filled(rich(7));
+    let old = slot_key(&world);
+    let old_counter = world.persistent_counter_key().unwrap().unwrap();
+    let ptr = address(&world);
+    let trial_ptr = world.world_slot_trial.as_ref().unwrap().as_ref() as *const _;
+    let mut receiver = SlotProjection::new(None);
+    let stale = match world
+        .prepare_world_slot_transfer(&old, &receiver, Direction::IntoPlayer, 2, caps())
+        .unwrap()
+    {
+        Preparation::Prepared(plan) => *plan,
+        other => panic!("expected stale plan: {other:?}"),
+    };
+    write(&mut world, 0);
+    for state in [1, 0, 1, 0, 1] {
+        write(&mut world, state);
+        assert_eq!(pending_address(&world), ptr);
+    }
+    assert_eq!(world.counter_domain_snapshot().unwrap().high_water, 4);
+    assert_eq!(
+        world.persistent_world_slot_metadata().unwrap().high_water,
+        1
+    );
+    assert_eq!(
+        world.reconcile_persistent_world_slot(),
+        Err(SlotLifecycleError::PendingRetirement)
+    );
+    let independent = filled(rich(7));
+    refused_take(
+        &mut world,
+        &slot_key(&independent),
+        SlotLifecycleError::StaleKey,
+    );
+    let before_counter = world.counter_trial_snapshot();
+    let before_domain = world.counter_domain_snapshot();
+    let rng = world.random.state();
+    let owned = world.take_persistent_world_slot_retirement(&old).unwrap();
+    assert_eq!(world.counter_trial_snapshot(), before_counter);
+    assert_eq!(world.counter_domain_snapshot(), before_domain);
+    assert_eq!(world.random.state(), rng);
+    assert_eq!(world.game_time, TIME);
+    assert_eq!(
+        world.world_slot_trial.as_ref().unwrap().as_ref() as *const _,
+        trial_ptr
+    );
+    assert_eq!(
+        world.persistent_world_slot_metadata(),
+        Some(SlotMetadataSnapshot {
+            high_water: 1,
+            allocation: SlotAllocation::Dormant,
+            status: SlotStatus::Healthy,
+        })
+    );
+    assert_eq!(
+        world
+            .take_persistent_world_slot_retirement(&old)
+            .unwrap_err(),
+        SlotLifecycleError::MissingPending
+    );
+    assert!(world.slot_checkpoint_bytes(fixture().1, TIME).is_err());
+    assert!(world.read_world_slot(&old).is_err());
+    // Same-state writes do nothing: reconciliation must explicitly close this gap.
+    write(&mut world, 1);
+    assert!(
+        world
+            .world_slot_trial
+            .as_ref()
+            .unwrap()
+            .borrowed()
+            .active
+            .is_none()
+    );
+    let fresh = world.reconcile_persistent_world_slot().unwrap().unwrap();
+    assert_eq!(fresh.incarnation(), 2);
+    assert_ne!(fresh, old);
+    assert_eq!(fresh.scope(), old.scope());
+    assert_eq!(
+        world.reconcile_persistent_world_slot().unwrap(),
+        Some(fresh.clone())
+    );
+    assert_eq!(world.counter_trial_snapshot(), before_counter);
+    assert_eq!(world.counter_domain_snapshot(), before_domain);
+    assert_eq!(
+        world.persistent_world_slot_metadata().unwrap().allocation,
+        SlotAllocation::Active {
+            slot_generation: 2,
+            machine_generation: 4,
+        }
+    );
+    assert_eq!(world.read_world_slot(&fresh).unwrap().slot.stack(), None);
+    assert_eq!(
+        world.read_world_slot(&old).unwrap_err(),
+        world_slot_trial::Error::StaleKey
+    );
+    assert!(world.read_persistent_counter(&old_counter).is_err());
+    assert_eq!(
+        world.commit_world_slot_transfer(stale, &mut receiver, caps()),
+        Err(world_slot_trial::Error::StaleKey)
+    );
+    assert!(receiver.into_stack().is_none());
+    let (allocation, reason, clock) = owned.into_parts();
+    assert_eq!(reason, RetirementReason::BlockChanged);
+    assert_eq!(clock, TIME);
+    let (key, projection, resident) = allocation.into_parts();
+    assert_eq!(key, old);
+    assert!(resident);
+    let stack = projection.into_stack().unwrap();
+    assert_eq!(stack.extra.as_deref().unwrap() as *const _, ptr);
+    assert_eq!(stack, rich(7));
+}
+
+#[test]
+fn persistent_slot_delivery_before_replacement_requires_explicit_reconcile() {
+    let mut world = filled(rich(7));
+    let old = slot_key(&world);
+    let ptr = address(&world);
+    write(&mut world, 0);
+    let owned = world.take_persistent_world_slot_retirement(&old).unwrap();
+    let dormant = world.persistent_world_slot_metadata();
+    assert_eq!(world.reconcile_persistent_world_slot(), Ok(None));
+    assert_eq!(world.reconcile_persistent_world_slot(), Ok(None));
+    assert_eq!(world.persistent_world_slot_metadata(), dormant);
+    assert!(world.slot_checkpoint_bytes(fixture().1, TIME).is_ok());
+    write(&mut world, 1);
+    assert_eq!(world.persistent_world_slot_metadata(), dormant);
+    assert!(
+        world
+            .world_slot_trial
+            .as_ref()
+            .unwrap()
+            .borrowed()
+            .active
+            .is_none()
+    );
+    assert!(world.slot_checkpoint_bytes(fixture().1, TIME).is_err());
+    assert!(
+        world
+            .prepare_world_slot_transfer(
+                &old,
+                &SlotProjection::new(None),
+                Direction::IntoPlayer,
+                1,
+                caps()
+            )
+            .is_err()
+    );
+    let fresh = world.reconcile_persistent_world_slot().unwrap().unwrap();
+    assert_eq!(fresh.incarnation(), 2);
+    assert_eq!(
+        world.persistent_world_slot_metadata().unwrap().allocation,
+        SlotAllocation::Active {
+            slot_generation: 2,
+            machine_generation: 2,
+        }
+    );
+    let (allocation, _, _) = owned.into_parts();
+    let (_, projection, _) = allocation.into_parts();
+    let stack = projection.into_stack().unwrap();
+    assert_eq!(stack.extra.as_deref().unwrap() as *const _, ptr);
+    assert_eq!(stack, rich(7));
+}
+
+#[test]
+fn persistent_slot_checked_take_refusals_preserve_nested_owner() {
+    for mode in 0..10 {
+        let mut world = filled(rich(7));
+        let key = slot_key(&world);
+        write(&mut world, 0);
+        let error = match mode {
+            0 => {
+                world.remove_streamed_chunk(&(0, 0)).unwrap();
+                SlotLifecycleError::NotResident
+            }
+            1 => {
+                world.game_time = -1;
+                SlotLifecycleError::ClockMismatch
+            }
+            2 => {
+                world.game_time = TIME - 1;
+                SlotLifecycleError::ClockMismatch
+            }
+            3 => {
+                world.world_slot_trial.as_mut().unwrap().persistent_fault();
+                SlotLifecycleError::Faulted
+            }
+            4 => {
+                world.slot_fault();
+                SlotLifecycleError::Faulted
+            }
+            5 => {
+                world.detach_persistent_slot();
+                SlotLifecycleError::Detached
+            }
+            6 => {
+                let metadata = world
+                    .counter_domain
+                    .as_mut()
+                    .unwrap()
+                    .slot
+                    .as_mut()
+                    .unwrap();
+                metadata.high_water += 1;
+                SlotLifecycleError::BindingMismatch
+            }
+            7 => {
+                world
+                    .counter_domain
+                    .as_mut()
+                    .unwrap()
+                    .slot
+                    .as_mut()
+                    .unwrap()
+                    .allocation = SlotAllocation::Pending {
+                    slot_generation: 1,
+                    machine_generation: 2,
+                };
+                SlotLifecycleError::BindingMismatch
+            }
+            8 => {
+                // Corrupt only physical context, bypassing hooks to test a stale anchor.
+                Arc::make_mut(world.chunks.get_mut(&(0, 0)).unwrap()).set(2, 70, 2, 1);
+                SlotLifecycleError::StateMismatch
+            }
+            _ => {
+                let configuration = world.counter_trial.as_ref().unwrap().configuration();
+                let changed = crate::counter_trial::Configuration::new(
+                    crate::mutation_observer::AuthorityScope::new(
+                        configuration.scope().world_instance() + 1,
+                        "minecraft:overworld",
+                    )
+                    .unwrap(),
+                    configuration.machine_type(),
+                    configuration.state().clone(),
+                    configuration.state_id(),
+                    POSITION,
+                )
+                .unwrap();
+                world.counter_trial = Some(Box::new(crate::counter_trial::Trial::new(
+                    changed,
+                    Some(BlockStateId(0)),
+                )));
+                SlotLifecycleError::BindingMismatch
+            }
+        };
+        refused_take(&mut world, &key, error);
+    }
+    let mut no_slot = anchor();
+    let unrelated = slot_key(&filled(rich(7)));
+    assert_eq!(
+        no_slot
+            .take_persistent_world_slot_retirement(&unrelated)
+            .unwrap_err(),
+        SlotLifecycleError::Disabled
+    );
+    assert_eq!(
+        no_slot.reconcile_persistent_world_slot(),
+        Err(SlotLifecycleError::Disabled)
+    );
+    let mut active = filled(rich(7));
+    let active_key = slot_key(&active);
+    assert_eq!(
+        active
+            .take_persistent_world_slot_retirement(&active_key)
+            .unwrap_err(),
+        SlotLifecycleError::MissingPending
+    );
+}
+
+#[test]
+fn persistent_slot_reconcile_refusals_and_streamer_keep_exact_state() {
+    for mode in 0..7 {
+        let mut world = filled(rich(7));
+        let key = slot_key(&world);
+        if mode == 0 {
+            write(&mut world, 0);
+        } else if mode == 1 {
+            world.remove_streamed_chunk(&(0, 0)).unwrap();
+        } else if mode == 2 {
+            world.detach_persistent_slot();
+        } else if mode == 3 {
+            world.slot_fault();
+        } else if mode == 4 {
+            world.game_time = -1;
+        } else if mode == 5 {
+            // Actual resident replacement retains the preexisting explicit fault.
+            world.insert_streamed_chunk(chunk(1));
+        } else {
+            world.remove_streamed_chunk(&(0, 0)).unwrap();
+            world.insert_streamed_chunk(chunk(2));
+        }
+        let expected = [
+            SlotLifecycleError::PendingRetirement,
+            SlotLifecycleError::NotResident,
+            SlotLifecycleError::Detached,
+            SlotLifecycleError::Faulted,
+            SlotLifecycleError::ClockMismatch,
+            SlotLifecycleError::Faulted,
+            SlotLifecycleError::Faulted,
+        ][mode];
+        let before_slot = world.persistent_world_slot_metadata();
+        let before_counter = world.counter_trial_snapshot();
+        let before_domain = world.counter_domain_snapshot();
+        let snapshot = format!("{:?}", world.world_slot_snapshot());
+        let rng = world.random.state();
+        let clock = world.game_time;
+        assert_eq!(world.reconcile_persistent_world_slot(), Err(expected));
+        assert_eq!(world.persistent_world_slot_metadata(), before_slot);
+        assert_eq!(world.counter_trial_snapshot(), before_counter);
+        assert_eq!(world.counter_domain_snapshot(), before_domain);
+        assert_eq!(format!("{:?}", world.world_slot_snapshot()), snapshot);
+        assert_eq!(world.random.state(), rng);
+        assert_eq!(world.game_time, clock);
+        if mode == 0 {
+            assert_eq!(
+                world
+                    .world_slot_snapshot()
+                    .unwrap()
+                    .pending
+                    .unwrap()
+                    .allocation
+                    .key,
+                key
+            );
+        } else if mode >= 5 {
+            refused_take(&mut world, &key, SlotLifecycleError::Faulted);
+        }
+    }
+    let mut world = filled(rich(7));
+    let old = slot_key(&world);
+    write(&mut world, 0);
+    write(&mut world, 1);
+    let retained = world.take_persistent_world_slot_retirement(&old).unwrap();
+    let key = world.reconcile_persistent_world_slot().unwrap().unwrap();
+    let mut donor = SlotProjection::new(Some(rich(3)));
+    let plan = match world
+        .prepare_world_slot_transfer(&key, &donor, Direction::IntoMachine, 3, caps())
+        .unwrap()
+    {
+        Preparation::Prepared(plan) => *plan,
+        other => panic!("expected new-slot transfer: {other:?}"),
+    };
+    world
+        .commit_world_slot_transfer(plan, &mut donor, caps())
+        .unwrap();
+    let ptr = address(&world);
+    assert_eq!(world.advance_counter_trial(true, true), Some(Ok(true)));
+    let before = world.counter_trial_snapshot().unwrap().record().unwrap();
+    let counter_key = world.persistent_counter_key().unwrap().unwrap();
+    let metadata = world.persistent_world_slot_metadata();
+    let domain = world.counter_domain_snapshot();
+    world.remove_streamed_chunk(&(0, 0)).unwrap();
+    world.game_time += 100;
+    assert_eq!(
+        world.reconcile_persistent_world_slot(),
+        Err(SlotLifecycleError::NotResident)
+    );
+    world.insert_streamed_chunk(chunk(1));
+    assert_eq!(
+        world.reconcile_persistent_world_slot(),
+        Ok(Some(key.clone()))
+    );
+    assert_eq!(address(&world), ptr);
+    assert_eq!(slot_key(&world), key);
+    assert_eq!(world.persistent_world_slot_metadata(), metadata);
+    assert_eq!(world.counter_domain_snapshot(), domain);
+    assert_eq!(world.read_persistent_counter(&counter_key).unwrap(), before);
+    assert_eq!(world.advance_counter_trial(true, true), Some(Ok(true)));
+    assert_eq!(
+        world
+            .read_persistent_counter(&counter_key)
+            .unwrap()
+            .counter(),
+        before.counter() + 1
+    );
+    assert_eq!(
+        world
+            .world_slot_trial
+            .as_ref()
+            .unwrap()
+            .borrowed()
+            .active
+            .unwrap()
+            .stack,
+        Some(&rich(3))
+    );
+    // Retain the earlier owner throughout this new allocation's unload/reload.
+    assert_eq!(retained.snapshot().allocation.slot.stack(), Some(&rich(7)));
+}
+
+#[test]
+fn persistent_slot_counter_exhaustion_does_not_admit_or_drop_pending() {
+    let source = filled(rich(7));
+    let mut counter = source.counter_checkpoint_frame(TIME).unwrap();
+    counter.allocation_high_water = u64::MAX;
+    let mut frame = decoded(&source);
+    frame.header.machine_head = u64::MAX;
+    let mut world = restore_anchor(&counter, 1);
+    let key = world
+        .restore_persistent_world_slot(
+            fixture().0,
+            fixture().1,
+            counter.world_uuid,
+            &target(),
+            frame,
+        )
+        .unwrap()
+        .unwrap();
+    let ptr = address(&world);
+    write(&mut world, 0);
+    write(&mut world, 1);
+    assert_eq!(
+        world.counter_domain_snapshot().unwrap().high_water,
+        u64::MAX
+    );
+    assert_eq!(
+        world.persistent_world_slot_metadata().unwrap().high_water,
+        1
+    );
+    assert_eq!(pending_address(&world), ptr);
+    refused_take(&mut world, &key, SlotLifecycleError::Faulted);
+    assert_eq!(
+        world.reconcile_persistent_world_slot(),
+        Err(SlotLifecycleError::Faulted)
     );
 }
