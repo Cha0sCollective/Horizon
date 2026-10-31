@@ -4,8 +4,10 @@ use super::server_game;
 use crate::game::{
     Game, Options, PackResources, Resources,
     execution_role::ExecutionRole,
-    lan::LanSettings,
-    levels::session_checkpoint::{CheckpointReceipt, Publication, next_session_checkpoint_epoch},
+    lan::{LanSettings, connected_recovery as connected},
+    levels::session_checkpoint::{
+        CheckpointReceipt, ManagedRecoveryRequest, Publication, next_session_checkpoint_epoch,
+    },
     world_loading::{
         WorldRequest,
         host_identity::{IdentityIntent, session_authority::AuthorityNamespace},
@@ -17,6 +19,7 @@ use horizon_client::{
     world::counter_restore::{CounterTarget, NativeBinding, RuntimeCounterKey},
     world_slot_trial::SlotKey,
 };
+use horizon_protocol::connection::Pipe;
 use std::{
     fs,
     io::{self, Write},
@@ -48,9 +51,51 @@ struct ManagedStart {
     first_stop_fault: Option<crate::game::levels::session_checkpoint::CheckpointTestFault>,
 }
 
+struct ManagedConnectedStart {
+    resources: Arc<Resources>,
+    pack: PackResources,
+    options: Options,
+    settings: Settings,
+    namespace: PathBuf,
+    request: ManagedRecoveryRequest,
+    continuation: PathBuf,
+    attempt_timeout: Duration,
+    #[cfg(test)]
+    first_stop_fault: Option<crate::game::levels::session_checkpoint::CheckpointTestFault>,
+}
+enum WorkerStart {
+    NewClosed(ManagedStart),
+    Connected(ManagedConnectedStart),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConnectedPhase {
+    Joining,
+    Admitted,
+    Loading,
+    ReadyFrozen,
+    RetainedFailure,
+    Refusing,
+    CleanupBlocked,
+    Closing,
+}
+#[derive(Clone, Debug)]
+struct ConnectedStatus {
+    phase: ConnectedPhase,
+    world_time: i64,
+    day_time: i64,
+    hub_ticks: u64,
+    guests: usize,
+    play_entries: usize,
+    pending_transport_bytes: usize,
+    attempts: usize,
+    detail: String,
+}
+
 #[derive(Clone, Debug)]
 enum State {
     Preparing,
+    Connected(ConnectedPhase),
     Ready,
     Stopping {
         attempt: u64,
@@ -67,6 +112,7 @@ enum State {
         receipt: CheckpointReceipt,
     },
     StartupFailed(String),
+    StartupRefused(String),
     FatalWorkerFailure(String),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -99,8 +145,11 @@ struct SupervisorView {
     state: State,
     last_admitted: u64,
     last_refusal: Option<Refusal>,
+    connected: Option<ConnectedStatus>,
     #[cfg(test)]
     observation: Option<Observation>,
+    #[cfg(test)]
+    connected_observation: Option<connected::Observation>,
 }
 
 /// Observers own no Game or JoinHandle. Their loss cannot stop or detach a worker.
@@ -175,6 +224,7 @@ enum WorkerEnd {
         receipt: CheckpointReceipt,
     },
     StartupFailed(String),
+    StartupRefused(String),
 }
 
 /// The driver is owned by this synchronous supervisor scope, never by a detached
@@ -184,14 +234,35 @@ fn run_owned_managed_stop(
     mut driver: impl FnMut(&SupervisorView, &ManagedStopControl) -> DriverCommand,
 ) -> Result<CheckpointReceipt, String> {
     checked_start_paths(&start.paths)?;
+    run_owned_supervisor(WorkerStart::NewClosed(start), |view, control, pipes| {
+        assert!(pipes.is_none(), "closed-profile worker offered connections");
+        driver(view, control)
+    })
+}
+
+fn run_owned_managed_connected(
+    start: ManagedConnectedStart,
+    driver: impl FnMut(&SupervisorView, &ManagedStopControl, Option<[Pipe; 2]>) -> DriverCommand,
+) -> Result<CheckpointReceipt, String> {
+    run_owned_supervisor(WorkerStart::Connected(start), driver)
+}
+
+fn run_owned_supervisor(
+    start: WorkerStart,
+    mut driver: impl FnMut(&SupervisorView, &ManagedStopControl, Option<[Pipe; 2]>) -> DriverCommand,
+) -> Result<CheckpointReceipt, String> {
     let (command, commands) = mpsc::sync_channel(1);
     let (changed, changes) = mpsc::sync_channel(1);
+    let (offer, offers) = mpsc::sync_channel(1);
     let shared = Arc::new(Mutex::new(SupervisorView {
         state: State::Preparing,
         last_admitted: 0,
         last_refusal: None,
+        connected: None,
         #[cfg(test)]
         observation: None,
+        #[cfg(test)]
+        connected_observation: None,
     }));
     let control = ManagedStopControl {
         shared: shared.clone(),
@@ -201,7 +272,12 @@ fn run_owned_managed_stop(
     let mut worker = AbortUnresolvedWorker(Some(
         thread::Builder::new()
             .name("Managed stop worker".into())
-            .spawn(move || owned_worker(start, shared, changed, commands))
+            .spawn(move || match start {
+                WorkerStart::NewClosed(start) => owned_worker(start, shared, changed, commands),
+                WorkerStart::Connected(start) => {
+                    connected_worker(start, shared, changed, commands, offer)
+                }
+            })
             .map_err(|e| e.to_string())?,
     ));
     let mut previous = String::new();
@@ -225,6 +301,14 @@ fn run_owned_managed_stop(
                     }
                 }
                 Ok(WorkerEnd::StartupFailed(detail)) => Err(detail),
+                Ok(WorkerEnd::StartupRefused(detail)) => {
+                    if matches!(&control.view().state, State::StartupRefused(current) if *current == detail)
+                    {
+                        Err(format!("connected startup refused: {detail}"))
+                    } else {
+                        Err("finished worker lacks matching startup refusal".into())
+                    }
+                }
                 Err(_) => {
                     let detail = "managed worker panicked; no shutdown receipt".to_owned();
                     control
@@ -236,7 +320,7 @@ fn run_owned_managed_stop(
                 }
             };
         }
-        let request = driver(&view, &control);
+        let request = driver(&view, &control, offers.try_recv().ok());
         let command = match request {
             DriverCommand::Wait => None,
             DriverCommand::RequestStop(attempt) => Some(Command::RequestStop { attempt }),
@@ -273,6 +357,242 @@ fn publish_view(
     let _ = observation;
     drop(view);
     let _ = changed.try_send(());
+}
+
+fn bounded_detail(mut detail: String) -> String {
+    if detail.len() > 256 {
+        let mut end = 256;
+        while !detail.is_char_boundary(end) {
+            end -= 1;
+        }
+        detail.truncate(end);
+    }
+    detail
+}
+
+fn publish_connected(
+    shared: &Mutex<SupervisorView>,
+    changed: &SyncSender<()>,
+    observation: connected::Observation,
+) {
+    use connected::State as C;
+    let (phase, state, detail) = match &observation.state {
+        C::Joining => (
+            ConnectedPhase::Joining,
+            State::Connected(ConnectedPhase::Joining),
+            String::new(),
+        ),
+        C::Admitted => (
+            ConnectedPhase::Admitted,
+            State::Connected(ConnectedPhase::Admitted),
+            String::new(),
+        ),
+        C::Loading => (
+            ConnectedPhase::Loading,
+            State::Connected(ConnectedPhase::Loading),
+            String::new(),
+        ),
+        C::ReadyFrozen => (ConnectedPhase::ReadyFrozen, State::Ready, String::new()),
+        C::RetainedFailure {
+            attempt,
+            publication,
+            detail,
+        } => {
+            let detail = bounded_detail(detail.clone());
+            (
+                ConnectedPhase::RetainedFailure,
+                State::RetainedFailure {
+                    attempt: *attempt,
+                    epoch: None,
+                    publication: *publication,
+                    detail: detail.clone(),
+                },
+                detail,
+            )
+        }
+        C::Refusing(detail) => (
+            ConnectedPhase::Refusing,
+            State::Connected(ConnectedPhase::Refusing),
+            bounded_detail(detail.clone()),
+        ),
+        C::CleanupBlocked(detail) => (
+            ConnectedPhase::CleanupBlocked,
+            State::Connected(ConnectedPhase::CleanupBlocked),
+            bounded_detail(detail.clone()),
+        ),
+        C::Closing(receipt) => (
+            ConnectedPhase::Closing,
+            State::Stopping {
+                attempt: 0,
+                epoch: Some(receipt.epoch),
+            },
+            String::new(),
+        ),
+    };
+    let mut view = shared.lock().unwrap_or_else(|e| e.into_inner());
+    // Admission and publication share this lock. A stale Ready or earlier failed
+    // attempt must never reopen admission while its newer command is in flight.
+    let preserve_inflight = match (&view.state, &observation.state) {
+        (State::Stopping { .. }, C::ReadyFrozen) => true,
+        (
+            State::Stopping {
+                attempt: current, ..
+            },
+            C::RetainedFailure { attempt, .. },
+        ) => current != attempt,
+        _ => false,
+    };
+    if !preserve_inflight {
+        view.state = match state {
+            State::Stopping { epoch, .. } => State::Stopping {
+                attempt: view.last_admitted,
+                epoch,
+            },
+            state => state,
+        };
+    }
+    view.connected = Some(ConnectedStatus {
+        phase,
+        world_time: observation.world_time,
+        day_time: observation.day_time,
+        hub_ticks: observation.hub_ticks,
+        guests: observation.guests,
+        play_entries: observation.play_entries,
+        pending_transport_bytes: observation.pending_transport_bytes,
+        attempts: observation.attempts,
+        detail,
+    });
+    #[cfg(test)]
+    {
+        view.connected_observation = Some(observation);
+    }
+    drop(view);
+    let _ = changed.try_send(());
+}
+
+fn connected_worker(
+    start: ManagedConnectedStart,
+    shared: Arc<Mutex<SupervisorView>>,
+    changed: SyncSender<()>,
+    commands: Receiver<Command>,
+    offers: SyncSender<[Pipe; 2]>,
+) -> WorkerEnd {
+    let result = (|| {
+        if start.attempt_timeout.is_zero() || start.attempt_timeout > Duration::from_secs(120) {
+            return Err("managed connected deadline bound".to_owned());
+        }
+        if !start.options.test_terrain || !start.options.mod_packages.has_pairs() {
+            return Err(
+                "managed connected profile requires captured pair and native TestTerrain".into(),
+            );
+        }
+        let namespace = AuthorityNamespace::new(&start.namespace).map_err(|e| e.to_string())?;
+        let mut options = start.options.clone();
+        options.execution_role = ExecutionRole::IntegratedServer;
+        options.dedicated = Some(Vec::new());
+        options.server_thread = false;
+        let mut game = Box::new(
+            server_game(
+                &start.resources,
+                start.pack.clone(),
+                options,
+                start.settings.clone(),
+            )
+            .map_err(|e| e.to_string())?,
+        );
+        game.start_mods();
+        #[cfg(feature = "mods")]
+        if !game.mods.server
+            || game
+                .mods
+                .mods
+                .entries()
+                .iter()
+                .any(|entry| matches!(entry.status, horizon_mods::Status::Failed(_)))
+        {
+            return Err("managed connected server packages did not activate".into());
+        }
+        if !cfg!(feature = "paired-packages") {
+            return Err("managed connected requires paired-packages runtime".to_owned());
+        }
+        let _ = game.advancement_tree();
+        #[cfg(test)]
+        connected::set_close_fault(start.first_stop_fault);
+        let mut offered = false;
+        connected::recover_connected(
+            game,
+            &namespace,
+            start.request,
+            &start.continuation,
+            start.attempt_timeout,
+            |observation, pipes| {
+                publish_connected(&shared, &changed, observation);
+                if let Some(pipes) = pipes {
+                    assert!(!offered, "duplicate connected pipe offer");
+                    offered = true;
+                    // On receiver loss the returned owned ends drop here. The
+                    // coordinator still owns all native cleanup and refusal.
+                    if let Err(error) = offers.try_send(pipes) {
+                        drop(error);
+                    }
+                }
+                match commands.try_recv() {
+                    Ok(Command::RequestStop { attempt }) => connected::Command::Close { attempt },
+                    Ok(Command::RetryStop {
+                        attempt,
+                        failed_attempt,
+                    }) => connected::Command::RetryClose {
+                        attempt,
+                        failed_attempt,
+                    },
+                    Err(_) => connected::Command::Wait,
+                }
+            },
+        )
+        .map_err(|e| e.to_string())
+    })();
+    match result {
+        Ok(connected::End::Closed(receipt)) => {
+            let attempt = shared
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .last_admitted;
+            assert!(
+                attempt != 0,
+                "closed connected worker lacks admitted attempt"
+            );
+            publish_view(
+                &shared,
+                &changed,
+                State::Stopped {
+                    attempt,
+                    receipt: receipt.clone(),
+                },
+                None,
+            );
+            WorkerEnd::Stopped { attempt, receipt }
+        }
+        Ok(connected::End::Refused(detail)) => {
+            let detail = bounded_detail(detail);
+            publish_view(
+                &shared,
+                &changed,
+                State::StartupRefused(detail.clone()),
+                None,
+            );
+            WorkerEnd::StartupRefused(detail)
+        }
+        Err(detail) => {
+            let detail = bounded_detail(detail);
+            publish_view(
+                &shared,
+                &changed,
+                State::StartupFailed(detail.clone()),
+                None,
+            );
+            WorkerEnd::StartupFailed(detail)
+        }
+    }
 }
 
 struct OwnedGame<'a> {
@@ -647,3 +967,7 @@ fn observe(owned: &OwnedGame<'_>) -> Observation {
 #[cfg(test)]
 #[path = "managed_stop_tests.rs"]
 mod tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "managed_connected_tests.rs"]
+mod connected_tests;

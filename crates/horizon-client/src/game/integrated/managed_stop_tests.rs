@@ -166,7 +166,9 @@ fn managed_controls_admit_one_request_and_reject_stale_or_inflight_without_worke
         state: State::Ready,
         last_admitted: 0,
         last_refusal: None,
+        connected: None,
         observation: None,
+        connected_observation: None,
     }));
     let control = ManagedStopControl {
         shared: shared.clone(),

@@ -14,7 +14,7 @@ use std::{
 };
 
 #[derive(Clone, Debug)]
-enum State {
+pub(in crate::game) enum State {
     Joining,
     Admitted,
     Loading,
@@ -29,30 +29,31 @@ enum State {
     Closing(CheckpointReceipt),
 }
 #[derive(Clone, Copy)]
-enum Command {
+pub(in crate::game) enum Command {
     Wait,
     Close { attempt: u64 },
     RetryClose { attempt: u64, failed_attempt: u64 },
 }
 #[derive(Clone, Debug)]
-struct Observation {
-    state: State,
-    world_time: i64,
-    day_time: i64,
-    hub_ticks: u64,
-    players: std::result::Result<Vec<SessionPlayerRow>, String>,
-    counter: std::result::Result<horizon_client::world::counter_restore::CounterFrameV2, String>,
-    slot_bytes: std::result::Result<Vec<u8>, String>,
-    counter_key: horizon_client::world::counter_restore::RuntimeCounterKey,
-    slot_key: horizon_client::world_slot_trial::SlotKey,
-    live_keys: std::result::Result<(), String>,
-    guests: usize,
-    play_entries: usize,
-    pending_transport_bytes: usize,
-    attempts: usize,
-    last_refusal: Option<&'static str>,
+pub(in crate::game) struct Observation {
+    pub(in crate::game) state: State,
+    pub(in crate::game) world_time: i64,
+    pub(in crate::game) day_time: i64,
+    pub(in crate::game) hub_ticks: u64,
+    pub(in crate::game) players: std::result::Result<Vec<SessionPlayerRow>, String>,
+    pub(in crate::game) counter:
+        std::result::Result<horizon_client::world::counter_restore::CounterFrameV2, String>,
+    pub(in crate::game) slot_bytes: std::result::Result<Vec<u8>, String>,
+    pub(in crate::game) counter_key: horizon_client::world::counter_restore::RuntimeCounterKey,
+    pub(in crate::game) slot_key: horizon_client::world_slot_trial::SlotKey,
+    pub(in crate::game) live_keys: std::result::Result<(), String>,
+    pub(in crate::game) guests: usize,
+    pub(in crate::game) play_entries: usize,
+    pub(in crate::game) pending_transport_bytes: usize,
+    pub(in crate::game) attempts: usize,
+    pub(in crate::game) last_refusal: Option<&'static str>,
 }
-enum End {
+pub(in crate::game) enum End {
     Closed(CheckpointReceipt),
     Refused(String),
 }
@@ -61,6 +62,12 @@ thread_local! {
     static CLOSE_FAULT: std::cell::Cell<Option<crate::game::levels::session_checkpoint::CheckpointTestFault>> = const { std::cell::Cell::new(None) };
 }
 
+#[cfg(test)]
+pub(in crate::game) fn set_close_fault(
+    fault: Option<crate::game::levels::session_checkpoint::CheckpointTestFault>,
+) {
+    CLOSE_FAULT.with(|slot| slot.set(fault));
+}
 /// This frame is never returned to callers. An unexpected unwind cannot drop a
 /// live native owner or detach connection threads. There is no joining in Drop.
 struct OwnedRecovery<'a> {
@@ -322,7 +329,7 @@ fn real_directory(path: &Path) -> Result<PathBuf> {
 
 /// The client driver sees immutable observations and the two owned initial pipes,
 /// never a Game, host, transport handle, tick entry or arbitrary game callback.
-fn recover_connected<'a>(
+pub(in crate::game) fn recover_connected<'a>(
     candidate: Box<Game<'a>>,
     namespace: &AuthorityNamespace,
     request: ManagedRecoveryRequest,
@@ -515,4 +522,4 @@ fn recover_connected<'a>(
 
 #[cfg(all(test, target_os = "linux"))]
 #[path = "connected_recovery_tests.rs"]
-mod tests;
+pub(in crate::game) mod tests;

@@ -114,9 +114,9 @@ fn connected_transport_unresolved_writer_is_process_fatal_child() {
     }
 }
 
-struct Scratch(PathBuf);
+pub(in crate::game) struct Scratch(PathBuf);
 impl Scratch {
-    fn new(label: &str) -> Self {
+    pub(in crate::game) fn new(label: &str) -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(
             "horizon-connected-recovery-{}-{}-{label}",
@@ -126,7 +126,7 @@ impl Scratch {
         fs::create_dir(&path).unwrap();
         Self(path)
     }
-    fn dir(&self, name: &str) -> PathBuf {
+    pub(in crate::game) fn dir(&self, name: &str) -> PathBuf {
         let path = self.0.join(name);
         fs::create_dir(&path).unwrap();
         path
@@ -138,7 +138,7 @@ impl Drop for Scratch {
     }
 }
 
-fn fresh(fixture: &Fixture, role: ExecutionRole) -> Game<'_> {
+pub(in crate::game) fn fresh(fixture: &Fixture, role: ExecutionRole) -> Game<'_> {
     let template = fixture.game();
     static RES: OnceLock<Arc<crate::game::Resources>> = OnceLock::new();
     let resources = RES.get_or_init(|| template.res.clone());
@@ -183,7 +183,7 @@ fn fresh(fixture: &Fixture, role: ExecutionRole) -> Game<'_> {
     game
 }
 
-fn inventory_count(game: &Game<'_>) -> u32 {
+pub(in crate::game) fn inventory_count(game: &Game<'_>) -> u32 {
     game.inventory
         .iter()
         .flatten()
@@ -191,12 +191,12 @@ fn inventory_count(game: &Game<'_>) -> u32 {
         .map(|s| s.count)
         .sum()
 }
-fn disconnect(game: &mut Game<'_>) {
+pub(in crate::game) fn disconnect(game: &mut Game<'_>) {
     if let Some(remote) = game.remote.as_mut() {
         remote.session.disconnect();
     }
 }
-fn inventory_tree(root: &Path) -> BTreeMap<String, String> {
+pub(in crate::game) fn inventory_tree(root: &Path) -> BTreeMap<String, String> {
     fn walk(root: &Path, at: &Path, out: &mut BTreeMap<String, String>) {
         for entry in fs::read_dir(at).unwrap() {
             let entry = entry.unwrap();
@@ -241,20 +241,20 @@ impl Drop for SourceGuard<'_> {
         }
     }
 }
-struct Source {
-    root: PathBuf,
-    archive: PathBuf,
-    namespace: AuthorityNamespace,
-    type_id: String,
-    target: CounterTarget,
-    rows: Vec<SessionPlayerRow>,
-    world_time: i64,
-    day_time: i64,
-    rounds: usize,
-    counter: horizon_client::world::counter_restore::CounterFrameV2,
-    slot_bytes: Vec<u8>,
+pub(in crate::game) struct Source {
+    pub(in crate::game) root: PathBuf,
+    pub(in crate::game) archive: PathBuf,
+    pub(in crate::game) namespace: AuthorityNamespace,
+    pub(in crate::game) type_id: String,
+    pub(in crate::game) target: CounterTarget,
+    pub(in crate::game) rows: Vec<SessionPlayerRow>,
+    pub(in crate::game) world_time: i64,
+    pub(in crate::game) day_time: i64,
+    pub(in crate::game) rounds: usize,
+    pub(in crate::game) counter: horizon_client::world::counter_restore::CounterFrameV2,
+    pub(in crate::game) slot_bytes: Vec<u8>,
 }
-fn source(fixture: &Fixture, scratch: &Scratch) -> Source {
+pub(in crate::game) fn source(fixture: &Fixture, scratch: &Scratch) -> Source {
     let root = scratch.0.join("source-world");
     let archive = scratch.dir("source-archive");
     let namespace = AuthorityNamespace::new(&scratch.dir("authority")).unwrap();
@@ -496,7 +496,11 @@ fn source(fixture: &Fixture, scratch: &Scratch) -> Source {
     }
 }
 
-fn request(source: &Source, scratch: &Scratch, name: &str) -> ManagedRecoveryRequest {
+pub(in crate::game) fn request(
+    source: &Source,
+    scratch: &Scratch,
+    name: &str,
+) -> ManagedRecoveryRequest {
     ManagedRecoveryRequest {
         owner_root: source.root.clone(),
         expected_target: source.target.clone(),
@@ -506,7 +510,10 @@ fn request(source: &Source, scratch: &Scratch, name: &str) -> ManagedRecoveryReq
         deadline: Instant::now() + WAIT,
     }
 }
-fn rows_equal(actual: &[SessionPlayerRow], expected: &[SessionPlayerRow]) -> bool {
+pub(in crate::game) fn rows_equal(
+    actual: &[SessionPlayerRow],
+    expected: &[SessionPlayerRow],
+) -> bool {
     actual.len() == expected.len()
         && actual.iter().all(|a| {
             expected.iter().any(|b| {
@@ -521,7 +528,7 @@ fn rows_equal(actual: &[SessionPlayerRow], expected: &[SessionPlayerRow]) -> boo
         })
 }
 
-fn client_matches(game: &Game<'_>, row: &SessionPlayerRow) -> bool {
+pub(in crate::game) fn client_matches(game: &Game<'_>, row: &SessionPlayerRow) -> bool {
     use horizon_world::nbt::Tag;
     let Some(Tag::List(position)) = row.player.get("Pos") else {
         return false;
@@ -552,7 +559,7 @@ fn client_matches(game: &Game<'_>, row: &SessionPlayerRow) -> bool {
         )
         && game.remote_backlog() == 0
 }
-fn source_core_matches(view: &Observation, source: &Source) -> bool {
+pub(in crate::game) fn source_core_matches(view: &Observation, source: &Source) -> bool {
     view.live_keys.is_ok()
         && view.world_time == source.world_time
         && view.day_time == source.day_time

@@ -4,7 +4,7 @@
 //! costs one `Option` check per tick.
 use super::{Game, shield::OFFHAND_SLOT};
 #[cfg(feature = "paired-packages")]
-mod connected_recovery;
+pub(in crate::game) mod connected_recovery;
 use horizon_client::{
     Result,
     items::ItemStack,
