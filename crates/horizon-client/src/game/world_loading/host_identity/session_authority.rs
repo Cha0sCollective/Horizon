@@ -152,6 +152,151 @@ impl AuthorityNamespace {
     }
 }
 
+/// Dormant lock-only partial acquisition. The caller's native world lock is a
+/// separate owner and is neither consumed nor released by this custody.
+/// Existing trusted regular/unlinked path checks are preserved; hostile external
+/// rename/inode replacement is not newly hardened by this prerequisite.
+pub(in crate::game) struct RetainedAuthorityAcquisition {
+    namespace: AuthorityNamespace,
+    key: PathBuf,
+    world: WorldId,
+    lock: horizon_client::save::RetainedSessionLock,
+    ready: bool,
+    first_failure: Option<String>,
+    #[cfg(test)]
+    hide_namespace_after_acquire: bool,
+}
+impl AuthorityNamespace {
+    pub(in crate::game) fn retained_acquisition(
+        &self,
+        world: WorldId,
+    ) -> Result<RetainedAuthorityAcquisition> {
+        let key = self.checked_key(world)?;
+        Ok(RetainedAuthorityAcquisition {
+            namespace: self.clone(),
+            lock: horizon_client::save::RetainedSessionLock::new(&key),
+            key,
+            world,
+            ready: false,
+            first_failure: None,
+            #[cfg(test)]
+            hide_namespace_after_acquire: false,
+        })
+    }
+}
+impl RetainedAuthorityAcquisition {
+    pub(in crate::game) fn acquired(&self) -> bool {
+        self.lock.acquired()
+    }
+    pub(in crate::game) fn ready(&self) -> bool {
+        self.ready && self.lock.ready()
+    }
+    pub(in crate::game) fn first_failure(&self) -> Option<&str> {
+        self.first_failure.as_deref()
+    }
+    fn remember<T>(&mut self, result: Result<T>) -> Result<T> {
+        if let Err(error) = &result {
+            self.first_failure.get_or_insert_with(|| error.to_string());
+        }
+        result
+    }
+    fn same_route(&self, namespace: &AuthorityNamespace, world: WorldId) -> Result<()> {
+        if namespace.root != self.namespace.root || world != self.world {
+            return Err(
+                failure("retained authority", "namespace/world correlation mismatch").into(),
+            );
+        }
+        Ok(())
+    }
+    fn recheck(&self) -> Result<()> {
+        if self.namespace.checked_key(self.world)? != self.key {
+            return Err(failure("retained authority", "checked key changed").into());
+        }
+        lock_path(&self.key)
+    }
+    pub(in crate::game) fn acquire(&mut self) -> Result<()> {
+        if self.lock.acquired() {
+            return Err("authority lock already acquired; repair same custody".into());
+        }
+        let result = (|| -> Result<()> {
+            self.recheck()?;
+            self.lock.acquire()?; // Actual partial File custody already installed.
+            #[cfg(test)]
+            if self.hide_namespace_after_acquire {
+                self.hide_namespace_after_acquire = false;
+                fs::rename(
+                    &self.namespace.root,
+                    self.namespace.root.with_extension("retained-held"),
+                )?;
+                fs::write(
+                    self.namespace.root.components().collect::<PathBuf>(),
+                    b"controlled post-lock non-directory namespace",
+                )?;
+            }
+            self.recheck()?;
+            self.ready = true;
+            Ok(())
+        })();
+        self.remember(result)
+    }
+    pub(in crate::game) fn repair(
+        &mut self,
+        namespace: &AuthorityNamespace,
+        world: WorldId,
+    ) -> Result<()> {
+        self.same_route(namespace, world)?;
+        self.ready = false;
+        let result = (|| -> Result<()> {
+            self.lock.repair(&self.key)?; // Same File, never reopen/reacquire.
+            self.recheck()?;
+            self.ready = true;
+            Ok(())
+        })();
+        self.remember(result)
+    }
+    pub(in crate::game) fn finish(
+        &mut self,
+        namespace: &AuthorityNamespace,
+        world: WorldId,
+    ) -> Result<WorldAuthority> {
+        self.same_route(namespace, world)?;
+        if !self.ready() {
+            return Err("retained authority is not fully validated".into());
+        }
+        let result = self.recheck();
+        if result.is_err() {
+            self.ready = false;
+        }
+        self.remember(result)?;
+        let lock = self.lock.finish(&self.key)?;
+        self.ready = false;
+        // No fallible operation after taking the actual ready lock.
+        Ok(WorldAuthority {
+            world: self.world,
+            _authority_lock: lock,
+            _anchor_lock: None,
+        })
+    }
+    /// Only the authority lock owned here. Never releases the caller's native
+    /// owner lock or claims producer/writer/PreparationClosed completion.
+    pub(in crate::game) fn release_lock_only(&mut self) -> Result<()> {
+        self.ready = false;
+        let result = self.lock.release_lock_only();
+        self.remember(result)
+    }
+}
+impl Drop for RetainedAuthorityAcquisition {
+    fn drop(&mut self) {
+        if self.lock.acquired() {
+            use std::io::Write;
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "fatal: unresolved retained world authority acquisition"
+            );
+            std::process::abort();
+        }
+    }
+}
 struct IdentityAnchor {
     root: PathBuf,
     identity: Vec<u8>,
@@ -473,5 +618,183 @@ mod tests {
         drop(session);
         assert!(SessionLock::acquire(&key).is_ok());
         assert!(root.join(IDENTITY_FILE).is_file());
+    }
+    #[test]
+    fn retained_authority_route_finish_and_lock_only_release_preserve_native_owner() {
+        let scratch = Scratch::new();
+        let ns = namespace(&scratch);
+        let other_ns = AuthorityNamespace::new(&scratch.dir("other-authority")).unwrap();
+        let (world, _) = allocate_identity().unwrap();
+        let (other_world, _) = allocate_identity().unwrap();
+        let native_root = scratch.dir("native-owner");
+        let native = SessionLock::acquire(&native_root).unwrap();
+        let mut custody = ns.retained_acquisition(world).unwrap();
+        custody.acquire().unwrap();
+        let key = ns.checked_key(world).unwrap();
+        let wrong_namespace = custody.finish(&other_ns, world).is_err();
+        let wrong_world = custody.finish(&ns, other_world).is_err();
+        let wrong_repair = custody.repair(&ns, other_world).is_err();
+        let excluded = SessionLock::acquire(&key).is_err();
+        custody.release_lock_only().unwrap();
+        let authority_released = SessionLock::acquire(&key).is_ok();
+        let native_retained = SessionLock::acquire(&native_root).is_err();
+        drop(native);
+        assert!(
+            wrong_namespace
+                && wrong_world
+                && wrong_repair
+                && excluded
+                && authority_released
+                && native_retained
+        );
+    }
+    #[test]
+    fn retained_authority_actual_postlock_path_failure_keeps_original_file_until_repair() {
+        let scratch = Scratch::new();
+        let ns = namespace(&scratch);
+        let (world, _) = allocate_identity().unwrap();
+        let mut custody = ns.retained_acquisition(world).unwrap();
+        custody.hide_namespace_after_acquire = true;
+        let failed = custody.acquire().is_err();
+        let acquired_partial = custody.acquired() && !custody.ready();
+        let backup = ns.root.with_extension("retained-held");
+        let moved_key = backup.join(world.to_string());
+        let excluded = SessionLock::acquire(&moved_key).is_err();
+        let failed_finish = custody.finish(&ns, world).is_err();
+        let first = custody.first_failure().unwrap().to_owned();
+        fs::remove_file(ns.root.components().collect::<PathBuf>()).unwrap();
+        fs::rename(&backup, &ns.root).unwrap();
+        custody.repair(&ns, world).unwrap();
+        let first_retained = custody.first_failure() == Some(first.as_str());
+        let lease = custody.finish(&ns, world).unwrap();
+        let key = ns.checked_key(world).unwrap();
+        let transferred = SessionLock::acquire(&key).is_err();
+        let consumed = !custody.acquired();
+        drop(lease);
+        assert!(
+            failed
+                && acquired_partial
+                && excluded
+                && failed_finish
+                && first_retained
+                && transferred
+                && consumed
+        );
+        assert!(SessionLock::acquire(&key).is_ok());
+        assert_eq!(fs::read(key.join("session.lock")).unwrap(), [0x26, 0x03]);
+    }
+    #[test]
+    fn retained_authority_actual_finish_revalidation_failure_retains_custody() {
+        let scratch = Scratch::new();
+        let ns = namespace(&scratch);
+        let (world, _) = allocate_identity().unwrap();
+        let mut custody = ns.retained_acquisition(world).unwrap();
+        custody.acquire().unwrap();
+        let backup = ns.root.with_extension("retained-held");
+        fs::rename(&ns.root, &backup).unwrap();
+        fs::write(
+            ns.root.components().collect::<PathBuf>(),
+            b"actual non-directory before finish",
+        )
+        .unwrap();
+        let failed = custody.finish(&ns, world).is_err();
+        let retained = custody.acquired() && !custody.ready();
+        let failed_repair = custody.repair(&ns, world).is_err();
+        let excluded = SessionLock::acquire(&backup.join(world.to_string())).is_err();
+        fs::remove_file(ns.root.components().collect::<PathBuf>()).unwrap();
+        fs::rename(&backup, &ns.root).unwrap();
+        custody.repair(&ns, world).unwrap();
+        let lease = custody.finish(&ns, world).unwrap();
+        assert_eq!(lease.world(), world);
+        drop(lease);
+        assert!(failed && retained && failed_repair && excluded);
+    }
+    #[test]
+    fn retained_authority_prelock_path_refusal_never_creates_capability() {
+        let scratch = Scratch::new();
+        let ns = namespace(&scratch);
+        let (world, _) = allocate_identity().unwrap();
+        let mut custody = ns.retained_acquisition(world).unwrap();
+        let backup = ns.root.with_extension("retained-held");
+        fs::rename(&ns.root, &backup).unwrap();
+        fs::write(
+            ns.root.components().collect::<PathBuf>(),
+            b"actual invalid namespace",
+        )
+        .unwrap();
+        let failed = custody.acquire().is_err();
+        let vacant = !custody.acquired() && !custody.ready();
+        fs::remove_file(ns.root.components().collect::<PathBuf>()).unwrap();
+        fs::rename(&backup, &ns.root).unwrap();
+        let untouched = fs::read_dir(&ns.root).unwrap().count() == 0;
+        custody.acquire().unwrap();
+        custody.release_lock_only().unwrap();
+        assert!(failed && vacant && untouched);
+    }
+    #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+    #[test]
+    fn retained_authority_partial_native_header_is_visible_across_library_boundary() {
+        use horizon_client::save::{RetainedLockTestFault, RetainedSessionLock};
+        let scratch = Scratch::new();
+        let ns = namespace(&scratch);
+        let (world, _) = allocate_identity().unwrap();
+        let mut custody = ns.retained_acquisition(world).unwrap();
+        custody.lock = RetainedSessionLock::with_test_fault(
+            &custody.key,
+            RetainedLockTestFault::PartialHeader,
+        );
+        let failed = custody.acquire().is_err();
+        let handle = custody.lock.test_handle();
+        let partial = custody.acquired() && !custody.ready();
+        let first = custody.first_failure().unwrap().to_owned();
+        let excluded = SessionLock::acquire(&custody.key).is_err();
+        custody.repair(&ns, world).unwrap();
+        let same_file = custody.lock.test_handle() == handle;
+        let original_error = custody.first_failure() == Some(first.as_str());
+        let lease = custody.finish(&ns, world).unwrap();
+        let header = fs::read(custody.key.join("session.lock")).unwrap();
+        drop(lease);
+        assert!(failed && partial && excluded && same_file && original_error);
+        assert_eq!(header, [0x26, 0x03]);
+    }
+    #[test]
+    #[ignore = "separate direct prebuilt process: marked fatal unresolved post-acquisition authority"]
+    fn retained_authority_partial_unresolved_drop_fatal() {
+        use std::io::Write;
+        let scratch = Scratch::new();
+        let ns = namespace(&scratch);
+        let (world, _) = allocate_identity().unwrap();
+        let mut custody = ns.retained_acquisition(world).unwrap();
+        custody.hide_namespace_after_acquire = true;
+        assert!(custody.acquire().is_err());
+        assert!(custody.acquired() && !custody.ready());
+        assert!(
+            SessionLock::acquire(
+                &ns.root
+                    .with_extension("retained-held")
+                    .join(world.to_string())
+            )
+            .is_err()
+        );
+        println!("HORIZON_RETAINED_AUTHORITY_PARTIAL_DROP_ARMED");
+        std::io::stdout().flush().unwrap();
+        drop(custody);
+        panic!("unresolved authority unexpectedly dropped");
+    }
+    #[test]
+    #[ignore = "separate direct prebuilt process: marked fatal unresolved ready authority"]
+    fn retained_authority_ready_unresolved_drop_fatal() {
+        use std::io::Write;
+        let scratch = Scratch::new();
+        let ns = namespace(&scratch);
+        let (world, _) = allocate_identity().unwrap();
+        let mut custody = ns.retained_acquisition(world).unwrap();
+        custody.acquire().unwrap();
+        assert!(custody.acquired() && custody.ready());
+        assert!(SessionLock::acquire(&custody.key).is_err());
+        println!("HORIZON_RETAINED_AUTHORITY_READY_DROP_ARMED");
+        std::io::stdout().flush().unwrap();
+        drop(custody);
+        panic!("unresolved ready authority unexpectedly dropped");
     }
 }

@@ -270,16 +270,33 @@ fn quantize_parameter_report(json: &str) -> Result<String, GeneratorError> {
     }
     Ok(Value::Array(entries).to_string())
 }
-/// `load` on a thread of its own ("Worldgen loader").
-fn loading<T: Send + 'static>(
-    load: impl FnOnce() -> T + Send + 'static,
-) -> io::Result<std::thread::JoinHandle<T>> {
+/// Every loader belongs to this invocation's lexical scope, including results
+/// omitted by optional resource branches and children started before an error.
+fn loading<'scope, 'env: 'scope, T: Send + 'scope>(
+    scope: &'scope std::thread::Scope<'scope, 'env>,
+    load: impl FnOnce() -> T + Send + 'scope,
+    #[cfg(test)] control: Option<(Arc<LoaderTestControl>, usize)>,
+) -> io::Result<std::thread::ScopedJoinHandle<'scope, T>> {
+    #[cfg(test)]
+    if control
+        .as_ref()
+        .is_some_and(|(c, i)| c.refuse_spawn == Some(*i))
+    {
+        return Err(io::Error::other(
+            "controlled later Worldgen loader spawn refusal",
+        ));
+    }
     std::thread::Builder::new()
         .name("Worldgen loader".into())
-        .spawn(load)
+        .spawn_scoped(scope, move || {
+            #[cfg(test)]
+            let _observation = control.map(|(c, i)| c.enter(i));
+            load()
+        })
 }
-/// A loading thread's result; its panic goes on in this thread.
-fn joined<T>(thread: std::thread::JoinHandle<T>) -> T {
+/// A loading thread's result; its panic goes on in this thread. Scope cleanup
+/// still waits for every other actual child before returning or unwinding.
+fn joined<T>(thread: std::thread::ScopedJoinHandle<'_, T>) -> T {
     thread
         .join()
         .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
@@ -297,6 +314,18 @@ impl GeneratorData {
     /// block behavior files in `blocks/` (see `generator_blocks`). Integer block properties are derived from
     /// the registry: properties whose every value is a decimal integer.
     pub fn load(dir: &Path, registry: &'static BlockRegistry) -> Result<Arc<Self>, GeneratorError> {
+        Self::load_scoped(
+            dir,
+            registry,
+            #[cfg(test)]
+            None,
+        )
+    }
+    fn load_scoped(
+        dir: &Path,
+        registry: &'static BlockRegistry,
+        #[cfg(test)] control: Option<Arc<LoaderTestControl>>,
+    ) -> Result<Arc<Self>, GeneratorError> {
         let flags: Vec<(bool, bool)> =
             serde_json::from_str(&fs::read_to_string(dir.join("block_flags.json"))?)?;
         if flags.len() != registry.len() {
@@ -322,175 +351,202 @@ impl GeneratorData {
         // and the block behaviours) need only the tags: they run on threads of
         // their own while this one reads the rest. A new world's first chunks
         // wait for all of it, with the chunk workers idle.
-        let blocks = loading({
-            let (dir, tags, fluids) = (dir.join("blocks"), block_tags.clone(), fluid_tags.clone());
-            move || super::generator_blocks::BlockBehavior::load(&dir, registry, &tags, &fluids)
-        })?;
-        let structures = loading({
-            let (dir, tags) = (dir.to_owned(), block_tags.clone());
-            move || -> Result<_, GeneratorError> {
-                let Ok(json) = fs::read_to_string(dir.join("blocks/structure-blocks.json")) else {
-                    return Ok(None);
-                };
-                Ok(Some(Arc::new(super::structure::StructureResources::new(
-                    registry,
-                    super::structure::StateTransforms::from_json(&json, registry.len())?,
-                    &dir.join("structure"),
-                    read_optional_bundle(&dir, "processor_lists")?.unwrap_or_default(),
-                    &tags,
-                ))))
-            }
-        })?;
-        let behaviours = loading({
-            let root = dir.parent().map(Path::to_owned);
-            move || {
-                root.filter(|root| root.join("block-behaviours.json").exists())
-                    .and_then(|root| crate::level::Behaviours::load(registry, &root).ok())
-                    .map(Arc::new)
-            }
-        })?;
-        let tag_set = |name: &str| -> Result<BTreeSet<&str>, GeneratorError> {
-            Ok(block_tags
-                .get(name)
-                .ok_or_else(|| resource(format!("missing block tag {name}")))?
-                .iter()
-                .map(String::as_str)
-                .collect())
-        };
-        let motion = tag_set("minecraft:blocks_motion_in_heightmap")?;
-        let no_leaves = tag_set("minecraft:blocks_motion_in_heightmap_no_leaves")?;
-        let mut values = BTreeMap::<(String, String), bool>::new();
-        let states = (0..registry.len())
-            .map(|i| {
-                let state = registry.state(BlockStateId(i as u32)).unwrap();
-                for (key, value) in &state.properties {
-                    let integer = !value.is_empty()
-                        && value
-                            .trim_start_matches('-')
-                            .bytes()
-                            .all(|b| b.is_ascii_digit());
-                    *values
-                        .entry((state.name.clone(), key.clone()))
-                        .or_insert(true) &= integer;
-                }
-                GenBlockState {
-                    air: flags[i].0,
-                    air_block: state.name == "minecraft:air",
-                    fluid: flags[i].1,
-                    motion: motion.contains(state.name.as_str()),
-                    no_leaves: no_leaves.contains(state.name.as_str()),
-                }
-            })
-            .collect::<Vec<_>>();
-        let integers = values
-            .into_iter()
-            .filter_map(|(key, integer)| integer.then_some(key))
-            .collect();
-        let biomes = read_bundle(dir, "biomes")?;
-        let biome_tags = build_tags(&read_bundle(dir, "biome_tags")?, |id| {
-            biomes.contains_key(id)
-        })?;
-        let biome_set = biomes.keys().cloned().collect::<BTreeSet<_>>();
-        let conditions = MaterialConditionRegistry::from_json_with_biome_tags(
-            &read_bundle(dir, "conditions")?,
-            &biome_set,
-            &biome_tags,
-        )?;
-        let mut presets = read_optional_bundle(dir, "presets")?.unwrap_or_default();
-        let reports = dir.join("biome_parameters");
-        if reports.is_dir() {
-            for entry in fs::read_dir(&reports)? {
-                let path = entry?.path();
-                let Some(stem) = path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .filter(|_| path.extension().is_some_and(|e| e == "json"))
-                else {
-                    continue;
-                };
-                presets
-                    .entry(format!("minecraft:{stem}"))
-                    .or_insert(quantize_parameter_report(&fs::read_to_string(&path)?)?);
-            }
-        }
-        let source_catalog =
-            BiomeSourceCatalog::new(&biome_set, &biome_tags, &presets.keys().cloned().collect())?;
-        let carvers = CarverCatalog::from_json(&read_bundle(dir, "carvers")?)?;
-        let mut biome_names = Vec::new();
-        let mut biome_ids = BTreeMap::new();
-        let mut biome_json = Vec::new();
-        let mut temperatures = Vec::new();
-        let mut biome_carvers = Vec::new();
-        for (name, json) in &biomes {
-            biome_ids.insert(name.clone(), BiomeId(biome_names.len() as u32));
-            biome_names.push(Arc::<str>::from(name.as_str()));
-            temperatures.push(BiomeTemperatureSettings::from_json(json)?);
-            let value: Value = serde_json::from_str(json)?;
-            biome_carvers.push(carvers.decode_set(&value["carvers"].to_string())?);
-            biome_json.push(json.clone());
-        }
-        let carving_blocks = CarvingBlocks::from_registry(
-            registry,
-            &tag_set("minecraft:uncarvable")?
+        std::thread::scope(|scope| {
+            #[cfg(test)]
+            let _body_observation = control.clone().map(LoaderBodyObservation);
+            let blocks = loading(
+                scope,
+                {
+                    let (dir, tags, fluids) =
+                        (dir.join("blocks"), block_tags.clone(), fluid_tags.clone());
+                    move || {
+                        super::generator_blocks::BlockBehavior::load(&dir, registry, &tags, &fluids)
+                    }
+                },
+                #[cfg(test)]
+                control.clone().map(|c| (c, 0)),
+            )?;
+            let structures = loading(
+                scope,
+                {
+                    let (dir, tags) = (dir.to_owned(), block_tags.clone());
+                    move || -> Result<_, GeneratorError> {
+                        let Ok(json) = fs::read_to_string(dir.join("blocks/structure-blocks.json"))
+                        else {
+                            return Ok(None);
+                        };
+                        Ok(Some(Arc::new(super::structure::StructureResources::new(
+                            registry,
+                            super::structure::StateTransforms::from_json(&json, registry.len())?,
+                            &dir.join("structure"),
+                            read_optional_bundle(&dir, "processor_lists")?.unwrap_or_default(),
+                            &tags,
+                        ))))
+                    }
+                },
+                #[cfg(test)]
+                control.clone().map(|c| (c, 1)),
+            )?;
+            let behaviours = loading(
+                scope,
+                {
+                    let root = dir.parent().map(Path::to_owned);
+                    move || {
+                        root.filter(|root| root.join("block-behaviours.json").exists())
+                            .and_then(|root| crate::level::Behaviours::load(registry, &root).ok())
+                            .map(Arc::new)
+                    }
+                },
+                #[cfg(test)]
+                control.clone().map(|c| (c, 2)),
+            )?;
+            let tag_set = |name: &str| -> Result<BTreeSet<&str>, GeneratorError> {
+                Ok(block_tags
+                    .get(name)
+                    .ok_or_else(|| resource(format!("missing block tag {name}")))?
+                    .iter()
+                    .map(String::as_str)
+                    .collect())
+            };
+            let motion = tag_set("minecraft:blocks_motion_in_heightmap")?;
+            let no_leaves = tag_set("minecraft:blocks_motion_in_heightmap_no_leaves")?;
+            let mut values = BTreeMap::<(String, String), bool>::new();
+            let states = (0..registry.len())
+                .map(|i| {
+                    let state = registry.state(BlockStateId(i as u32)).unwrap();
+                    for (key, value) in &state.properties {
+                        let integer = !value.is_empty()
+                            && value
+                                .trim_start_matches('-')
+                                .bytes()
+                                .all(|b| b.is_ascii_digit());
+                        *values
+                            .entry((state.name.clone(), key.clone()))
+                            .or_insert(true) &= integer;
+                    }
+                    GenBlockState {
+                        air: flags[i].0,
+                        air_block: state.name == "minecraft:air",
+                        fluid: flags[i].1,
+                        motion: motion.contains(state.name.as_str()),
+                        no_leaves: no_leaves.contains(state.name.as_str()),
+                    }
+                })
+                .collect::<Vec<_>>();
+            let integers = values
                 .into_iter()
-                .map(str::to_owned)
-                .collect(),
-        )
-        .map_err(|e| resource(format!("carving blocks: {e}")))?;
-        let feature_resources = match (
-            read_optional_bundle(dir, "features")?,
-            read_optional_bundle(dir, "placed_features")?,
-        ) {
-            (Some(features), Some(placed)) => Some(FeatureResources {
-                features,
-                placed,
-                feature_tags: read_optional_bundle(dir, "feature_tags")?.unwrap_or_default(),
-                blocks: joined(blocks)?,
-                fluid_tags,
-                state_providers: read_optional_bundle(dir, "state_providers")?.unwrap_or_default(),
-            }),
-            _ => None,
-        };
-        let structures = joined(structures)?;
-        let structure_resources = match (
-            read_optional_bundle(dir, "structures")?,
-            read_optional_bundle(dir, "structure_sets")?,
-            read_optional_bundle(dir, "template_pools")?,
-        ) {
-            (Some(structures), Some(sets), Some(pools)) => Some(StructureBundles {
+                .filter_map(|(key, integer)| integer.then_some(key))
+                .collect();
+            let biomes = read_bundle(dir, "biomes")?;
+            let biome_tags = build_tags(&read_bundle(dir, "biome_tags")?, |id| {
+                biomes.contains_key(id)
+            })?;
+            let biome_set = biomes.keys().cloned().collect::<BTreeSet<_>>();
+            let conditions = MaterialConditionRegistry::from_json_with_biome_tags(
+                &read_bundle(dir, "conditions")?,
+                &biome_set,
+                &biome_tags,
+            )?;
+            let mut presets = read_optional_bundle(dir, "presets")?.unwrap_or_default();
+            let reports = dir.join("biome_parameters");
+            if reports.is_dir() {
+                for entry in fs::read_dir(&reports)? {
+                    let path = entry?.path();
+                    let Some(stem) = path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .filter(|_| path.extension().is_some_and(|e| e == "json"))
+                    else {
+                        continue;
+                    };
+                    presets
+                        .entry(format!("minecraft:{stem}"))
+                        .or_insert(quantize_parameter_report(&fs::read_to_string(&path)?)?);
+                }
+            }
+            let source_catalog = BiomeSourceCatalog::new(
+                &biome_set,
+                &biome_tags,
+                &presets.keys().cloned().collect(),
+            )?;
+            let carvers = CarverCatalog::from_json(&read_bundle(dir, "carvers")?)?;
+            let mut biome_names = Vec::new();
+            let mut biome_ids = BTreeMap::new();
+            let mut biome_json = Vec::new();
+            let mut temperatures = Vec::new();
+            let mut biome_carvers = Vec::new();
+            for (name, json) in &biomes {
+                biome_ids.insert(name.clone(), BiomeId(biome_names.len() as u32));
+                biome_names.push(Arc::<str>::from(name.as_str()));
+                temperatures.push(BiomeTemperatureSettings::from_json(json)?);
+                let value: Value = serde_json::from_str(json)?;
+                biome_carvers.push(carvers.decode_set(&value["carvers"].to_string())?);
+                biome_json.push(json.clone());
+            }
+            let carving_blocks = CarvingBlocks::from_registry(
+                registry,
+                &tag_set("minecraft:uncarvable")?
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+            )
+            .map_err(|e| resource(format!("carving blocks: {e}")))?;
+            let feature_resources = match (
+                read_optional_bundle(dir, "features")?,
+                read_optional_bundle(dir, "placed_features")?,
+            ) {
+                (Some(features), Some(placed)) => Some(FeatureResources {
+                    features,
+                    placed,
+                    feature_tags: read_optional_bundle(dir, "feature_tags")?.unwrap_or_default(),
+                    blocks: joined(blocks)?,
+                    fluid_tags,
+                    state_providers: read_optional_bundle(dir, "state_providers")?
+                        .unwrap_or_default(),
+                }),
+                _ => None,
+            };
+            let structures = joined(structures)?;
+            let structure_resources = match (
+                read_optional_bundle(dir, "structures")?,
+                read_optional_bundle(dir, "structure_sets")?,
+                read_optional_bundle(dir, "template_pools")?,
+            ) {
+                (Some(structures), Some(sets), Some(pools)) => Some(StructureBundles {
+                    structures,
+                    sets,
+                    pools,
+                }),
+                _ => None,
+            };
+            let behaviours = joined(behaviours);
+            Ok(Arc::new(Self {
+                behaviours,
+                structure_resources,
                 structures,
-                sets,
-                pools,
-            }),
-            _ => None,
-        };
-        let behaviours = joined(behaviours);
-        Ok(Arc::new(Self {
-            behaviours,
-            structure_resources,
-            structures,
-            registry,
-            states: GenBlockStates(states.into()),
-            integers,
-            noises: read_bundle(dir, "noises")?,
-            densities: read_bundle(dir, "densities")?,
-            rules: read_bundle(dir, "rules")?,
-            settings: read_bundle(dir, "settings")?,
-            world_presets: read_bundle(dir, "world_presets")?,
-            presets,
-            conditions,
-            source_catalog,
-            biome_names,
-            biome_ids,
-            biome_json,
-            temperatures,
-            biome_carvers,
-            carving_blocks,
-            block_tags,
-            biome_tags,
-            feature_resources,
-            ring_cache: Mutex::new(Vec::new()),
-        }))
+                registry,
+                states: GenBlockStates(states.into()),
+                integers,
+                noises: read_bundle(dir, "noises")?,
+                densities: read_bundle(dir, "densities")?,
+                rules: read_bundle(dir, "rules")?,
+                settings: read_bundle(dir, "settings")?,
+                world_presets: read_bundle(dir, "world_presets")?,
+                presets,
+                conditions,
+                source_catalog,
+                biome_names,
+                biome_ids,
+                biome_json,
+                temperatures,
+                biome_carvers,
+                carving_blocks,
+                block_tags,
+                biome_tags,
+                feature_resources,
+                ring_cache: Mutex::new(Vec::new()),
+            }))
+        })
     }
     /// The concentric ring positions (strongholds) of the generator for
     /// `seed` and the dimension `generator` definition, shared by every
@@ -2616,6 +2672,134 @@ impl GeneratorWorker {
 }
 
 #[cfg(test)]
+#[derive(Default)]
+struct LoaderObservation {
+    entered: [bool; 3],
+    finished: [bool; 3],
+    named: [bool; 3],
+    body_done: bool,
+    released: bool,
+    returned: Option<LoaderReturnObservation>,
+    duplicate_return: bool,
+}
+#[cfg(test)]
+#[derive(Clone, Copy)]
+struct LoaderReturnObservation {
+    entered: [bool; 3],
+    finished: [bool; 3],
+    named: [bool; 3],
+    released: bool,
+    panicked: bool,
+}
+#[cfg(test)]
+impl LoaderReturnObservation {
+    fn all_started_finished(&self, started: usize) -> bool {
+        (0..3).all(|index| {
+            self.entered[index] == (index < started)
+                && self.finished[index] == (index < started)
+                && (index >= started || self.named[index])
+        })
+    }
+}
+#[cfg(test)]
+struct LoaderTestControl {
+    observation: Mutex<LoaderObservation>,
+    event: std::sync::Condvar,
+    hold: [bool; 3],
+    refuse_spawn: Option<usize>,
+    panic_child: Option<usize>,
+}
+#[cfg(test)]
+impl LoaderTestControl {
+    fn new(hold: [bool; 3], refuse_spawn: Option<usize>, panic_child: Option<usize>) -> Arc<Self> {
+        Arc::new(Self {
+            observation: Mutex::new(LoaderObservation::default()),
+            event: std::sync::Condvar::new(),
+            hold,
+            refuse_spawn,
+            panic_child,
+        })
+    }
+    fn enter(self: Arc<Self>, index: usize) -> LoaderWorkerObservation {
+        let guard = LoaderWorkerObservation {
+            control: self.clone(),
+            index,
+        };
+        let mut state = self.observation.lock().unwrap();
+        state.entered[index] = true;
+        state.named[index] = std::thread::current().name() == Some("Worldgen loader");
+        self.event.notify_all();
+        while self.hold[index] && !state.released {
+            state = self.event.wait(state).unwrap();
+        }
+        drop(state);
+        if self.panic_child == Some(index) {
+            panic!("controlled actual Worldgen loader panic");
+        }
+        guard
+    }
+    fn wait_for(&self, started: usize, body_done: bool) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        let mut state = self.observation.lock().unwrap();
+        while (body_done && !state.body_done)
+            || !state.entered[..started].iter().all(|entered| *entered)
+        {
+            let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) else {
+                return false;
+            };
+            let waited = self.event.wait_timeout(state, left).unwrap();
+            state = waited.0;
+            if waited.1.timed_out() {
+                return false;
+            }
+        }
+        true
+    }
+    // Called by the outer wrapper immediately after ACTUAL load return/caught
+    // unwind, before forwarding that same result/panic. Preserve the first
+    // boundary snapshot: later fixture release/completion cannot rewrite it.
+    fn record_return(&self, panicked: bool) {
+        let mut state = self.observation.lock().unwrap();
+        if state.returned.is_some() {
+            state.duplicate_return = true;
+        } else {
+            state.returned = Some(LoaderReturnObservation {
+                entered: state.entered,
+                finished: state.finished,
+                named: state.named,
+                released: state.released,
+                panicked,
+            });
+        }
+        self.event.notify_all();
+    }
+    fn release(&self) {
+        self.observation.lock().unwrap().released = true;
+        self.event.notify_all();
+    }
+}
+#[cfg(test)]
+struct LoaderWorkerObservation {
+    control: Arc<LoaderTestControl>,
+    index: usize,
+}
+#[cfg(test)]
+impl Drop for LoaderWorkerObservation {
+    fn drop(&mut self) {
+        self.control.observation.lock().unwrap().finished[self.index] = true;
+        self.control.event.notify_all();
+    }
+}
+#[cfg(test)]
+struct LoaderBodyObservation(Arc<LoaderTestControl>);
+#[cfg(test)]
+impl Drop for LoaderBodyObservation {
+    fn drop(&mut self) {
+        self.0.observation.lock().unwrap().body_done = true;
+        self.0.event.notify_all();
+    }
+}
+#[cfg(test)]
 mod tests {
     use super::*;
     #[test]
@@ -3223,6 +3407,256 @@ mod tests {
         let again = worker.structure_starts(pos);
         for (first, hit) in fresh.iter().zip(&again) {
             assert!(Arc::ptr_eq(first, hit));
+        }
+    }
+}
+
+#[cfg(test)]
+mod retained_loader_tests {
+    use super::*;
+    use std::{
+        path::PathBuf,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+    struct Scratch(PathBuf);
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                eprintln!("RETAINED_LOADER_SCRATCH {}", self.0.display());
+            } else {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+    }
+    fn resources(label: &str, late_parse_error: bool) -> (Scratch, &'static BlockRegistry) {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let pinned = PathBuf::from(
+            std::env::var_os("HORIZON_TEST_RESOURCES")
+                .expect("pinned actual worldgen resources required; no skip"),
+        );
+        let registry = Box::leak(Box::new(
+            crate::level::data::load_registry(&pinned).unwrap(),
+        ));
+        let root = std::env::temp_dir().join(format!(
+            "horizon-retained-loader-{}-{}-{label}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&root).unwrap();
+        // Actual pinned scalar/tag resources; optional features deliberately
+        // absent, so the genuine blocks result is not consumed by load's branch.
+        for name in [
+            "block_flags",
+            "block_tags",
+            "biomes",
+            "biome_tags",
+            "conditions",
+            "carvers",
+            "noises",
+            "densities",
+            "rules",
+            "settings",
+            "world_presets",
+        ] {
+            fs::copy(
+                pinned.join(format!("worldgen/{name}.json")),
+                root.join(format!("{name}.json")),
+            )
+            .unwrap();
+        }
+        for name in ["fluid_tags", "presets"] {
+            let source = pinned.join(format!("worldgen/{name}.json"));
+            if source.try_exists().unwrap() {
+                fs::copy(source, root.join(format!("{name}.json"))).unwrap();
+            }
+        }
+        if late_parse_error {
+            fs::write(root.join("biomes.json"), b"actual late invalid JSON").unwrap();
+        }
+        (Scratch(root), registry)
+    }
+    #[derive(Clone, Copy)]
+    enum Expected {
+        Success,
+        LateParse,
+        SpawnRefusal,
+        ChildPanic,
+    }
+    fn run(
+        label: &str,
+        hold: [bool; 3],
+        refuse: Option<usize>,
+        panic_child: Option<usize>,
+        expected: Expected,
+    ) {
+        let (scratch, registry) = resources(label, matches!(expected, Expected::LateParse));
+        let control = LoaderTestControl::new(hold, refuse, panic_child);
+        let child_control = control.clone();
+        let dir = scratch.0.clone();
+        let outer = std::thread::Builder::new()
+            .name("Retained Worldgen initialization".into())
+            .spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    GeneratorData::load_scoped(&dir, registry, Some(child_control.clone()))
+                }));
+                child_control.record_return(result.is_err());
+                match result {
+                    Ok(result) => result,
+                    Err(panic) => std::panic::resume_unwind(panic),
+                }
+            })
+            .unwrap();
+        let started = refuse.unwrap_or(3);
+        let reached = control.wait_for(started, true);
+        // Release and harvest EVERY actual held child before any assertions.
+        control.release();
+        let result = outer.join();
+        let state = control.observation.lock().unwrap();
+        assert!(
+            reached,
+            "actual load body/children did not reach defining boundary"
+        );
+        let actual_return = state
+            .returned
+            .expect("actual return/unwind snapshot required");
+        assert!(!state.duplicate_return);
+        assert!(
+            actual_return.all_started_finished(started),
+            "actual load returned/unwound before a started child finished"
+        );
+        assert!(
+            actual_return.released,
+            "a held genuine child cannot finish before explicit fixture release"
+        );
+        assert_eq!(
+            actual_return.panicked,
+            matches!(expected, Expected::ChildPanic)
+        );
+        for index in 0..3 {
+            assert_eq!(state.entered[index], index < started);
+            assert_eq!(state.finished[index], index < started);
+            if index < started {
+                assert!(state.named[index]);
+            }
+        }
+        drop(state);
+        match expected {
+            Expected::Success => {
+                let data = result.unwrap().unwrap();
+                assert!(data.feature_resources.is_none());
+                assert_eq!(data.block_states().0.len(), registry.len());
+            }
+            Expected::LateParse => assert!(matches!(result, Ok(Err(GeneratorError::Decode(_))))),
+            Expected::SpawnRefusal => assert!(matches!(result, Ok(Err(GeneratorError::Io(_))))),
+            Expected::ChildPanic => assert!(
+                result.is_err(),
+                "child panic must unwind outer initialization"
+            ),
+        }
+    }
+    #[test]
+    fn retained_loader_known_nonwaiting_return_is_rejected_before_fixture_release() {
+        let control = LoaderTestControl::new([true, false, false], None, None);
+        let child_control = control.clone();
+        // Deliberately bad initialization omits joining this genuine held OS
+        // worker. The FIXTURE retains its actual JoinHandle, so no child leaks.
+        let child = std::thread::Builder::new()
+            .name("Worldgen loader".into())
+            .spawn(move || {
+                let _observation = child_control.enter(0);
+            })
+            .unwrap();
+        let reached = control.wait_for(1, false);
+        let return_control = control.clone();
+        let nonwaiting = match std::thread::Builder::new()
+            .name("Known nonwaiting initialization".into())
+            .spawn(move || {
+                let result = std::panic::catch_unwind(|| ());
+                return_control.record_return(result.is_err());
+                match result {
+                    Ok(result) => result,
+                    Err(panic) => std::panic::resume_unwind(panic),
+                }
+            }) {
+            Ok(handle) => handle,
+            Err(error) => {
+                // A genuine child is already held. Reap it before reporting
+                // this second-thread setup failure; never detach on unwrap.
+                control.release();
+                let child_result = child.join();
+                panic!(
+                    "known nonwaiting initialization spawn failed: {error}; retained child panicked: {}",
+                    child_result.is_err()
+                );
+            }
+        };
+        // Synchronize on the actual bad return BEFORE releasing its child.
+        // This deterministically exercises the same immutable-boundary predicate,
+        // rather than depending on scheduling, sleeps or is_finished sampling.
+        let nonwaiting_result = nonwaiting.join();
+        let before_release = control.observation.lock().unwrap().returned;
+        control.release();
+        let child_result = child.join();
+        let state = control.observation.lock().unwrap();
+        assert!(reached);
+        assert!(nonwaiting_result.is_ok() && child_result.is_ok());
+        let actual_return = before_release.expect("known bad actual return was recorded");
+        assert!(!actual_return.released && !actual_return.panicked);
+        assert!(actual_return.entered[0] && !actual_return.finished[0]);
+        assert!(
+            !actual_return.all_started_finished(1),
+            "known nonwaiting initialization MUST be rejected"
+        );
+        assert!(
+            state.finished[0],
+            "fixture reaped the retained genuine worker"
+        );
+        assert!(!state.duplicate_return);
+        assert!(
+            !state.returned.unwrap().all_started_finished(1),
+            "later release cannot erase bad return evidence"
+        );
+    }
+    #[test]
+    #[ignore = "pinned actual resources: held genuine loaders survive late parse error; no silent skip"]
+    fn retained_loader_late_parse_error_waits_for_all_started_children() {
+        run("late-parse", [true; 3], None, None, Expected::LateParse);
+    }
+    #[test]
+    #[ignore = "pinned actual resources: absent optional features still await genuine blocks loader"]
+    fn retained_loader_absent_optional_features_waits_for_unconsumed_blocks() {
+        run(
+            "absent-features",
+            [true, false, false],
+            None,
+            None,
+            Expected::Success,
+        );
+    }
+    #[test]
+    #[ignore = "pinned actual resources: controlled second/third spawn refusal retains earlier genuine helpers"]
+    fn retained_loader_partial_spawn_refusal_waits_for_earlier_children() {
+        for index in [1, 2] {
+            run(
+                &format!("spawn-{index}"),
+                [true; 3],
+                Some(index),
+                None,
+                Expected::SpawnRefusal,
+            );
+        }
+    }
+    #[test]
+    #[ignore = "pinned actual resources: real child panic propagates after scope has reaped every helper"]
+    fn retained_loader_child_panic_unwinds_after_all_children_finish() {
+        for child in [0, 1] {
+            run(
+                &format!("panic-{child}"),
+                [true, false, false],
+                None,
+                Some(child),
+                Expected::ChildPanic,
+            );
         }
     }
 }

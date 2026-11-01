@@ -161,6 +161,180 @@ impl SessionLock {
         Ok(Self(file))
     }
 }
+/// Dormant lock-only acquisition custody. No producer, writer or world is owned
+/// here. The actual File is installed before the first post-lock operation.
+/// This retains the existing trusted-path threat boundary; it does not harden
+/// hostile external rename/inode replacement or certify PreparationClosed.
+pub struct RetainedSessionLock {
+    world: PathBuf,
+    lock: Option<SessionLock>,
+    ready: bool,
+    first_failure: Option<String>,
+    release_failed: bool,
+    discharged: bool,
+    #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+    test_fault: Option<RetainedLockTestFault>,
+}
+#[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetainedLockTestFault {
+    PartialHeader,
+    ReadOnlyHeader,
+}
+impl RetainedSessionLock {
+    pub fn new(world: &Path) -> Self {
+        Self {
+            world: world.to_owned(),
+            lock: None,
+            ready: false,
+            first_failure: None,
+            release_failed: false,
+            discharged: false,
+            #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+            test_fault: None,
+        }
+    }
+    pub fn acquired(&self) -> bool {
+        self.lock.is_some()
+    }
+    pub fn ready(&self) -> bool {
+        self.ready
+    }
+    /// The original failure remains observable even after a successful repair.
+    pub fn first_failure(&self) -> Option<&str> {
+        self.first_failure.as_deref()
+    }
+    fn remember<T>(&mut self, result: Result<T>) -> Result<T> {
+        if let Err(error) = &result {
+            self.first_failure.get_or_insert_with(|| error.to_string());
+        }
+        result
+    }
+    pub fn acquire(&mut self) -> Result<()> {
+        if self.lock.is_some() || self.discharged {
+            return Err(
+                "retained lock already acquired or discharged; never substitute its owner".into(),
+            );
+        }
+        let result = (|| -> Result<()> {
+            fs::create_dir_all(&self.world)?;
+            #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+            let read_only = self.test_fault == Some(RetainedLockTestFault::ReadOnlyHeader);
+            #[cfg(not(all(feature = "native-writer-test-control", debug_assertions)))]
+            let read_only = false;
+            let file = fs::OpenOptions::new()
+                .read(read_only)
+                .write(!read_only)
+                .create(!read_only)
+                .truncate(false)
+                .open(self.world.join("session.lock"))?;
+            file.try_lock().map_err(|_| {
+                format!(
+                    "{} is already open in another instance",
+                    self.world.display()
+                )
+            })?;
+            self.lock = Some(SessionLock(file)); // No fallible work before custody.
+            self.initialize_header()
+        })();
+        self.remember(result)
+    }
+    fn initialize_header(&mut self) -> Result<()> {
+        use std::io::{Seek, Write};
+        self.ready = false;
+        let file = &mut self
+            .lock
+            .as_mut()
+            .ok_or("retained lock was not acquired")?
+            .0;
+        file.set_len(0)?;
+        file.rewind()?;
+        #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+        if self.test_fault == Some(RetainedLockTestFault::PartialHeader) {
+            self.test_fault = None;
+            file.write_all(&[0x26])?;
+            file.flush()?;
+            return Err(std::io::Error::other(
+                "controlled failure after actual partial lock header",
+            )
+            .into());
+        }
+        file.write_all(&[0x26, 0x03])?;
+        file.flush()?;
+        self.ready = true;
+        Ok(())
+    }
+    /// Never reopen or acquire a replacement. Repair resets the SAME File's
+    /// cursor and full header, including after a real or controlled partial I/O.
+    pub fn repair(&mut self, world: &Path) -> Result<()> {
+        if world != self.world || self.lock.is_none() || self.release_failed || self.discharged {
+            return Err("retained lock repair route/state mismatch".into());
+        }
+        let result = self.initialize_header();
+        self.remember(result)
+    }
+    /// All checks precede take; failure leaves this exact acquired owner intact.
+    pub fn finish(&mut self, world: &Path) -> Result<SessionLock> {
+        if world != self.world || !self.ready || self.lock.is_none() || self.discharged {
+            return Err("retained lock is not ready for the requested route".into());
+        }
+        self.ready = false;
+        self.discharged = true;
+        Ok(self.lock.take().expect("checked retained lock owner"))
+    }
+    /// Explicitly discharge ONLY this lock, never another owner or a prepared
+    /// world's producers/writer. An unlock error retains the actual File.
+    pub fn release_lock_only(&mut self) -> Result<()> {
+        self.ready = false;
+        if let Some(lock) = &self.lock
+            && let Err(error) = lock.0.unlock()
+        {
+            self.release_failed = true;
+            return self.remember(Err(error.into()));
+        }
+        drop(self.lock.take());
+        self.release_failed = false;
+        self.discharged = true;
+        Ok(())
+    }
+    #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+    pub fn with_test_fault(world: &Path, fault: RetainedLockTestFault) -> Self {
+        let mut owner = Self::new(world);
+        owner.test_fault = Some(fault);
+        owner
+    }
+    #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+    pub fn test_handle(&self) -> Option<usize> {
+        let file = &self.lock.as_ref()?.0;
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            Some(file.as_raw_fd() as usize)
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            Some(file.as_raw_handle() as usize)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = file;
+            None
+        }
+    }
+}
+impl Drop for RetainedSessionLock {
+    fn drop(&mut self) {
+        if self.lock.is_some() {
+            use std::io::Write;
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "fatal: unresolved retained SessionLock ownership"
+            );
+            std::process::abort(); // Before fields can unlock/drop the actual File.
+        }
+    }
+}
 /// Bring a world last saved by an older game version to the current format, as
 /// 26.3 does when it opens one: the file fixes and level.dat first
 /// (`FileFixerUpper`), then the DataFixers upgrades of every chunk, entity chunk,
@@ -9966,5 +10140,161 @@ mod tests {
             );
         }
         fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod retained_acquisition_tests {
+    use super::*;
+    struct Scratch(PathBuf);
+    impl Scratch {
+        fn new(label: &str) -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let root = std::env::temp_dir().join(format!(
+                "horizon-retained-lock-{}-{}-{label}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&root).unwrap();
+            Self(root)
+        }
+    }
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                eprintln!("RETAINED_LOCK_SCRATCH {}", self.0.display());
+            } else {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+    }
+    #[test]
+    fn retained_lock_ready_finish_transfers_actual_exclusion() {
+        let root = Scratch::new("ready");
+        let mut owner = RetainedSessionLock::new(&root.0);
+        owner.acquire().unwrap();
+        let ready = owner.acquired() && owner.ready();
+        let excluded = SessionLock::acquire(&root.0).is_err();
+        let lock = owner.finish(&root.0).unwrap();
+        let empty = !owner.acquired() && !owner.ready();
+        let transferred_exclusion = SessionLock::acquire(&root.0).is_err();
+        drop(lock);
+        assert!(ready && excluded && empty && transferred_exclusion);
+        assert_eq!(fs::read(root.0.join("session.lock")).unwrap(), [0x26, 0x03]);
+        assert!(SessionLock::acquire(&root.0).is_ok());
+    }
+    #[test]
+    fn retained_lock_wrong_route_and_repeated_repair_never_take_owner() {
+        let root = Scratch::new("route");
+        let wrong = root.0.join("other");
+        let mut owner = RetainedSessionLock::new(&root.0);
+        owner.acquire().unwrap();
+        let wrong_finish = owner.finish(&wrong).is_err();
+        let wrong_repair = owner.repair(&wrong).is_err();
+        let excluded = SessionLock::acquire(&root.0).is_err();
+        owner.repair(&root.0).unwrap();
+        owner.repair(&root.0).unwrap();
+        let header = fs::read(root.0.join("session.lock")).unwrap();
+        owner.release_lock_only().unwrap();
+        assert!(wrong_finish && wrong_repair && excluded);
+        assert_eq!(header, [0x26, 0x03]);
+        assert!(SessionLock::acquire(&root.0).is_ok());
+        assert!(owner.finish(&root.0).is_err());
+        assert!(owner.acquire().is_err()); // Explicit release is terminal.
+    }
+    #[test]
+    fn retained_lock_real_preacquisition_io_and_contention_have_no_capability() {
+        let root = Scratch::new("prelock");
+        let path = root.0.join("blocked");
+        fs::write(&path, b"actual non-directory").unwrap();
+        let mut owner = RetainedSessionLock::new(&path);
+        let refused = owner.acquire().is_err();
+        let vacant = !owner.acquired() && !owner.ready();
+        fs::remove_file(&path).unwrap();
+        let held = SessionLock::acquire(&path).unwrap();
+        let contended = owner.acquire().is_err();
+        let still_vacant = !owner.acquired();
+        drop(held);
+        owner.acquire().unwrap();
+        owner.release_lock_only().unwrap();
+        assert!(refused && vacant && contended && still_vacant);
+        assert!(owner.first_failure().is_some());
+    }
+    #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+    #[test]
+    fn retained_lock_partial_header_repair_keeps_same_handle_and_resets_cursor() {
+        use std::io::Seek;
+        let root = Scratch::new("partial");
+        let mut owner =
+            RetainedSessionLock::with_test_fault(&root.0, RetainedLockTestFault::PartialHeader);
+        let failed = owner.acquire().is_err();
+        let partial = fs::read(root.0.join("session.lock")).unwrap();
+        let offset = owner.lock.as_mut().unwrap().0.stream_position().unwrap();
+        let handle = owner.test_handle();
+        let excluded = SessionLock::acquire(&root.0).is_err();
+        let not_ready = owner.acquired() && !owner.ready() && owner.finish(&root.0).is_err();
+        let first = owner.first_failure().unwrap().to_owned();
+        owner.repair(&root.0).unwrap();
+        let same_handle = owner.test_handle() == handle;
+        owner.repair(&root.0).unwrap();
+        let header = fs::read(root.0.join("session.lock")).unwrap();
+        let repaired_offset = owner.lock.as_mut().unwrap().0.stream_position().unwrap();
+        let first_retained = owner.first_failure() == Some(first.as_str());
+        let lock = owner.finish(&root.0).unwrap();
+        drop(lock);
+        assert!(failed && excluded && not_ready && same_handle && first_retained);
+        assert_eq!(partial, [0x26]);
+        assert_eq!(offset, 1);
+        assert_eq!(header, [0x26, 0x03]);
+        assert_eq!(repaired_offset, 2);
+    }
+    #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+    #[test]
+    fn retained_lock_real_readonly_header_error_retains_actual_os_lock() {
+        let root = Scratch::new("readonly");
+        fs::write(root.0.join("session.lock"), b"original header").unwrap();
+        let mut owner =
+            RetainedSessionLock::with_test_fault(&root.0, RetainedLockTestFault::ReadOnlyHeader);
+        let failed = owner.acquire().is_err(); // Actual set_len on read-only File.
+        let acquired = owner.acquired() && !owner.ready();
+        let handle = owner.test_handle();
+        let excluded = SessionLock::acquire(&root.0).is_err();
+        let retry_failed = owner.repair(&root.0).is_err();
+        let same_handle = owner.test_handle() == handle;
+        let finish_failed = owner.finish(&root.0).is_err();
+        owner.release_lock_only().unwrap();
+        assert!(failed && acquired && excluded && retry_failed && same_handle && finish_failed);
+        assert!(SessionLock::acquire(&root.0).is_ok());
+    }
+    #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+    #[test]
+    #[ignore = "separate direct prebuilt process: expected marked SIGABRT; never run in ordinary battery"]
+    fn retained_lock_partial_unresolved_drop_fatal() {
+        use std::io::Write;
+        let root = Scratch::new("fatal-partial");
+        let mut owner =
+            RetainedSessionLock::with_test_fault(&root.0, RetainedLockTestFault::PartialHeader);
+        assert!(owner.acquire().is_err());
+        assert!(owner.acquired() && !owner.ready());
+        assert!(SessionLock::acquire(&root.0).is_err());
+        assert_eq!(fs::read(root.0.join("session.lock")).unwrap(), [0x26]);
+        println!("HORIZON_RETAINED_LOCK_PARTIAL_DROP_ARMED");
+        std::io::stdout().flush().unwrap();
+        drop(owner);
+        panic!("unresolved retained lock unexpectedly dropped");
+    }
+    #[test]
+    #[ignore = "separate direct prebuilt process: expected marked SIGABRT; never run in ordinary battery"]
+    fn retained_lock_ready_unresolved_drop_fatal() {
+        use std::io::Write;
+        let root = Scratch::new("fatal-ready");
+        let mut owner = RetainedSessionLock::new(&root.0);
+        owner.acquire().unwrap();
+        assert!(owner.acquired() && owner.ready());
+        assert!(SessionLock::acquire(&root.0).is_err());
+        println!("HORIZON_RETAINED_LOCK_READY_DROP_ARMED");
+        std::io::stdout().flush().unwrap();
+        drop(owner);
+        panic!("unresolved ready retained lock unexpectedly dropped");
     }
 }
