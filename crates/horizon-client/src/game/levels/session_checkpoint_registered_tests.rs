@@ -1151,3 +1151,7 @@ fn registered_actual_bootstrap_refusals_leave_real_grant_unused() {
             .is_err()
     );
 }
+
+#[cfg(feature = "mods")]
+#[path = "../persistent_guest_counter_tests.rs"]
+mod persistent_guest;

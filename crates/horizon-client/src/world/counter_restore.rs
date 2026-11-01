@@ -205,6 +205,7 @@ impl NativeBindingProfile {
 #[derive(Clone)]
 pub struct NativeBinding {
     profile: NativeBindingProfile,
+    guest: Option<Arc<PreparedBundle>>,
     package: [u8; 32],
     machine_type: MachineType,
     block_id: String,
@@ -292,6 +293,7 @@ impl NativeBinding {
         }
         Ok(Self {
             profile,
+            guest: None,
             package: *prepared.identity(),
             machine_type: machine_type.clone(),
             block_id: block.id.clone(),
@@ -333,14 +335,20 @@ impl NativeBinding {
         target: &CounterTarget,
         scope: AuthorityScope,
     ) -> Result<Configuration> {
-        Configuration::new(
+        let configuration = Configuration::new(
             scope,
             &self.machine_type,
             self.symbolic_state(),
             self.state_id,
             target.position,
         )
-        .map_err(|_| RestoreError::BindingMismatch)
+        .map_err(|_| RestoreError::BindingMismatch)?;
+        match &self.guest {
+            None => Ok(configuration),
+            Some(pair) => configuration
+                .with_guest_package(pair)
+                .map_err(|_| RestoreError::BindingMismatch),
+        }
     }
 }
 
@@ -435,14 +443,20 @@ impl CounterFrameV2 {
     }
     pub fn validate(&self) -> Result<()> {
         let profile = self.binding_profile()?;
+        if self.format != 2 {
+            return Err(RestoreError::InvalidFrame);
+        }
+        self.validate_fields(profile)
+    }
+    // Common scalar validation only: callers must separately validate their exact header.
+    fn validate_fields(&self, profile: NativeBindingProfile) -> Result<()> {
         CounterTarget::new(&self.dimension, self.position)?;
         let generation =
             |generation: u64| generation > 0 && generation <= self.allocation_high_water;
         let payload = |counter: u64, last: Option<i64>, end: i64| {
             (counter == 0) == last.is_none() && last.is_none_or(|time| time >= 0 && time <= end)
         };
-        if self.format != 2
-            || self.save_schema != 1
+        if self.save_schema != 1
             || self.saved_game_time < 0
             || !valid_digest(&self.package_identity)
             || !canonical(&self.type_id)
@@ -636,6 +650,7 @@ pub(super) struct Domain {
     retired_key: Option<PlacementKey>,
     session: Arc<Session>,
     status: DomainStatus,
+    guest_fault: Option<GuestFaultWitness>,
     binding: NativeBinding,
     pub(super) slot: Option<super::slot_restore::SlotDomain>,
 }
@@ -664,6 +679,9 @@ impl Domain {
         self.status = DomainStatus::Detached;
     }
     fn healthy(&self) -> Result<()> {
+        if self.guest_fault.is_some() {
+            return Err(RestoreError::Faulted);
+        }
         match self.status {
             DomainStatus::Healthy => Ok(()),
             DomainStatus::Faulted => Err(RestoreError::Faulted),
@@ -679,7 +697,7 @@ impl Domain {
         }
     }
     pub(super) fn configuration_matches(&self, configuration: &Configuration) -> bool {
-        configuration.backend() == &crate::counter_trial::Backend::Native
+        self.binding.matches_backend(configuration)
             && configuration.scope().dimension() == self.target.dimension
             && configuration.position() == self.target.position
             && configuration.machine_type() == &self.binding.machine_type
@@ -760,6 +778,7 @@ impl World {
             retired_key: None,
             session: session.clone(),
             status: DomainStatus::Healthy,
+            guest_fault: None,
             binding: binding.clone(),
             slot: None,
         });
@@ -854,6 +873,7 @@ impl World {
             retired_key: None,
             session: session.clone(),
             status: DomainStatus::Healthy,
+            guest_fault: None,
             binding: binding.clone(),
             slot: None,
         });
@@ -918,6 +938,7 @@ impl World {
             retired_key: None,
             session: session.clone(),
             status: DomainStatus::Healthy,
+            guest_fault: None,
             binding: binding.clone(),
             slot: None,
         });
@@ -961,7 +982,11 @@ impl World {
             high_water: domain.high_water,
             active_key: domain.active_key.clone(),
             retired_key: domain.retired_key.clone(),
-            status: domain.status,
+            status: if domain.guest_fault.is_some() {
+                DomainStatus::Faulted
+            } else {
+                domain.status
+            },
         })
     }
     pub fn read_persistent_counter(&self, key: &RuntimeCounterKey) -> Result<Record> {
@@ -1031,6 +1056,13 @@ impl World {
         Ok(Some(key))
     }
     pub fn counter_checkpoint_frame(&self, saved_game_time: i64) -> Result<CounterFrameV2> {
+        if self
+            .counter_domain
+            .as_ref()
+            .is_some_and(|d| d.binding.is_guest())
+        {
+            return Err(RestoreError::BindingMismatch);
+        }
         let domain = self
             .counter_domain
             .as_ref()
@@ -2203,5 +2235,1152 @@ mod tests {
         );
         assert_eq!(host_state(&transient), before);
         assert!(!grant.bound && !grant.spent);
+    }
+    // Host-only defenses: metadata fixtures deliberately never execute their
+    // placeholder component bytes. Actual Wasm families live in Game tests.
+    #[cfg(feature = "mods")]
+    mod persistent_guest_host_tests {
+        use super::*;
+        use crate::counter_trial::{Completion, Fault, GuestFailure, PhaseError, Proposal};
+        fn host_guest() -> World {
+            let prepared = Arc::new(prepared_with_block(br#"{"template":"minecraft:iron_block","machine-type":"counter_demo:counter_type"}"#));
+            let registry = Box::leak(Box::new(BlockRegistry::from_facts_json(&br#"{"defaults":{"minecraft:air":0,"minecraft:iron_block":1,"counter_demo:counter":2},"states":[["air",true,false,"","minecraft:air"],["iron",false,false,"","minecraft:iron_block"],["alias",false,false,"","counter_demo:counter"]]}"#[..]).unwrap()));
+            let binding = NativeBinding::from_registered_guest_prepared(
+                &prepared,
+                "counter_demo:counter_type",
+                registry,
+            )
+            .unwrap();
+            let mut world = bare(2, 0);
+            let mut grant = host_grant();
+            world
+                .bind_host_counter_bootstrap(&mut grant, "minecraft:overworld")
+                .unwrap();
+            world
+                .initialize_registered_guest_pair_from_host(&binding, &target(), &mut grant)
+                .unwrap();
+            world
+        }
+        #[test]
+        fn persistent_guest_host_invalid_reply_preserves_record_and_first_fault() {
+            for field in 0..5 {
+                let mut world = host_guest();
+                world.game_time = 1;
+                let token = world
+                    .prepare_persistent_guest_counter_phase(true, true)
+                    .unwrap()
+                    .unwrap();
+                let phase = token.phase();
+                let record = phase.record();
+                let mut proposal = Proposal {
+                    world_instance: phase.configuration().scope().world_instance(),
+                    instance: record.instance(),
+                    game_time: phase.game_time(),
+                    expected_counter: record.counter(),
+                    next_counter: record.counter() + 1,
+                };
+                match field {
+                    0 => proposal.world_instance += 1,
+                    1 => proposal.instance += 1,
+                    2 => proposal.game_time += 1,
+                    3 => proposal.expected_counter += 1,
+                    _ => proposal.next_counter += 1,
+                }
+                assert_eq!(
+                    world.commit_persistent_guest_counter_phase(token, proposal, true, true),
+                    Err(PhaseError::Fault(Fault::GuestFailure(
+                        GuestFailure::InvalidReply
+                    )))
+                );
+                assert_eq!(
+                    world.counter_trial_snapshot().unwrap().record(),
+                    Some(record)
+                );
+                let status = GuestStatus::Faulted {
+                    code: GuestFaultCode::GuestInvalidReply,
+                    observed_tick: 1,
+                };
+                assert_eq!(
+                    world
+                        .guest_storage_view()
+                        .unwrap()
+                        .counter()
+                        .execution
+                        .status,
+                    status
+                );
+                world.game_time = 2;
+                assert!(matches!(
+                    world.prepare_persistent_guest_counter_phase(true, true),
+                    Err(PhaseError::Fault(Fault::GuestFailure(
+                        GuestFailure::InvalidReply
+                    )))
+                ));
+                assert_eq!(
+                    world
+                        .guest_storage_view()
+                        .unwrap()
+                        .counter()
+                        .execution
+                        .status,
+                    status
+                );
+                assert_eq!(
+                    world.counter_trial_snapshot().unwrap().record(),
+                    Some(record)
+                );
+            }
+        }
+        #[test]
+        fn persistent_guest_host_exhaustion_is_real_factory_state_and_stops_before_callback() {
+            let mut world = host_guest();
+            let config = world
+                .counter_trial
+                .as_ref()
+                .unwrap()
+                .configuration()
+                .clone();
+            world.counter_trial = Some(Box::new(
+                Trial::restore_persistent_guest(config, Some((u64::MAX, Some(0))), None, 0, None)
+                    .unwrap(),
+            ));
+            let record = world.counter_trial_snapshot().unwrap().record().unwrap();
+            assert!(world.persistent_counter_key().unwrap().is_some());
+            world.game_time = 1;
+            assert!(matches!(
+                world.prepare_persistent_guest_counter_phase(true, true),
+                Err(PhaseError::Fault(Fault::CounterExhausted))
+            ));
+            assert_eq!(
+                world.counter_trial_snapshot().unwrap().record(),
+                Some(record)
+            );
+            let saved = world.guest_storage_view().unwrap().counter().clone();
+            assert_eq!(
+                saved.execution.status,
+                GuestStatus::Faulted {
+                    code: GuestFaultCode::CounterExhausted,
+                    observed_tick: 1
+                }
+            );
+            assert!(matches!(
+                saved.fields.placement,
+                Placement::Active {
+                    counter: u64::MAX,
+                    last_advanced: Some(0),
+                    ..
+                }
+            ));
+            assert_eq!(
+                GuestCounterFrameV3::decode(&saved.encode().unwrap()).unwrap(),
+                saved
+            );
+            world.game_time = 2;
+            assert!(matches!(
+                world.prepare_persistent_guest_counter_phase(true, true),
+                Err(PhaseError::Fault(Fault::CounterExhausted))
+            ));
+            assert_eq!(
+                world.counter_trial_snapshot().unwrap().record(),
+                Some(record)
+            );
+        }
+        #[test]
+        fn persistent_guest_host_storage_refuses_fault_witness_and_structural_mismatch() {
+            for mode in 0..6 {
+                let mut world = host_guest();
+                world.game_time = 1;
+                let token = world
+                    .prepare_persistent_guest_counter_phase(true, true)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    world.fail_persistent_guest_counter_phase(
+                        token,
+                        GuestFailure::Trap,
+                        true,
+                        true
+                    ),
+                    Err(PhaseError::Fault(Fault::GuestFailure(GuestFailure::Trap)))
+                );
+                assert!(world.guest_storage_view().is_ok());
+                let record = world.counter_trial_snapshot().unwrap().record();
+                let domain = world.counter_domain.as_mut().unwrap();
+                match mode {
+                    0 => {
+                        domain.guest_fault.as_mut().unwrap().status = GuestStatus::Faulted {
+                            code: GuestFaultCode::GuestFuel,
+                            observed_tick: 1,
+                        }
+                    }
+                    1 => {
+                        domain.guest_fault.as_mut().unwrap().status = GuestStatus::Faulted {
+                            code: GuestFaultCode::GuestTrap,
+                            observed_tick: 2,
+                        }
+                    }
+                    2 => domain.guest_fault.as_mut().unwrap().key.instance += 1,
+                    3 => domain.status = DomainStatus::Faulted,
+                    4 => domain.slot.as_mut().unwrap().high_water += 1,
+                    _ => domain.guest_fault = None,
+                }
+                assert!(world.guest_storage_view().is_err(), "mode {mode}");
+                assert!(world.guest_runtime_state().is_err(), "mode {mode}");
+                assert!(
+                    world
+                        .prepare_persistent_guest_counter_phase(true, true)
+                        .is_err()
+                );
+                assert_eq!(world.counter_trial_snapshot().unwrap().record(), record);
+                assert_eq!(
+                    world.counter_trial_snapshot().unwrap().fault(),
+                    Some(Fault::GuestFailure(GuestFailure::Trap))
+                );
+            }
+        }
+        #[test]
+        fn persistent_guest_host_stale_foreign_world_does_not_fault_owner() {
+            let mut source = host_guest();
+            source.game_time = 1;
+            let success = source
+                .prepare_persistent_guest_counter_phase(true, true)
+                .unwrap()
+                .unwrap();
+            let phase = success.phase();
+            let proposal = Proposal {
+                world_instance: phase.configuration().scope().world_instance(),
+                instance: phase.record().instance(),
+                game_time: phase.game_time(),
+                expected_counter: 0,
+                next_counter: 1,
+            };
+            let failure = source
+                .prepare_persistent_guest_counter_phase(true, true)
+                .unwrap()
+                .unwrap();
+            let mut other = host_guest();
+            other.game_time = 1;
+            let before = other.counter_trial_snapshot().unwrap();
+            assert_eq!(
+                other.commit_persistent_guest_counter_phase(success, proposal, true, true),
+                Ok(Completion::Stale)
+            );
+            assert_eq!(
+                other.fail_persistent_guest_counter_phase(failure, GuestFailure::Trap, true, true),
+                Ok(Completion::Stale)
+            );
+            assert_eq!(other.counter_trial_snapshot().unwrap(), before);
+            assert_eq!(
+                other
+                    .guest_storage_view()
+                    .unwrap()
+                    .counter()
+                    .execution
+                    .status,
+                GuestStatus::Ready
+            );
+        }
+    }
+}
+
+// Explicit persistent Guest execution. Existing Native frame headers remain unchanged.
+pub const GUEST_COUNTER_KIND: &str = "registered-guest-counter-checkpoint";
+pub const GUEST_SLOT_KIND: &str = "registered-guest-slot-checkpoint";
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GuestFaultCode {
+    GuestTrap,
+    GuestFuel,
+    GuestMemory,
+    GuestRejected,
+    GuestInvalidReply,
+    GuestUnavailable,
+    GuestEvaluation,
+    CounterExhausted,
+}
+impl GuestFaultCode {
+    fn from_fault(fault: crate::counter_trial::Fault) -> Result<Self> {
+        use crate::counter_trial::{Fault, GuestFailure as G};
+        Ok(match fault {
+            Fault::GuestFailure(G::Trap) => Self::GuestTrap,
+            Fault::GuestFailure(G::Fuel) => Self::GuestFuel,
+            Fault::GuestFailure(G::Memory) => Self::GuestMemory,
+            Fault::GuestFailure(G::Rejected) => Self::GuestRejected,
+            Fault::GuestFailure(G::InvalidReply) => Self::GuestInvalidReply,
+            Fault::GuestFailure(G::Unavailable) => Self::GuestUnavailable,
+            Fault::GuestFailure(G::Evaluation) => Self::GuestEvaluation,
+            Fault::CounterExhausted => Self::CounterExhausted,
+            _ => return Err(RestoreError::Faulted),
+        })
+    }
+    pub fn fault(self) -> crate::counter_trial::Fault {
+        use crate::counter_trial::{Fault, GuestFailure as G};
+        match self {
+            Self::GuestTrap => Fault::GuestFailure(G::Trap),
+            Self::GuestFuel => Fault::GuestFailure(G::Fuel),
+            Self::GuestMemory => Fault::GuestFailure(G::Memory),
+            Self::GuestRejected => Fault::GuestFailure(G::Rejected),
+            Self::GuestInvalidReply => Fault::GuestFailure(G::InvalidReply),
+            Self::GuestUnavailable => Fault::GuestFailure(G::Unavailable),
+            Self::GuestEvaluation => Fault::GuestFailure(G::Evaluation),
+            Self::CounterExhausted => Fault::CounterExhausted,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "lowercase", deny_unknown_fields)]
+pub enum GuestStatus {
+    Ready,
+    Faulted {
+        code: GuestFaultCode,
+        observed_tick: i64,
+    },
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GuestExecution {
+    pub profile: String,
+    pub primary_owner: String,
+    pub status: GuestStatus,
+}
+/// The reused field shape is NOT a valid Native frame: header3 and Guest kind
+/// are validated here and never passed to Native restoration/encoding.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GuestCounterFrameV3 {
+    pub fields: CounterFrameV2,
+    pub execution: GuestExecution,
+}
+impl GuestCounterFrameV3 {
+    pub fn validate(&self) -> Result<()> {
+        let f = &self.fields;
+        if f.format != 3
+            || f.kind != GUEST_COUNTER_KIND
+            || self.execution.profile != "registered-guest-v1"
+            || f.type_id.split_once(':').map(|(owner, _)| owner)
+                != Some(self.execution.primary_owner.as_str())
+        {
+            return Err(RestoreError::InvalidFrame);
+        }
+        f.validate_fields(NativeBindingProfile::RegisteredCube)?;
+        if f.allocation_high_water == 0
+            || (matches!(f.placement, Placement::Dormant) && f.last_retired.is_none())
+        {
+            return Err(RestoreError::InvalidFrame);
+        }
+        if let GuestStatus::Faulted {
+            code,
+            observed_tick,
+        } = self.execution.status
+        {
+            let Placement::Active {
+                counter,
+                last_advanced,
+                ..
+            } = f.placement
+            else {
+                return Err(RestoreError::InvalidFrame);
+            };
+            if observed_tick < 0
+                || observed_tick > f.saved_game_time
+                || last_advanced.is_some_and(|last| last >= observed_tick)
+                || (code == GuestFaultCode::CounterExhausted && counter != u64::MAX)
+            {
+                return Err(RestoreError::InvalidFrame);
+            }
+        }
+        Ok(())
+    }
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() > 16 << 10 {
+            return Err(RestoreError::InvalidFrame);
+        }
+        let mut nodes = 0;
+        let mut decoder = serde_json::Deserializer::from_slice(bytes);
+        let mut value = Seed {
+            nodes: &mut nodes,
+            depth: 0,
+        }
+        .deserialize(&mut decoder)
+        .map_err(|_| RestoreError::InvalidFrame)?;
+        decoder.end().map_err(|_| RestoreError::InvalidFrame)?;
+        let execution = value
+            .as_object_mut()
+            .and_then(|v| v.remove("execution"))
+            .ok_or(RestoreError::InvalidFrame)?;
+        let frame = Self {
+            fields: serde_json::from_value(value).map_err(|_| RestoreError::InvalidFrame)?,
+            execution: serde_json::from_value(execution).map_err(|_| RestoreError::InvalidFrame)?,
+        };
+        frame.validate()?;
+        Ok(frame)
+    }
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        self.validate()?;
+        let mut value =
+            serde_json::to_value(&self.fields).map_err(|_| RestoreError::InvalidFrame)?;
+        value
+            .as_object_mut()
+            .ok_or(RestoreError::InvalidFrame)?
+            .insert(
+                "execution".into(),
+                serde_json::to_value(&self.execution).map_err(|_| RestoreError::InvalidFrame)?,
+            );
+        let bytes = serde_json::to_vec(&value).map_err(|_| RestoreError::InvalidFrame)?;
+        Self::decode(&bytes)?;
+        Ok(bytes)
+    }
+}
+struct GuestFaultWitness {
+    key: RuntimeCounterKey,
+    record: Record,
+    status: GuestStatus,
+}
+impl NativeBinding {
+    pub fn from_registered_guest_prepared(
+        pair: &Arc<PreparedBundle>,
+        type_id: &str,
+        registry: &'static BlockRegistry,
+    ) -> Result<Self> {
+        if !cfg!(feature = "mods") {
+            return Err(RestoreError::BindingMismatch);
+        }
+        let mut binding = Self::from_registered_prepared(pair, type_id, registry)?;
+        binding.guest = Some(pair.clone());
+        Ok(binding)
+    }
+    pub fn is_guest(&self) -> bool {
+        self.guest.is_some()
+    }
+    pub fn guest_owner(&self) -> Option<&str> {
+        self.guest
+            .as_ref()
+            .map(|p| p.bundle().content_owner().id.as_str())
+    }
+    fn matches_backend(&self, configuration: &Configuration) -> bool {
+        use crate::counter_trial::Backend;
+        match (&self.guest, configuration.backend()) {
+            (None, Backend::Native) => true,
+            (
+                Some(pair),
+                Backend::Guest {
+                    primary_owner,
+                    package_identity,
+                },
+            ) => {
+                primary_owner == &pair.bundle().content_owner().id
+                    && package_identity == pair.identity()
+            }
+            _ => false,
+        }
+    }
+}
+/// No healthy runtime key is exposed by faulted storage.
+pub struct GuestStorageReceipt {
+    key: RuntimeCounterKey,
+    slot: crate::world_slot_trial::SlotKey,
+    revision: u64,
+    status: GuestStatus,
+}
+pub enum GuestRuntimeState {
+    ReadyActive {
+        counter: RuntimeCounterKey,
+        slot: crate::world_slot_trial::SlotKey,
+    },
+    FaultedActive {
+        receipt: GuestStorageReceipt,
+    },
+    ReadyDormant,
+}
+pub struct GuestStorageView<'a> {
+    world: &'a World,
+    frame: GuestCounterFrameV3,
+}
+impl GuestStorageView<'_> {
+    pub fn counter(&self) -> &GuestCounterFrameV3 {
+        &self.frame
+    }
+    /// Original borrowed native value, never a cloned owner or transfer capability.
+    pub fn stack(&self) -> Option<&crate::items::ItemStack> {
+        self.world
+            .world_slot_trial
+            .as_ref()?
+            .borrowed()
+            .active?
+            .stack
+    }
+    pub fn slot_bytes(
+        &self,
+        items: &crate::items::Items,
+    ) -> std::result::Result<Vec<u8>, super::slot_restore::SlotRestoreError> {
+        self.world
+            .guest_slot_checkpoint_bytes(items, self.world.game_time)
+    }
+}
+pub struct PersistentGuestPhaseToken {
+    key: RuntimeCounterKey,
+    slot: crate::world_slot_trial::SlotKey,
+    revision: u64,
+    column: Arc<crate::chunk::Chunk>,
+    phase: crate::counter_trial::PhaseToken,
+}
+impl PersistentGuestPhaseToken {
+    pub fn phase(&self) -> &crate::counter_trial::PhaseToken {
+        &self.phase
+    }
+}
+impl World {
+    pub fn has_persistent_guest_counter(&self) -> bool {
+        self.counter_domain
+            .as_ref()
+            .is_some_and(|d| d.binding.is_guest())
+    }
+    pub fn initialize_registered_guest_pair_from_host(
+        &mut self,
+        binding: &NativeBinding,
+        target: &CounterTarget,
+        grant: &mut HostCounterBootstrap,
+    ) -> Result<(RuntimeCounterKey, crate::world_slot_trial::SlotKey)> {
+        use super::slot_restore::{SlotAllocation, SlotMetadataSnapshot, SlotStatus};
+        if !binding.is_guest()
+            || grant.spent
+            || !grant.bound
+            || target.dimension != "minecraft:overworld"
+            || self.game_time < 0
+        {
+            return Err(RestoreError::IdentityMismatch);
+        }
+        let marker = self
+            .host_counter_bootstrap
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .ok_or(RestoreError::IdentityMismatch)?;
+        if !Arc::ptr_eq(&marker, &grant.marker) {
+            return Err(RestoreError::IdentityMismatch);
+        }
+        self.vacant_counter_domain()?;
+        if self.world_slot_trial.is_some()
+            || self.restore_current(target)? != binding.state_id
+            || binding.state_id == self.air
+        {
+            return Err(RestoreError::StateMismatch);
+        }
+        let (session, scope) = Self::fresh_counter_authority(target)?;
+        let configuration = binding.configuration(target, scope)?;
+        let trial = Box::new(
+            Trial::restore_persistent_guest(
+                configuration.clone(),
+                Some((0, None)),
+                None,
+                self.game_time,
+                None,
+            )
+            .map_err(|_| RestoreError::RuntimeExhausted)?,
+        );
+        let mut input = Some(crate::world_slot_trial::RestoreAllocation {
+            generation: 1,
+            revision: 0,
+            stack: None,
+        });
+        let slot_trial = Box::new(
+            crate::world_slot_trial::Trial::restore_guest_checked(configuration, 1, &mut input)
+                .map_err(|_| RestoreError::RuntimeExhausted)?,
+        );
+        let slot = slot_trial
+            .borrowed()
+            .active
+            .ok_or(RestoreError::InvalidFrame)?
+            .key
+            .clone();
+        let placement = PlacementKey {
+            world: grant.world,
+            dimension: target.dimension.clone(),
+            position: target.position,
+            generation: 1,
+        };
+        let key = RuntimeCounterKey {
+            session: session.clone(),
+            placement: placement.clone(),
+            instance: trial
+                .snapshot()
+                .record()
+                .ok_or(RestoreError::InvalidFrame)?
+                .instance(),
+        };
+        let domain = Box::new(Domain {
+            world: grant.world,
+            target: target.clone(),
+            high_water: 1,
+            active_key: Some(placement),
+            retired_key: None,
+            session,
+            status: DomainStatus::Healthy,
+            guest_fault: None,
+            binding: binding.clone(),
+            slot: Some(SlotMetadataSnapshot {
+                high_water: 1,
+                allocation: SlotAllocation::Active {
+                    slot_generation: 1,
+                    machine_generation: 1,
+                },
+                status: SlotStatus::Healthy,
+            }),
+        });
+        self.counter_domain = Some(domain);
+        self.counter_trial = Some(trial);
+        self.world_slot_trial = Some(slot_trial);
+        grant.spent = true;
+        Ok((key, slot))
+    }
+    pub(super) fn guest_storage_counter(&self) -> Result<GuestCounterFrameV3> {
+        let d = self.counter_domain.as_ref().ok_or(RestoreError::Detached)?;
+        if d.status != DomainStatus::Healthy || !d.binding.is_guest() || self.game_time < 0 {
+            return Err(RestoreError::Faulted);
+        }
+        let t = self.counter_trial.as_ref().ok_or(RestoreError::Detached)?;
+        let s = t.snapshot();
+        if !d.configuration_matches(s.configuration()) {
+            return Err(RestoreError::BindingMismatch);
+        }
+        let current = self.restore_current(&d.target)?;
+        let observed = d
+            .binding
+            .registry
+            .state(current)
+            .ok_or(RestoreError::StateMismatch)?;
+        let placement = match (&d.active_key, s.record()) {
+            (Some(key), Some(record)) if record.resident() && current == d.binding.state_id => {
+                Placement::Active {
+                    generation: key.generation,
+                    counter: record.counter(),
+                    last_advanced: record.last_advanced(),
+                }
+            }
+            (None, None) if current != d.binding.state_id => Placement::Dormant,
+            _ => return Err(RestoreError::StateMismatch),
+        };
+        let status = match (&d.guest_fault, s.fault(), s.record()) {
+            (None, None, _) => GuestStatus::Ready,
+            (Some(w), Some(fault), Some(record))
+                if w.record == record
+                    && w.key.instance == record.instance()
+                    && Arc::ptr_eq(&w.key.session, &d.session)
+                    && d.active_key.as_ref() == Some(&w.key.placement)
+                    && matches!(w.status, GuestStatus::Faulted { code, .. } if code.fault() == fault) =>
+            {
+                w.status
+            }
+            _ => return Err(RestoreError::Faulted),
+        };
+        let last_retired = match (&d.retired_key, s.last_retirement()) {
+            (None, None) => None,
+            (Some(key), Some(retired)) => Some(RetiredFrame {
+                generation: key.generation,
+                counter: retired.record().counter(),
+                last_advanced: retired.record().last_advanced(),
+                reason: NativeRetirementReason::from_native(retired.reason()),
+                game_time: retired.game_time(),
+            }),
+            _ => return Err(RestoreError::InvalidFrame),
+        };
+        let frame = GuestCounterFrameV3 {
+            fields: CounterFrameV2 {
+                format: 3,
+                kind: GUEST_COUNTER_KIND.into(),
+                world_uuid: d.world,
+                dimension: d.target.dimension.clone(),
+                position: d.target.position,
+                allocation_high_water: d.high_water,
+                package_identity: digest(&d.binding.package),
+                type_id: d.binding.type_id().into(),
+                save_schema: 1,
+                binding: FrameBinding {
+                    block_id: d.binding.block_id.clone(),
+                    template: "minecraft:iron_block".into(),
+                    properties: BTreeMap::new(),
+                },
+                observed_state: FrameState {
+                    name: observed.name.clone(),
+                    properties: observed.properties.clone(),
+                },
+                saved_game_time: self.game_time,
+                placement,
+                last_retired,
+            },
+            execution: GuestExecution {
+                profile: "registered-guest-v1".into(),
+                primary_owner: d
+                    .binding
+                    .guest_owner()
+                    .ok_or(RestoreError::BindingMismatch)?
+                    .into(),
+                status,
+            },
+        };
+        frame.validate()?;
+        Ok(frame)
+    }
+    pub fn guest_storage_view(&self) -> Result<GuestStorageView<'_>> {
+        let frame = self.guest_storage_counter()?;
+        self.guest_storage_slot_guard()
+            .map_err(|_| RestoreError::Faulted)?;
+        Ok(GuestStorageView { world: self, frame })
+    }
+    pub fn guest_runtime_state(&self) -> Result<GuestRuntimeState> {
+        let view = self.guest_storage_view()?;
+        let d = self.counter_domain.as_ref().unwrap();
+        let Some(placement) = &d.active_key else {
+            return Ok(GuestRuntimeState::ReadyDormant);
+        };
+        let record = self
+            .counter_trial
+            .as_ref()
+            .unwrap()
+            .snapshot()
+            .record()
+            .ok_or(RestoreError::InvalidFrame)?;
+        let slot = self.world_slot_trial.as_ref().unwrap().borrowed();
+        let active = slot.active.ok_or(RestoreError::InvalidFrame)?;
+        let key = RuntimeCounterKey {
+            session: d.session.clone(),
+            placement: placement.clone(),
+            instance: record.instance(),
+        };
+        Ok(match view.frame.execution.status {
+            GuestStatus::Ready => GuestRuntimeState::ReadyActive {
+                counter: key,
+                slot: active.key.clone(),
+            },
+            status @ GuestStatus::Faulted { .. } => GuestRuntimeState::FaultedActive {
+                receipt: GuestStorageReceipt {
+                    key,
+                    slot: active.key.clone(),
+                    revision: active.revision,
+                    status,
+                },
+            },
+        })
+    }
+    pub fn validate_guest_storage_receipt(&self, receipt: &GuestStorageReceipt) -> Result<()> {
+        let view = self.guest_storage_view()?;
+        let d = self.counter_domain.as_ref().unwrap();
+        let slot = self.world_slot_trial.as_ref().unwrap().borrowed();
+        let active = slot.active.ok_or(RestoreError::InvalidFrame)?;
+        if !Arc::ptr_eq(&d.session, &receipt.key.session)
+            || d.active_key.as_ref() != Some(&receipt.key.placement)
+            || self
+                .counter_trial
+                .as_ref()
+                .unwrap()
+                .snapshot()
+                .record()
+                .map(|r| r.instance())
+                != Some(receipt.key.instance)
+            || active.key != &receipt.slot
+            || active.revision != receipt.revision
+            || view.frame.execution.status != receipt.status
+        {
+            return Err(RestoreError::IdentityMismatch);
+        }
+        Ok(())
+    }
+}
+impl World {
+    pub(super) fn guest_storage_anchor(&self) -> Result<SlotAnchor<'_>> {
+        self.guest_storage_counter()?;
+        let d = self.counter_domain.as_ref().ok_or(RestoreError::Detached)?;
+        Ok(SlotAnchor {
+            world: d.world,
+            target: &d.target,
+            high_water: d.high_water,
+            generation: d.active_key.as_ref().map(|k| k.generation),
+            binding: &d.binding,
+        })
+    }
+    fn correlate_guest_failure(
+        &mut self,
+        key: RuntimeCounterKey,
+        record: Record,
+        fault: crate::counter_trial::Fault,
+    ) -> Result<()> {
+        let code = GuestFaultCode::from_fault(fault)?;
+        let d = self.counter_domain.as_mut().ok_or(RestoreError::Detached)?;
+        let snapshot = self
+            .counter_trial
+            .as_ref()
+            .ok_or(RestoreError::Detached)?
+            .snapshot();
+        if d.status != DomainStatus::Healthy
+            || d.guest_fault.is_some()
+            || !d.binding.is_guest()
+            || !Arc::ptr_eq(&d.session, &key.session)
+            || d.active_key.as_ref() != Some(&key.placement)
+            || snapshot.record() != Some(record)
+            || snapshot.fault() != Some(fault)
+            || record.instance() != key.instance
+            || !d.configuration_matches(snapshot.configuration())
+            || self.game_time < 0
+            || record
+                .last_advanced()
+                .is_some_and(|time| time >= self.game_time)
+        {
+            d.status = DomainStatus::Faulted;
+            return Err(RestoreError::Faulted);
+        }
+        d.guest_fault = Some(GuestFaultWitness {
+            key,
+            record,
+            status: GuestStatus::Faulted {
+                code,
+                observed_tick: self.game_time,
+            },
+        });
+        Ok(())
+    }
+    pub(super) fn prepare_persistent_guest_checked(
+        &mut self,
+        running: bool,
+        eligible: bool,
+    ) -> std::result::Result<Option<PersistentGuestPhaseToken>, crate::counter_trial::PhaseError>
+    {
+        use crate::counter_trial::{Fault, PhaseError};
+        if !self.has_persistent_guest_counter() {
+            return Err(PhaseError::DispatchMismatch);
+        }
+        self.persistent_counter_phase_guard();
+        if let Some(w) = self
+            .counter_domain
+            .as_ref()
+            .and_then(|d| d.guest_fault.as_ref())
+        {
+            return Err(PhaseError::Fault(match w.status {
+                GuestStatus::Faulted { code, .. } => code.fault(),
+                GuestStatus::Ready => Fault::PersistentDomain,
+            }));
+        }
+        self.persistent_slot_guard()
+            .map_err(|_| PhaseError::Fault(Fault::PersistentDomain))?;
+        let Some(key) = self
+            .persistent_counter_key()
+            .map_err(|_| PhaseError::Fault(Fault::PersistentDomain))?
+        else {
+            return Ok(None);
+        };
+        let record = self
+            .read_persistent_counter(&key)
+            .map_err(|_| PhaseError::Fault(Fault::PersistentDomain))?;
+        let view = self
+            .world_slot_trial
+            .as_ref()
+            .ok_or(PhaseError::Fault(Fault::PersistentDomain))?
+            .borrowed();
+        let active = view
+            .active
+            .ok_or(PhaseError::Fault(Fault::PersistentDomain))?;
+        let slot = active.key.clone();
+        let revision = active.revision;
+        let column = self
+            .chunks
+            .get(&(
+                key.placement.position[0] >> 4,
+                key.placement.position[2] >> 4,
+            ))
+            .ok_or(PhaseError::Fault(Fault::PersistentDomain))?
+            .clone();
+        let current = self.guest_counter_current();
+        match self.counter_trial.as_mut().unwrap().prepare_guest(
+            running,
+            eligible,
+            current,
+            self.game_time,
+        ) {
+            Ok(Some(phase)) => Ok(Some(PersistentGuestPhaseToken {
+                key,
+                slot,
+                revision,
+                column,
+                phase,
+            })),
+            Ok(None) => Ok(None),
+            Err(error @ PhaseError::Fault(fault)) => {
+                self.correlate_guest_failure(key, record, fault)
+                    .map_err(|_| PhaseError::Fault(Fault::PersistentDomain))?;
+                Err(error)
+            }
+            Err(error) => Err(error),
+        }
+    }
+    pub(super) fn complete_persistent_guest_checked(
+        &mut self,
+        token: PersistentGuestPhaseToken,
+        result: std::result::Result<
+            crate::counter_trial::Proposal,
+            crate::counter_trial::GuestFailure,
+        >,
+        running: bool,
+        eligible: bool,
+    ) -> std::result::Result<crate::counter_trial::Completion, crate::counter_trial::PhaseError>
+    {
+        use crate::counter_trial::{Completion, Fault, PhaseError};
+        let same = self.counter_domain.as_ref().is_some_and(|d| {
+            Arc::ptr_eq(&d.session, &token.key.session)
+                && d.active_key.as_ref() == Some(&token.key.placement)
+                && d.binding.is_guest()
+                && d.guest_fault.is_none()
+        }) && self.counter_trial.as_ref().is_some_and(|t| {
+            t.configuration() == token.phase.configuration()
+                && t.snapshot().record() == Some(token.phase.record())
+        }) && self.world_slot_trial.as_ref().is_some_and(|t| {
+            t.borrowed()
+                .active
+                .is_some_and(|a| a.key == &token.slot && a.revision == token.revision)
+        }) && self.game_time == token.phase.game_time()
+            && self
+                .chunks
+                .get(&(
+                    token.key.placement.position[0] >> 4,
+                    token.key.placement.position[2] >> 4,
+                ))
+                .is_some_and(|column| Arc::ptr_eq(column, &token.column));
+        if !same {
+            return Ok(Completion::Stale);
+        }
+        self.persistent_counter_phase_guard();
+        self.persistent_slot_guard()
+            .map_err(|_| PhaseError::Fault(Fault::PersistentDomain))?;
+        self.read_persistent_counter(&token.key)
+            .map_err(|_| PhaseError::Fault(Fault::PersistentDomain))?;
+        let current = self.guest_counter_current();
+        let record = token.phase.record();
+        let completed = self.counter_trial.as_mut().unwrap().complete_guest(
+            token.phase,
+            result,
+            running,
+            eligible,
+            current,
+            self.game_time,
+        );
+        if let Err(PhaseError::Fault(fault)) = completed {
+            self.correlate_guest_failure(token.key, record, fault)
+                .map_err(|_| PhaseError::Fault(Fault::PersistentDomain))?;
+        }
+        completed
+    }
+    pub fn restore_guest_counter_frame(
+        &mut self,
+        binding: &NativeBinding,
+        expected_world: WorldId,
+        target: &CounterTarget,
+        frame: &GuestCounterFrameV3,
+    ) -> Result<()> {
+        self.vacant_counter_domain()?;
+        frame.validate()?;
+        let f = &frame.fields;
+        if !binding.is_guest()
+            || f.world_uuid != expected_world
+            || f.dimension != target.dimension
+            || f.position != target.position
+            || self.game_time != f.saved_game_time
+        {
+            return Err(RestoreError::IdentityMismatch);
+        }
+        if f.package_identity != digest(&binding.package)
+            || f.type_id != binding.type_id()
+            || f.binding.block_id != binding.block_id
+            || frame.execution.primary_owner.as_str()
+                != binding.guest_owner().ok_or(RestoreError::BindingMismatch)?
+        {
+            return Err(RestoreError::BindingMismatch);
+        }
+        let current = self.restore_current(target)?;
+        let observed = binding
+            .registry
+            .state(current)
+            .ok_or(RestoreError::StateMismatch)?;
+        if observed.name != f.observed_state.name
+            || observed.properties != f.observed_state.properties
+            || binding.state_id == self.air
+            || (matches!(f.placement, Placement::Active { .. }) && current != binding.state_id)
+        {
+            return Err(RestoreError::StateMismatch);
+        }
+        let (session, scope) = Self::fresh_counter_authority(target)?;
+        let configuration = binding.configuration(target, scope)?;
+        let (placement, active) = match f.placement {
+            Placement::Active {
+                generation,
+                counter,
+                last_advanced,
+            } => (
+                Some(PlacementKey {
+                    world: expected_world,
+                    dimension: target.dimension.clone(),
+                    position: target.position,
+                    generation,
+                }),
+                Some((counter, last_advanced)),
+            ),
+            Placement::Dormant => (None, None),
+        };
+        let retired = f
+            .last_retired
+            .as_ref()
+            .map(|r| (r.counter, r.last_advanced, r.reason.native(), r.game_time));
+        let fault = match frame.execution.status {
+            GuestStatus::Ready => None,
+            GuestStatus::Faulted { code, .. } => Some(code.fault()),
+        };
+        let trial = Box::new(
+            Trial::restore_persistent_guest(
+                configuration,
+                active,
+                retired,
+                f.saved_game_time,
+                fault,
+            )
+            .map_err(|_| RestoreError::RuntimeExhausted)?,
+        );
+        let guest_fault = match frame.execution.status {
+            GuestStatus::Ready => None,
+            status @ GuestStatus::Faulted { .. } => {
+                let record = trial
+                    .snapshot()
+                    .record()
+                    .ok_or(RestoreError::InvalidFrame)?;
+                Some(GuestFaultWitness {
+                    key: RuntimeCounterKey {
+                        session: session.clone(),
+                        placement: placement.clone().ok_or(RestoreError::InvalidFrame)?,
+                        instance: record.instance(),
+                    },
+                    record,
+                    status,
+                })
+            }
+        };
+        let retired_key = f.last_retired.as_ref().map(|r| PlacementKey {
+            world: expected_world,
+            dimension: target.dimension.clone(),
+            position: target.position,
+            generation: r.generation,
+        });
+        let domain = Box::new(Domain {
+            world: expected_world,
+            target: target.clone(),
+            high_water: f.allocation_high_water,
+            active_key: placement,
+            retired_key,
+            session,
+            status: DomainStatus::Healthy,
+            guest_fault,
+            binding: binding.clone(),
+            slot: None,
+        });
+        self.counter_domain = Some(domain);
+        self.counter_trial = Some(trial);
+        Ok(())
+    }
+}
+#[cfg(test)]
+mod persistent_guest_frame_tests {
+    use super::*;
+    fn ready() -> GuestCounterFrameV3 {
+        GuestCounterFrameV3 {
+            fields: CounterFrameV2 {
+                format: 3,
+                kind: GUEST_COUNTER_KIND.into(),
+                world_uuid: WorldId::parse("00000000-0000-4000-8000-000000000001").unwrap(),
+                dimension: "minecraft:overworld".into(),
+                position: [2, 70, 2],
+                allocation_high_water: 7,
+                package_identity: "01".repeat(32),
+                type_id: "guest:counter".into(),
+                save_schema: 1,
+                binding: FrameBinding {
+                    block_id: "guest:counter".into(),
+                    template: "minecraft:iron_block".into(),
+                    properties: BTreeMap::new(),
+                },
+                observed_state: FrameState {
+                    name: "guest:counter".into(),
+                    properties: BTreeMap::new(),
+                },
+                saved_game_time: 8,
+                placement: Placement::Active {
+                    generation: 7,
+                    counter: 3,
+                    last_advanced: Some(5),
+                },
+                last_retired: None,
+            },
+            execution: GuestExecution {
+                profile: "registered-guest-v1".into(),
+                primary_owner: "guest".into(),
+                status: GuestStatus::Ready,
+            },
+        }
+    }
+    #[test]
+    fn guest3_closed_header_roundtrip_and_native_rejection() {
+        let frame = ready();
+        let bytes = frame.encode().unwrap();
+        assert_eq!(GuestCounterFrameV3::decode(&bytes).unwrap(), frame);
+        assert!(CounterFrameV2::decode(&bytes).is_err());
+        for mode in 0..5 {
+            let mut bad = frame.clone();
+            match mode {
+                0 => bad.fields.format = 2,
+                1 => bad.fields.kind = "native-registered-counter-checkpoint".into(),
+                2 => bad.execution.profile = "unknown".into(),
+                3 => bad.execution.primary_owner = "other".into(),
+                _ => bad.fields.save_schema = 2,
+            }
+            assert!(bad.encode().is_err());
+        }
+    }
+    #[test]
+    fn guest3_fault_clock_and_faulted_dormant_are_strict() {
+        let mut frame = ready();
+        for tick in [-1, 4, 5, 9] {
+            frame.execution.status = GuestStatus::Faulted {
+                code: GuestFaultCode::GuestEvaluation,
+                observed_tick: tick,
+            };
+            assert!(frame.encode().is_err());
+        }
+        frame.execution.status = GuestStatus::Faulted {
+            code: GuestFaultCode::GuestEvaluation,
+            observed_tick: 6,
+        };
+        let bytes = frame.encode().unwrap();
+        assert_eq!(GuestCounterFrameV3::decode(&bytes).unwrap(), frame);
+        frame.fields.placement = Placement::Dormant;
+        frame.fields.observed_state.name = "minecraft:air".into();
+        assert!(frame.encode().is_err());
+        frame.execution.status = GuestStatus::Ready;
+        frame.fields.last_retired = Some(RetiredFrame {
+            generation: 7,
+            counter: 3,
+            last_advanced: Some(5),
+            reason: NativeRetirementReason::BlockChanged,
+            game_time: 6,
+        });
+        assert!(frame.encode().is_ok());
+    }
+    #[test]
+    fn guest3_duplicate_unknown_and_inconsistent_exhaustion_refuse() {
+        let frame = ready();
+        let bytes = frame.encode().unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        let duplicate = text.replacen("\"execution\":", "\"format\":3,\"execution\":", 1);
+        assert!(GuestCounterFrameV3::decode(duplicate.as_bytes()).is_err());
+        let mut value = serde_json::to_value(&frame.fields).unwrap();
+        value.as_object_mut().unwrap().insert("execution".into(),serde_json::json!({"profile":"registered-guest-v1","primary_owner":"guest","status":{"state":"faulted","code":"unknown","observed_tick":6}}));
+        assert!(GuestCounterFrameV3::decode(&serde_json::to_vec(&value).unwrap()).is_err());
+        let mut bad = frame;
+        bad.execution.status = GuestStatus::Faulted {
+            code: GuestFaultCode::CounterExhausted,
+            observed_tick: 6,
+        };
+        assert!(bad.encode().is_err());
     }
 }

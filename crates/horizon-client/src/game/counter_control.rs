@@ -20,6 +20,13 @@ use horizon_world::{chunk::BlockState, registry::BlockStateId};
 use serde_json::{Value, json};
 use std::{io::Write, sync::Arc};
 
+#[cfg(all(test, feature = "mods"))]
+thread_local! { static GUEST_EVALUATION_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }
+#[cfg(all(test, feature = "mods"))]
+pub(super) fn guest_evaluation_calls() -> u64 {
+    GUEST_EVALUATION_CALLS.with(std::cell::Cell::get)
+}
+
 fn package_hex(identity: &[u8; 32]) -> String {
     identity.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -251,7 +258,7 @@ impl Game<'_> {
     }
 
     fn tick_guest_counter_trial(&mut self, running: bool, eligible: bool, was_faulted: bool) {
-        let token = match self.world.prepare_guest_counter_phase(running, eligible) {
+        let token = match self.prepare_guest_counter_token(running, eligible) {
             Ok(Some(token)) => token,
             Ok(None) => return,
             Err(error) => {
@@ -259,13 +266,13 @@ impl Game<'_> {
                 return;
             }
         };
-        let position = token.configuration().position();
+        let position = token.phase().configuration().position();
         #[cfg(feature = "mods")]
         let (result, detail, receipt) = {
             let Backend::Guest {
                 primary_owner,
                 package_identity,
-            } = token.configuration().backend()
+            } = token.phase().configuration().backend()
             else {
                 return;
             };
@@ -280,7 +287,9 @@ impl Game<'_> {
                     None,
                 ),
                 Ok(evaluator) => {
-                    let request = counter_request(&token);
+                    let request = counter_request(token.phase());
+                    #[cfg(test)]
+                    GUEST_EVALUATION_CALLS.with(|calls| calls.set(calls.get() + 1));
                     let evaluated = evaluator.evaluate(&request);
                     let proposal = evaluated.as_ref().ok().copied().map(host_proposal);
                     let detail = evaluated.as_ref().err().map(|error| clipped_detail(error));
@@ -305,15 +314,50 @@ impl Game<'_> {
             Some("counter guest needs the mods runtime".into()),
         );
         let (ticket, storage) = self.counter_position_eligibility(position);
-        let completed = match result {
-            Ok(proposal) => {
-                self.world
-                    .commit_guest_counter_phase(token, proposal, running, ticket && storage)
+        #[cfg(feature = "mods")]
+        let result = {
+            if let Backend::Guest {
+                primary_owner,
+                package_identity,
+            } = token.phase().configuration().backend()
+                && self
+                    .mods
+                    .mods
+                    .counter_evaluator(primary_owner, package_identity)
+                    .is_err()
+            {
+                Err(GuestFailure::Unavailable)
+            } else {
+                result
             }
-            Err(failure) => {
-                self.world
-                    .fail_guest_counter_phase(token, failure, running, ticket && storage)
-            }
+        };
+        let completed = match token {
+            GuestCounterToken::Transient(token) => match result {
+                Ok(proposal) => self.world.commit_guest_counter_phase(
+                    token,
+                    proposal,
+                    running,
+                    ticket && storage,
+                ),
+                Err(failure) => {
+                    self.world
+                        .fail_guest_counter_phase(token, failure, running, ticket && storage)
+                }
+            },
+            GuestCounterToken::Persistent(token) => match result {
+                Ok(proposal) => self.world.commit_persistent_guest_counter_phase(
+                    token,
+                    proposal,
+                    running,
+                    ticket && storage,
+                ),
+                Err(failure) => self.world.fail_persistent_guest_counter_phase(
+                    token,
+                    failure,
+                    running,
+                    ticket && storage,
+                ),
+            },
         };
         log_new_guest_fault(was_faulted, &completed, detail.as_deref());
         #[cfg(feature = "mods")]
@@ -620,5 +664,98 @@ mod tests {
             "type_id": machine.id(), "schema": 1, "x": 2, "y": 70, "z": 2,
             "instance": guest.record().unwrap().instance(), "counter": 0, "game_time": -22 })
         );
+    }
+}
+
+enum GuestCounterToken {
+    Transient(horizon_client::counter_trial::PhaseToken),
+    Persistent(horizon_client::world::counter_restore::PersistentGuestPhaseToken),
+}
+impl GuestCounterToken {
+    fn phase(&self) -> &horizon_client::counter_trial::PhaseToken {
+        match self {
+            Self::Transient(token) => token,
+            Self::Persistent(token) => token.phase(),
+        }
+    }
+}
+impl Game<'_> {
+    fn prepare_guest_counter_token(
+        &mut self,
+        running: bool,
+        eligible: bool,
+    ) -> std::result::Result<Option<GuestCounterToken>, horizon_client::counter_trial::PhaseError>
+    {
+        if self.world.has_persistent_guest_counter() {
+            self.world
+                .prepare_persistent_guest_counter_phase(running, eligible)
+                .map(|token| token.map(GuestCounterToken::Persistent))
+        } else {
+            self.world
+                .prepare_guest_counter_phase(running, eligible)
+                .map(|token| token.map(GuestCounterToken::Transient))
+        }
+    }
+    #[allow(dead_code)] // Dormant explicit bootstrap, never ordinary placement.
+    pub(super) fn bootstrap_registered_guest_counter(
+        &mut self,
+        type_id: &str,
+        position: [i32; 3],
+    ) -> Result<(RuntimeCounterKey, horizon_client::world_slot_trial::SlotKey)> {
+        #[cfg(not(feature = "mods"))]
+        {
+            let _ = (type_id, position);
+            Err("persistent Guest requires the actual mod runtime".into())
+        }
+        #[cfg(feature = "mods")]
+        {
+            if self.remote.is_some()
+                || self.integrated.is_some()
+                || self.lan_acting.is_some()
+                || self.options.execution_role.is_client()
+                || self.dim != super::Dim::Overworld
+            {
+                return Err(
+                    "persistent Guest bootstrap requires authoritative initial Overworld".into(),
+                );
+            }
+            let catalog = self
+                .options
+                .mod_packages
+                .catalog()
+                .ok_or("captured Guest catalog absent")?;
+            if catalog.prepared().len() != 1 {
+                return Err("persistent Guest supports exactly one captured pair".into());
+            }
+            let prepared = catalog
+                .prepared()
+                .values()
+                .next()
+                .ok_or("captured Guest pair absent")?
+                .clone();
+            let binding = NativeBinding::from_registered_guest_prepared(
+                &prepared,
+                type_id,
+                self.pack.assets.registry,
+            )?;
+            let owner = prepared.bundle().content_owner().id.clone();
+            self.mods
+                .mods
+                .prepare_counter_evaluator(&owner, prepared.identity())?;
+            self.mods
+                .mods
+                .counter_evaluator(&owner, prepared.identity())?;
+            let target = CounterTarget::new(self.dim.id(), position)?;
+            let session = self
+                .session_lock
+                .as_mut()
+                .ok_or("identified native session absent")?;
+            let grant = session
+                .counter_bootstrap()
+                .ok_or("actual unused host bootstrap grant unavailable")?;
+            Ok(self
+                .world
+                .initialize_registered_guest_pair_from_host(&binding, &target, grant)?)
+        }
     }
 }

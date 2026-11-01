@@ -607,6 +607,59 @@ impl Trial {
     }
 }
 
+impl Trial {
+    /// Fresh persistent Guest allocation from already checked host scalar storage.
+    /// Native restoration still rejects Guest and uses its original entry point.
+    pub(crate) fn restore_persistent_guest(
+        configuration: Configuration,
+        active: Option<(u64, Option<i64>)>,
+        retired: Option<(u64, Option<i64>, RetirementReason, i64)>,
+        saved_time: i64,
+        fault: Option<Fault>,
+    ) -> Result<Self, Fault> {
+        let valid = |counter: u64, last: Option<i64>, end: i64| {
+            (counter == 0) == last.is_none() && last.is_none_or(|time| time >= 0 && time <= end)
+        };
+        if !matches!(configuration.backend(), Backend::Guest { .. })
+            || saved_time < 0
+            || active.is_some_and(|(counter, last)| !valid(counter, last, saved_time))
+            || retired.is_some_and(|(counter, last, _, time)| {
+                time < 0 || time > saved_time || !valid(counter, last, time)
+            })
+            || fault.is_some_and(|fault| {
+                !matches!(fault, Fault::GuestFailure(_) | Fault::CounterExhausted)
+            })
+            || (fault.is_some() && active.is_none())
+        {
+            return Err(Fault::PersistentDomain);
+        }
+        let count = u64::from(active.is_some()) + u64::from(retired.is_some());
+        let first = reserve_instances(&LAST_INSTANCE, count)?;
+        Ok(Self {
+            configuration: Arc::new(configuration),
+            record: active.map(|(counter, last_advanced)| Record {
+                instance: first.unwrap(),
+                counter,
+                last_advanced,
+                resident: true,
+            }),
+            last_retirement: retired.map(|(counter, last_advanced, reason, game_time)| {
+                Retirement {
+                    record: Record {
+                        instance: first.unwrap() + u64::from(active.is_some()),
+                        counter,
+                        last_advanced,
+                        resident: false,
+                    },
+                    reason,
+                    game_time,
+                }
+            }),
+            fault,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

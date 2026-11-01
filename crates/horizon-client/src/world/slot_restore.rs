@@ -100,6 +100,7 @@ pub struct SlotMetadataSnapshot {
 pub(super) type SlotDomain = SlotMetadataSnapshot;
 #[derive(Debug)]
 struct Header {
+    guest: bool,
     profile: NativeBindingProfile,
     world: WorldId,
     target: CounterTarget,
@@ -145,6 +146,9 @@ pub enum SlotFrameAllocation<'a> {
     },
 }
 impl DecodedSlotFrame {
+    pub fn is_guest(&self) -> bool {
+        self.header.guest
+    }
     pub fn binding_profile(&self) -> NativeBindingProfile {
         self.header.profile
     }
@@ -709,7 +713,14 @@ fn encode_frame(header: &Header, value: Option<ValueRef<'_>>, items: &Items) -> 
     };
     let root = Tag::compound([
         ("format", Tag::Int(1)),
-        ("kind", text(header.profile.slot_kind())),
+        (
+            "kind",
+            text(if header.guest {
+                super::counter_restore::GUEST_SLOT_KIND
+            } else {
+                header.profile.slot_kind()
+            }),
+        ),
         ("world_uuid", text(&header.world.to_string())),
         ("dimension", text(&header.target.dimension)),
         ("position", Tag::IntArray(header.target.position.to_vec())),
@@ -740,7 +751,11 @@ impl Header {
         for id in [&self.type_id, &self.block_id, &self.observed] {
             CounterTarget::new(id, [0, 0, 0]).map_err(|_| SlotRestoreError::InvalidFrame)?;
         }
-        if self.time < 0
+        if (self.guest
+            && (self.profile != NativeBindingProfile::RegisteredCube
+                || self.machine_head == 0
+                || self.slot_head == 0))
+            || self.time < 0
             || self.package.len() != 64
             || !self
                 .package
@@ -767,6 +782,12 @@ impl Header {
     }
 }
 pub fn decode_slot_frame(bytes: &[u8], items: &Items) -> Result<DecodedSlotFrame> {
+    decode_slot_profile(bytes, items, false)
+}
+pub fn decode_guest_slot_frame(bytes: &[u8], items: &Items) -> Result<DecodedSlotFrame> {
+    decode_slot_profile(bytes, items, true)
+}
+fn decode_slot_profile(bytes: &[u8], items: &Items, guest: bool) -> Result<DecodedSlotFrame> {
     preflight(bytes)?;
     let (root, used) =
         nbt::read_named(bytes, limits()).map_err(|_| SlotRestoreError::InvalidFrame)?;
@@ -795,8 +816,15 @@ pub fn decode_slot_frame(bytes: &[u8], items: &Items) -> Result<DecodedSlotFrame
             "ownership",
         ],
     )?;
-    let profile = NativeBindingProfile::from_slot_kind(&read_text(field(tag, "kind")?)?)
-        .map_err(|_| SlotRestoreError::InvalidFrame)?;
+    let kind = read_text(field(tag, "kind")?)?;
+    let profile = if guest {
+        if kind != super::counter_restore::GUEST_SLOT_KIND {
+            return Err(SlotRestoreError::InvalidFrame);
+        }
+        NativeBindingProfile::RegisteredCube
+    } else {
+        NativeBindingProfile::from_slot_kind(&kind).map_err(|_| SlotRestoreError::InvalidFrame)?
+    };
     if field(tag, "format")? != &Tag::Int(1)
         || field(tag, "save_schema")? != &Tag::Int(1)
         || read_text(field(tag, "template")?)? != "minecraft:iron_block"
@@ -819,6 +847,7 @@ pub fn decode_slot_frame(bytes: &[u8], items: &Items) -> Result<DecodedSlotFrame
         _ => return Err(SlotRestoreError::InvalidFrame),
     };
     let mut header = Header {
+        guest,
         profile,
         world: WorldId::parse(&read_text(field(tag, "world_uuid")?)?)
             .map_err(|_| SlotRestoreError::InvalidFrame)?,
@@ -1260,14 +1289,42 @@ impl World {
         items: &Items,
         expected_world: WorldId,
         target: &CounterTarget,
+        frame: DecodedSlotFrame,
+    ) -> std::result::Result<Option<SlotKey>, RejectedSlotFrame> {
+        self.restore_slot_profile(binding, items, expected_world, target, frame, false)
+    }
+    pub fn restore_guest_world_slot(
+        &mut self,
+        binding: &NativeBinding,
+        items: &Items,
+        expected_world: WorldId,
+        target: &CounterTarget,
+        frame: DecodedSlotFrame,
+    ) -> std::result::Result<Option<SlotKey>, RejectedSlotFrame> {
+        self.restore_slot_profile(binding, items, expected_world, target, frame, true)
+    }
+    fn restore_slot_profile(
+        &mut self,
+        binding: &NativeBinding,
+        items: &Items,
+        expected_world: WorldId,
+        target: &CounterTarget,
         mut frame: DecodedSlotFrame,
+        guest: bool,
     ) -> std::result::Result<Option<SlotKey>, RejectedSlotFrame> {
         let validate = || -> Result<()> {
             if self.world_slot_trial.is_some() || self.has_persistent_slot_mode() {
                 return Err(SlotRestoreError::Occupied);
             }
             frame.header.validate(frame.allocation.as_ref())?;
-            let anchor = self.validate_slot_target(binding, expected_world, target)?;
+            if frame.header.guest != guest || binding.is_guest() != guest {
+                return Err(SlotRestoreError::BindingMismatch);
+            }
+            let anchor = if guest {
+                self.validate_guest_slot_target(binding, expected_world, target)?
+            } else {
+                self.validate_slot_target(binding, expected_world, target)?
+            };
             let header = &frame.header;
             if header.world != expected_world
                 || &header.target != target
@@ -1324,23 +1381,28 @@ impl World {
                 .unwrap_or(SlotAllocation::Dormant),
         };
         let configuration = self.counter_trial.as_ref().unwrap().configuration().clone();
-        let trial =
-            match Trial::restore_checked(configuration, metadata.high_water, &mut frame.allocation)
-            {
-                Ok(trial) => Box::new(trial),
-                Err(_) => {
-                    return Err(RejectedSlotFrame {
-                        error: SlotRestoreError::GenerationExhausted,
-                        frame,
-                    });
-                }
-            };
+        let trial = match if guest {
+            Trial::restore_guest_checked(configuration, metadata.high_water, &mut frame.allocation)
+        } else {
+            Trial::restore_checked(configuration, metadata.high_water, &mut frame.allocation)
+        } {
+            Ok(trial) => Box::new(trial),
+            Err(_) => {
+                return Err(RejectedSlotFrame {
+                    error: SlotRestoreError::GenerationExhausted,
+                    frame,
+                });
+            }
+        };
         let key = trial.borrowed().active.map(|value| value.key.clone());
         self.counter_domain.as_mut().unwrap().slot = Some(metadata);
         self.world_slot_trial = Some(trial);
         Ok(key)
     }
     pub fn slot_checkpoint_bytes(&self, items: &Items, saved_game_time: i64) -> Result<Vec<u8>> {
+        if self.has_persistent_guest_counter() {
+            return Err(SlotRestoreError::BindingMismatch);
+        }
         let metadata = self
             .persistent_world_slot_metadata()
             .ok_or(SlotRestoreError::BindingMismatch)?;
@@ -1381,6 +1443,7 @@ impl World {
             return Err(SlotRestoreError::UnsupportedStack);
         }
         let header = Header {
+            guest: false,
             profile: anchor.binding.profile(),
             world: anchor.world,
             target: anchor.target.clone(),
@@ -1498,3 +1561,131 @@ impl World {
 #[cfg(test)]
 #[path = "slot_restore_tests.rs"]
 mod tests;
+
+impl World {
+    fn validate_guest_slot_target(
+        &self,
+        binding: &NativeBinding,
+        world: WorldId,
+        target: &CounterTarget,
+    ) -> Result<super::counter_restore::SlotAnchor<'_>> {
+        let anchor = self.guest_storage_anchor().map_err(native_error)?;
+        if !binding.is_guest() || anchor.world != world || anchor.target != target {
+            return Err(SlotRestoreError::IdentityMismatch);
+        }
+        if anchor.binding.package_identity() != binding.package_identity()
+            || anchor.binding.profile() != binding.profile()
+            || anchor.binding.type_id() != binding.type_id()
+            || anchor.binding.state_id() != binding.state_id()
+            || anchor.binding.guest_owner() != binding.guest_owner()
+        {
+            return Err(SlotRestoreError::BindingMismatch);
+        }
+        Ok(anchor)
+    }
+    pub(crate) fn guest_storage_slot_guard(
+        &self,
+    ) -> std::result::Result<(), world_slot_trial::Error> {
+        use world_slot_trial::{Error, Fault};
+        let anchor = self
+            .guest_storage_anchor()
+            .map_err(|_| Error::Fault(Fault::PersistentDomain))?;
+        let metadata = self
+            .persistent_world_slot_metadata()
+            .ok_or(Error::Disabled)?;
+        if metadata.status != SlotStatus::Healthy {
+            return Err(Error::Fault(Fault::PersistentDomain));
+        }
+        let trial = self.world_slot_trial.as_ref().ok_or(Error::Disabled)?;
+        let view = trial.borrowed();
+        if view.pending {
+            return Err(Error::PendingRetirement);
+        }
+        if view.fault.is_some()
+            || !trial.persistent_keys_valid()
+            || metadata.high_water != view.high_water
+            || view.configuration
+                != self
+                    .counter_trial
+                    .as_ref()
+                    .ok_or(Error::Disabled)?
+                    .configuration()
+            || !self
+                .counter_domain
+                .as_ref()
+                .ok_or(Error::Disabled)?
+                .configuration_matches(view.configuration)
+        {
+            return Err(Error::Fault(Fault::PersistentDomain));
+        }
+        match (metadata.allocation, view.active, anchor.generation) {
+            (SlotAllocation::Dormant, None, None) => Ok(()),
+            (
+                SlotAllocation::Active {
+                    slot_generation,
+                    machine_generation,
+                },
+                Some(value),
+                Some(generation),
+            ) if value.resident
+                && slot_generation > 0
+                && slot_generation <= metadata.high_water
+                && value.key.incarnation() == slot_generation
+                && generation == machine_generation =>
+            {
+                Ok(())
+            }
+            _ => Err(Error::Fault(Fault::PersistentDomain)),
+        }
+    }
+    pub fn guest_slot_checkpoint_bytes(
+        &self,
+        items: &Items,
+        saved_game_time: i64,
+    ) -> Result<Vec<u8>> {
+        self.guest_storage_slot_guard()
+            .map_err(|_| SlotRestoreError::Faulted)?;
+        if saved_game_time != self.game_time {
+            return Err(SlotRestoreError::ClockMismatch);
+        }
+        let anchor = self.guest_storage_anchor().map_err(native_error)?;
+        let metadata = self
+            .persistent_world_slot_metadata()
+            .ok_or(SlotRestoreError::BindingMismatch)?;
+        let view = self
+            .world_slot_trial
+            .as_ref()
+            .ok_or(SlotRestoreError::Detached)?
+            .borrowed();
+        let [x, y, z] = anchor.target.position;
+        let current = self
+            .chunks
+            .get(&(x >> 4, z >> 4))
+            .ok_or(SlotRestoreError::NotResident)?
+            .block(x & 15, y, z & 15);
+        let observed = anchor
+            .binding
+            .physical_state(current)
+            .ok_or(SlotRestoreError::StateMismatch)?;
+        let header = Header {
+            guest: true,
+            profile: NativeBindingProfile::RegisteredCube,
+            world: anchor.world,
+            target: anchor.target.clone(),
+            package: hex(anchor.binding.package_identity()),
+            type_id: anchor.binding.type_id().into(),
+            block_id: anchor.binding.block_id().into(),
+            observed: observed.name.clone(),
+            time: saved_game_time,
+            machine_head: anchor.high_water,
+            slot_head: metadata.high_water,
+            machine_generation: anchor.generation,
+        };
+        let value = view.active.map(|a| ValueRef {
+            generation: a.key.incarnation(),
+            revision: a.revision,
+            stack: a.stack,
+        });
+        encode_frame(&header, value, items)
+    }
+}
