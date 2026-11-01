@@ -15,6 +15,218 @@ use std::{
 
 const POSITION: [i32; 3] = [2, 70, 2];
 const TIME: i64 = 12;
+fn registered_registry() -> &'static BlockRegistry {
+    static REGISTRY: OnceLock<BlockRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(|| BlockRegistry::from_facts_json(&br#"{"defaults":{"minecraft:air":0,"minecraft:iron_block":1,"minecraft:stone":2,"slot_restore:cube":3},"states":[["air",true,false,"","minecraft:air"],["iron",false,false,"","minecraft:iron_block"],["stone",false,false,"","minecraft:stone"],["alias",false,false,"","slot_restore:cube"]]}"#[..]).unwrap())
+}
+fn registered_binding() -> NativeBinding {
+    NativeBinding::from_registered_prepared(
+        &fixture_material().2,
+        "slot_restore:type",
+        registered_registry(),
+    )
+    .unwrap()
+}
+
+#[test]
+fn registered_slot_profiles_are_explicit_and_legacy_binding_cannot_restore_them() {
+    let binding = registered_binding();
+    let mut world = bare(binding.state_id().0);
+    world
+        .initialize_counter_domain(&binding, &target())
+        .unwrap();
+    let key = world
+        .initialize_persistent_world_slot(&binding, &target())
+        .unwrap()
+        .unwrap();
+    let counter = world.counter_checkpoint_frame(TIME).unwrap();
+    let bytes = world.slot_checkpoint_bytes(fixture().1, TIME).unwrap();
+    assert_eq!(counter.kind, "native-registered-counter-checkpoint");
+    assert_eq!(counter.binding.template, "minecraft:iron_block");
+    assert_eq!(counter.observed_state.name, "slot_restore:cube");
+    let decoded = decode_slot_frame(&bytes, fixture().1).unwrap();
+    assert_eq!(
+        decoded.binding_profile(),
+        NativeBindingProfile::RegisteredCube
+    );
+    assert_eq!(decoded.view().observed_state, "slot_restore:cube");
+    let legacy = NativeBinding::from_prepared(
+        &fixture_material().2,
+        "slot_restore:type",
+        registered_registry(),
+    )
+    .unwrap();
+    let mut wrong = bare(binding.state_id().0);
+    assert_eq!(
+        wrong.restore_counter_frame(&legacy, counter.world_uuid, &target(), &counter),
+        Err(super::super::counter_restore::RestoreError::BindingMismatch)
+    );
+    assert!(wrong.counter_domain_snapshot().is_none());
+    let mut fresh = bare(binding.state_id().0);
+    fresh
+        .restore_counter_frame(&binding, counter.world_uuid, &target(), &counter)
+        .unwrap();
+    assert!(
+        fresh
+            .restore_persistent_world_slot(
+                &legacy,
+                fixture().1,
+                counter.world_uuid,
+                &target(),
+                decoded
+            )
+            .is_err()
+    );
+    assert!(fresh.world_slot_snapshot().is_none());
+    let restored = fresh
+        .restore_persistent_world_slot(
+            &binding,
+            fixture().1,
+            counter.world_uuid,
+            &target(),
+            decode_slot_frame(&bytes, fixture().1).unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+    assert_ne!(key, restored);
+    assert_eq!(
+        fresh.slot_checkpoint_bytes(fixture().1, TIME).unwrap(),
+        bytes
+    );
+}
+
+#[test]
+fn registered_dormant_air_and_iron_preserve_profile_heads_and_original_custody() {
+    for replacement in [0, 1] {
+        let binding = registered_binding();
+        let mut world = bare(binding.state_id().0);
+        let old_counter = world
+            .initialize_counter_domain(&binding, &target())
+            .unwrap();
+        let old_slot = world
+            .initialize_persistent_world_slot(&binding, &target())
+            .unwrap()
+            .unwrap();
+        world
+            .set(
+                POSITION[0],
+                POSITION[1],
+                POSITION[2],
+                BlockStateId(replacement),
+            )
+            .unwrap();
+        assert!(world.slot_checkpoint_bytes(fixture().1, TIME).is_err());
+        let owned = world
+            .take_persistent_world_slot_retirement(&old_slot)
+            .unwrap();
+        assert!(owned.into_parts().0.into_parts().1.into_stack().is_none());
+        assert!(world.reconcile_persistent_world_slot().unwrap().is_none());
+        let counter = world.counter_checkpoint_frame(TIME).unwrap();
+        let bytes = world.slot_checkpoint_bytes(fixture().1, TIME).unwrap();
+        assert_eq!(
+            counter.placement,
+            super::super::counter_restore::Placement::Dormant
+        );
+        assert_eq!(
+            counter.binding_profile().unwrap(),
+            NativeBindingProfile::RegisteredCube
+        );
+        let mut fresh = bare(replacement);
+        assert!(
+            fresh
+                .restore_counter_frame(&binding, counter.world_uuid, &target(), &counter)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            fresh
+                .restore_persistent_world_slot(
+                    &binding,
+                    fixture().1,
+                    counter.world_uuid,
+                    &target(),
+                    decode_slot_frame(&bytes, fixture().1).unwrap()
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(fresh.counter_checkpoint_frame(TIME).unwrap(), counter);
+        assert_eq!(
+            fresh.slot_checkpoint_bytes(fixture().1, TIME).unwrap(),
+            bytes
+        );
+        fresh
+            .set(POSITION[0], POSITION[1], POSITION[2], binding.state_id())
+            .unwrap();
+        let new_slot = fresh.reconcile_persistent_world_slot().unwrap().unwrap();
+        assert_eq!(new_slot.incarnation(), 2);
+        assert!(fresh.read_world_slot(&old_slot).is_err());
+        assert!(fresh.read_persistent_counter(&old_counter).is_err());
+        assert_eq!(fresh.counter_domain_snapshot().unwrap().high_water, 2);
+    }
+}
+
+#[test]
+fn registered_raw_slot_kind_profile_and_typed_fields_are_closed() {
+    // Closed raw records, independent of the production encoder's output.
+    let template = Tag::compound([
+        ("format", Tag::Int(1)),
+        ("kind", text("native-registered-slot-checkpoint")),
+        ("world_uuid", text("12345678-1234-4234-8234-123456789abc")),
+        ("dimension", text("minecraft:overworld")),
+        ("position", Tag::IntArray(POSITION.to_vec())),
+        ("package_identity", text(&"ab".repeat(32))),
+        ("type_id", text("slot_restore:type")),
+        ("save_schema", Tag::Int(1)),
+        ("block_id", text("slot_restore:cube")),
+        ("template", text("minecraft:iron_block")),
+        ("properties", Tag::compound([] as [(&str, Tag); 0])),
+        (
+            "observed_state",
+            Tag::compound([
+                ("name", text("minecraft:iron_block")),
+                ("properties", Tag::compound([] as [(&str, Tag); 0])),
+            ]),
+        ),
+        ("saved_game_time", Tag::Long(TIME)),
+        (
+            "machine_high_water",
+            Tag::ByteArray(vec![0, 0, 0, 0, 0, 0, 0, 7]),
+        ),
+        (
+            "slot_high_water",
+            Tag::ByteArray(vec![0, 0, 0, 0, 0, 0, 0, 3]),
+        ),
+        ("ownership", Tag::compound([("kind", text("dormant"))])),
+    ]);
+    assert_eq!(
+        decode_slot_frame(&raw(template.clone()), fixture().1)
+            .unwrap()
+            .binding_profile(),
+        NativeBindingProfile::RegisteredCube
+    );
+    for mode in 0..7 {
+        let mut tag = template.clone();
+        match mode {
+            0 => *tag.get_mut("kind").unwrap() = text("native-registered-slot-checkpoint-vnext"),
+            1 => *tag.get_mut("format").unwrap() = Tag::Int(2),
+            2 => *tag.get_mut("kind").unwrap() = text("native-slot-checkpoint"),
+            3 => *tag.get_mut("saved_game_time").unwrap() = Tag::Int(TIME as i32),
+            4 => {
+                *tag.get_mut("observed_state")
+                    .unwrap()
+                    .get_mut("name")
+                    .unwrap() = text("slot_restore:cube")
+            }
+            5 => *tag.get_mut("properties").unwrap() = Tag::compound([("axis", text("x"))]),
+            _ => *tag.get_mut("ownership").unwrap() = Tag::compound([("kind", text("pending"))]),
+        }
+        assert!(
+            decode_slot_frame(&raw(tag), fixture().1).is_err(),
+            "mode {mode}"
+        );
+    }
+}
 fn fixture_material() -> &'static (NativeBinding, Items, PreparedBundle) {
     static FIXTURE: OnceLock<(NativeBinding, Items, PreparedBundle)> = OnceLock::new();
     FIXTURE.get_or_init(|| {

@@ -170,8 +170,41 @@ fn valid_digest(text: &str) -> bool {
 }
 
 /// Immutable captured package and native registry descriptors, never scalar payloads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeBindingProfile {
+    LegacyIron,
+    RegisteredCube,
+}
+impl NativeBindingProfile {
+    pub fn counter_kind(self) -> &'static str {
+        match self {
+            Self::LegacyIron => "native-counter-checkpoint",
+            Self::RegisteredCube => "native-registered-counter-checkpoint",
+        }
+    }
+    pub(super) fn slot_kind(self) -> &'static str {
+        match self {
+            Self::LegacyIron => "native-slot-checkpoint",
+            Self::RegisteredCube => "native-registered-slot-checkpoint",
+        }
+    }
+    pub(super) fn from_slot_kind(kind: &str) -> Result<Self> {
+        match kind {
+            "native-slot-checkpoint" => Ok(Self::LegacyIron),
+            "native-registered-slot-checkpoint" => Ok(Self::RegisteredCube),
+            _ => Err(RestoreError::InvalidFrame),
+        }
+    }
+    pub(super) fn physical_name(self, alias: &str) -> &str {
+        match self {
+            Self::LegacyIron => "minecraft:iron_block",
+            Self::RegisteredCube => alias,
+        }
+    }
+}
 #[derive(Clone)]
 pub struct NativeBinding {
+    profile: NativeBindingProfile,
     package: [u8; 32],
     machine_type: MachineType,
     block_id: String,
@@ -183,6 +216,33 @@ impl NativeBinding {
         prepared: &PreparedBundle,
         type_id: &str,
         registry: &'static BlockRegistry,
+    ) -> Result<Self> {
+        Self::from_profile(
+            prepared,
+            type_id,
+            registry,
+            NativeBindingProfile::LegacyIron,
+        )
+    }
+    /// Captured declaration plus the actual materialized host registry. This is
+    /// a checked binding, not resource provenance or a bootstrap capability.
+    pub fn from_registered_prepared(
+        prepared: &PreparedBundle,
+        type_id: &str,
+        registry: &'static BlockRegistry,
+    ) -> Result<Self> {
+        Self::from_profile(
+            prepared,
+            type_id,
+            registry,
+            NativeBindingProfile::RegisteredCube,
+        )
+    }
+    fn from_profile(
+        prepared: &PreparedBundle,
+        type_id: &str,
+        registry: &'static BlockRegistry,
+        profile: NativeBindingProfile,
     ) -> Result<Self> {
         let owner = &prepared.bundle().content_owner().id;
         let content = prepared.content();
@@ -208,13 +268,30 @@ impl NativeBinding {
             return Err(RestoreError::BindingMismatch);
         }
         let physical = BlockState {
-            name: "minecraft:iron_block".into(),
+            name: profile.physical_name(&block.id).into(),
             properties: BTreeMap::new(),
         };
         let state_id = registry
             .id(&physical)
             .ok_or(RestoreError::BindingMismatch)?;
+        if profile == NativeBindingProfile::RegisteredCube
+            && (registry.default_state(&block.id) != Some(state_id)
+                || registry.state(state_id) != Some(&physical)
+                || registry.default_state("minecraft:air") == Some(state_id)
+                || registry.default_state("minecraft:iron_block") == Some(state_id)
+                || (0..registry.len())
+                    .filter(|&id| {
+                        registry
+                            .state(BlockStateId(id as u32))
+                            .is_some_and(|s| s.name == block.id)
+                    })
+                    .count()
+                    != 1)
+        {
+            return Err(RestoreError::BindingMismatch);
+        }
         Ok(Self {
+            profile,
             package: *prepared.identity(),
             machine_type: machine_type.clone(),
             block_id: block.id.clone(),
@@ -224,6 +301,14 @@ impl NativeBinding {
     }
     pub fn package_identity(&self) -> [u8; 32] {
         self.package
+    }
+    pub fn profile(&self) -> NativeBindingProfile {
+        self.profile
+    }
+    pub fn physical_descriptor(&self) -> &BlockState {
+        self.registry
+            .state(self.state_id)
+            .expect("checked immutable binding state")
     }
     pub fn type_id(&self) -> &str {
         self.machine_type.id()
@@ -341,7 +426,15 @@ pub struct CounterFrameV2 {
     pub last_retired: Option<RetiredFrame>,
 }
 impl CounterFrameV2 {
+    pub fn binding_profile(&self) -> Result<NativeBindingProfile> {
+        match self.kind.as_str() {
+            "native-counter-checkpoint" => Ok(NativeBindingProfile::LegacyIron),
+            "native-registered-counter-checkpoint" => Ok(NativeBindingProfile::RegisteredCube),
+            _ => Err(RestoreError::InvalidFrame),
+        }
+    }
     pub fn validate(&self) -> Result<()> {
+        let profile = self.binding_profile()?;
         CounterTarget::new(&self.dimension, self.position)?;
         let generation =
             |generation: u64| generation > 0 && generation <= self.allocation_high_water;
@@ -349,7 +442,6 @@ impl CounterFrameV2 {
             (counter == 0) == last.is_none() && last.is_none_or(|time| time >= 0 && time <= end)
         };
         if self.format != 2
-            || self.kind != "native-counter-checkpoint"
             || self.save_schema != 1
             || self.saved_game_time < 0
             || !valid_digest(&self.package_identity)
@@ -372,7 +464,7 @@ impl CounterFrameV2 {
         {
             if !generation(active)
                 || !payload(counter, last_advanced, self.saved_game_time)
-                || self.observed_state.name != self.binding.template
+                || self.observed_state.name != profile.physical_name(&self.binding.block_id)
                 || self
                     .last_retired
                     .as_ref()
@@ -380,7 +472,7 @@ impl CounterFrameV2 {
             {
                 return Err(RestoreError::InvalidFrame);
             }
-        } else if self.observed_state.name == self.binding.template {
+        } else if self.observed_state.name == profile.physical_name(&self.binding.block_id) {
             return Err(RestoreError::InvalidFrame);
         }
         if self.last_retired.as_ref().is_some_and(|retired| {
@@ -794,6 +886,7 @@ impl World {
             return Err(RestoreError::IdentityMismatch);
         }
         if frame.package_identity != digest(&binding.package)
+            || frame.binding_profile()? != binding.profile
             || frame.type_id != binding.type_id()
             || frame.binding.block_id != binding.block_id
             || frame.save_schema != binding.machine_type.save_schema()
@@ -990,7 +1083,7 @@ impl World {
         };
         let frame = CounterFrameV2 {
             format: 2,
-            kind: "native-counter-checkpoint".into(),
+            kind: domain.binding.profile.counter_kind().into(),
             world_uuid: domain.world,
             dimension: domain.target.dimension.clone(),
             position: domain.target.position,
@@ -1138,6 +1231,123 @@ mod tests {
     }
     fn write(world: &mut World, state: u32) {
         world.set(2, 70, 2, BlockStateId(state)).unwrap();
+    }
+
+    #[test]
+    fn registered_counter_closed_raw_kinds_and_physical_descriptors() {
+        let raw = serde_json::json!({
+            "format":2,"kind":"native-registered-counter-checkpoint",
+            "world_uuid":"12345678-1234-4234-8234-123456789abc",
+            "dimension":"minecraft:overworld","position":[2,70,2],
+            "allocation_high_water":7,"package_identity":"ab".repeat(32),
+            "type_id":"counter_demo:counter_type","save_schema":1,
+            "binding":{"block_id":"counter_demo:counter","template":"minecraft:iron_block","properties":{}},
+            "observed_state":{"name":"counter_demo:counter","properties":{}},
+            "saved_game_time":12,"placement":{"state":"active","generation":7,"counter":0,"last_advanced":null},
+            "last_retired":null
+        });
+        let decode = |value: &Value| CounterFrameV2::decode(&serde_json::to_vec(value).unwrap());
+        assert_eq!(
+            decode(&raw).unwrap().binding_profile().unwrap(),
+            NativeBindingProfile::RegisteredCube
+        );
+        for mode in 0..7 {
+            let mut bad = raw.clone();
+            match mode {
+                0 => bad["kind"] = "native-registered-counter-checkpoint-vnext".into(),
+                1 => bad["kind"] = "native-counter-checkpoint".into(),
+                2 => bad["format"] = 3.into(),
+                3 => bad["observed_state"]["name"] = "minecraft:iron_block".into(),
+                4 => bad["binding"]["template"] = "counter_demo:counter".into(),
+                5 => bad["binding"]["properties"] = serde_json::json!({"axis":"x"}),
+                _ => bad["placement"]["generation"] = 8.into(),
+            }
+            assert!(decode(&bad).is_err(), "mode {mode}");
+        }
+        for observed in ["minecraft:air", "minecraft:iron_block"] {
+            let mut dormant = raw.clone();
+            dormant["placement"] = serde_json::json!({"state":"dormant"});
+            dormant["observed_state"]["name"] = observed.into();
+            assert!(matches!(
+                decode(&dormant).unwrap().placement,
+                Placement::Dormant
+            ));
+        }
+    }
+
+    #[test]
+    fn registered_counter_factory_checks_default_propertyless_unique_actual_alias() {
+        let prepared = prepared_with_block(
+            br#"{"template":"minecraft:iron_block","machine-type":"counter_demo:counter_type"}"#,
+        );
+        let make = |states: Vec<serde_json::Value>, default: u32| -> &'static BlockRegistry {
+            let value = serde_json::json!({"defaults":{"minecraft:air":0,"minecraft:iron_block":1,"counter_demo:counter":default},"states":states});
+            Box::leak(Box::new(
+                BlockRegistry::from_facts_json(&serde_json::to_vec(&value).unwrap()[..]).unwrap(),
+            ))
+        };
+        let base = vec![
+            serde_json::json!(["air", true, false, "", "minecraft:air"]),
+            serde_json::json!(["iron", false, false, "", "minecraft:iron_block"]),
+        ];
+        let mut states = base.clone();
+        states.push(serde_json::json!([
+            "alias",
+            false,
+            false,
+            "",
+            "counter_demo:counter"
+        ]));
+        let registry = make(states.clone(), 2);
+        let actual = NativeBinding::from_registered_prepared(
+            &prepared,
+            "counter_demo:counter_type",
+            registry,
+        )
+        .unwrap();
+        assert_eq!(actual.state_id(), BlockStateId(2));
+        assert_eq!(actual.physical_descriptor().name, "counter_demo:counter");
+        assert_eq!(
+            NativeBinding::from_prepared(&prepared, "counter_demo:counter_type", registry)
+                .unwrap()
+                .state_id(),
+            BlockStateId(1)
+        );
+        assert!(
+            NativeBinding::from_registered_prepared(&prepared, "other:counter_type", registry)
+                .is_err()
+        );
+        assert!(
+            NativeBinding::from_registered_prepared(
+                &prepared,
+                "counter_demo:counter_type",
+                binding().registry
+            )
+            .is_err()
+        );
+        states.push(serde_json::json!(["extra",false,false,"",{"id":"counter_demo:counter","properties":{"axis":"x"}}]));
+        assert!(
+            NativeBinding::from_registered_prepared(
+                &prepared,
+                "counter_demo:counter_type",
+                make(states, 2)
+            )
+            .is_err()
+        );
+        let mut states = base;
+        states.push(serde_json::json!(["property",false,false,"",{"id":"counter_demo:counter","properties":{"axis":"x"}}]));
+        assert!(
+            NativeBinding::from_registered_prepared(
+                &prepared,
+                "counter_demo:counter_type",
+                make(states, 2)
+            )
+            .is_err()
+        );
+        for decl in [br#"{"template":"minecraft:iron_block","machine-type":"counter_demo:counter_type","properties":{"light":15}}"#.as_slice(), br#"{"template":"minecraft:iron_block","machine-type":"counter_demo:counter_type","properties":{"hardness":5.0}}"#.as_slice()] {
+            let changed = prepared_with_block(decl);
+            assert!(NativeBinding::from_registered_prepared(&changed, "counter_demo:counter_type", registry).is_err());
+        }
     }
 
     #[test]

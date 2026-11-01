@@ -10,8 +10,8 @@ use horizon_client::{
     chunk::Chunk,
     save::{self, LevelShape},
     world::counter_restore::{
-        CounterFrameV2, CounterTarget, NativeBinding, NativeRetirementReason, Placement,
-        RuntimeCounterKey, WorldId,
+        CounterFrameV2, CounterTarget, NativeBinding, NativeBindingProfile, NativeRetirementReason,
+        Placement, RuntimeCounterKey, WorldId,
     },
     world::slot_restore::{DecodedSlotFrame, SlotFrameAllocation, decode_slot_frame},
     world_slot_trial::SlotKey,
@@ -177,6 +177,19 @@ pub(in crate::game) struct RecoveryReceipt {
     pub epoch: u64,
     pub counter: RuntimeCounterKey,
     pub slot: SlotKey,
+}
+/// New registered profile; Dormant has no fabricated runtime allocation keys.
+#[derive(Clone)]
+pub(in crate::game) enum RegisteredRecoveryState {
+    Active {
+        counter: RuntimeCounterKey,
+        slot: SlotKey,
+    },
+    Dormant,
+}
+pub(in crate::game) struct RegisteredRecoveryReceipt {
+    pub epoch: u64,
+    pub state: RegisteredRecoveryState,
 }
 /// Trusted coordinator routing, not a decoded image or an expected-UUID assertion.
 pub(in crate::game) struct ManagedRecoveryRequest {
@@ -1168,11 +1181,16 @@ fn binding(game: &Game<'_>, frame: &CounterFrameV2) -> SResult<NativeBinding> {
         .next()
         .ok_or_else(|| fail("prepared machine type absent"))?;
     require(matches.next().is_none(), "ambiguous prepared machine type")?;
-    let binding = checked(NativeBinding::from_prepared(
-        prepared,
-        &frame.type_id,
-        game.pack.assets.registry,
-    ))?;
+    let binding = checked(match checked(frame.binding_profile())? {
+        NativeBindingProfile::LegacyIron => {
+            NativeBinding::from_prepared(prepared, &frame.type_id, game.pack.assets.registry)
+        }
+        NativeBindingProfile::RegisteredCube => NativeBinding::from_registered_prepared(
+            prepared,
+            &frame.type_id,
+            game.pack.assets.registry,
+        ),
+    })?;
     let package = binding
         .package_identity()
         .iter()
@@ -1182,7 +1200,6 @@ fn binding(game: &Game<'_>, frame: &CounterFrameV2) -> SResult<NativeBinding> {
         frame.package_identity == package
             && frame.type_id == binding.type_id()
             && frame.binding.block_id == binding.block_id()
-            && frame.observed_state.name == "minecraft:iron_block"
             && frame.observed_state.properties.is_empty(),
         "physical binding/package mismatch",
     )?;
@@ -1194,16 +1211,28 @@ fn correlate(
     slot: &DecodedSlotFrame,
 ) -> SResult<()> {
     checked(counter.validate())?;
-    let Placement::Active { generation, .. } = counter.placement else {
-        return Err(fail("healthy active counter required"));
-    };
+    let profile = checked(counter.binding_profile())?;
+    require(
+        slot.binding_profile() == profile,
+        "counter/slot physical profiles differ",
+    )?;
     let view = slot.view();
-    let SlotFrameAllocation::Active {
-        machine_generation, ..
-    } = view.allocation
-    else {
-        return Err(fail("healthy active slot required"));
-    };
+    match (counter.placement, &view.allocation) {
+        (
+            Placement::Active { generation, .. },
+            SlotFrameAllocation::Active {
+                machine_generation, ..
+            },
+        ) => {
+            require(
+                *machine_generation == generation,
+                "machine/slot active generation mismatch",
+            )?;
+        }
+        (Placement::Dormant, SlotFrameAllocation::Dormant)
+            if profile == NativeBindingProfile::RegisteredCube => {}
+        _ => return Err(fail("healthy paired allocation required")),
+    }
     require(
         counter
             .last_retired
@@ -1225,10 +1254,9 @@ fn correlate(
             && view.type_id == counter.type_id
             && view.block_id == counter.binding.block_id
             && view.save_schema == counter.save_schema
-            && view.observed_state == "minecraft:iron_block"
+            && view.observed_state == counter.observed_state.name
             && view.saved_game_time == counter.saved_game_time
-            && view.machine_high_water == counter.allocation_high_water
-            && machine_generation == generation,
+            && view.machine_high_water == counter.allocation_high_water,
         "slot/counter correlation",
     )
 }
@@ -1617,12 +1645,24 @@ fn verify_image(
         .get(&at)
         .ok_or_else(|| fail("target full record absent"))?;
     let binding = binding(game, &counter)?;
+    let current = target.block(
+        expected_target.position[0] & 15,
+        expected_target.position[1],
+        expected_target.position[2] & 15,
+    );
+    let actual = game
+        .pack
+        .assets
+        .registry
+        .state(current)
+        .ok_or_else(|| fail("native target registry state absent"))?;
     require(
-        target.block(
-            expected_target.position[0] & 15,
-            expected_target.position[1],
-            expected_target.position[2] & 15,
-        ) == binding.state_id(),
+        actual.name == counter.observed_state.name
+            && actual.properties == counter.observed_state.properties
+            && match counter.placement {
+                Placement::Active { .. } => current == binding.state_id(),
+                Placement::Dormant => current != binding.state_id(),
+            },
         "native physical target/frame mismatch",
     )?;
     // A checked player brand is issued only after every member, frame, native
@@ -1942,6 +1982,46 @@ impl Game<'_> {
     ) -> SResult<CheckpointReceipt> {
         self.checkpoint_session_steps(archive_root, epoch, until, |_| Ok(()))
     }
+    pub(in crate::game) fn checkpoint_registered_session(
+        &mut self,
+        archive_root: &Path,
+        epoch: u64,
+        until: Instant,
+    ) -> SResult<CheckpointReceipt> {
+        self.checkpoint_session_profile_steps(
+            NativeBindingProfile::RegisteredCube,
+            archive_root,
+            epoch,
+            until,
+            |_| Ok(()),
+        )
+    }
+    #[cfg(test)]
+    fn checkpoint_registered_session_with_test_fault(
+        &mut self,
+        archive: &Path,
+        epoch: u64,
+        until: Instant,
+        fault: CheckpointTestFault,
+    ) -> SResult<CheckpointReceipt> {
+        self.checkpoint_session_profile_steps(
+            NativeBindingProfile::RegisteredCube,
+            archive,
+            epoch,
+            until,
+            |step| {
+                if matches!(
+                    (fault, step),
+                    (CheckpointTestFault::Copied, Step::Copied)
+                        | (CheckpointTestFault::Promoted, Step::Promoted)
+                ) {
+                    Err(fail("injected registered checkpoint post-phase failure"))
+                } else {
+                    Ok(())
+                }
+            },
+        )
+    }
     #[cfg(test)]
     pub(in crate::game) fn checkpoint_session_with_test_fault(
         &mut self,
@@ -1967,6 +2047,22 @@ impl Game<'_> {
         archive_root: &Path,
         epoch: u64,
         until: Instant,
+        step: impl FnMut(Step) -> SResult<()>,
+    ) -> SResult<CheckpointReceipt> {
+        self.checkpoint_session_profile_steps(
+            NativeBindingProfile::LegacyIron,
+            archive_root,
+            epoch,
+            until,
+            step,
+        )
+    }
+    fn checkpoint_session_profile_steps(
+        &mut self,
+        profile: NativeBindingProfile,
+        archive_root: &Path,
+        epoch: u64,
+        until: Instant,
         mut step: impl FnMut(Step) -> SResult<()>,
     ) -> SResult<CheckpointReceipt> {
         let mut publication = Publication::NotPublished;
@@ -1974,6 +2070,11 @@ impl Game<'_> {
         let result = (|| {
             deadline(until)?;
             let world = self.session_context()?;
+            let frame = checked(self.world.counter_checkpoint_frame(self.world.game_time))?;
+            require(
+                checked(frame.binding_profile())? == profile,
+                "checkpoint adapter physical profile mismatch",
+            )?;
             require(epoch > 0, "zero epoch")?;
             let archive = directory(archive_root)?;
             let source = directory(&self.world_root)?;
@@ -2429,6 +2530,69 @@ impl<'a> Game<'a> {
         Ok((*game, receipt))
     }
 
+    pub(in crate::game) fn recover_managed_registered_session_checkpoint(
+        self,
+        namespace: &crate::game::world_loading::host_identity::session_authority::AuthorityNamespace,
+        request: ManagedRecoveryRequest,
+        host: LanHost,
+    ) -> SResult<(Self, RegisteredRecoveryReceipt)> {
+        deadline(request.deadline)?;
+        let mut lease = Some(checked(namespace.acquire_recovery(
+            &request.owner_root,
+            &request.archive_root,
+            &request.destination,
+        ))?);
+        let expected_world = lease.as_ref().expect("just acquired authority").world();
+        let (mut game, receipt) = self.recover_registered_session_checkpoint(
+            RecoveryRequest {
+                expected_world,
+                expected_target: request.expected_target,
+                expected_type: request.expected_type,
+                archive_root: request.archive_root,
+                destination: request.destination,
+                deadline: request.deadline,
+            },
+            host,
+        )?;
+        let session = game
+            .session_lock
+            .as_mut()
+            .ok_or_else(|| fail("missing recovered native session"))?;
+        checked(session.install_authority(&mut lease))?;
+        Ok((game, receipt))
+    }
+
+    pub(in crate::game) fn recover_registered_session_checkpoint(
+        self,
+        request: RecoveryRequest,
+        host: LanHost,
+    ) -> SResult<(Self, RegisteredRecoveryReceipt)> {
+        let mut parts = Box::new(self).prepare_registered_session_checkpoint(request)?;
+        checked(
+            parts
+                .core
+                .game
+                .install_session_checkpoint_participants(host, &parts.core.verified.players),
+        )?;
+        let (game, receipt) = parts.finish()?;
+        Ok((*game, receipt))
+    }
+
+    pub(in crate::game) fn prepare_registered_session_checkpoint(
+        self: Box<Self>,
+        request: RecoveryRequest,
+    ) -> SResult<RegisteredNativeRecoveryParts<'a>> {
+        Ok(RegisteredNativeRecoveryParts {
+            core: self.prepare_session_checkpoint_profile_steps(
+                NativeBindingProfile::RegisteredCube,
+                request,
+                |_, _| Ok(()),
+                #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+                None,
+            )?,
+        })
+    }
+
     /// Own the unpublished native candidate before admitting any transport.
     /// Participant installation and the final correlation remain separate gates.
     pub(in crate::game) fn prepare_session_checkpoint(
@@ -2452,12 +2616,44 @@ impl<'a> Game<'a> {
         )
     }
     fn prepare_session_checkpoint_steps(
+        self: Box<Self>,
+        request: RecoveryRequest,
+        before_items: impl FnOnce(&mut Game<'a>, &CheckedSessionItems) -> SResult<()>,
+        #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+        item_load_test: Option<&mut SessionItemLoadTest>,
+    ) -> SResult<NativeRecoveryParts<'a>> {
+        let core = self.prepare_session_checkpoint_profile_steps(
+            NativeBindingProfile::LegacyIron,
+            request,
+            before_items,
+            #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+            item_load_test,
+        )?;
+        let RegisteredRecoveryState::Active { counter, slot } = core.receipt.state else {
+            return Err(fail("legacy recovery requires active keys"));
+        };
+        Ok(NativeRecoveryParts {
+            game: core.game,
+            request: core.request,
+            verified: core.verified,
+            selected: core.selected,
+            clocks: core.clocks,
+            random: core.random,
+            receipt: RecoveryReceipt {
+                epoch: core.receipt.epoch,
+                counter,
+                slot,
+            },
+        })
+    }
+    fn prepare_session_checkpoint_profile_steps(
         mut self: Box<Self>,
+        profile: NativeBindingProfile,
         request: RecoveryRequest,
         before_items: impl FnOnce(&mut Game<'a>, &CheckedSessionItems) -> SResult<()>,
         #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
         mut item_load_test: Option<&mut SessionItemLoadTest>,
-    ) -> SResult<NativeRecoveryParts<'a>> {
+    ) -> SResult<PreparedSessionRecovery<'a>> {
         self.fresh_session_candidate()?;
         deadline(request.deadline)?;
         let _ = self.advancement_tree();
@@ -2489,6 +2685,10 @@ impl<'a> Game<'a> {
             request.expected_world,
             &request.expected_target,
             &request.expected_type,
+        )?;
+        require(
+            checked(verified.counter.binding_profile())? == profile,
+            "recovery adapter physical profile mismatch",
         )?;
         let mut centers = player_centers(verified.players.rows(), &request.expected_target)?;
         let coverage = required_coverage(&centers)?;
@@ -2675,8 +2875,7 @@ impl<'a> Game<'a> {
             request.expected_world,
             &request.expected_target,
             &verified.counter,
-        ))?
-        .ok_or_else(|| fail("restored active counter key absent"))?;
+        ))?;
         let slot = prepared
             .world
             .restore_persistent_world_slot(
@@ -2686,8 +2885,14 @@ impl<'a> Game<'a> {
                 &request.expected_target,
                 verified.slot,
             )
-            .map_err(|e| fail(e.error))?
-            .ok_or_else(|| fail("restored active slot key absent"))?;
+            .map_err(|e| fail(e.error))?;
+        let state = match (counter, slot) {
+            (Some(counter), Some(slot)) => RegisteredRecoveryState::Active { counter, slot },
+            (None, None) if profile == NativeBindingProfile::RegisteredCube => {
+                RegisteredRecoveryState::Dormant
+            }
+            _ => return Err(fail("restored counter/slot allocation mismatch")),
+        };
         checked(self.finish_open_world(prepared))?;
         let random = self.world.random.state();
         require(
@@ -2704,7 +2909,7 @@ impl<'a> Game<'a> {
         // Opening resets progress and starts a fresh native tree prefetch.
         // Finish it before player restoration and its strict JSON re-projection.
         let _ = self.advancement_tree();
-        Ok(NativeRecoveryParts {
+        Ok(PreparedSessionRecovery {
             game: self,
             request,
             verified: NativeRecoveryImage {
@@ -2717,11 +2922,7 @@ impl<'a> Game<'a> {
             selected,
             clocks,
             random: recovery_random,
-            receipt: RecoveryReceipt {
-                epoch,
-                counter,
-                slot,
-            },
+            receipt: RegisteredRecoveryReceipt { epoch, state },
         })
     }
 }
@@ -2733,6 +2934,94 @@ struct NativeRecoveryImage {
     players: CheckedSessionPlayers,
     raids: Option<Tag>,
     items: CheckedSessionItems,
+}
+/// Shared concrete ownership only; legacy adapters keep their existing fields.
+struct PreparedSessionRecovery<'a> {
+    game: Box<Game<'a>>,
+    request: RecoveryRequest,
+    verified: NativeRecoveryImage,
+    selected: PathBuf,
+    clocks: (i64, i64),
+    random: u64,
+    receipt: RegisteredRecoveryReceipt,
+}
+pub(in crate::game) struct RegisteredNativeRecoveryParts<'a> {
+    core: PreparedSessionRecovery<'a>,
+}
+impl<'a> RegisteredNativeRecoveryParts<'a> {
+    pub(in crate::game) fn runtime_state(&self) -> RegisteredRecoveryState {
+        self.core.receipt.state.clone()
+    }
+    pub(in crate::game) fn validate_runtime_keys(&self) -> SResult<()> {
+        match &self.core.receipt.state {
+            RegisteredRecoveryState::Active { counter, slot } => {
+                checked(self.core.game.world.read_persistent_counter(counter))?;
+                self.core
+                    .game
+                    .world
+                    .read_world_slot(slot)
+                    .map_err(|e| fail(format!("{e:?}")))?;
+            }
+            RegisteredRecoveryState::Dormant => {
+                require(
+                    checked(self.core.game.world.persistent_counter_key())?.is_none(),
+                    "dormant counter allocated",
+                )?;
+                let slot = checked(decode_slot_frame(
+                    &checked(self.core.game.world.slot_checkpoint_bytes(
+                        self.core.game.res.items(),
+                        self.core.game.world.game_time,
+                    ))?,
+                    self.core.game.res.items(),
+                ))?;
+                require(
+                    matches!(slot.view().allocation, SlotFrameAllocation::Dormant),
+                    "dormant slot allocated",
+                )?;
+            }
+        }
+        Ok(())
+    }
+    pub(in crate::game) fn game_mut(&mut self) -> &mut Game<'a> {
+        &mut self.core.game
+    }
+    pub(in crate::game) fn players(&self) -> &CheckedSessionPlayers {
+        &self.core.verified.players
+    }
+    pub(in crate::game) fn game_and_players(&mut self) -> (&mut Game<'a>, &CheckedSessionPlayers) {
+        (&mut self.core.game, &self.core.verified.players)
+    }
+    pub(in crate::game) fn install_authority(
+        &mut self,
+        lease: &mut Option<
+            crate::game::world_loading::host_identity::session_authority::WorldAuthority,
+        >,
+    ) -> SResult<()> {
+        checked(
+            self.core
+                .game
+                .session_lock
+                .as_mut()
+                .ok_or_else(|| fail("missing recovered native session"))?
+                .install_authority(lease),
+        )
+    }
+    pub(in crate::game) fn verify_final(&mut self) -> SResult<()> {
+        self.validate_runtime_keys()?;
+        let core = &mut self.core;
+        verify_recovery_final(
+            &mut core.game,
+            &core.request,
+            &core.verified,
+            &core.selected,
+            core.clocks,
+            core.random,
+        )
+    }
+    pub(in crate::game) fn finish(mut self) -> SResult<(Box<Game<'a>>, RegisteredRecoveryReceipt)> {
+        self.verify_final()?;
+        Ok((self.core.game, self.core.receipt))
+    }
 }
 pub(in crate::game) struct NativeRecoveryParts<'a> {
     game: Box<Game<'a>>,
@@ -2794,40 +3083,50 @@ impl<'a> NativeRecoveryParts<'a> {
             random,
             ..
         } = self;
-        game.session_fence(request.deadline)?;
-        require(
-            (game.world.game_time, game.world.day_time) == *clocks,
-            "recovery advanced native clocks",
-        )?;
-        require(
-            game.world.random.state() == *random,
-            "recovery drew from world random",
-        )?;
-        let snapshot = game.session_snapshot()?;
-        require(
-            snapshot.counter == verified.counter
-                && same_players(&snapshot.players, verified.players.rows())
-                && snapshot.raids == verified.raids
-                && snapshot.items == verified.items.projection
-                && raid_metadata(&game.world_root)? == verified.raids,
-            "final restored counter/player mismatch",
-        )?;
-        let recovered_slot = checked(decode_slot_frame(&snapshot.slot, game.res.items()))?;
-        correlate(&verified.manifest, &snapshot.counter, &recovered_slot)?;
-        // The slot bytes are deterministic current-schema output; compare the
-        // original member rather than permitting a new revision/default value.
-        require(
-            snapshot.slot == read(&selected.join(SLOT), STRUCTURED_LIMIT)?,
-            "final restored slot mismatch",
-        )?;
-        require(
-            game.session_context()? == request.expected_world,
-            "final native origin/identity",
-        )?;
-        checked(game.inspect_session_checkpoint_owners())?;
-        deadline(request.deadline)?;
-        Ok(())
+        verify_recovery_final(game, request, verified, selected, *clocks, *random)
     }
+}
+fn verify_recovery_final(
+    game: &mut Game<'_>,
+    request: &RecoveryRequest,
+    verified: &NativeRecoveryImage,
+    selected: &Path,
+    clocks: (i64, i64),
+    random: u64,
+) -> SResult<()> {
+    game.session_fence(request.deadline)?;
+    require(
+        (game.world.game_time, game.world.day_time) == clocks,
+        "recovery advanced native clocks",
+    )?;
+    require(
+        game.world.random.state() == random,
+        "recovery drew from world random",
+    )?;
+    let snapshot = game.session_snapshot()?;
+    require(
+        snapshot.counter == verified.counter
+            && same_players(&snapshot.players, verified.players.rows())
+            && snapshot.raids == verified.raids
+            && snapshot.items == verified.items.projection
+            && raid_metadata(&game.world_root)? == verified.raids,
+        "final restored counter/player mismatch",
+    )?;
+    let recovered_slot = checked(decode_slot_frame(&snapshot.slot, game.res.items()))?;
+    correlate(&verified.manifest, &snapshot.counter, &recovered_slot)?;
+    // The slot bytes are deterministic current-schema output; compare the
+    // original member rather than permitting a new revision/default value.
+    require(
+        snapshot.slot == read(&selected.join(SLOT), STRUCTURED_LIMIT)?,
+        "final restored slot mismatch",
+    )?;
+    require(
+        game.session_context()? == request.expected_world,
+        "final native origin/identity",
+    )?;
+    checked(game.inspect_session_checkpoint_owners())?;
+    deadline(request.deadline)?;
+    Ok(())
 }
 
 #[cfg(all(test, feature = "paired-packages", target_os = "linux"))]

@@ -162,6 +162,25 @@ impl Game<'_> {
         type_id: &str,
         position: [i32; 3],
     ) -> Result<RuntimeCounterKey> {
+        self.bootstrap_host_counter_profile(type_id, position, false)
+    }
+
+    /// Explicit registered physical binding only. No placement/Running caller.
+    #[allow(dead_code)]
+    pub(super) fn bootstrap_registered_host_counter(
+        &mut self,
+        type_id: &str,
+        position: [i32; 3],
+    ) -> Result<RuntimeCounterKey> {
+        self.bootstrap_host_counter_profile(type_id, position, true)
+    }
+
+    fn bootstrap_host_counter_profile(
+        &mut self,
+        type_id: &str,
+        position: [i32; 3],
+        registered: bool,
+    ) -> Result<RuntimeCounterKey> {
         if self.remote.is_some()
             || self.integrated.is_some()
             || self.lan_acting.is_some()
@@ -186,7 +205,11 @@ impl Game<'_> {
         if selected.next().is_some() {
             return Err("host counter bootstrap type has multiple owners".into());
         }
-        let binding = NativeBinding::from_prepared(prepared, type_id, self.pack.assets.registry)?;
+        let binding = if registered {
+            NativeBinding::from_registered_prepared(prepared, type_id, self.pack.assets.registry)?
+        } else {
+            NativeBinding::from_prepared(prepared, type_id, self.pack.assets.registry)?
+        };
         let target = CounterTarget::new(self.dim.id(), position)?;
         let session = self
             .session_lock

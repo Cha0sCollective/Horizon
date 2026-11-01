@@ -1,7 +1,7 @@
 //! Bounded native library slot install. No epoch, Game admission or item codec migration.
 use super::{
     World,
-    counter_restore::{CounterTarget, NativeBinding, WorldId},
+    counter_restore::{CounterTarget, NativeBinding, NativeBindingProfile, WorldId},
 };
 use crate::{
     items::{ItemStack, Items},
@@ -100,6 +100,7 @@ pub struct SlotMetadataSnapshot {
 pub(super) type SlotDomain = SlotMetadataSnapshot;
 #[derive(Debug)]
 struct Header {
+    profile: NativeBindingProfile,
     world: WorldId,
     target: CounterTarget,
     package: String,
@@ -144,6 +145,9 @@ pub enum SlotFrameAllocation<'a> {
     },
 }
 impl DecodedSlotFrame {
+    pub fn binding_profile(&self) -> NativeBindingProfile {
+        self.header.profile
+    }
     pub fn view(&self) -> SlotFrameView<'_> {
         let allocation = match self.allocation.as_ref() {
             Some(value) => SlotFrameAllocation::Active {
@@ -705,7 +709,7 @@ fn encode_frame(header: &Header, value: Option<ValueRef<'_>>, items: &Items) -> 
     };
     let root = Tag::compound([
         ("format", Tag::Int(1)),
-        ("kind", text("native-slot-checkpoint")),
+        ("kind", text(header.profile.slot_kind())),
         ("world_uuid", text(&header.world.to_string())),
         ("dimension", text(&header.target.dimension)),
         ("position", Tag::IntArray(header.target.position.to_vec())),
@@ -753,11 +757,11 @@ impl Header {
                     && value.generation <= self.slot_head
                     && machine > 0
                     && machine <= self.machine_head
-                    && self.observed == "minecraft:iron_block" =>
+                    && self.observed == self.profile.physical_name(&self.block_id) =>
             {
                 Ok(())
             }
-            (None, None) if self.observed != "minecraft:iron_block" => Ok(()),
+            (None, None) if self.observed != self.profile.physical_name(&self.block_id) => Ok(()),
             _ => Err(SlotRestoreError::InvalidFrame),
         }
     }
@@ -791,8 +795,9 @@ pub fn decode_slot_frame(bytes: &[u8], items: &Items) -> Result<DecodedSlotFrame
             "ownership",
         ],
     )?;
+    let profile = NativeBindingProfile::from_slot_kind(&read_text(field(tag, "kind")?)?)
+        .map_err(|_| SlotRestoreError::InvalidFrame)?;
     if field(tag, "format")? != &Tag::Int(1)
-        || read_text(field(tag, "kind")?)? != "native-slot-checkpoint"
         || field(tag, "save_schema")? != &Tag::Int(1)
         || read_text(field(tag, "template")?)? != "minecraft:iron_block"
     {
@@ -814,6 +819,7 @@ pub fn decode_slot_frame(bytes: &[u8], items: &Items) -> Result<DecodedSlotFrame
         _ => return Err(SlotRestoreError::InvalidFrame),
     };
     let mut header = Header {
+        profile,
         world: WorldId::parse(&read_text(field(tag, "world_uuid")?)?)
             .map_err(|_| SlotRestoreError::InvalidFrame)?,
         target: CounterTarget::new(&read_text(field(tag, "dimension")?)?, position)
@@ -1051,6 +1057,7 @@ impl World {
             return Err(SlotRestoreError::IdentityMismatch);
         }
         if anchor.binding.package_identity() != binding.package_identity()
+            || anchor.binding.profile() != binding.profile()
             || anchor.binding.type_id() != binding.type_id()
             || anchor.binding.block_id() != binding.block_id()
             || anchor.binding.state_id() != binding.state_id()
@@ -1270,6 +1277,7 @@ impl World {
                 return Err(SlotRestoreError::IdentityMismatch);
             }
             if header.package != hex(binding.package_identity())
+                || header.profile != binding.profile()
                 || header.type_id != binding.type_id()
                 || header.block_id != binding.block_id()
             {
@@ -1373,6 +1381,7 @@ impl World {
             return Err(SlotRestoreError::UnsupportedStack);
         }
         let header = Header {
+            profile: anchor.binding.profile(),
             world: anchor.world,
             target: anchor.target.clone(),
             package: hex(anchor.binding.package_identity()),

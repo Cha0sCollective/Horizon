@@ -29,6 +29,8 @@ const WAIT: Duration = Duration::from_secs(120);
 const POSITION: [i32; 3] = [2, 120, 2];
 const OWNER: u128 = 0x55;
 const EXTERNAL: u128 = 0x66;
+#[path = "session_checkpoint_registered_tests.rs"]
+mod registered;
 
 #[test]
 #[ignore = "isolated pinned resources + prebuilt pair: managed new Game holds UUID authority"]
@@ -449,6 +451,16 @@ fn fresh_with_role(fixture: &Fixture, role: ExecutionRole) -> Game<'_> {
     let mut settings = template.settings.clone();
     settings.render_distance = 2;
     settings.simulation_distance = 2;
+    let pack = template.pack.clone();
+    drop(template);
+    fresh_with_resources(resources, pack, options, settings)
+}
+fn fresh_with_resources<'a>(
+    resources: &'a Arc<crate::game::Resources>,
+    pack: crate::game::PackResources,
+    options: crate::game::Options,
+    settings: horizon_client::settings::Settings,
+) -> Game<'a> {
     let gui = crate::game::UiResources {
         atlas: horizon_client::hud::HudAtlas::fonts(&options.resources).unwrap(),
         panorama: Arc::new(horizon_client::gfx::panorama::Faces {
@@ -457,17 +469,7 @@ fn fresh_with_role(fixture: &Fixture, role: ExecutionRole) -> Game<'_> {
         }),
     };
     let audio = horizon_client::audio::Audio::silent(&options.resources);
-    let mut game = Game::new(
-        resources,
-        template.pack.clone(),
-        gui,
-        options,
-        settings,
-        audio,
-        None,
-    )
-    .unwrap();
-    drop(template);
+    let mut game = Game::new(resources, pack, gui, options, settings, audio, None).unwrap();
     game.start_mods();
     game.session_running_packages().unwrap();
     let _ = game.advancement_tree();
@@ -763,7 +765,7 @@ struct Session<'a> {
     receivers: Vec<mpsc::Receiver<Out>>,
 }
 fn session<'a>(fixture: &'a Fixture, label: &str, radius: i32, owner: bool) -> Session<'a> {
-    let mut game = fresh_with_role(
+    let game = fresh_with_role(
         fixture,
         if owner {
             ExecutionRole::IntegratedServer
@@ -777,6 +779,16 @@ fn session<'a>(fixture: &'a Fixture, label: &str, radius: i32, owner: bool) -> S
         .parent()
         .unwrap()
         .join(format!("native-{label}"));
+    session_with_game(game, root, label, radius, owner, false)
+}
+fn session_with_game<'a>(
+    mut game: Game<'a>,
+    root: PathBuf,
+    label: &str,
+    radius: i32,
+    owner: bool,
+    registered: bool,
+) -> Session<'a> {
     open_native(&mut game, &root);
     residency(&mut game, radius, (0, 0));
     let catalog = game.options.mod_packages.catalog().unwrap();
@@ -793,12 +805,21 @@ fn session<'a>(fixture: &'a Fixture, label: &str, radius: i32, owner: bool) -> S
         .next()
         .unwrap();
     let type_id = ty.to_owned();
-    let binding =
-        NativeBinding::from_prepared(prepared, &type_id, game.pack.assets.registry).unwrap();
+    let binding = if registered {
+        NativeBinding::from_registered_prepared(prepared, &type_id, game.pack.assets.registry)
+            .unwrap()
+    } else {
+        NativeBinding::from_prepared(prepared, &type_id, game.pack.assets.registry).unwrap()
+    };
     game.world
         .set(POSITION[0], POSITION[1], POSITION[2], binding.state_id())
         .unwrap();
-    let counter = game.bootstrap_host_counter(&type_id, POSITION).unwrap();
+    let counter = if registered {
+        game.bootstrap_registered_host_counter(&type_id, POSITION)
+            .unwrap()
+    } else {
+        game.bootstrap_host_counter(&type_id, POSITION).unwrap()
+    };
     let target = CounterTarget::new(Dim::Overworld.id(), POSITION).unwrap();
     let slot = game
         .world
