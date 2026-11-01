@@ -2037,6 +2037,8 @@ pub struct SaveDir {
     pending: Arc<PendingWrites>,
     sequence: AtomicU64,
     writer: Mutex<Option<Writer>>,
+    #[cfg(feature = "paired-packages")]
+    retained: Option<retained_writer::State>,
     outstanding: Arc<Outstanding>,
     /// Set by `Persistent` before the first load.
     pub tables: OnceLock<Arc<SaveTables>>,
@@ -2059,6 +2061,8 @@ impl SaveDir {
             pending: Default::default(),
             sequence: AtomicU64::new(0),
             writer: Mutex::new(None),
+            #[cfg(feature = "paired-packages")]
+            retained: None,
             outstanding: Default::default(),
             tables: OnceLock::new(),
             shape,
@@ -2191,6 +2195,10 @@ impl SaveDir {
         self.queue(Folder::of(folder), records, wait)
     }
     fn queue(&self, folder: Folder, records: Vec<((i32, i32), Record)>, wait: bool) -> Result<()> {
+        #[cfg(feature = "paired-packages")]
+        if self.retained.is_some() {
+            return self.queue_retained(folder, records, wait);
+        }
         if !records.is_empty() {
             let mut batch = Vec::with_capacity(records.len());
             {
@@ -2523,9 +2531,2837 @@ impl SaveDir {
     }
 }
 
+/// Opt-in native writer ownership. No ordinary world caller selects this service.
+#[cfg(feature = "paired-packages")]
+pub use retained_writer::{NativeWriterClose, NativeWriterClosed, RetainedWriterStatus};
+
+#[cfg(feature = "paired-packages")]
+mod retained_writer {
+    use super::*;
+    use std::{
+        sync::{MutexGuard, TryLockError, Weak},
+        time::Instant,
+    };
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum RetainedWriterStatus {
+        Pending,
+        Blocked(String),
+        Complete,
+    }
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Phase {
+        Open,
+        Sealed,
+        Closed,
+    }
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Disposition {
+        Queued,
+        Completed,
+        Unsent,
+    }
+    type Address = (Folder, i32, i32, u64);
+    struct Fact {
+        epoch: u64,
+        disposition: Disposition,
+        accepted: HashSet<Address>,
+        written: HashSet<Address>,
+        failure_generation: Option<u64>,
+    }
+    #[derive(Clone, Copy)]
+    struct ErrorWitness {
+        generation: u64,
+        batch: u64,
+        epoch: u64,
+        unsent: bool,
+    }
+    #[derive(Clone, Copy)]
+    struct Receipt {
+        batch: u64,
+        epoch: u64,
+    }
+    struct Latest {
+        seq: u64,
+        accepted: u64,
+        owner: Option<Record>,
+        receipt: Option<Receipt>,
+    }
+    #[derive(Clone, Copy, Default, PartialEq, Eq)]
+    struct Verification {
+        accepted: u64,
+        completed: u64,
+        unsent: u64,
+        version: u64,
+        error_generation: u64,
+        latest: usize,
+        pending: usize,
+        unsettled: usize,
+    }
+    impl Verification {
+        fn capture(ledger: &Ledger, pending: usize) -> Self {
+            Self {
+                accepted: ledger.accepted,
+                completed: ledger.completed,
+                unsent: ledger.unsent,
+                version: ledger.version,
+                error_generation: ledger.error_generation,
+                latest: ledger.expected.len(),
+                pending,
+                unsettled: ledger.unsettled,
+            }
+        }
+    }
+    struct Batch {
+        id: u64,
+        epoch: u64,
+        folder: Folder,
+        records: Vec<((i32, i32), Record, u64)>,
+    }
+    struct OpenWriter {
+        send: mpsc::Sender<Batch>,
+        thread: std::thread::JoinHandle<()>,
+    }
+    struct Admission {
+        phase: Phase,
+        owner: Weak<()>,
+        writer: Option<OpenWriter>,
+    }
+    #[derive(Default)]
+    struct Ledger {
+        next: u64,
+        epoch: u64,
+        accepted: u64,
+        completed: u64,
+        unsent: u64,
+        facts: HashMap<u64, Fact>,
+        unsent_batches: Vec<Batch>,
+        expected: HashMap<(Folder, i32, i32), Latest>,
+        unsettled: usize,
+        version: u64,
+        verified: Option<Verification>,
+        poisoned_files: Vec<Arc<Mutex<RegionFile>>>,
+        history: Vec<String>,
+        error: Option<String>,
+        error_generation: u64,
+        error_witness: Option<ErrorWitness>,
+        error_corrupt: bool,
+        fault: Option<String>,
+        retry_success: Option<u64>,
+    }
+    pub(super) struct State {
+        admission: Mutex<Admission>,
+        ledger: Arc<Mutex<Ledger>>,
+        #[cfg(test)]
+        fail_spawn: std::sync::atomic::AtomicBool,
+        #[cfg(test)]
+        stop_receiver: std::sync::atomic::AtomicBool,
+        #[cfg(test)]
+        after_region: Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
+        #[cfg(test)]
+        before_io: Arc<Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>>,
+    }
+    impl State {
+        fn new() -> Self {
+            Self {
+                admission: Mutex::new(Admission {
+                    phase: Phase::Open,
+                    owner: Weak::new(),
+                    writer: None,
+                }),
+                ledger: Arc::new(Mutex::new(Ledger {
+                    verified: Some(Verification::default()),
+                    ..Ledger::default()
+                })),
+                #[cfg(test)]
+                fail_spawn: std::sync::atomic::AtomicBool::new(false),
+                #[cfg(test)]
+                stop_receiver: std::sync::atomic::AtomicBool::new(false),
+                #[cfg(test)]
+                after_region: Mutex::new(None),
+                #[cfg(test)]
+                before_io: Arc::default(),
+            }
+        }
+        pub(super) fn require_closed_before_drop(&mut self) {
+            if !matches!(self.admission.get_mut(), Ok(a) if a.phase == Phase::Closed && a.writer.is_none())
+            {
+                fatal("retained SaveDir relinquished before explicit writer close");
+            }
+        }
+    }
+    fn fatal(message: &str) -> ! {
+        eprintln!("HORIZON_RETAINED_WRITER_FATAL: {message}");
+        std::process::abort()
+    }
+    fn nonwaiting<T>(lock: &Mutex<T>) -> std::result::Result<Option<MutexGuard<'_, T>>, String> {
+        match lock.try_lock() {
+            Ok(value) => Ok(Some(value)),
+            Err(TryLockError::WouldBlock) => Ok(None),
+            Err(TryLockError::Poisoned(_)) => Err("retained writer lock poisoned".into()),
+        }
+    }
+    #[must_use = "poll and explicitly finish the original native writer owner"]
+    pub struct NativeWriterClose {
+        save: Option<Arc<SaveDir>>,
+        identity: Arc<()>,
+        thread: Option<std::thread::JoinHandle<()>>,
+        deadline: Instant,
+        status: RetainedWriterStatus,
+        epoch: u64,
+        fault: Option<String>,
+        armed: bool,
+    }
+    impl Drop for NativeWriterClose {
+        fn drop(&mut self) {
+            // Drop runs BEFORE fields: an unfinished JoinHandle can never detach here.
+            if self.armed {
+                fatal("unresolved native writer close owner relinquished");
+            }
+        }
+    }
+    #[must_use = "retain the exact closed native writer allocation until its caller is done"]
+    pub struct NativeWriterClosed {
+        save: Arc<SaveDir>,
+        _identity: Arc<()>,
+    }
+    impl std::fmt::Debug for NativeWriterClose {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("NativeWriterClose")
+                .field("status", &self.status)
+                .field("epoch", &self.epoch)
+                .field(
+                    "thread_finished",
+                    &self.thread.as_ref().map(|t| t.is_finished()),
+                )
+                .finish_non_exhaustive()
+        }
+    }
+    impl std::fmt::Debug for NativeWriterClosed {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("NativeWriterClosed")
+                .field("allocation", &Arc::as_ptr(&self.save))
+                .finish_non_exhaustive()
+        }
+    }
+    impl NativeWriterClosed {
+        pub fn save(&self) -> &Arc<SaveDir> {
+            &self.save
+        }
+    }
+    impl SaveDir {
+        #[must_use = "this native owner requires explicit retained writer close even when no writes were submitted"]
+        pub fn new_retained(root: PathBuf) -> Self {
+            let mut save = Self::new(root);
+            save.retained = Some(State::new());
+            save
+        }
+        /// Busy acquires no owner and changes no admission state.
+        pub fn begin_retained_writer_close(
+            self: &Arc<Self>,
+            deadline: Instant,
+        ) -> Result<Option<NativeWriterClose>> {
+            let state = self
+                .retained
+                .as_ref()
+                .ok_or("SaveDir was not constructed retained")?;
+            let Some(mut admission) = nonwaiting(&state.admission)? else {
+                return Ok(None);
+            };
+            if admission.phase != Phase::Open {
+                return Err("retained writer admission already sealed".into());
+            }
+            let identity = Arc::new(());
+            admission.phase = Phase::Sealed;
+            admission.owner = Arc::downgrade(&identity);
+            let thread = admission.writer.take().map(|writer| {
+                drop(writer.send);
+                writer.thread
+            });
+            Ok(Some(NativeWriterClose {
+                save: Some(self.clone()),
+                identity,
+                thread,
+                deadline,
+                status: RetainedWriterStatus::Pending,
+                epoch: 0,
+                fault: None,
+                armed: true,
+            }))
+        }
+        pub(super) fn queue_retained(
+            &self,
+            folder: Folder,
+            records: Vec<((i32, i32), Record)>,
+            wait: bool,
+        ) -> Result<()> {
+            let state = self.retained.as_ref().expect("retained dispatch");
+            // All producer publication is serialized with seal. The worker never takes admission.
+            let mut admission = state
+                .admission
+                .lock()
+                .map_err(|_| "retained admission poisoned")?;
+            if admission.phase != Phase::Open {
+                return Err("retained writer admission sealed".into());
+            }
+            if records.is_empty() {
+                drop(admission);
+                return if wait { self.flush() } else { Ok(()) };
+            }
+            let mut pending = self.pending.lock().map_err(|_| "pending writes poisoned")?;
+            let mut count = self
+                .outstanding
+                .count
+                .lock()
+                .map_err(|_| "writer count poisoned")?;
+            let mut ledger = state.ledger.lock().map_err(|_| "writer ledger poisoned")?;
+            let mut current_error = self
+                .outstanding
+                .error
+                .lock()
+                .map_err(|_| "writer error poisoned")?;
+            if !check_error(&mut ledger, &current_error) {
+                return Err("native enqueue found an uncorrelated error cell".into());
+            }
+            if ledger.fault.is_some() {
+                return Err("retained writer has an ownership fault".into());
+            }
+            let previous_valid = records.iter().all(|(key, _)| {
+                let address = (folder, key.0, key.1);
+                match ledger.expected.get(&address) {
+                    Some(row) => {
+                        Context::accepted_owner(&ledger, address, row)
+                            && match &row.owner {
+                                Some(original) => {
+                                    row.receipt.is_none()
+                                        && pending.get(&address).is_some_and(|(seq, value)| {
+                                            *seq == row.seq && same_record_owner(original, value)
+                                        })
+                                }
+                                None => {
+                                    !pending.contains_key(&address)
+                                        && Context::durable(&ledger, address, row, false)
+                                }
+                            }
+                    }
+                    None => !pending.contains_key(&address),
+                }
+            });
+            if !previous_valid {
+                ledger.fault =
+                    Some("native previous latest owner/receipt mismatch before enqueue".into());
+                return Err("native enqueue cannot supersede an uncorrelated owner".into());
+            }
+            let len = u64::try_from(records.len()).map_err(|_| "record count overflow")?;
+            let first = self.sequence.load(Ordering::Relaxed);
+            let next = first.checked_add(len).ok_or("record sequence exhausted")?;
+            let id = ledger.next;
+            let next_id = id.checked_add(1).ok_or("writer batch identity exhausted")?;
+            let accepted = ledger
+                .accepted
+                .checked_add(1)
+                .ok_or("accepted batch count exhausted")?;
+            let outstanding = count
+                .checked_add(1)
+                .ok_or("outstanding batch count exhausted")?;
+            ledger
+                .facts
+                .try_reserve(1)
+                .map_err(|_| "writer fact allocation refused")?;
+            ledger
+                .unsent_batches
+                .try_reserve(1)
+                .map_err(|_| "writer unsent allocation refused")?;
+            pending
+                .try_reserve(records.len())
+                .map_err(|_| "pending allocation refused")?;
+            ledger
+                .expected
+                .try_reserve(records.len())
+                .map_err(|_| "record proof allocation refused")?;
+            let version = ledger
+                .version
+                .checked_add(1)
+                .ok_or("native record verification version exhausted")?;
+            let mut accepted_records = HashSet::new();
+            accepted_records
+                .try_reserve(records.len())
+                .map_err(|_| "native accepted receipt allocation refused")?;
+            let additions = records
+                .iter()
+                .map(|(key, _)| *key)
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .filter(|key| {
+                    ledger
+                        .expected
+                        .get(&(folder, key.0, key.1))
+                        .is_none_or(|row| row.owner.is_none())
+                })
+                .count();
+            let unsettled = ledger
+                .unsettled
+                .checked_add(additions)
+                .ok_or("native latest owner count exhausted")?;
+            let mut batch_records = Vec::new();
+            batch_records
+                .try_reserve(records.len())
+                .map_err(|_| "batch allocation refused")?;
+            for (offset, (key, record)) in records.into_iter().enumerate() {
+                let seq = first + offset as u64;
+                accepted_records.insert((folder, key.0, key.1, seq));
+                batch_records.push((key, record, seq));
+            }
+            let spawned = if admission.writer.is_none() {
+                Some(self.spawn_retained_open())
+            } else {
+                None
+            };
+            // Publish accepted native snapshots, including a proved never-enqueued spawn failure.
+            for (key, record, seq) in &batch_records {
+                pending.insert((folder, key.0, key.1), (*seq, record.clone()));
+                let previous = ledger.expected.insert(
+                    (folder, key.0, key.1),
+                    Latest {
+                        seq: *seq,
+                        accepted: id,
+                        owner: Some(record.clone()),
+                        receipt: None,
+                    },
+                );
+                if let Some(previous) = previous {
+                    if ledger
+                        .facts
+                        .get(&previous.accepted)
+                        .is_some_and(|fact| fact.disposition != Disposition::Queued)
+                    {
+                        prune_fact(&mut ledger, previous.accepted);
+                    }
+                    if let Some(receipt) = previous.receipt
+                        && ledger
+                            .facts
+                            .get(&receipt.batch)
+                            .is_some_and(|fact| fact.disposition != Disposition::Queued)
+                    {
+                        prune_fact(&mut ledger, receipt.batch);
+                    }
+                }
+            }
+            self.sequence.store(next, Ordering::Relaxed);
+            ledger.next = next_id;
+            ledger.accepted = accepted;
+            ledger.unsettled = unsettled;
+            ledger.version = version;
+            ledger.verified = None;
+            ledger.facts.insert(
+                id,
+                Fact {
+                    epoch: 0,
+                    disposition: Disposition::Queued,
+                    accepted: accepted_records,
+                    written: HashSet::new(),
+                    failure_generation: None,
+                },
+            );
+            let batch = Batch {
+                id,
+                epoch: 0,
+                folder,
+                records: batch_records,
+            };
+            if let Some(spawned) = spawned {
+                match spawned {
+                    Ok(writer) => admission.writer = Some(writer),
+                    Err(error) => {
+                        ledger.unsent += 1;
+                        ledger.facts.get_mut(&id).unwrap().disposition = Disposition::Unsent;
+                        let message = format!("native writer spawn: {error}");
+                        post_error(
+                            &mut ledger,
+                            &mut current_error,
+                            id,
+                            0,
+                            true,
+                            message.clone(),
+                        );
+                        ledger.unsent_batches.push(batch);
+                        return Err(message.into());
+                    }
+                }
+            }
+            *count = outstanding;
+            if let Err(unsent) = admission.writer.as_ref().unwrap().send.send(batch) {
+                *count -= 1;
+                ledger.unsent += 1;
+                ledger.facts.get_mut(&id).unwrap().disposition = Disposition::Unsent;
+                ledger.unsent_batches.push(unsent.0);
+                ledger.fault = Some("native writer receiver died before accepted send".into());
+                post_error(
+                    &mut ledger,
+                    &mut current_error,
+                    id,
+                    0,
+                    true,
+                    "retained native writer receiver stopped".into(),
+                );
+                self.outstanding.done.notify_all();
+                return Err(
+                    "retained native writer receiver stopped; original batch retained".into(),
+                );
+            }
+            drop(current_error);
+            drop(ledger);
+            drop(count);
+            drop(pending);
+            drop(admission);
+            #[cfg(test)]
+            if folder == Folder::Region {
+                let gate = state.after_region.lock().unwrap().take();
+                if let Some((entered, release)) = gate {
+                    let _ = entered.send(());
+                    let _ = release.recv_timeout(std::time::Duration::from_secs(15));
+                }
+            }
+            if wait {
+                self.flush()?;
+            }
+            Ok(())
+        }
+        fn retained_context(&self) -> Context {
+            Context {
+                root: self.root.clone(),
+                caches: [
+                    self.regions.clone(),
+                    self.entity_regions.clone(),
+                    self.poi_regions.clone(),
+                ],
+                pending: self.pending.clone(),
+                outstanding: self.outstanding.clone(),
+                ledger: self.retained.as_ref().unwrap().ledger.clone(),
+                #[cfg(test)]
+                before_io: self.retained.as_ref().unwrap().before_io.clone(),
+                #[cfg(any(test, all(feature = "native-writer-test-control", debug_assertions)))]
+                test_step: self.writer_test_step.clone(),
+            }
+        }
+        fn spawn_retained_open(&self) -> std::io::Result<OpenWriter> {
+            #[cfg(test)]
+            if self
+                .retained
+                .as_ref()
+                .unwrap()
+                .fail_spawn
+                .swap(false, Ordering::SeqCst)
+            {
+                return Err(std::io::Error::other("fixed retained writer spawn refusal"));
+            }
+            let context = self.retained_context();
+            #[cfg(test)]
+            let stop_receiver = self
+                .retained
+                .as_ref()
+                .unwrap()
+                .stop_receiver
+                .swap(false, Ordering::SeqCst);
+            #[cfg(test)]
+            let (stopped, observed) = mpsc::channel();
+            let (send, receive) = mpsc::channel::<Batch>();
+            let thread = std::thread::Builder::new()
+                .name("horizon-retained-region-writer".into())
+                .spawn(move || {
+                    let mut guard = WorkerGuard {
+                        ledger: context.ledger.clone(),
+                        finished: false,
+                    };
+                    #[cfg(test)]
+                    if stop_receiver {
+                        drop(receive);
+                        guard.finished = true;
+                        let _ = stopped.send(());
+                        return;
+                    }
+                    for batch in receive {
+                        context.run_batch(batch);
+                    }
+                    let _ = context.verify_latest(true);
+                    guard.finished = true;
+                })?;
+            #[cfg(test)]
+            if stop_receiver
+                && observed
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .is_err()
+            {
+                fatal("native receiver exit control did not finish");
+            }
+            Ok(OpenWriter { send, thread })
+        }
+    }
+    struct Context {
+        root: PathBuf,
+        caches: [Arc<RegionCache>; 3],
+        pending: Arc<PendingWrites>,
+        outstanding: Arc<Outstanding>,
+        ledger: Arc<Mutex<Ledger>>,
+        #[cfg(test)]
+        before_io: Arc<Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>>,
+        #[cfg(any(test, all(feature = "native-writer-test-control", debug_assertions)))]
+        test_step: WriterTestStep,
+    }
+    fn error_correlated(ledger: &Ledger, current: &Option<String>) -> bool {
+        if ledger.error_corrupt {
+            return false;
+        }
+        match (&ledger.error, &ledger.error_witness, current) {
+            (None, None, None) => true,
+            (Some(expected), Some(witness), Some(actual)) => {
+                expected == actual
+                    && witness.generation == ledger.error_generation
+                    && ledger.facts.get(&witness.batch).is_some_and(|fact| {
+                        fact.epoch == witness.epoch
+                            && fact.failure_generation == Some(witness.generation)
+                            && fact.disposition
+                                == if witness.unsent {
+                                    Disposition::Unsent
+                                } else {
+                                    Disposition::Completed
+                                }
+                    })
+            }
+            _ => false,
+        }
+    }
+    fn check_error(ledger: &mut Ledger, current: &Option<String>) -> bool {
+        if error_correlated(ledger, current) {
+            return true;
+        }
+        if !ledger.error_corrupt {
+            ledger.history.push(format!(
+                "unexplained native error cell: current={current:?}, retained={:?}",
+                ledger.error
+            ));
+        }
+        ledger.error_corrupt = true;
+        ledger.fault.get_or_insert_with(|| {
+            "native sticky error has no correlated retained attempt witness".into()
+        });
+        false
+    }
+    fn post_error(
+        ledger: &mut Ledger,
+        current: &mut Option<String>,
+        id: u64,
+        epoch: u64,
+        unsent: bool,
+        message: String,
+    ) {
+        // Never let a later genuine failure overwrite an already unexplained error cell.
+        let correlated = check_error(ledger, current);
+        ledger.history.push(message.clone());
+        if !correlated {
+            return;
+        }
+        let Some(generation) = ledger.error_generation.checked_add(1) else {
+            ledger
+                .fault
+                .get_or_insert_with(|| "native error witness generation exhausted".into());
+            return;
+        };
+        let expected = if unsent {
+            Disposition::Unsent
+        } else {
+            Disposition::Completed
+        };
+        let Some(fact) = ledger
+            .facts
+            .get_mut(&id)
+            .filter(|fact| fact.epoch == epoch && fact.disposition == expected)
+        else {
+            ledger
+                .fault
+                .get_or_insert_with(|| "native error completion witness mismatch".into());
+            return;
+        };
+        fact.failure_generation = Some(generation);
+        ledger.error_generation = generation;
+        ledger.error_witness = Some(ErrorWitness {
+            generation,
+            batch: id,
+            epoch,
+            unsent,
+        });
+        ledger.error = Some(message.clone());
+        *current = Some(message);
+        ledger.verified = None;
+    }
+    fn prune_fact(ledger: &mut Ledger, id: u64) {
+        // Keep only native record-address receipts still referenced by the current latest rows.
+        // Historical batch completion remains a small payload-free accounting fact.
+        let latest = &ledger.expected;
+        if let Some(fact) = ledger.facts.get_mut(&id) {
+            fact.accepted.retain(|&(folder, x, z, seq)| {
+                latest
+                    .get(&(folder, x, z))
+                    .is_some_and(|row| row.accepted == id && row.seq == seq)
+            });
+            let epoch = fact.epoch;
+            fact.written.retain(|&(folder, x, z, seq)| {
+                latest.get(&(folder, x, z)).is_some_and(|row| {
+                    row.seq == seq
+                        && row
+                            .receipt
+                            .is_some_and(|receipt| receipt.batch == id && receipt.epoch == epoch)
+                })
+            });
+        }
+    }
+    fn same_record_owner(a: &Record, b: &Record) -> bool {
+        match (a, b) {
+            (Record::Tag(a), Record::Tag(b)) => Arc::ptr_eq(a, b),
+            (Record::Chunk(a, x), Record::Chunk(b, y)) => Arc::ptr_eq(a, b) && Arc::ptr_eq(x, y),
+            (Record::Poi(a, x), Record::Poi(b, y)) => Arc::ptr_eq(a, b) && Arc::ptr_eq(x, y),
+            (Record::FinishedEntities(a), Record::FinishedEntities(b)) => Arc::ptr_eq(a, b),
+            (Record::Delete, Record::Delete) => true,
+            _ => false,
+        }
+    }
+    struct WorkerGuard {
+        ledger: Arc<Mutex<Ledger>>,
+        finished: bool,
+    }
+    impl Drop for WorkerGuard {
+        fn drop(&mut self) {
+            if !self.finished {
+                self.ledger.lock().unwrap_or_else(|e| e.into_inner()).fault =
+                    Some("native writer worker exited unexpectedly".into());
+            }
+        }
+    }
+    impl Context {
+        fn cache(&self, folder: Folder) -> &RegionCache {
+            &self.caches[match folder {
+                Folder::Region => 0,
+                Folder::Entities => 1,
+                Folder::Poi => 2,
+            }]
+        }
+        fn fault(&self, message: &str) -> Box<dyn std::error::Error> {
+            self.ledger.lock().unwrap_or_else(|e| e.into_inner()).fault = Some(message.into());
+            message.into()
+        }
+        fn accepted_owner(ledger: &Ledger, key: (Folder, i32, i32), row: &Latest) -> bool {
+            ledger.facts.get(&row.accepted).is_some_and(|fact| {
+                fact.epoch == 0 && fact.accepted.contains(&(key.0, key.1, key.2, row.seq))
+            })
+        }
+        fn durable(ledger: &Ledger, key: (Folder, i32, i32), row: &Latest, finished: bool) -> bool {
+            row.owner.is_none()
+                && row.receipt.is_some_and(|receipt| {
+                    ledger.facts.get(&receipt.batch).is_some_and(|fact| {
+                        fact.epoch == receipt.epoch
+                            && fact.disposition != Disposition::Unsent
+                            && (!finished || fact.disposition == Disposition::Completed)
+                            && fact.written.contains(&(key.0, key.1, key.2, row.seq))
+                    })
+                })
+        }
+        fn verify_latest(&self, finished: bool) -> Result<()> {
+            // Entire-map/receipt walks are confined to the actual native worker.
+            let pending = self
+                .pending
+                .lock()
+                .map_err(|_| self.fault("native pending lock poisoned during verification"))?;
+            let mut ledger = self.ledger.lock().map_err(|_| "writer ledger poisoned")?;
+            let current_error = match self.outstanding.error.lock() {
+                Ok(value) => value,
+                Err(_) => {
+                    ledger.fault.get_or_insert_with(|| {
+                        "native error cell mutex poisoned during verification".into()
+                    });
+                    return Err("native error cell mutex poisoned".into());
+                }
+            };
+            if !check_error(&mut ledger, &current_error) {
+                return Err("native error witness verification failed".into());
+            }
+            let mut valid = ledger.fault.is_none();
+            let mut queued = 0u64;
+            let mut completed = 0u64;
+            let mut unsent = 0u64;
+            for fact in ledger.facts.values() {
+                match fact.disposition {
+                    Disposition::Queued => queued += 1,
+                    Disposition::Completed => completed += 1,
+                    Disposition::Unsent => unsent += 1,
+                }
+            }
+            valid &= completed == ledger.completed
+                && unsent == ledger.unsent
+                && queued
+                    .checked_add(completed)
+                    .and_then(|v| v.checked_add(unsent))
+                    == Some(ledger.accepted);
+            let mut owners = 0usize;
+            for (&key, row) in &ledger.expected {
+                valid &= Self::accepted_owner(&ledger, key, row);
+                match &row.owner {
+                    Some(original) => {
+                        owners += 1;
+                        valid &= row.receipt.is_none()
+                            && pending.get(&key).is_some_and(|(seq, record)| {
+                                *seq == row.seq && same_record_owner(original, record)
+                            });
+                    }
+                    None => {
+                        valid &= !pending.contains_key(&key)
+                            && Self::durable(&ledger, key, row, finished)
+                    }
+                }
+            }
+            for (&key, (seq, record)) in pending.iter() {
+                valid &= ledger.expected.get(&key).is_some_and(|row| {
+                    row.seq == *seq
+                        && row.receipt.is_none()
+                        && row
+                            .owner
+                            .as_ref()
+                            .is_some_and(|original| same_record_owner(original, record))
+                });
+            }
+            valid &= owners == ledger.unsettled && owners == pending.len();
+            if !valid {
+                ledger.fault.get_or_insert_with(|| {
+                    "native bidirectional latest/pending/durable receipt mismatch".into()
+                });
+                return Err("native record verification failed".into());
+            }
+            ledger.verified = Some(Verification::capture(&ledger, pending.len()));
+            Ok(())
+        }
+        fn probe_inner(&self, folder: Folder, keys: &HashSet<(i32, i32)>) -> Result<()> {
+            for key in keys {
+                let entry = self
+                    .cache(folder)
+                    .lock()
+                    .map_err(|_| self.fault("native outer region cache poisoned"))?
+                    .get(key)
+                    .and_then(Clone::clone);
+                if let Some(entry) = entry
+                    && entry.is_poisoned()
+                {
+                    let mut ledger = self.ledger.lock().unwrap_or_else(|e| e.into_inner());
+                    ledger.poisoned_files.push(entry);
+                    ledger.fault = Some("native inner RegionFile owner poisoned".into());
+                    return Err("native inner RegionFile owner poisoned".into());
+                }
+            }
+            Ok(())
+        }
+        fn refresh_selected(&self, records: &[(u64, Folder, (i32, i32), Record)]) -> Result<()> {
+            let mut selected: HashMap<Folder, HashSet<(i32, i32)>> = HashMap::new();
+            for (_, folder, (x, z), _) in records {
+                selected
+                    .entry(*folder)
+                    .or_default()
+                    .insert((*x >> 5, *z >> 5));
+            }
+            // Probe every selected original owner BEFORE removing any cache entry.
+            for (&folder, keys) in &selected {
+                self.probe_inner(folder, keys)?;
+            }
+            for (folder, keys) in selected {
+                for key in keys {
+                    let mut cache = self
+                        .cache(folder)
+                        .lock()
+                        .map_err(|_| self.fault("native outer region cache poisoned"))?;
+                    if let Some(Some(original)) = cache.get(&key).cloned() {
+                        // Hold the actual original mutex during removal. A prior poison never gets evicted.
+                        let guard = match original.lock() {
+                            Ok(guard) => guard,
+                            Err(_) => {
+                                let mut ledger =
+                                    self.ledger.lock().unwrap_or_else(|e| e.into_inner());
+                                ledger.poisoned_files.push(original.clone());
+                                ledger.fault =
+                                    Some("native inner RegionFile owner poisoned".into());
+                                return Err("native inner RegionFile owner poisoned".into());
+                            }
+                        };
+                        cache.remove(&key);
+                        drop(guard);
+                        drop(original);
+                    } else {
+                        cache.remove(&key);
+                    }
+                    // Unrelated entries remain in the original cache allocation untouched.
+                }
+            }
+            Ok(())
+        }
+        fn write(
+            &self,
+            folder: Folder,
+            batch: &[((i32, i32), Record, u64)],
+            id: u64,
+            epoch: u64,
+        ) -> Result<()> {
+            #[cfg(any(test, all(feature = "native-writer-test-control", debug_assertions)))]
+            {
+                let step = self.test_step.lock().unwrap().take();
+                if let Some(step) = step {
+                    step();
+                }
+            }
+            let cache = self.cache(folder);
+            let mut selected = Vec::new();
+            {
+                let pending = self
+                    .pending
+                    .lock()
+                    .map_err(|_| self.fault("native pending lock poisoned"))?;
+                let mut ledger = self.ledger.lock().map_err(|_| "writer ledger poisoned")?;
+                let current_error = match self.outstanding.error.lock() {
+                    Ok(value) => value,
+                    Err(_) => {
+                        ledger.fault.get_or_insert_with(|| {
+                            "native error cell mutex poisoned before write".into()
+                        });
+                        return Err("native error cell mutex poisoned".into());
+                    }
+                };
+                if !check_error(&mut ledger, &current_error) {
+                    return Err("native write found an uncorrelated error cell".into());
+                }
+                let mut valid = ledger.fault.is_none()
+                    && ledger.facts.get(&id).is_some_and(|fact| {
+                        fact.epoch == epoch && fact.disposition == Disposition::Queued
+                    });
+                for (key, record, seq) in batch {
+                    let address = (folder, key.0, key.1);
+                    let Some(row) = ledger.expected.get(&address) else {
+                        valid = false;
+                        continue;
+                    };
+                    valid &= Self::accepted_owner(&ledger, address, row);
+                    if row.seq == *seq {
+                        let owns = row.receipt.is_none()
+                            && row
+                                .owner
+                                .as_ref()
+                                .is_some_and(|original| same_record_owner(original, record))
+                            && pending.get(&address).is_some_and(|(current, original)| {
+                                *current == *seq && same_record_owner(original, record)
+                            });
+                        valid &= owns;
+                        if owns {
+                            selected.push((*key, record.clone(), *seq));
+                        }
+                    } else if row.seq > *seq {
+                        // Only a real newer accepted owner OR native durable receipt can supersede this record.
+                        valid &= match &row.owner {
+                            Some(original) => {
+                                row.receipt.is_none()
+                                    && pending.get(&address).is_some_and(|(current, value)| {
+                                        *current == row.seq && same_record_owner(original, value)
+                                    })
+                            }
+                            None => {
+                                !pending.contains_key(&address)
+                                    && Self::durable(&ledger, address, row, false)
+                            }
+                        };
+                    } else {
+                        valid = false;
+                    }
+                    if epoch == 0 {
+                        valid &= ledger.facts.get(&id).is_some_and(|fact| {
+                            fact.accepted.contains(&(folder, key.0, key.1, *seq))
+                        });
+                    }
+                }
+                if !valid {
+                    ledger.fault = Some(
+                        "native accepted record missing or supersession receipt mismatch".into(),
+                    );
+                    return Err("native record pre-write correlation failed".into());
+                }
+                ledger
+                    .facts
+                    .get_mut(&id)
+                    .unwrap()
+                    .written
+                    .try_reserve(selected.len())
+                    .map_err(|_| "native receipt allocation refused")?;
+            }
+            let regions = selected
+                .iter()
+                .map(|(key, _, _)| (key.0 >> 5, key.1 >> 5))
+                .collect::<HashSet<_>>();
+            self.probe_inner(folder, &regions)?;
+            let result = (|| -> Result<()> {
+                let mut resolved = Vec::new();
+                for (key, record, _) in &selected {
+                    if let Some(record) = resolve_poi(&self.root, cache, *key, record)? {
+                        resolved.push((*key, record));
+                    }
+                }
+                let borrowed = resolved
+                    .iter()
+                    .map(|(key, record)| (*key, record))
+                    .collect::<Vec<_>>();
+                #[cfg(test)]
+                {
+                    let gate = self.before_io.lock().unwrap().take();
+                    if let Some((entered, release)) = gate {
+                        let _ = entered.send(());
+                        let _ = release.recv_timeout(std::time::Duration::from_secs(15));
+                    }
+                }
+                write_region_records(&self.root, cache, folder.name(), &borrowed)
+            })();
+            // Detect genuine inner poison raised while strict POI/native IO was running.
+            if result.is_err() {
+                self.probe_inner(folder, &regions)?;
+                return result;
+            }
+            let mut pending = self
+                .pending
+                .lock()
+                .map_err(|_| self.fault("native pending lock poisoned after write"))?;
+            let mut ledger = self.ledger.lock().map_err(|_| "writer ledger poisoned")?;
+            let version = ledger
+                .version
+                .checked_add(1)
+                .ok_or("native record verification version exhausted")?;
+            for (key, original, seq) in &selected {
+                let address = (folder, key.0, key.1);
+                let Some(row) = ledger.expected.get(&address) else {
+                    ledger.fault = Some("native latest record disappeared during write".into());
+                    return Err("native write receipt lost owner".into());
+                };
+                if row.seq == *seq {
+                    if row.receipt.is_some()
+                        || !row
+                            .owner
+                            .as_ref()
+                            .is_some_and(|r| same_record_owner(r, original))
+                        || !pending.get(&address).is_some_and(|(current, r)| {
+                            *current == *seq && same_record_owner(r, original)
+                        })
+                        || ledger.unsettled == 0
+                    {
+                        ledger.fault = Some(
+                            "native pending record disappeared before durable acknowledgment"
+                                .into(),
+                        );
+                        return Err("native write acknowledgment owner mismatch".into());
+                    }
+                    pending.remove(&address);
+                    ledger.unsettled -= 1;
+                    let row = ledger.expected.get_mut(&address).unwrap();
+                    row.owner = None;
+                    row.receipt = Some(Receipt { batch: id, epoch });
+                } else if row.seq < *seq || !Self::accepted_owner(&ledger, address, row) {
+                    ledger.fault =
+                        Some("native superseding receipt disappeared during write".into());
+                    return Err("native superseding owner mismatch".into());
+                }
+                ledger
+                    .facts
+                    .get_mut(&id)
+                    .unwrap()
+                    .written
+                    .insert((folder, key.0, key.1, *seq));
+            }
+            ledger.version = version;
+            ledger.verified = None;
+            Ok(())
+        }
+        fn complete(&self, id: u64, epoch: u64, result: Result<()>, retry: bool) {
+            // Queue takes pending, then count, then ledger. No worker holds pending here.
+            let mut count = self
+                .outstanding
+                .count
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let mut ledger = self.ledger.lock().unwrap_or_else(|e| e.into_inner());
+            let mut current_error = self
+                .outstanding
+                .error
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let error_cell_good = if self.outstanding.error.is_poisoned() {
+                ledger
+                    .fault
+                    .get_or_insert_with(|| "native error cell mutex poisoned at completion".into());
+                false
+            } else {
+                check_error(&mut ledger, &current_error)
+            };
+            let valid = ledger
+                .facts
+                .get(&id)
+                .is_some_and(|f| f.epoch == epoch && f.disposition == Disposition::Queued);
+            if !valid || *count == 0 || ledger.completed.checked_add(1).is_none() {
+                ledger.fault = Some("native writer completion accounting mismatch".into());
+                return;
+            }
+            ledger.facts.get_mut(&id).unwrap().disposition = Disposition::Completed;
+            ledger.completed += 1;
+            ledger.verified = None;
+            *count -= 1;
+            prune_fact(&mut ledger, id);
+            match result {
+                Ok(()) => {
+                    if retry && error_cell_good && ledger.fault.is_none() {
+                        ledger.retry_success = Some(epoch);
+                        ledger.unsent_batches.clear();
+                    }
+                }
+                Err(error) => {
+                    let message = format!("retained native write: {error}");
+                    if error_cell_good {
+                        post_error(&mut ledger, &mut current_error, id, epoch, false, message);
+                    } else {
+                        ledger.history.push(message);
+                    }
+                }
+            }
+            self.outstanding.done.notify_all();
+        }
+        fn run_batch(&self, batch: Batch) {
+            let result = self.write(batch.folder, &batch.records, batch.id, batch.epoch);
+            self.complete(batch.id, batch.epoch, result, false);
+        }
+        fn retry_records(&self, id: u64, epoch: u64) -> Result<()> {
+            self.verify_latest(true)?;
+            let mut records = self
+                .pending
+                .lock()
+                .map_err(|_| self.fault("native pending lock poisoned during retry"))?
+                .iter()
+                .map(|(&(folder, x, z), (seq, record))| (*seq, folder, (x, z), record.clone()))
+                .collect::<Vec<_>>();
+            self.refresh_selected(&records)?;
+            records.sort_unstable_by_key(|row| row.0);
+            let mut at = 0;
+            let mut first_error = None;
+            while at < records.len() {
+                let folder = records[at].1;
+                let mut batch = Vec::new();
+                while at < records.len() && records[at].1 == folder {
+                    let (seq, _, key, record) = &records[at];
+                    batch.push((*key, record.clone(), *seq));
+                    at += 1;
+                }
+                if let Err(error) = self.write(folder, &batch, id, epoch)
+                    && first_error.is_none()
+                {
+                    first_error = Some(error);
+                }
+            }
+            match first_error {
+                Some(error) => Err(error),
+                None => Ok(()),
+            }
+        }
+    }
+    impl NativeWriterClose {
+        fn blocked(&mut self, reason: impl Into<String>) -> RetainedWriterStatus {
+            self.status = RetainedWriterStatus::Blocked(reason.into());
+            self.status.clone()
+        }
+        pub fn status(&self) -> &RetainedWriterStatus {
+            &self.status
+        }
+        pub fn failure_count(&self) -> Result<Option<usize>> {
+            Ok(nonwaiting(&self.save().retained.as_ref().unwrap().ledger)?
+                .map(|ledger| ledger.history.len()))
+        }
+        pub fn save(&self) -> &Arc<SaveDir> {
+            self.save.as_ref().expect("unharvested native owner")
+        }
+        pub fn poll(&mut self) -> RetainedWriterStatus {
+            if self.status == RetainedWriterStatus::Complete {
+                return self.status.clone();
+            }
+            if Instant::now() >= self.deadline && self.status == RetainedWriterStatus::Pending {
+                self.status = RetainedWriterStatus::Blocked(
+                    "native writer close deadline expired; owners retained".into(),
+                );
+            }
+            // Even Blocked owners harvest genuine finished handles, without erasing their failure.
+            if self.thread.as_ref().is_some_and(|t| t.is_finished())
+                && self.thread.take().unwrap().join().is_err()
+            {
+                self.fault = Some("native writer thread panicked".into());
+            }
+            let save = self.save().clone();
+            let state = save.retained.as_ref().unwrap();
+            let attempt = (|| -> std::result::Result<Option<()>, String> {
+                let Some(mut admission) = nonwaiting(&state.admission)? else {
+                    return Ok(None);
+                };
+                if admission.phase != Phase::Sealed
+                    || !admission.owner.ptr_eq(&Arc::downgrade(&self.identity))
+                    || admission.writer.is_some()
+                {
+                    return Err("native close allocation/phase mismatch".into());
+                }
+                let Some(count) = nonwaiting(&save.outstanding.count)? else {
+                    return Ok(None);
+                };
+                let Some(pending) = nonwaiting(&save.pending)? else {
+                    return Ok(None);
+                };
+                let Some(mut ledger) = nonwaiting(&state.ledger)? else {
+                    return Ok(None);
+                };
+                let Some(mut error) = nonwaiting(&save.outstanding.error)? else {
+                    return Ok(None);
+                };
+                if !check_error(&mut ledger, &error) {
+                    return Err("uncorrelated sticky native writer error".into());
+                }
+                if let Some(fault) = self.fault.as_ref().or(ledger.fault.as_ref()) {
+                    return Err(fault.clone());
+                }
+                let remaining = ledger
+                    .accepted
+                    .checked_sub(ledger.completed)
+                    .and_then(|v| v.checked_sub(ledger.unsent))
+                    .ok_or("native writer batch accounting underflow")?;
+                if remaining != *count as u64 {
+                    return Err(
+                        "native outstanding count does not match original batch facts".into(),
+                    );
+                }
+                if ledger.unsettled != pending.len()
+                    || u64::try_from(ledger.facts.len()).ok() != Some(ledger.accepted)
+                {
+                    return Err("native latest/pending ownership count mismatch".into());
+                }
+                if self.thread.is_some() {
+                    return Ok(None);
+                }
+                if *count != 0 {
+                    return Err("finished native writer retained unresolved batches".into());
+                }
+                if !pending.is_empty() {
+                    return Err(ledger
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "native pending records remain".into()));
+                }
+                if ledger.verified != Some(Verification::capture(&ledger, pending.len())) {
+                    return Err("native finished worker verification receipt missing".into());
+                }
+                if ledger.error.is_some() && ledger.retry_success != Some(self.epoch) {
+                    return Err(ledger.error.clone().unwrap());
+                }
+                if matches!(self.status, RetainedWriterStatus::Blocked(_)) {
+                    return Ok(Some(()));
+                }
+                // The same error guard has been held since the correlated witness check above.
+                if self.epoch > 0 && ledger.retry_success == Some(self.epoch) {
+                    *error = None;
+                    ledger.error = None;
+                    ledger.error_witness = None;
+                }
+                if error.is_some() {
+                    return Err("uncorrelated sticky native writer error".into());
+                }
+                admission.phase = Phase::Closed;
+                Ok(Some(()))
+            })();
+            match attempt {
+                Ok(Some(())) if !matches!(self.status, RetainedWriterStatus::Blocked(_)) => {
+                    self.status = RetainedWriterStatus::Complete;
+                    self.status.clone()
+                }
+                // A deadline/earlier failure needs explicit Retry even after late completion.
+                Ok(Some(())) => self.status.clone(),
+                Ok(None) if Instant::now() >= self.deadline => {
+                    self.blocked("native writer close deadline expired; owners retained")
+                }
+                Ok(None) => self.status.clone(),
+                Err(error) => {
+                    if matches!(
+                        error.as_str(),
+                        "retained writer lock poisoned"
+                            | "native close allocation/phase mismatch"
+                            | "native writer batch accounting underflow"
+                            | "native outstanding count does not match original batch facts"
+                            | "finished native writer retained unresolved batches"
+                            | "uncorrelated sticky native writer error"
+                            | "native latest/pending ownership count mismatch"
+                            | "native finished worker verification receipt missing"
+                    ) {
+                        self.fault = Some(error.clone());
+                    }
+                    self.blocked(error)
+                }
+            }
+        }
+        pub fn retry(&mut self, deadline: Instant) -> Result<()> {
+            if !matches!(self.status, RetainedWriterStatus::Blocked(_)) {
+                return Err("native retry requires Blocked".into());
+            }
+            if deadline <= Instant::now() {
+                return Err("native retry deadline is not in the future".into());
+            }
+            if self.thread.is_some() {
+                return Err("native previous writer handle has not been harvested".into());
+            }
+            if self.fault.is_some() {
+                return Err("native writer has a terminal owner fault; retry refused".into());
+            }
+            let save = self.save().clone();
+            let state = save.retained.as_ref().unwrap();
+            let Some(admission) = nonwaiting(&state.admission)? else {
+                return Err("native retry admission busy".into());
+            };
+            if admission.phase != Phase::Sealed
+                || !admission.owner.ptr_eq(&Arc::downgrade(&self.identity))
+            {
+                return Err("native retry owner mismatch".into());
+            }
+            let Some(mut count) = nonwaiting(&save.outstanding.count)? else {
+                return Err("native retry count busy".into());
+            };
+            let Some(pending) = nonwaiting(&save.pending)? else {
+                return Err("native retry pending busy".into());
+            };
+            let Some(mut ledger) = nonwaiting(&state.ledger)? else {
+                return Err("native retry ledger busy".into());
+            };
+            let Some(current_error) = nonwaiting(&save.outstanding.error)? else {
+                return Err("native retry error cell busy".into());
+            };
+            if !check_error(&mut ledger, &current_error) {
+                return Err("native retry found an uncorrelated error cell".into());
+            }
+            if ledger.unsettled != pending.len()
+                || u64::try_from(ledger.facts.len()).ok() != Some(ledger.accepted)
+            {
+                ledger.fault = Some("native latest/pending ownership count mismatch".into());
+                return Err("native retry lost original record ownership".into());
+            }
+            for cache in [&save.regions, &save.entity_regions, &save.poi_regions] {
+                if nonwaiting(cache)?.is_none() {
+                    return Err("native retry cache busy".into());
+                }
+            }
+            if ledger.fault.is_some()
+                || *count != 0
+                || ledger.accepted
+                    != ledger
+                        .completed
+                        .checked_add(ledger.unsent)
+                        .ok_or("native retry accounting overflow")?
+            {
+                return Err("native retry has unresolved original accounting".into());
+            }
+            let epoch = ledger
+                .epoch
+                .checked_add(1)
+                .ok_or("native retry epoch exhausted")?;
+            let id = ledger.next;
+            let next = id.checked_add(1).ok_or("native retry batch exhausted")?;
+            let accepted = ledger
+                .accepted
+                .checked_add(1)
+                .ok_or("native retry count exhausted")?;
+            ledger
+                .facts
+                .try_reserve(1)
+                .map_err(|_| "native retry fact allocation refused")?;
+            let context = save.retained_context();
+            let (start, ready) = mpsc::channel::<()>();
+            #[cfg(test)]
+            if state.fail_spawn.swap(false, Ordering::SeqCst) {
+                return Err("fixed retry spawn refusal".into());
+            }
+            let handle = std::thread::Builder::new()
+                .name("horizon-retained-region-retry".into())
+                .spawn(move || {
+                    let mut guard = WorkerGuard {
+                        ledger: context.ledger.clone(),
+                        finished: false,
+                    };
+                    if ready.recv().is_err() {
+                        return;
+                    }
+                    let result = context.retry_records(id, epoch);
+                    context.complete(id, epoch, result, true);
+                    let _ = context.verify_latest(true);
+                    guard.finished = true;
+                })?;
+            // Own the real handle before accepting or starting any retry work.
+            self.thread = Some(handle);
+            ledger.next = next;
+            ledger.epoch = epoch;
+            ledger.accepted = accepted;
+            ledger.facts.insert(
+                id,
+                Fact {
+                    epoch,
+                    disposition: Disposition::Queued,
+                    accepted: HashSet::new(),
+                    written: HashSet::new(),
+                    failure_generation: None,
+                },
+            );
+            ledger.verified = None;
+            *count = 1;
+            self.epoch = epoch;
+            self.deadline = deadline;
+            self.status = RetainedWriterStatus::Pending;
+            if start.send(()).is_err() {
+                ledger.fault = Some("native retry start receiver died".into());
+                return Err("native retry start failed; owner retained".into());
+            }
+            Ok(())
+        }
+        pub fn finish(mut self) -> std::result::Result<NativeWriterClosed, Self> {
+            if self.status != RetainedWriterStatus::Complete || self.thread.is_some() {
+                return Err(self);
+            }
+            self.armed = false;
+            Ok(NativeWriterClosed {
+                save: self.save.take().unwrap(),
+                _identity: self.identity.clone(),
+            })
+        }
+    }
+    #[cfg(test)]
+    mod retained_writer_tests {
+        use super::*;
+        use std::{io::Write, time::Duration};
+        fn root(name: &str) -> PathBuf {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let root = std::env::temp_dir().join(format!(
+                "retained-native-writer-{name}-{}-{nonce}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&root).unwrap();
+            root
+        }
+        fn tag(value: i32) -> Arc<NamedTag> {
+            Arc::new(NamedTag {
+                name: "".into(),
+                tag: Tag::compound([("value", Tag::Int(value))]),
+            })
+        }
+        fn deadline() -> Instant {
+            Instant::now() + Duration::from_secs(15)
+        }
+        fn begin(save: &Arc<SaveDir>) -> NativeWriterClose {
+            loop {
+                if let Some(close) = save.begin_retained_writer_close(deadline()).unwrap() {
+                    return close;
+                }
+                std::thread::yield_now();
+            }
+        }
+        fn until_harvest(close: &mut NativeWriterClose) {
+            let end = deadline();
+            loop {
+                close.poll();
+                if close.thread.is_none() {
+                    return;
+                }
+                assert!(
+                    Instant::now() < end,
+                    "actual writer failed to finish: {close:?}"
+                );
+                std::thread::yield_now();
+            }
+        }
+        fn finish(mut close: NativeWriterClose) -> NativeWriterClosed {
+            let end = deadline();
+            loop {
+                if close.poll() == RetainedWriterStatus::Complete {
+                    return close.finish().unwrap();
+                }
+                assert!(Instant::now() < end, "native close failed: {close:?}");
+                std::thread::yield_now();
+            }
+        }
+        fn disk(root: &Path, folder: Folder, x: i32, z: i32) -> Option<NamedTag> {
+            read_region_record(root, &RegionCache::default(), folder.name(), x, z).unwrap()
+        }
+        fn queue(save: &SaveDir, folder: Folder, x: i32, value: Arc<NamedTag>) {
+            save.queue(folder, vec![((x, 0), Record::Tag(value))], false)
+                .unwrap();
+        }
+        fn native_gate(save: &SaveDir) -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
+            let (entered, observed) = mpsc::channel();
+            let (release, wait) = mpsc::channel();
+            save.native_fence_writer_step(move || {
+                entered.send(()).unwrap();
+                let _ = wait.recv_timeout(Duration::from_secs(15));
+            });
+            (observed, release)
+        }
+        fn claimed_poi() -> NamedTag {
+            let mut sections = Compound::new();
+            sections.insert(
+                "4".into(),
+                Tag::compound([
+                    ("Valid", Tag::Byte(1)),
+                    (
+                        "Records",
+                        Tag::List(vec![Tag::compound([
+                            ("pos", Tag::IntArray(vec![5, 71, 5])),
+                            ("type", Tag::String("minecraft:meeting".into())),
+                            ("free_tickets", Tag::Int(30)),
+                        ])]),
+                    ),
+                ]),
+            );
+            poi_root(sections)
+        }
+        fn poi_tickets(tag: &NamedTag, pos: [i32; 3]) -> Option<i64> {
+            let Tag::Compound(sections) = tag.tag.get("Sections")? else {
+                return None;
+            };
+            for section in sections.values() {
+                if let Some(Tag::List(records)) = section.get("Records") {
+                    for record in records {
+                        if record.get("pos") == Some(&Tag::IntArray(pos.to_vec())) {
+                            return number(record.get("free_tickets"));
+                        }
+                    }
+                }
+            }
+            None
+        }
+        fn marker(name: &str) {
+            println!("HORIZON_RETAINED_WRITER_ASSERTED:{name}");
+            std::io::stdout().flush().unwrap();
+        }
+
+        #[test]
+        fn no_writer_close_and_extra_arcs_cannot_restart_or_reclose() {
+            let path = root("empty");
+            let save = Arc::new(SaveDir::new_retained(path.clone()));
+            let alias = save.clone();
+            let closed = finish(begin(&save));
+            let same = Arc::ptr_eq(closed.save(), &save);
+            let denied = alias.queue(Folder::Region, vec![], false).is_err()
+                && alias.save_entities_later(vec![]).is_err()
+                && alias.begin_retained_writer_close(deadline()).is_err();
+            let untouched = alias.pending.lock().unwrap().is_empty()
+                && alias.sequence.load(Ordering::Relaxed) == 0;
+            drop(closed);
+            drop(alias);
+            drop(save);
+            fs::remove_dir_all(path).unwrap();
+            assert!(same && denied && untouched);
+        }
+        #[test]
+        fn healthy_three_folder_records_delete_and_native_reread() {
+            let path = root("all-folders");
+            let save = Arc::new(SaveDir::new_retained(path.clone()));
+            for folder in [Folder::Region, Folder::Entities, Folder::Poi] {
+                queue(&save, folder, 0, tag(7));
+                queue(&save, folder, 32, tag(19));
+            }
+            save.flush().unwrap();
+            for folder in [Folder::Region, Folder::Entities, Folder::Poi] {
+                save.queue(folder, vec![((0, 0), Record::Delete)], false)
+                    .unwrap();
+            }
+            let closed = finish(begin(&save));
+            for folder in [Folder::Region, Folder::Entities, Folder::Poi] {
+                assert!(disk(&path, folder, 0, 0).is_none());
+                assert_eq!(disk(&path, folder, 32, 0).unwrap(), *tag(19));
+            }
+            assert!(save.pending.lock().unwrap().is_empty());
+            assert!(save.writes_finished().unwrap());
+            drop(closed);
+            drop(save);
+            fs::remove_dir_all(path).unwrap();
+        }
+        #[test]
+        fn actual_writer_stall_deadline_requires_explicit_retry_after_join() {
+            let path = root("held");
+            let save = Arc::new(SaveDir::new_retained(path.clone()));
+            let (entered, release) = native_gate(&save);
+            let original = tag(11);
+            queue(&save, Folder::Region, 0, original.clone());
+            entered.recv_timeout(Duration::from_secs(5)).unwrap();
+            let mut close = save
+                .begin_retained_writer_close(Instant::now())
+                .unwrap()
+                .unwrap();
+            let blocked = matches!(close.poll(), RetainedWriterStatus::Blocked(_));
+            let refused = close.retry(deadline()).is_err();
+            let pending_read = save.read_record("region", 0, 0).unwrap() == *original;
+            let original_kept = matches!(&save.pending.lock().unwrap()[&(Folder::Region,0,0)].1,Record::Tag(t) if Arc::ptr_eq(t,&original));
+            let original_kept = original_kept && pending_read;
+            release.send(()).unwrap();
+            until_harvest(&mut close);
+            let still_blocked = matches!(close.status(), RetainedWriterStatus::Blocked(_));
+            close.retry(deadline()).unwrap();
+            let closed = finish(close);
+            assert!(blocked && refused && original_kept && still_blocked);
+            assert_eq!(disk(&path, Folder::Region, 0, 0).unwrap(), *original);
+            drop(closed);
+            drop(save);
+            fs::remove_dir_all(path).unwrap();
+        }
+        #[test]
+        fn poll_and_begin_are_nonwaiting_under_real_mutex_contention() {
+            let path = root("contention");
+            let save = Arc::new(SaveDir::new_retained(path.clone()));
+            let state = save.retained.as_ref().unwrap();
+            let admission = state.admission.lock().unwrap();
+            let busy = save
+                .begin_retained_writer_close(deadline())
+                .unwrap()
+                .is_none();
+            drop(admission);
+            let mut close = begin(&save);
+            for lock in 0..5 {
+                let status = match lock {
+                    0 => {
+                        let _guard = state.admission.lock().unwrap();
+                        close.poll()
+                    }
+                    1 => {
+                        let _guard = save.outstanding.count.lock().unwrap();
+                        close.poll()
+                    }
+                    2 => {
+                        let _guard = save.pending.lock().unwrap();
+                        close.poll()
+                    }
+                    3 => {
+                        let _guard = state.ledger.lock().unwrap();
+                        close.poll()
+                    }
+                    _ => {
+                        let _guard = save.outstanding.error.lock().unwrap();
+                        close.poll()
+                    }
+                };
+                assert_eq!(status, RetainedWriterStatus::Pending);
+            }
+            let closed = finish(close);
+            assert!(busy);
+            drop(closed);
+            drop(save);
+            fs::remove_dir_all(path).unwrap();
+        }
+        #[test]
+        fn real_filesystem_failure_repair_retry_each_native_folder() {
+            for folder in [Folder::Region, Folder::Entities, Folder::Poi] {
+                let path = root(folder.name());
+                let obstruction = region_path(&path, folder.name(), 0, 0);
+                fs::create_dir_all(&obstruction).unwrap();
+                let save = Arc::new(SaveDir::new_retained(path.clone()));
+                let original = tag(29);
+                queue(&save, folder, 0, original.clone());
+                let mut close = begin(&save);
+                until_harvest(&mut close);
+                let blocked = matches!(close.status(), RetainedWriterStatus::Blocked(_));
+                let retained = matches!(&save.pending.lock().unwrap()[&(folder,0,0)].1,Record::Tag(t) if Arc::ptr_eq(t,&original));
+                let history = close.failure_count().unwrap().unwrap();
+                fs::remove_dir(&obstruction).unwrap();
+                close.retry(deadline()).unwrap();
+                let closed = finish(close);
+                assert!(blocked && retained && history > 0);
+                assert_eq!(disk(&path, folder, 0, 0).unwrap(), *original);
+                assert!(save.writes_finished().unwrap());
+                drop(closed);
+                drop(save);
+                fs::remove_dir_all(path).unwrap();
+            }
+        }
+        #[test]
+        fn partial_native_region_prefix_is_retained_then_repaired_without_other_slot_loss() {
+            let path = root("partial");
+            let obstruction = region_path(&path, "region", 1, 0);
+            fs::create_dir_all(&obstruction).unwrap();
+            let save = Arc::new(SaveDir::new_retained(path.clone()));
+            let a = tag(41);
+            let b = tag(42);
+            save.queue(
+                Folder::Region,
+                vec![
+                    ((0, 0), Record::Tag(a.clone())),
+                    ((32, 0), Record::Tag(b.clone())),
+                ],
+                false,
+            )
+            .unwrap();
+            let mut close = begin(&save);
+            until_harvest(&mut close);
+            let retained = save.pending.lock().unwrap().len() == 2;
+            let prefix = disk(&path, Folder::Region, 0, 0) == Some((*a).clone());
+            fs::remove_dir(&obstruction).unwrap();
+            close.retry(deadline()).unwrap();
+            let closed = finish(close);
+            assert!(retained && prefix);
+            assert_eq!(disk(&path, Folder::Region, 32, 0), Some((*b).clone()));
+            drop(closed);
+            drop(save);
+            fs::remove_dir_all(path).unwrap();
+        }
+        #[test]
+        fn latest_sequence_supersession_and_sticky_failure_do_not_replay_old_values() {
+            let path = root("superseded");
+            let obstruction = region_path(&path, "poi", 0, 0);
+            fs::create_dir_all(&obstruction).unwrap();
+            let save = Arc::new(SaveDir::new_retained(path.clone()));
+            let (entered, release) = native_gate(&save);
+            queue(&save, Folder::Region, 0, tag(1));
+            entered.recv_timeout(Duration::from_secs(5)).unwrap();
+            queue(&save, Folder::Region, 0, tag(2));
+            queue(&save, Folder::Poi, 0, tag(3));
+            queue(&save, Folder::Poi, 0, tag(4));
+            queue(&save, Folder::Entities, 0, tag(5));
+            queue(&save, Folder::Entities, 32, tag(6));
+            let mut close = begin(&save);
+            release.send(()).unwrap();
+            until_harvest(&mut close);
+            let latest = matches!(&save.pending.lock().unwrap()[&(Folder::Poi,0,0)].1,Record::Tag(t) if **t==*tag(4));
+            let unaffected = disk(&path, Folder::Region, 0, 0) == Some((*tag(2)).clone())
+                && disk(&path, Folder::Entities, 32, 0) == Some((*tag(6)).clone());
+            fs::remove_dir(&obstruction).unwrap();
+            close.retry(deadline()).unwrap();
+            let closed = finish(close);
+            assert!(latest && unaffected);
+            assert_eq!(disk(&path, Folder::Poi, 0, 0), Some((*tag(4)).clone()));
+            drop(closed);
+            drop(save);
+            fs::remove_dir_all(path).unwrap();
+        }
+        #[test]
+        fn initial_and_retry_spawn_refusal_keep_original_unsent_record_and_counts() {
+            let path = root("spawn");
+            let save = Arc::new(SaveDir::new_retained(path.clone()));
+            let original = tag(51);
+            save.retained
+                .as_ref()
+                .unwrap()
+                .fail_spawn
+                .store(true, Ordering::SeqCst);
+            let refused = save
+                .queue(
+                    Folder::Region,
+                    vec![((0, 0), Record::Tag(original.clone()))],
+                    false,
+                )
+                .is_err();
+            let counts = *save.outstanding.count.lock().unwrap() == 0;
+            let mut close = begin(&save);
+            close.poll();
+            save.retained
+                .as_ref()
+                .unwrap()
+                .fail_spawn
+                .store(true, Ordering::SeqCst);
+            let retry_refused = close.retry(deadline()).is_err();
+            let retained = matches!(&save.pending.lock().unwrap()[&(Folder::Region,0,0)].1,Record::Tag(t) if Arc::ptr_eq(t,&original));
+            close.retry(deadline()).unwrap();
+            let closed = finish(close);
+            assert!(refused && counts && retry_refused && retained);
+            assert_eq!(disk(&path, Folder::Region, 0, 0), Some((*original).clone()));
+            drop(closed);
+            drop(save);
+            fs::remove_dir_all(path).unwrap();
+        }
+        #[test]
+        fn producer_and_seal_race_commits_or_refuses_each_actual_native_batch() {
+            let path = root("race");
+            let save = Arc::new(SaveDir::new_retained(path.clone()));
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let copy = save.clone();
+            let started = barrier.clone();
+            let producer = std::thread::spawn(move || {
+                started.wait();
+                (0..64)
+                    .map(|x| {
+                        (
+                            x,
+                            copy.queue(Folder::Region, vec![((x, 0), Record::Tag(tag(x)))], false)
+                                .is_ok(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            });
+            barrier.wait();
+            let closed = finish(begin(&save));
+            while !producer.is_finished() {
+                std::thread::yield_now();
+            }
+            let results = producer.join().unwrap();
+            for (x, accepted) in results {
+                assert_eq!(
+                    disk(&path, Folder::Region, x, 0),
+                    accepted.then(|| (*tag(x)).clone())
+                );
+            }
+            assert!(save.pending.lock().unwrap().is_empty());
+            drop(closed);
+            drop(save);
+            fs::remove_dir_all(path).unwrap();
+        }
+        #[test]
+        fn sequence_and_batch_exhaustion_refuse_before_native_publication() {
+            for sequence in [true, false] {
+                let path = root("exhaust");
+                let save = Arc::new(SaveDir::new_retained(path.clone()));
+                if sequence {
+                    save.sequence.store(u64::MAX, Ordering::Relaxed);
+                } else {
+                    save.retained.as_ref().unwrap().ledger.lock().unwrap().next = u64::MAX;
+                }
+                let refused = save
+                    .queue(Folder::Region, vec![((0, 0), Record::Tag(tag(1)))], false)
+                    .is_err();
+                let unchanged = save.pending.lock().unwrap().is_empty()
+                    && *save.outstanding.count.lock().unwrap() == 0;
+                let closed = finish(begin(&save));
+                assert!(refused && unchanged);
+                assert!(disk(&path, Folder::Region, 0, 0).is_none());
+                drop(closed);
+                drop(save);
+                fs::remove_dir_all(path).unwrap();
+            }
+        }
+        #[test]
+        fn original_allocation_is_retained_and_finish_refuses_before_completion() {
+            let a = root("allocation-a");
+            let b = root("allocation-b");
+            let first = Arc::new(SaveDir::new_retained(a.clone()));
+            let second = Arc::new(SaveDir::new_retained(b.clone()));
+            let owner = begin(&first);
+            let owner = owner.finish().unwrap_err();
+            let distinct = !Arc::ptr_eq(owner.save(), &second) && Arc::ptr_eq(owner.save(), &first);
+            let done_a = finish(owner);
+            let done_b = finish(begin(&second));
+            assert!(distinct);
+            drop(done_a);
+            drop(done_b);
+            drop(first);
+            drop(second);
+            fs::remove_dir_all(a).unwrap();
+            fs::remove_dir_all(b).unwrap();
+        }
+        #[test]
+        fn legacy_constructor_writer_flush_and_drop_remain_native() {
+            let path = root("legacy");
+            let save = Arc::new(SaveDir::new(path.clone()));
+            queue(&save, Folder::Entities, 0, tag(71));
+            save.flush().unwrap();
+            assert!(save.retained.is_none());
+            assert!(save.begin_retained_writer_close(deadline()).is_err());
+            drop(save);
+            assert_eq!(
+                disk(&path, Folder::Entities, 0, 0),
+                Some((*tag(71)).clone())
+            );
+            fs::remove_dir_all(path).unwrap();
+        }
+
+        #[test]
+        #[ignore = "requires pinned resource root: actual Chunk/Encoding/Poi/FinishedEntities native variants"]
+        fn actual_rich_native_record_variants_survive_failure_repair_and_native_reread() {
+            let resources = PathBuf::from(
+                std::env::var_os("HORIZON_TEST_RESOURCES").expect("pinned resources mandatory"),
+            );
+            let assets = crate::assets::Assets::load(&resources).expect("pinned assets");
+            let biomes = Arc::new(Biomes::load(&resources).expect("pinned biomes"));
+            let tables = Arc::new(SaveTables::new(&assets));
+            let bell = assets.registry.default_state("minecraft:bell").unwrap().0;
+            let path = root("rich");
+            for folder in ["region", "entities", "poi"] {
+                fs::create_dir_all(region_path(&path, folder, 0, 0)).unwrap();
+            }
+            let save = Arc::new(SaveDir::new_retained(path.clone()));
+            let mut chunk = Chunk::empty(0, 0);
+            chunk.set(5, 71, 5, bell);
+            chunk.entities.push(Tag::compound([
+                ("id", Tag::String("minecraft:item".into())),
+                ("opaque", Tag::IntArray(vec![7, -4, 2])),
+            ]));
+            let chunk = Arc::new(chunk);
+            let encoding = Arc::new(Encoding {
+                registry: assets.registry,
+                biomes,
+                tables: Some(tables.clone()),
+                shape: save.shape,
+            });
+            save.queue(
+                Folder::Region,
+                vec![((0, 0), Record::Chunk(chunk.clone(), encoding.clone()))],
+                false,
+            )
+            .unwrap();
+            save.queue(
+                Folder::Entities,
+                vec![((0, 0), Record::FinishedEntities(chunk.clone()))],
+                false,
+            )
+            .unwrap();
+            save.queue(
+                Folder::Poi,
+                vec![((0, 0), Record::Poi(chunk.clone(), tables.clone()))],
+                false,
+            )
+            .unwrap();
+            let mut close = begin(&save);
+            until_harvest(&mut close);
+            let same = {
+                let pending = save.pending.lock().unwrap();
+                matches!(&pending[&(Folder::Region,0,0)].1,Record::Chunk(c,e)if Arc::ptr_eq(c,&chunk)&&Arc::ptr_eq(e,&encoding))
+                    && matches!(&pending[&(Folder::Entities,0,0)].1,Record::FinishedEntities(c)if Arc::ptr_eq(c,&chunk))
+                    && matches!(&pending[&(Folder::Poi,0,0)].1,Record::Poi(c,t)if Arc::ptr_eq(c,&chunk)&&Arc::ptr_eq(t,&tables))
+            };
+            for folder in ["region", "entities", "poi"] {
+                fs::remove_dir(region_path(&path, folder, 0, 0)).unwrap();
+            }
+            close.retry(deadline()).unwrap();
+            let closed = finish(close);
+            assert!(same);
+            assert!(disk(&path, Folder::Region, 0, 0).is_some());
+            assert_eq!(
+                disk(&path, Folder::Entities, 0, 0)
+                    .unwrap()
+                    .tag
+                    .get("Entities"),
+                Some(&Tag::List(chunk.entities.clone()))
+            );
+            assert_eq!(
+                disk(&path, Folder::Poi, 0, 0).unwrap(),
+                encode_poi(&chunk, &tables).unwrap()
+            );
+            drop(closed);
+            drop(save);
+            fs::remove_dir_all(path).unwrap();
+        }
+        #[test]
+        #[ignore = "requires pinned resources: actual strict old-POI decode failure, negative cache and repaired claims"]
+        fn actual_strict_poi_failure_preserves_original_snapshots_until_real_repair() {
+            let resources = PathBuf::from(
+                std::env::var_os("HORIZON_TEST_RESOURCES").expect("pinned resources mandatory"),
+            );
+            let assets = crate::assets::Assets::load(&resources).unwrap();
+            let tables = Arc::new(SaveTables::new(&assets));
+            let bell = assets.registry.default_state("minecraft:bell").unwrap().0;
+            let path = root("strict-poi");
+            let file = region_path(&path, "poi", 0, 0);
+            fs::create_dir_all(file.parent().unwrap()).unwrap();
+            let save = Arc::new(SaveDir::new_retained(path.clone()));
+            assert!(save.read_record("poi", 0, 0).is_none());
+            assert!(matches!(
+                save.poi_regions.lock().unwrap().get(&(0, 0)),
+                Some(None)
+            ));
+            {
+                let mut region = RegionFile::open_writable(&file, true).unwrap();
+                region
+                    .write(
+                        ChunkPos::new(0, 0),
+                        &ChunkRecord::from_nbt(
+                            &claimed_poi(),
+                            Compression::Zlib,
+                            1,
+                            Limits::default(),
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                region
+                    .write(
+                        ChunkPos::new(1, 0),
+                        &ChunkRecord {
+                            compression: Compression::None,
+                            compressed: vec![255],
+                            timestamp: 1,
+                        },
+                    )
+                    .unwrap();
+                region.sync().unwrap();
+            }
+            let before = fs::read(&file).unwrap();
+            let mut a = Chunk::empty(0, 0);
+            a.set(5, 71, 5, bell);
+            let a = Arc::new(a);
+            let mut b = Chunk::empty(1, 0);
+            b.set(5, 71, 5, bell);
+            let b = Arc::new(b);
+            save.queue(
+                Folder::Poi,
+                vec![
+                    ((0, 0), Record::Poi(a.clone(), tables.clone())),
+                    ((1, 0), Record::Poi(b.clone(), tables.clone())),
+                ],
+                false,
+            )
+            .unwrap();
+            let mut close = begin(&save);
+            until_harvest(&mut close);
+            let unchanged =
+                fs::read(&file).unwrap() == before && save.pending.lock().unwrap().len() == 2;
+            {
+                let mut region = RegionFile::open_writable(&file, false).unwrap();
+                region.clear(ChunkPos::new(1, 0), 2).unwrap();
+                region.sync().unwrap();
+            }
+            close.retry(deadline()).unwrap();
+            let closed = finish(close);
+            assert!(unchanged);
+            let saved = save.read_record("poi", 0, 0).unwrap();
+            assert_eq!(poi_tickets(&saved, [5, 71, 5]), Some(30));
+            assert_eq!(
+                disk(&path, Folder::Poi, 1, 0).unwrap(),
+                encode_poi(&b, &tables).unwrap()
+            );
+            let empty_path = path.join("empty-poi");
+            {
+                let seed = SaveDir::new(empty_path.clone());
+                seed.queue(
+                    Folder::Poi,
+                    vec![((0, 0), Record::Tag(Arc::new(claimed_poi())))],
+                    true,
+                )
+                .unwrap();
+            }
+            let empty = Arc::new(SaveDir::new_retained(empty_path.clone()));
+            empty
+                .queue(
+                    Folder::Poi,
+                    vec![(
+                        (0, 0),
+                        Record::Poi(Arc::new(Chunk::empty(0, 0)), tables.clone()),
+                    )],
+                    false,
+                )
+                .unwrap();
+            let empty_done = finish(begin(&empty));
+            let empty_tag = empty.read_record("poi", 0, 0).unwrap();
+            assert_eq!(
+                empty_tag.tag.get("Sections"),
+                Some(&Tag::Compound(Compound::new()))
+            );
+            drop(empty_done);
+            drop(empty);
+            drop(closed);
+            drop(save);
+            fs::remove_dir_all(path).unwrap();
+        }
+        #[test]
+        #[cfg(unix)]
+        fn actual_readonly_cached_handle_is_reopened_on_retry_after_path_repair() {
+            use std::os::unix::fs::PermissionsExt;
+            for folder in [Folder::Region, Folder::Entities, Folder::Poi] {
+                let path = root("cached");
+                let file = region_path(&path, folder.name(), 0, 0);
+                let save = Arc::new(SaveDir::new_retained(path.clone()));
+                save.queue(folder, vec![((0, 0), Record::Tag(tag(1)))], true)
+                    .unwrap();
+                save.queue(folder, vec![((32, 0), Record::Tag(tag(88)))], true)
+                    .unwrap();
+                fs::set_permissions(&file, fs::Permissions::from_mode(0o444)).unwrap();
+                let cache = match folder {
+                    Folder::Region => &save.regions,
+                    Folder::Entities => &save.entity_regions,
+                    Folder::Poi => &save.poi_regions,
+                };
+                cache.lock().unwrap().remove(&(0, 0)); // Fixture makes the real native reader take its readonly-open fallback.
+                let first = save.read_record(folder.name(), 0, 0).unwrap();
+                let unrelated = cache.lock().unwrap()[&(1, 0)].as_ref().unwrap().clone();
+                let old = cache.lock().unwrap()[&(0, 0)].as_ref().unwrap().clone();
+                queue(&save, folder, 0, tag(2));
+                let mut close = begin(&save);
+                until_harvest(&mut close);
+                let blocked = matches!(close.status(), RetainedWriterStatus::Blocked(_));
+                let archived = file.with_extension("old");
+                fs::rename(&file, &archived).unwrap();
+                fs::copy(&archived, &file).unwrap();
+                fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+                close.retry(deadline()).unwrap();
+                let closed = finish(close);
+                let previous = old
+                    .lock()
+                    .unwrap()
+                    .read(ChunkPos::new(0, 0))
+                    .unwrap()
+                    .unwrap()
+                    .nbt(Limits::default())
+                    .unwrap();
+                assert!(blocked);
+                assert_eq!(first, *tag(1));
+                assert_eq!(previous, *tag(1));
+                assert_eq!(disk(&path, folder, 0, 0), Some((*tag(2)).clone()));
+                assert_eq!(
+                    save.read_record(folder.name(), 0, 0),
+                    Some((*tag(2)).clone())
+                );
+                assert_eq!(
+                    save.read_record(folder.name(), 32, 0),
+                    Some((*tag(88)).clone())
+                );
+                let cache = cache.lock().unwrap();
+                assert!(!Arc::ptr_eq(cache[&(0, 0)].as_ref().unwrap(), &old));
+                assert!(Arc::ptr_eq(cache[&(1, 0)].as_ref().unwrap(), &unrelated));
+                drop(cache);
+                drop(unrelated);
+                drop(old);
+                drop(closed);
+                drop(save);
+                fs::remove_dir_all(path).unwrap();
+            }
+        }
+
+        #[test]
+        #[ignore = "external fatal fixture: actual retained Open SaveDir must abort before destructor join/detach"]
+        fn fatal_open_save_dir_before_any_hidden_cleanup() {
+            let save = SaveDir::new_retained(root("fatal-open"));
+            assert!(save.retained.is_some());
+            assert!(save.writer.lock().unwrap().is_none());
+            marker("open-save-dir");
+            drop(save);
+            panic!("retained Open Drop returned");
+        }
+        #[test]
+        #[ignore = "external fatal fixture: genuine held native worker, marker then unresolved owner Drop abort"]
+        fn fatal_unresolved_owner_before_worker_handle_detaches() {
+            let save = Arc::new(SaveDir::new_retained(root("fatal-owner")));
+            let (entered, _release) = native_gate(&save);
+            queue(&save, Folder::Region, 0, tag(91));
+            entered.recv_timeout(Duration::from_secs(5)).unwrap();
+            let close = begin(&save);
+            assert!(!close.thread.as_ref().unwrap().is_finished());
+            assert_eq!(save.pending.lock().unwrap().len(), 1);
+            marker("unresolved-owner-held-worker");
+            drop(close);
+            panic!("unresolved owner Drop returned");
+        }
+        #[test]
+        #[ignore = "external fatal fixture: actual native writer panic strands original batch, never reset to success"]
+        fn fatal_actual_worker_panic_retains_original_accounting() {
+            let save = Arc::new(SaveDir::new_retained(root("fatal-panic")));
+            let (entered, observed) = mpsc::channel();
+            let (release, wait) = mpsc::channel();
+            save.native_fence_writer_step(move || {
+                entered.send(()).unwrap();
+                let _ = wait.recv_timeout(Duration::from_secs(15));
+                panic!("fixed actual native writer panic")
+            });
+            let original = tag(92);
+            queue(&save, Folder::Region, 0, original.clone());
+            observed.recv_timeout(Duration::from_secs(5)).unwrap();
+            queue(&save, Folder::Entities, 0, tag(94));
+            queue(&save, Folder::Poi, 0, tag(95));
+            let mut close = begin(&save);
+            release.send(()).unwrap();
+            until_harvest(&mut close);
+            assert!(matches!(close.status(), RetainedWriterStatus::Blocked(_)));
+            assert!(close.retry(deadline()).is_err());
+            assert_eq!(*save.outstanding.count.lock().unwrap(), 3);
+            assert_eq!(save.pending.lock().unwrap().len(), 3);
+            assert!(
+                matches!(&save.pending.lock().unwrap()[&(Folder::Region,0,0)].1,Record::Tag(t)if Arc::ptr_eq(t,&original))
+            );
+            marker("worker-panic-original-accounting");
+            drop(close);
+            panic!("panic owner Drop returned");
+        }
+        #[test]
+        #[ignore = "external fatal fixture: genuine disconnected native receiver preserves unsent original batch"]
+        fn fatal_unsent_batch_preserved_after_actual_receiver_exit() {
+            let save = Arc::new(SaveDir::new_retained(root("fatal-send")));
+            save.retained
+                .as_ref()
+                .unwrap()
+                .stop_receiver
+                .store(true, Ordering::SeqCst);
+            let original = tag(93);
+            assert!(
+                save.queue(
+                    Folder::Region,
+                    vec![((0, 0), Record::Tag(original.clone()))],
+                    false
+                )
+                .is_err()
+            );
+            let mut close = begin(&save);
+            until_harvest(&mut close);
+            assert!(close.retry(deadline()).is_err());
+            assert_eq!(*save.outstanding.count.lock().unwrap(), 0);
+            {
+                let ledger = save.retained.as_ref().unwrap().ledger.lock().unwrap();
+                assert_eq!(ledger.unsent_batches.len(), 1);
+                assert_eq!(ledger.unsent, 1);
+                assert!(ledger.fault.is_some());
+            }
+            assert!(
+                matches!(&save.pending.lock().unwrap()[&(Folder::Region,0,0)].1,Record::Tag(t)if Arc::ptr_eq(t,&original))
+            );
+            marker("unsent-original-batch");
+            drop(close);
+            panic!("unsent owner Drop returned");
+        }
+        #[test]
+        fn failed_older_batch_then_successful_newer_retains_sticky_history_until_explicit_retry() {
+            let path = root("older-failed");
+            let file = region_path(&path, "poi", 0, 0);
+            fs::create_dir_all(&file).unwrap();
+            let save = Arc::new(SaveDir::new_retained(path.clone()));
+            queue(&save, Folder::Poi, 0, tag(81));
+            assert!(save.flush().is_err());
+            fs::remove_dir(&file).unwrap();
+            queue(&save, Folder::Poi, 0, tag(82));
+            queue(&save, Folder::Entities, 0, tag(83));
+            assert!(save.flush().is_err());
+            let mut close = begin(&save);
+            until_harvest(&mut close);
+            let blocked = matches!(close.status(), RetainedWriterStatus::Blocked(_));
+            let empty = save.pending.lock().unwrap().is_empty();
+            close.retry(deadline()).unwrap();
+            let closed = finish(close);
+            assert!(blocked && empty);
+            assert_eq!(disk(&path, Folder::Poi, 0, 0), Some((*tag(82)).clone()));
+            assert_eq!(
+                disk(&path, Folder::Entities, 0, 0),
+                Some((*tag(83)).clone())
+            );
+            drop(closed);
+            drop(save);
+            fs::remove_dir_all(path).unwrap();
+        }
+        #[test]
+        #[ignore = "external fatal fixture: poisoned native count remains owned Blocked without a reset"]
+        fn fatal_poisoned_count_is_not_waived() {
+            let save = Arc::new(SaveDir::new_retained(root("fatal-count-poison")));
+            let mut close = begin(&save);
+            poison(&save.outstanding.count);
+            assert!(matches!(close.poll(), RetainedWriterStatus::Blocked(_)));
+            assert!(close.retry(deadline()).is_err());
+            assert!(save.outstanding.count.is_poisoned());
+            marker("poisoned-count-retained");
+            drop(close);
+            panic!("poisoned count owner returned");
+        }
+        #[test]
+        #[ignore = "external fatal fixture: poisoned native ledger remains owned Blocked without fabricated batch success"]
+        fn fatal_poisoned_ledger_is_not_waived() {
+            let save = Arc::new(SaveDir::new_retained(root("fatal-ledger-poison")));
+            let mut close = begin(&save);
+            poison(&save.retained.as_ref().unwrap().ledger);
+            assert!(matches!(close.poll(), RetainedWriterStatus::Blocked(_)));
+            assert!(close.retry(deadline()).is_err());
+            assert!(save.retained.as_ref().unwrap().ledger.is_poisoned());
+            marker("poisoned-ledger-retained");
+            drop(close);
+            panic!("poisoned ledger owner returned");
+        }
+        #[test]
+        #[ignore = "external fatal fixture: poisoned native error after real successful IO cannot be cleared into a close token"]
+        fn fatal_poisoned_error_is_not_waived_after_actual_write() {
+            let path = root("fatal-error-poison");
+            let save = Arc::new(SaveDir::new_retained(path.clone()));
+            queue(&save, Folder::Region, 0, tag(84));
+            save.flush().unwrap();
+            let mut close = begin(&save);
+            while close.thread.as_ref().is_some_and(|t| !t.is_finished()) {
+                std::thread::yield_now();
+            }
+            poison(&save.outstanding.error);
+            until_harvest(&mut close);
+            assert!(matches!(close.status(), RetainedWriterStatus::Blocked(_)));
+            assert!(close.retry(deadline()).is_err());
+            assert_eq!(disk(&path, Folder::Region, 0, 0), Some((*tag(84)).clone()));
+            assert!(save.outstanding.error.is_poisoned());
+            marker("poisoned-error-retained");
+            drop(close);
+            panic!("poisoned error owner returned");
+        }
+        #[test]
+        #[ignore = "external fatal fixture: genuine native cache poison during actual batch refuses repair instead of resetting the cache lock"]
+        fn fatal_poisoned_native_cache_is_not_waived() {
+            let save = Arc::new(SaveDir::new_retained(root("fatal-cache-poison")));
+            let (entered, release) = native_gate(&save);
+            let original = tag(85);
+            queue(&save, Folder::Region, 0, original.clone());
+            entered.recv_timeout(Duration::from_secs(5)).unwrap();
+            poison(&save.regions);
+            let mut close = begin(&save);
+            release.send(()).unwrap();
+            until_harvest(&mut close);
+            assert!(matches!(close.status(), RetainedWriterStatus::Blocked(_)));
+            assert!(close.retry(deadline()).is_err());
+            assert!(
+                matches!(&save.pending.lock().unwrap()[&(Folder::Region,0,0)].1,Record::Tag(t)if Arc::ptr_eq(t,&original))
+            );
+            assert!(save.regions.is_poisoned());
+            marker("poisoned-cache-retained");
+            drop(close);
+            panic!("poisoned cache owner returned");
+        }
+        #[test]
+        #[ignore = "external fatal fixture: accepted original Record cannot be replaced by a native-equal new allocation to forge retry"]
+        fn fatal_native_record_correlation_mismatch_retains_original() {
+            let path = root("fatal-record-correlation");
+            let file = region_path(&path, "region", 0, 0);
+            fs::create_dir_all(&file).unwrap();
+            let save = Arc::new(SaveDir::new_retained(path));
+            let original = tag(96);
+            queue(&save, Folder::Region, 0, original.clone());
+            let mut close = begin(&save);
+            until_harvest(&mut close);
+            {
+                let mut pending = save.pending.lock().unwrap();
+                let entry = pending.get_mut(&(Folder::Region, 0, 0)).unwrap();
+                entry.1 = Record::Tag(tag(96));
+            }
+            fs::remove_dir(file).unwrap();
+            close.retry(deadline()).unwrap();
+            until_harvest(&mut close);
+            assert!(matches!(close.status(), RetainedWriterStatus::Blocked(_)));
+            assert!(close.retry(deadline()).is_err());
+            {
+                let ledger = save.retained.as_ref().unwrap().ledger.lock().unwrap();
+                assert!(ledger.fault.is_some());
+                assert!(
+                    matches!(&ledger.expected[&(Folder::Region,0,0)].owner,Some(Record::Tag(t))if Arc::ptr_eq(t,&original))
+                );
+            }
+            assert_eq!(save.pending.lock().unwrap().len(), 1);
+            marker("native-record-correlation-retained");
+            drop(close);
+            panic!("record mismatch owner returned");
+        }
+        #[test]
+        #[ignore = "external fatal fixture: overflowed original outstanding count refuses enqueue before native publication and remains Blocked"]
+        fn fatal_outstanding_overflow_does_not_accept_or_reset_records() {
+            let save = Arc::new(SaveDir::new_retained(root("fatal-overflow")));
+            *save.outstanding.count.lock().unwrap() = usize::MAX;
+            assert!(
+                save.queue(Folder::Region, vec![((0, 0), Record::Tag(tag(97)))], false)
+                    .is_err()
+            );
+            assert!(save.pending.lock().unwrap().is_empty());
+            assert_eq!(save.sequence.load(Ordering::Relaxed), 0);
+            let mut close = begin(&save);
+            assert!(matches!(close.poll(), RetainedWriterStatus::Blocked(_)));
+            assert!(close.retry(deadline()).is_err());
+            assert_eq!(*save.outstanding.count.lock().unwrap(), usize::MAX);
+            marker("outstanding-overflow-retained");
+            drop(close);
+            panic!("overflow owner returned");
+        }
+        #[test]
+        fn actual_durable_receipts_release_original_payload_owners() {
+            let path = root("released-payload");
+            let save = Arc::new(SaveDir::new_retained(path.clone()));
+            let original = tag(101);
+            let weak = Arc::downgrade(&original);
+            queue(&save, Folder::Region, 0, original.clone());
+            drop(original);
+            let closed = finish(begin(&save));
+            assert!(weak.upgrade().is_none());
+            assert_eq!(save.read_record("region", 0, 0), Some((*tag(101)).clone()));
+            {
+                let ledger = save.retained.as_ref().unwrap().ledger.lock().unwrap();
+                let row = &ledger.expected[&(Folder::Region, 0, 0)];
+                assert!(row.owner.is_none());
+                assert!(row.receipt.is_some());
+                assert_eq!(ledger.unsettled, 0);
+            }
+            drop(closed);
+            drop(save);
+            fs::remove_dir_all(path).unwrap();
+        }
+        #[test]
+        #[ignore = "requires pinned native resources: actual outer Region acceptance then sealed Poi refusal preserves original dirty markers"]
+        fn actual_outer_region_acceptance_then_poi_refusal_preserves_dirty_markers() {
+            let resources = PathBuf::from(
+                std::env::var_os("HORIZON_TEST_RESOURCES").expect("pinned resources mandatory"),
+            );
+            let assets = crate::assets::Assets::load(&resources).unwrap();
+            let biomes = Arc::new(Biomes::load(&resources).unwrap());
+            let tables = Arc::new(SaveTables::new(&assets));
+            let bell = assets.registry.default_state("minecraft:bell").unwrap().0;
+            let path = root("outer-partial");
+            let save = Arc::new(SaveDir::new_retained(path.clone()));
+            assert!(save.tables.set(tables).is_ok());
+            let mut chunk = Chunk::empty(0, 0);
+            chunk.set(5, 71, 5, bell);
+            let original = Arc::new(chunk);
+            let (entered, observed) = mpsc::channel();
+            let (release, wait) = mpsc::channel();
+            *save.retained.as_ref().unwrap().after_region.lock().unwrap() = Some((entered, wait));
+            let actor = save.clone();
+            let snapshot = original.clone();
+            let registry = assets.registry;
+            let producer = std::thread::spawn(move || {
+                let mut modified = HashSet::from([(0, 0)]);
+                let error = actor
+                    .save_modified_later(
+                        &mut modified,
+                        std::slice::from_ref(&snapshot),
+                        registry,
+                        &biomes,
+                    )
+                    .is_err();
+                (error, modified, snapshot)
+            });
+            observed.recv_timeout(Duration::from_secs(5)).unwrap();
+            let close = begin(&save);
+            release.send(()).unwrap();
+            while !producer.is_finished() {
+                std::thread::yield_now();
+            }
+            let (error, modified, snapshot) = producer.join().unwrap();
+            let closed = finish(close);
+            assert!(error && modified.contains(&(0, 0)));
+            assert!(Arc::ptr_eq(&snapshot, &original));
+            assert!(disk(&path, Folder::Region, 0, 0).is_some());
+            assert!(disk(&path, Folder::Poi, 0, 0).is_none());
+            assert!(save.pending.lock().unwrap().is_empty());
+            drop(closed);
+            drop(save);
+            fs::remove_dir_all(path).unwrap();
+        }
+        #[test]
+        #[ignore = "external fatal fixture: actual poisoned inner RegionFile owner is never evicted/reopened to waive a terminal fault"]
+        fn fatal_poisoned_inner_region_file_retains_original_owner() {
+            let path = root("fatal-inner-poison");
+            let save = Arc::new(SaveDir::new_retained(path.clone()));
+            save.queue(Folder::Region, vec![((0, 0), Record::Tag(tag(1)))], true)
+                .unwrap();
+            let original_file = save.regions.lock().unwrap()[&(0, 0)]
+                .as_ref()
+                .unwrap()
+                .clone();
+            let original = tag(102);
+            let (entered, release) = native_gate(&save);
+            queue(&save, Folder::Region, 0, original.clone());
+            entered.recv_timeout(Duration::from_secs(5)).unwrap();
+            poison(&original_file);
+            let mut close = begin(&save);
+            release.send(()).unwrap();
+            until_harvest(&mut close);
+            assert!(matches!(close.status(), RetainedWriterStatus::Blocked(_)));
+            assert!(close.retry(deadline()).is_err());
+            assert!(original_file.is_poisoned());
+            assert!(Arc::ptr_eq(
+                save.regions.lock().unwrap()[&(0, 0)].as_ref().unwrap(),
+                &original_file
+            ));
+            {
+                let ledger = save.retained.as_ref().unwrap().ledger.lock().unwrap();
+                assert!(ledger.fault.is_some());
+                assert!(
+                    ledger
+                        .poisoned_files
+                        .iter()
+                        .any(|file| Arc::ptr_eq(file, &original_file))
+                );
+            }
+            assert!(
+                matches!(&save.pending.lock().unwrap()[&(Folder::Region,0,0)].1,Record::Tag(record)if Arc::ptr_eq(record,&original))
+            );
+            assert_eq!(disk(&path, Folder::Region, 0, 0), Some((*tag(1)).clone()));
+            let close = close.finish().unwrap_err();
+            marker("inner-regionfile-poison-retained");
+            drop(close);
+            panic!("inner poisoned owner returned");
+        }
+        #[test]
+        #[ignore = "external fatal fixture: actual failed write missing pending key cannot fabricate an empty successful retry"]
+        fn fatal_missing_pending_after_real_failure_retains_original() {
+            let path = root("fatal-missing-pending");
+            let file = region_path(&path, "region", 0, 0);
+            fs::create_dir_all(&file).unwrap();
+            let save = Arc::new(SaveDir::new_retained(path));
+            let original = tag(103);
+            queue(&save, Folder::Region, 0, original.clone());
+            let mut close = begin(&save);
+            until_harvest(&mut close);
+            assert!(matches!(close.status(), RetainedWriterStatus::Blocked(_)));
+            save.pending.lock().unwrap().remove(&(Folder::Region, 0, 0));
+            assert!(matches!(close.poll(), RetainedWriterStatus::Blocked(_)));
+            assert!(close.retry(deadline()).is_err());
+            {
+                let ledger = save.retained.as_ref().unwrap().ledger.lock().unwrap();
+                assert_eq!(ledger.unsettled, 1);
+                assert!(
+                    matches!(&ledger.expected[&(Folder::Region,0,0)].owner,Some(Record::Tag(record))if Arc::ptr_eq(record,&original))
+                );
+            }
+            assert!(close.thread.is_none());
+            assert!(save.pending.lock().unwrap().is_empty());
+            marker("missing-pending-original-retained");
+            drop(close);
+            panic!("missing pending owner returned");
+        }
+        #[test]
+        #[ignore = "external fatal fixture: missing native-written receipt cannot certify a completed durable row during retry"]
+        fn fatal_inconsistent_durable_receipt_never_certifies_retry() {
+            let path = root("fatal-durable-receipt");
+            let save = Arc::new(SaveDir::new_retained(path.clone()));
+            save.queue(Folder::Region, vec![((0, 0), Record::Tag(tag(104)))], true)
+                .unwrap();
+            let file = region_path(&path, "entities", 0, 0);
+            fs::create_dir_all(file).unwrap();
+            let original = tag(105);
+            queue(&save, Folder::Entities, 0, original.clone());
+            let mut close = begin(&save);
+            until_harvest(&mut close);
+            {
+                let mut ledger = save.retained.as_ref().unwrap().ledger.lock().unwrap();
+                let row = &ledger.expected[&(Folder::Region, 0, 0)];
+                let receipt = row.receipt.unwrap();
+                let seq = row.seq;
+                assert!(row.owner.is_none());
+                assert!(
+                    ledger
+                        .facts
+                        .get_mut(&receipt.batch)
+                        .unwrap()
+                        .written
+                        .remove(&(Folder::Region, 0, 0, seq))
+                );
+            }
+            close.retry(deadline()).unwrap();
+            until_harvest(&mut close);
+            assert!(matches!(close.status(), RetainedWriterStatus::Blocked(_)));
+            assert!(close.retry(deadline()).is_err());
+            assert!(
+                save.retained
+                    .as_ref()
+                    .unwrap()
+                    .ledger
+                    .lock()
+                    .unwrap()
+                    .fault
+                    .is_some()
+            );
+            assert_eq!(disk(&path, Folder::Region, 0, 0), Some((*tag(104)).clone()));
+            assert!(
+                matches!(&save.pending.lock().unwrap()[&(Folder::Entities,0,0)].1,Record::Tag(record)if Arc::ptr_eq(record,&original))
+            );
+            marker("durable-receipt-mismatch-retained");
+            drop(close);
+            panic!("durable receipt owner returned");
+        }
+        #[test]
+        #[ignore = "external fatal fixture: worker never treats an absent pending record as an accepted supersession"]
+        fn fatal_missing_record_before_actual_write_is_not_supersession() {
+            let path = root("fatal-before-write");
+            let save = Arc::new(SaveDir::new_retained(path.clone()));
+            let original = tag(106);
+            let (entered, release) = native_gate(&save);
+            queue(&save, Folder::Region, 0, original.clone());
+            entered.recv_timeout(Duration::from_secs(5)).unwrap();
+            save.pending.lock().unwrap().remove(&(Folder::Region, 0, 0));
+            let mut close = begin(&save);
+            release.send(()).unwrap();
+            until_harvest(&mut close);
+            assert!(matches!(close.status(), RetainedWriterStatus::Blocked(_)));
+            assert!(close.retry(deadline()).is_err());
+            assert!(disk(&path, Folder::Region, 0, 0).is_none());
+            let ledger = save.retained.as_ref().unwrap().ledger.lock().unwrap();
+            assert!(ledger.fault.is_some());
+            assert!(
+                matches!(&ledger.expected[&(Folder::Region,0,0)].owner,Some(Record::Tag(record))if Arc::ptr_eq(record,&original))
+            );
+            drop(ledger);
+            marker("missing-before-write-retained");
+            drop(close);
+            panic!("missing pre-write owner returned");
+        }
+        #[test]
+        fn correlated_repeated_native_failures_advance_witness_then_repair() {
+            let path = root("repeated-error-witness");
+            let file = region_path(&path, "region", 0, 0);
+            fs::create_dir_all(&file).unwrap();
+            let save = Arc::new(SaveDir::new_retained(path.clone()));
+            queue(&save, Folder::Region, 0, tag(111));
+            let mut close = begin(&save);
+            until_harvest(&mut close);
+            let first = {
+                let ledger = save.retained.as_ref().unwrap().ledger.lock().unwrap();
+                ledger.error_witness.unwrap().generation
+            };
+            close.retry(deadline()).unwrap();
+            until_harvest(&mut close);
+            let second = {
+                let ledger = save.retained.as_ref().unwrap().ledger.lock().unwrap();
+                assert!(!ledger.error_corrupt);
+                let current = save.outstanding.error.lock().unwrap();
+                assert!(error_correlated(&ledger, &current));
+                ledger.error_witness.unwrap().generation
+            };
+            fs::remove_dir(&file).unwrap();
+            close.retry(deadline()).unwrap();
+            let closed = finish(close);
+            assert!(second > first);
+            assert_eq!(disk(&path, Folder::Region, 0, 0), Some((*tag(111)).clone()));
+            {
+                let ledger = save.retained.as_ref().unwrap().ledger.lock().unwrap();
+                assert!(ledger.error.is_none() && ledger.error_witness.is_none());
+                assert!(ledger.history.len() >= 2);
+                assert!(!ledger.error_corrupt);
+            }
+            drop(closed);
+            drop(save);
+            fs::remove_dir_all(path).unwrap();
+        }
+        #[test]
+        #[ignore = "external fatal fixture: actual failed write then unexplained sticky mismatch cannot be retired by repair retry"]
+        fn fatal_unexplained_sticky_error_before_repair_never_closes() {
+            let path = root("fatal-error-before-retry");
+            let file = region_path(&path, "region", 0, 0);
+            fs::create_dir_all(&file).unwrap();
+            let save = Arc::new(SaveDir::new_retained(path));
+            let original = tag(112);
+            queue(&save, Folder::Region, 0, original.clone());
+            let mut close = begin(&save);
+            until_harvest(&mut close);
+            let (old, generation) = {
+                let ledger = save.retained.as_ref().unwrap().ledger.lock().unwrap();
+                (
+                    ledger.error.clone(),
+                    ledger.error_witness.unwrap().generation,
+                )
+            };
+            *save.outstanding.error.lock().unwrap() = Some("UNEXPLAINED_BEFORE_REPAIR".into());
+            fs::remove_dir(file).unwrap();
+            assert!(close.retry(deadline()).is_err());
+            assert!(matches!(close.poll(), RetainedWriterStatus::Blocked(_)));
+            assert!(close.thread.is_none());
+            {
+                let ledger = save.retained.as_ref().unwrap().ledger.lock().unwrap();
+                assert!(ledger.error_corrupt && ledger.fault.is_some());
+                assert_eq!(ledger.error, old);
+                assert_eq!(ledger.error_witness.unwrap().generation, generation);
+                assert!(
+                    ledger
+                        .history
+                        .iter()
+                        .any(|entry| entry.contains("UNEXPLAINED_BEFORE_REPAIR"))
+                );
+            }
+            assert_eq!(
+                save.outstanding.error.lock().unwrap().as_deref(),
+                Some("UNEXPLAINED_BEFORE_REPAIR")
+            );
+            assert!(
+                matches!(&save.pending.lock().unwrap()[&(Folder::Region,0,0)].1,Record::Tag(record)if Arc::ptr_eq(record,&original))
+            );
+            marker("unexplained-before-repair-retained");
+            drop(close);
+            panic!("unexplained error owner returned");
+        }
+        #[test]
+        #[ignore = "external fatal fixture: genuine held retry cannot erase a late unexplained sticky error"]
+        fn fatal_late_unexplained_error_while_retry_worker_held_never_closes() {
+            let path = root("fatal-error-retry-held");
+            let file = region_path(&path, "region", 0, 0);
+            fs::create_dir_all(&file).unwrap();
+            let save = Arc::new(SaveDir::new_retained(path));
+            queue(&save, Folder::Region, 0, tag(113));
+            let mut close = begin(&save);
+            until_harvest(&mut close);
+            let generation = save
+                .retained
+                .as_ref()
+                .unwrap()
+                .ledger
+                .lock()
+                .unwrap()
+                .error_witness
+                .unwrap()
+                .generation;
+            fs::remove_dir(file).unwrap();
+            let (entered, release) = native_gate(&save);
+            close.retry(deadline()).unwrap();
+            entered.recv_timeout(Duration::from_secs(5)).unwrap();
+            *save.outstanding.error.lock().unwrap() = Some("UNEXPLAINED_RETRY_HELD".into());
+            release.send(()).unwrap();
+            until_harvest(&mut close);
+            assert!(matches!(close.status(), RetainedWriterStatus::Blocked(_)));
+            assert!(close.retry(deadline()).is_err());
+            {
+                let ledger = save.retained.as_ref().unwrap().ledger.lock().unwrap();
+                assert!(ledger.error_corrupt && ledger.fault.is_some());
+                assert_eq!(ledger.error_witness.unwrap().generation, generation);
+                assert!(ledger.retry_success.is_none());
+            }
+            assert_eq!(
+                save.outstanding.error.lock().unwrap().as_deref(),
+                Some("UNEXPLAINED_RETRY_HELD")
+            );
+            marker("late-retry-error-retained");
+            drop(close);
+            panic!("late error owner returned");
+        }
+        #[test]
+        #[ignore = "external fatal fixture: late unknown error while deadline Blocked remains terminal even after actual retry worker completion"]
+        fn fatal_late_unexplained_error_while_deadline_blocked_never_closes() {
+            let path = root("fatal-error-deadline-held");
+            let file = region_path(&path, "region", 0, 0);
+            fs::create_dir_all(&file).unwrap();
+            let save = Arc::new(SaveDir::new_retained(path));
+            queue(&save, Folder::Region, 0, tag(114));
+            let mut close = begin(&save);
+            until_harvest(&mut close);
+            fs::remove_dir(file).unwrap();
+            let (entered, release) = native_gate(&save);
+            close
+                .retry(Instant::now() + Duration::from_millis(100))
+                .unwrap();
+            entered.recv_timeout(Duration::from_secs(5)).unwrap();
+            std::thread::sleep(Duration::from_millis(110));
+            assert!(matches!(close.poll(), RetainedWriterStatus::Blocked(_)));
+            assert!(
+                close
+                    .thread
+                    .as_ref()
+                    .is_some_and(|thread| !thread.is_finished())
+            );
+            *save.outstanding.error.lock().unwrap() = Some("UNEXPLAINED_DEADLINE_BLOCKED".into());
+            release.send(()).unwrap();
+            until_harvest(&mut close);
+            assert!(matches!(close.status(), RetainedWriterStatus::Blocked(_)));
+            assert!(close.retry(deadline()).is_err());
+            assert!(
+                save.retained
+                    .as_ref()
+                    .unwrap()
+                    .ledger
+                    .lock()
+                    .unwrap()
+                    .error_corrupt
+            );
+            assert_eq!(
+                save.outstanding.error.lock().unwrap().as_deref(),
+                Some("UNEXPLAINED_DEADLINE_BLOCKED")
+            );
+            marker("deadline-blocked-error-retained");
+            drop(close);
+            panic!("deadline error owner returned");
+        }
+        #[test]
+        #[ignore = "external fatal fixture: a NEW genuine native filesystem failure after preflight cannot overwrite an unexplained current error"]
+        fn fatal_actual_new_io_failure_cannot_mask_unexplained_error() {
+            let path = root("fatal-error-completion");
+            let file = region_path(&path, "region", 0, 0);
+            fs::create_dir_all(file).unwrap();
+            let save = Arc::new(SaveDir::new_retained(path));
+            queue(&save, Folder::Region, 0, tag(115));
+            let mut close = begin(&save);
+            until_harvest(&mut close);
+            let (old, generation) = {
+                let ledger = save.retained.as_ref().unwrap().ledger.lock().unwrap();
+                (
+                    ledger.error.clone(),
+                    ledger.error_witness.unwrap().generation,
+                )
+            };
+            let (entered, observed) = mpsc::channel();
+            let (release, wait) = mpsc::channel();
+            *save.retained.as_ref().unwrap().before_io.lock().unwrap() = Some((entered, wait));
+            close.retry(deadline()).unwrap();
+            observed.recv_timeout(Duration::from_secs(5)).unwrap();
+            *save.outstanding.error.lock().unwrap() =
+                Some("UNEXPLAINED_BEFORE_NEW_IO_ERROR".into());
+            release.send(()).unwrap();
+            until_harvest(&mut close);
+            assert!(matches!(close.status(), RetainedWriterStatus::Blocked(_)));
+            assert!(close.retry(deadline()).is_err());
+            {
+                let ledger = save.retained.as_ref().unwrap().ledger.lock().unwrap();
+                assert!(ledger.error_corrupt && ledger.fault.is_some());
+                assert_eq!(ledger.error, old);
+                assert_eq!(ledger.error_witness.unwrap().generation, generation);
+                assert!(
+                    ledger
+                        .history
+                        .iter()
+                        .filter(|entry| entry.starts_with("retained native write:"))
+                        .count()
+                        >= 2
+                );
+                assert!(ledger.retry_success.is_none());
+            }
+            assert_eq!(
+                save.outstanding.error.lock().unwrap().as_deref(),
+                Some("UNEXPLAINED_BEFORE_NEW_IO_ERROR")
+            );
+            marker("new-io-error-does-not-mask-unknown");
+            drop(close);
+            panic!("completion error owner returned");
+        }
+        fn poison(lock: &Mutex<impl Send>) {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _held = lock.lock().unwrap();
+                panic!("fixed genuine mutex poison")
+            }));
+        }
+        #[test]
+        #[ignore = "external fatal fixture: genuine poisoned native pending lock remains owned Blocked"]
+        fn fatal_poisoned_pending_is_not_waived() {
+            let save = Arc::new(SaveDir::new_retained(root("fatal-poison")));
+            let mut close = begin(&save);
+            poison(&save.pending);
+            assert!(matches!(close.poll(), RetainedWriterStatus::Blocked(_)));
+            assert!(close.retry(deadline()).is_err());
+            assert!(matches!(close.status(), RetainedWriterStatus::Blocked(_)));
+            assert!(save.pending.is_poisoned());
+            marker("poisoned-pending-retained");
+            drop(close);
+            panic!("poisoned owner Drop returned");
+        }
+        #[test]
+        #[ignore = "external fatal fixture: genuine poisoned close admission remains Blocked, no fabricated token"]
+        fn fatal_poisoned_admission_is_not_waived() {
+            let save = Arc::new(SaveDir::new_retained(root("fatal-admission")));
+            let mut close = begin(&save);
+            poison(&save.retained.as_ref().unwrap().admission);
+            assert!(matches!(close.poll(), RetainedWriterStatus::Blocked(_)));
+            assert!(close.retry(deadline()).is_err());
+            assert!(close.thread.is_none());
+            marker("poisoned-admission-retained");
+            drop(close);
+            panic!("poisoned owner Drop returned");
+        }
+        #[test]
+        #[ignore = "external fatal fixture: unexplained actual count refuses retry without zeroing accounting"]
+        fn fatal_unexplained_count_never_resets() {
+            let save = Arc::new(SaveDir::new_retained(root("fatal-count")));
+            let mut close = begin(&save);
+            *save.outstanding.count.lock().unwrap() = 1;
+            assert!(matches!(close.poll(), RetainedWriterStatus::Blocked(_)));
+            assert!(close.retry(deadline()).is_err());
+            assert_eq!(*save.outstanding.count.lock().unwrap(), 1);
+            marker("unexplained-count-retained");
+            drop(close);
+            panic!("unexplained owner Drop returned");
+        }
+    }
+}
+
 impl Drop for SaveDir {
     /// Finish queued writes before the world is let go.
     fn drop(&mut self) {
+        #[cfg(feature = "paired-packages")]
+        if let Some(retained) = &mut self.retained {
+            retained.require_closed_before_drop();
+        }
         if let Some(writer) = self.writer.get_mut().ok().and_then(Option::take) {
             drop(writer.send);
             let _ = writer.thread.join();
