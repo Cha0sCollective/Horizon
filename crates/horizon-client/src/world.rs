@@ -380,6 +380,9 @@ impl World {
         running: bool,
         eligible: bool,
     ) -> Result<Option<crate::counter_trial::PhaseToken>, crate::counter_trial::PhaseError> {
+        if self.counter_domain.is_some() {
+            return Err(crate::counter_trial::PhaseError::DispatchMismatch);
+        }
         let current = self.guest_counter_current();
         match &mut self.counter_trial {
             Some(trial) => trial.prepare_guest(running, eligible, current, self.game_time),
@@ -394,6 +397,9 @@ impl World {
         running: bool,
         eligible: bool,
     ) -> Result<crate::counter_trial::Completion, crate::counter_trial::PhaseError> {
+        if self.counter_domain.is_some() {
+            return Ok(crate::counter_trial::Completion::Stale);
+        }
         let current = self.guest_counter_current();
         match &mut self.counter_trial {
             Some(trial) => {
@@ -1932,5 +1938,35 @@ mod native_empty_root_tests {
         stable(&world, Some(K::OpaqueChunkRoot));
         world.block_entities.insert(p, BlockEntity::Chest(vec![]));
         stable(&world, Some(K::PendingBlockEntityTicker));
+    }
+}
+
+#[cfg(feature = "paired-packages")]
+impl World {
+    pub fn prepare_persistent_guest_counter_phase(
+        &mut self,
+        running: bool,
+        eligible: bool,
+    ) -> Result<Option<counter_restore::PersistentGuestPhaseToken>, crate::counter_trial::PhaseError>
+    {
+        self.prepare_persistent_guest_checked(running, eligible)
+    }
+    pub fn commit_persistent_guest_counter_phase(
+        &mut self,
+        token: counter_restore::PersistentGuestPhaseToken,
+        proposal: crate::counter_trial::Proposal,
+        running: bool,
+        eligible: bool,
+    ) -> Result<crate::counter_trial::Completion, crate::counter_trial::PhaseError> {
+        self.complete_persistent_guest_checked(token, Ok(proposal), running, eligible)
+    }
+    pub fn fail_persistent_guest_counter_phase(
+        &mut self,
+        token: counter_restore::PersistentGuestPhaseToken,
+        failure: crate::counter_trial::GuestFailure,
+        running: bool,
+        eligible: bool,
+    ) -> Result<crate::counter_trial::Completion, crate::counter_trial::PhaseError> {
+        self.complete_persistent_guest_checked(token, Err(failure), running, eligible)
     }
 }

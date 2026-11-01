@@ -650,3 +650,40 @@ mod presence_tests {
         }
     }
 }
+
+impl Trial {
+    /// Additive Guest-only restore; input remains owned on every returned refusal.
+    pub(crate) fn restore_guest_checked(
+        configuration: Configuration,
+        high_water: u64,
+        input: &mut Option<RestoreAllocation>,
+    ) -> Result<Self, Error> {
+        if !matches!(
+            configuration.backend(),
+            crate::counter_trial::Backend::Guest { .. }
+        ) || input
+            .as_ref()
+            .is_some_and(|value| value.generation == 0 || value.generation > high_water)
+        {
+            return Err(Error::Fault(Fault::PersistentDomain));
+        }
+        let identity = Arc::new(());
+        let active = input.take().map(|value| OwnedSlot {
+            key: SlotKey {
+                scope: configuration.scope().clone(),
+                trial: identity.clone(),
+                incarnation: value.generation,
+            },
+            slot: SlotProjection::restored(value.stack, value.revision),
+            resident: true,
+        });
+        Ok(Self {
+            configuration: Arc::new(configuration),
+            identity,
+            last_incarnation: high_water,
+            active,
+            pending: None,
+            fault: None,
+        })
+    }
+}

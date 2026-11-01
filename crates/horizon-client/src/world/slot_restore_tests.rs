@@ -1907,3 +1907,63 @@ fn persistent_slot_counter_exhaustion_does_not_admit_or_drop_pending() {
         Err(SlotLifecycleError::Faulted)
     );
 }
+
+mod persistent_guest_slot_profile_tests {
+    use super::*;
+    fn dormant() -> Header {
+        Header {
+            guest: true,
+            profile: NativeBindingProfile::RegisteredCube,
+            world: WorldId::parse("00000000-0000-4000-8000-000000000001").unwrap(),
+            target: CounterTarget::new("minecraft:overworld", [2, 70, 2]).unwrap(),
+            package: "01".repeat(32),
+            type_id: "guest:counter".into(),
+            block_id: "guest:counter".into(),
+            observed: "minecraft:air".into(),
+            time: 8,
+            machine_head: 7,
+            slot_head: 4,
+            machine_generation: None,
+        }
+    }
+    #[test]
+    fn guest_slot_kind_is_separate_and_healthy_dormant_has_no_allocation() {
+        let header = dormant();
+        header.validate(None).unwrap();
+        assert!(
+            NativeBindingProfile::from_slot_kind(
+                super::super::super::counter_restore::GUEST_SLOT_KIND
+            )
+            .is_err()
+        );
+        let decoded = DecodedSlotFrame {
+            header: Box::new(header),
+            allocation: None,
+        };
+        assert!(decoded.is_guest());
+        assert!(matches!(
+            decoded.view().allocation,
+            SlotFrameAllocation::Dormant
+        ));
+    }
+    #[test]
+    fn guest_slot_header_refuses_mixed_profile_and_uncorrelated_heads() {
+        let mut header = dormant();
+        header.profile = NativeBindingProfile::LegacyIron;
+        assert!(header.validate(None).is_err());
+        header.profile = NativeBindingProfile::RegisteredCube;
+        header.observed = "guest:counter".into();
+        header.machine_generation = Some(5);
+        let mut original = RestoreAllocation {
+            generation: 2,
+            revision: 9,
+            stack: None,
+        };
+        header.validate(Some(&original)).unwrap();
+        original.generation = 5;
+        assert!(header.validate(Some(&original)).is_err());
+        original.generation = 2;
+        header.machine_generation = Some(8);
+        assert!(header.validate(Some(&original)).is_err());
+    }
+}

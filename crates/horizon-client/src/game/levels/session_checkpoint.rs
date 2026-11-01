@@ -10,10 +10,13 @@ use horizon_client::{
     chunk::Chunk,
     save::{self, LevelShape},
     world::counter_restore::{
-        CounterFrameV2, CounterTarget, NativeBinding, NativeBindingProfile, NativeRetirementReason,
-        Placement, RuntimeCounterKey, WorldId,
+        CounterFrameV2, CounterTarget, GuestCounterFrameV3, GuestRuntimeState, GuestStatus,
+        NativeBinding, NativeBindingProfile, NativeRetirementReason, Placement, RuntimeCounterKey,
+        WorldId,
     },
-    world::slot_restore::{DecodedSlotFrame, SlotFrameAllocation, decode_slot_frame},
+    world::slot_restore::{
+        DecodedSlotFrame, SlotFrameAllocation, decode_guest_slot_frame, decode_slot_frame,
+    },
     world_slot_trial::SlotKey,
 };
 use horizon_core::position::ChunkPos;
@@ -40,6 +43,7 @@ use std::{
 };
 
 const KIND: &str = "horizon-native-session-checkpoint";
+const GUEST_KIND: &str = "horizon-registered-guest-session-checkpoint";
 const COUNTER: &str = "host/counter.json";
 const SLOT: &str = "host/slot.nbt";
 const PIN: &str = "horizon-paired-packages.json";
@@ -1167,7 +1171,7 @@ fn columns(game: &Game<'_>, root: &Path, clock: i64) -> SResult<BTreeMap<(i32, i
     }
     Ok(result)
 }
-fn binding(game: &Game<'_>, frame: &CounterFrameV2) -> SResult<NativeBinding> {
+fn binding(game: &Game<'_>, frame: &SessionCounter) -> SResult<NativeBinding> {
     let catalog = game
         .options
         .mod_packages
@@ -1181,6 +1185,25 @@ fn binding(game: &Game<'_>, frame: &CounterFrameV2) -> SResult<NativeBinding> {
         .next()
         .ok_or_else(|| fail("prepared machine type absent"))?;
     require(matches.next().is_none(), "ambiguous prepared machine type")?;
+    if let SessionCounter::Guest(guest) = frame {
+        let binding = checked(NativeBinding::from_registered_guest_prepared(
+            prepared,
+            &frame.type_id,
+            game.pack.assets.registry,
+        ))?;
+        let identity = binding
+            .package_identity()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        require(
+            frame.package_identity == identity
+                && guest.execution.primary_owner == prepared.bundle().content_owner().id
+                && frame.binding.block_id == binding.block_id(),
+            "Guest capture/binding mismatch",
+        )?;
+        return Ok(binding);
+    }
     let binding = checked(match checked(frame.binding_profile())? {
         NativeBindingProfile::LegacyIron => {
             NativeBinding::from_prepared(prepared, &frame.type_id, game.pack.assets.registry)
@@ -1207,10 +1230,15 @@ fn binding(game: &Game<'_>, frame: &CounterFrameV2) -> SResult<NativeBinding> {
 }
 fn correlate(
     manifest: &Manifest,
-    counter: &CounterFrameV2,
+    counter: &SessionCounter,
     slot: &DecodedSlotFrame,
 ) -> SResult<()> {
     checked(counter.validate())?;
+    require(
+        counter.is_guest() == slot.is_guest()
+            && (manifest.kind == GUEST_KIND) == counter.is_guest(),
+        "counter/slot/envelope execution profiles differ",
+    )?;
     let profile = checked(counter.binding_profile())?;
     require(
         slot.binding_profile() == profile,
@@ -1488,7 +1516,7 @@ fn player_rows(
 }
 struct Verified {
     manifest: Manifest,
-    counter: CounterFrameV2,
+    counter: SessionCounter,
     slot: DecodedSlotFrame,
     players: CheckedSessionPlayers,
     columns: BTreeMap<(i32, i32), Arc<Chunk>>,
@@ -1498,7 +1526,7 @@ struct Verified {
 fn manifest_shape(manifest: &Manifest, epoch: u64) -> SResult<()> {
     require(
         manifest.format == 1
-            && manifest.kind == KIND
+            && matches!(manifest.kind.as_str(), KIND | GUEST_KIND)
             && manifest.epoch == epoch
             && epoch > 0
             && manifest.dimension == Dim::Overworld.id()
@@ -1613,11 +1641,14 @@ fn verify_image(
     level_clock(&world, manifest.saved_clock)?;
     let counter_bytes = read(&root.join(COUNTER), STRUCTURED_LIMIT)?;
     let _: Value = json(&counter_bytes, STRUCTURED_LIMIT)?;
-    let counter = checked(CounterFrameV2::decode(&counter_bytes))?;
+    let counter = checked(SessionCounter::decode(
+        &counter_bytes,
+        manifest.kind == GUEST_KIND,
+    ))?;
     let _ = binding(game, &counter)?;
     let slot_bytes = read(&root.join(SLOT), STRUCTURED_LIMIT)?;
     let _ = raw_nbt(&slot_bytes)?;
-    let slot = checked(decode_slot_frame(&slot_bytes, game.res.items()))?;
+    let slot = checked(counter.decode_slot(&slot_bytes, game.res.items()))?;
     correlate(&manifest, &counter, &slot)?;
     let rows = player_rows(game, root, &manifest.players)?;
     sidecars(&world, &manifest.players)?;
@@ -1696,7 +1727,7 @@ enum Step {
     ParentSynced,
 }
 struct Snapshot {
-    counter: CounterFrameV2,
+    counter: SessionCounter,
     slot: Vec<u8>,
     players: Vec<SessionPlayerRow>,
     columns: BTreeMap<(i32, i32), NamedTag>,
@@ -1748,13 +1779,10 @@ impl Game<'_> {
     /// Full owner/player/profile preflight precedes the explicit UUID stage.
     pub(in crate::game) fn session_checkpoint_identity_preflight(&self) -> SResult<Vec<[i32; 4]>> {
         let world = self.session_context()?;
-        let counter = checked(self.world.counter_checkpoint_frame(self.world.game_time))?;
+        let counter = checked(SessionCounter::from_world(&self.world))?;
         let _ = binding(self, &counter)?;
-        let slot = checked(
-            self.world
-                .slot_checkpoint_bytes(self.res.items(), self.world.game_time),
-        )?;
-        let parsed = checked(decode_slot_frame(&slot, self.res.items()))?;
+        let slot = checked(counter.slot_bytes(&self.world, self.res.items()))?;
+        let parsed = checked(counter.decode_slot(&slot, self.res.items()))?;
         let roster = checked(
             self.observe_checkpoint_participants()
                 .map_err(|e| format!("{e:?}")),
@@ -1778,7 +1806,7 @@ impl Game<'_> {
         }
         let manifest = Manifest {
             format: 1,
-            kind: KIND.into(),
+            kind: counter.image_kind().into(),
             epoch: 1,
             world_uuid: world,
             dimension: self.dim.id().into(),
@@ -1868,7 +1896,50 @@ impl Game<'_> {
         identity(&self.world_root, world)?;
         checked(self.options.mod_packages.check_world(&self.world_root))?;
         let _: Value = json(&read(&self.world_root.join(PIN), 64 << 10)?, 64 << 10)?;
-        self.session_running_packages()?;
+        if self.world.has_persistent_guest_counter() {
+            let view = checked(self.world.guest_storage_view())?;
+            let catalog = self
+                .options
+                .mod_packages
+                .catalog()
+                .ok_or_else(|| fail("Guest captured catalog absent"))?;
+            require(
+                catalog.prepared().len() == 1,
+                "Guest storage requires exactly one captured pair",
+            )?;
+            let pair = catalog
+                .prepared()
+                .values()
+                .next()
+                .ok_or_else(|| fail("Guest pair absent"))?;
+            let identity = pair
+                .identity()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>();
+            require(
+                view.counter().fields.package_identity == identity
+                    && view.counter().execution.primary_owner == pair.bundle().content_owner().id,
+                "Guest storage capture changed",
+            )?;
+            if view.counter().execution.status == GuestStatus::Ready {
+                self.session_running_packages()?;
+                #[cfg(feature = "mods")]
+                {
+                    checked(
+                        self.mods
+                            .mods
+                            .counter_evaluator(&pair.bundle().content_owner().id, pair.identity()),
+                    )?;
+                }
+                #[cfg(not(feature = "mods"))]
+                {
+                    return Err(fail("Guest runtime absent"));
+                }
+            }
+        } else {
+            self.session_running_packages()?;
+        }
         Ok(world)
     }
     fn session_fence(&mut self, until: Instant) -> SResult<()> {
@@ -1880,12 +1951,9 @@ impl Game<'_> {
     }
     fn session_snapshot(&self) -> SResult<Snapshot> {
         let world = self.session_context()?;
-        let counter = checked(self.world.counter_checkpoint_frame(self.world.game_time))?;
-        let slot = checked(
-            self.world
-                .slot_checkpoint_bytes(self.res.items(), self.world.game_time),
-        )?;
-        let parsed = checked(decode_slot_frame(&slot, self.res.items()))?;
+        let counter = checked(SessionCounter::from_world(&self.world))?;
+        let slot = checked(counter.slot_bytes(&self.world, self.res.items()))?;
+        let parsed = checked(counter.decode_slot(&slot, self.res.items()))?;
         let roster = checked(
             self.observe_checkpoint_participants()
                 .map_err(|e| format!("{e:?}")),
@@ -1934,7 +2002,7 @@ impl Game<'_> {
         let residents = columns.keys().copied().collect();
         let manifest = Manifest {
             format: 1,
-            kind: KIND.into(),
+            kind: counter.image_kind().into(),
             epoch: 1,
             world_uuid: world,
             dimension: self.dim.id().into(),
@@ -1990,6 +2058,7 @@ impl Game<'_> {
     ) -> SResult<CheckpointReceipt> {
         self.checkpoint_session_profile_steps(
             NativeBindingProfile::RegisteredCube,
+            false,
             archive_root,
             epoch,
             until,
@@ -2006,6 +2075,7 @@ impl Game<'_> {
     ) -> SResult<CheckpointReceipt> {
         self.checkpoint_session_profile_steps(
             NativeBindingProfile::RegisteredCube,
+            false,
             archive,
             epoch,
             until,
@@ -2051,6 +2121,7 @@ impl Game<'_> {
     ) -> SResult<CheckpointReceipt> {
         self.checkpoint_session_profile_steps(
             NativeBindingProfile::LegacyIron,
+            false,
             archive_root,
             epoch,
             until,
@@ -2060,6 +2131,7 @@ impl Game<'_> {
     fn checkpoint_session_profile_steps(
         &mut self,
         profile: NativeBindingProfile,
+        guest: bool,
         archive_root: &Path,
         epoch: u64,
         until: Instant,
@@ -2070,7 +2142,11 @@ impl Game<'_> {
         let result = (|| {
             deadline(until)?;
             let world = self.session_context()?;
-            let frame = checked(self.world.counter_checkpoint_frame(self.world.game_time))?;
+            let frame = checked(SessionCounter::from_world(&self.world))?;
+            require(
+                frame.is_guest() == guest,
+                "checkpoint adapter execution mismatch",
+            )?;
             require(
                 checked(frame.binding_profile())? == profile,
                 "checkpoint adapter physical profile mismatch",
@@ -2202,7 +2278,7 @@ impl Game<'_> {
             let physical = tree(&pending, &[])?;
             let manifest = Manifest {
                 format: 1,
-                kind: KIND.into(),
+                kind: before.counter.image_kind().into(),
                 epoch,
                 world_uuid: world,
                 dimension: self.dim.id().into(),
@@ -2585,6 +2661,7 @@ impl<'a> Game<'a> {
         Ok(RegisteredNativeRecoveryParts {
             core: self.prepare_session_checkpoint_profile_steps(
                 NativeBindingProfile::RegisteredCube,
+                false,
                 request,
                 |_, _| Ok(()),
                 #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
@@ -2624,12 +2701,15 @@ impl<'a> Game<'a> {
     ) -> SResult<NativeRecoveryParts<'a>> {
         let core = self.prepare_session_checkpoint_profile_steps(
             NativeBindingProfile::LegacyIron,
+            false,
             request,
             before_items,
             #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
             item_load_test,
         )?;
-        let RegisteredRecoveryState::Active { counter, slot } = core.receipt.state else {
+        let CoreRecoveryState::Native(RegisteredRecoveryState::Active { counter, slot }) =
+            core.receipt.state
+        else {
             return Err(fail("legacy recovery requires active keys"));
         };
         Ok(NativeRecoveryParts {
@@ -2649,6 +2729,7 @@ impl<'a> Game<'a> {
     fn prepare_session_checkpoint_profile_steps(
         mut self: Box<Self>,
         profile: NativeBindingProfile,
+        guest: bool,
         request: RecoveryRequest,
         before_items: impl FnOnce(&mut Game<'a>, &CheckedSessionItems) -> SResult<()>,
         #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
@@ -2690,6 +2771,13 @@ impl<'a> Game<'a> {
             checked(verified.counter.binding_profile())? == profile,
             "recovery adapter physical profile mismatch",
         )?;
+        require(
+            verified.counter.is_guest() == guest,
+            "recovery adapter execution profile mismatch",
+        )?;
+        if guest {
+            self.prepare_guest_image_evaluator(&verified.counter)?;
+        }
         let mut centers = player_centers(verified.players.rows(), &request.expected_target)?;
         let coverage = required_coverage(&centers)?;
         for at in &coverage {
@@ -2870,28 +2958,48 @@ impl<'a> Game<'a> {
             &prepared.world.loaded_entities,
         )?;
         let binding = binding(&self, &verified.counter)?;
-        let counter = checked(prepared.world.restore_counter_frame(
-            &binding,
-            request.expected_world,
-            &request.expected_target,
-            &verified.counter,
-        ))?;
-        let slot = prepared
-            .world
-            .restore_persistent_world_slot(
+        let state = if let SessionCounter::Guest(frame) = &verified.counter {
+            checked(prepared.world.restore_guest_counter_frame(
                 &binding,
-                self.res.items(),
                 request.expected_world,
                 &request.expected_target,
-                verified.slot,
-            )
-            .map_err(|e| fail(e.error))?;
-        let state = match (counter, slot) {
-            (Some(counter), Some(slot)) => RegisteredRecoveryState::Active { counter, slot },
-            (None, None) if profile == NativeBindingProfile::RegisteredCube => {
-                RegisteredRecoveryState::Dormant
-            }
-            _ => return Err(fail("restored counter/slot allocation mismatch")),
+                frame,
+            ))?;
+            prepared
+                .world
+                .restore_guest_world_slot(
+                    &binding,
+                    self.res.items(),
+                    request.expected_world,
+                    &request.expected_target,
+                    verified.slot,
+                )
+                .map_err(|e| fail(e.error))?;
+            CoreRecoveryState::Guest(checked(prepared.world.guest_runtime_state())?)
+        } else {
+            let counter = checked(prepared.world.restore_counter_frame(
+                &binding,
+                request.expected_world,
+                &request.expected_target,
+                &verified.counter,
+            ))?;
+            let slot = prepared
+                .world
+                .restore_persistent_world_slot(
+                    &binding,
+                    self.res.items(),
+                    request.expected_world,
+                    &request.expected_target,
+                    verified.slot,
+                )
+                .map_err(|e| fail(e.error))?;
+            CoreRecoveryState::Native(match (counter, slot) {
+                (Some(counter), Some(slot)) => RegisteredRecoveryState::Active { counter, slot },
+                (None, None) if profile == NativeBindingProfile::RegisteredCube => {
+                    RegisteredRecoveryState::Dormant
+                }
+                _ => return Err(fail("restored counter/slot allocation mismatch")),
+            })
         };
         checked(self.finish_open_world(prepared))?;
         let random = self.world.random.state();
@@ -2922,7 +3030,7 @@ impl<'a> Game<'a> {
             selected,
             clocks,
             random: recovery_random,
-            receipt: RegisteredRecoveryReceipt { epoch, state },
+            receipt: CoreRecoveryReceipt { epoch, state },
         })
     }
 }
@@ -2930,7 +3038,7 @@ impl<'a> Game<'a> {
 /// Non-clone ownership of a verified native recovery, not a ready Game.
 struct NativeRecoveryImage {
     manifest: Manifest,
-    counter: CounterFrameV2,
+    counter: SessionCounter,
     players: CheckedSessionPlayers,
     raids: Option<Tag>,
     items: CheckedSessionItems,
@@ -2943,17 +3051,17 @@ struct PreparedSessionRecovery<'a> {
     selected: PathBuf,
     clocks: (i64, i64),
     random: u64,
-    receipt: RegisteredRecoveryReceipt,
+    receipt: CoreRecoveryReceipt,
 }
 pub(in crate::game) struct RegisteredNativeRecoveryParts<'a> {
     core: PreparedSessionRecovery<'a>,
 }
 impl<'a> RegisteredNativeRecoveryParts<'a> {
     pub(in crate::game) fn runtime_state(&self) -> RegisteredRecoveryState {
-        self.core.receipt.state.clone()
+        self.core.receipt.native_state().clone()
     }
     pub(in crate::game) fn validate_runtime_keys(&self) -> SResult<()> {
-        match &self.core.receipt.state {
+        match self.core.receipt.native_state() {
             RegisteredRecoveryState::Active { counter, slot } => {
                 checked(self.core.game.world.read_persistent_counter(counter))?;
                 self.core
@@ -3020,7 +3128,16 @@ impl<'a> RegisteredNativeRecoveryParts<'a> {
     }
     pub(in crate::game) fn finish(mut self) -> SResult<(Box<Game<'a>>, RegisteredRecoveryReceipt)> {
         self.verify_final()?;
-        Ok((self.core.game, self.core.receipt))
+        let CoreRecoveryState::Native(state) = self.core.receipt.state else {
+            return Err(fail("Native recovery state mismatch"));
+        };
+        Ok((
+            self.core.game,
+            RegisteredRecoveryReceipt {
+                epoch: self.core.receipt.epoch,
+                state,
+            },
+        ))
     }
 }
 pub(in crate::game) struct NativeRecoveryParts<'a> {
@@ -3112,7 +3229,11 @@ fn verify_recovery_final(
             && raid_metadata(&game.world_root)? == verified.raids,
         "final restored counter/player mismatch",
     )?;
-    let recovered_slot = checked(decode_slot_frame(&snapshot.slot, game.res.items()))?;
+    let recovered_slot = checked(
+        snapshot
+            .counter
+            .decode_slot(&snapshot.slot, game.res.items()),
+    )?;
     correlate(&verified.manifest, &snapshot.counter, &recovered_slot)?;
     // The slot bytes are deterministic current-schema output; compare the
     // original member rather than permitting a new revision/default value.
@@ -3565,4 +3686,275 @@ fn validate_native_local_player(root: &Path, players: &[PlayerDescriptor]) -> SR
         )?;
     }
     Ok(uuid)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SessionCounter {
+    Native(CounterFrameV2),
+    Guest(GuestCounterFrameV3),
+}
+impl std::ops::Deref for SessionCounter {
+    type Target = CounterFrameV2;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Native(frame) => frame,
+            Self::Guest(frame) => &frame.fields,
+        }
+    }
+}
+impl SessionCounter {
+    fn is_guest(&self) -> bool {
+        matches!(self, Self::Guest(_))
+    }
+    fn image_kind(&self) -> &'static str {
+        if self.is_guest() { GUEST_KIND } else { KIND }
+    }
+    fn binding_profile(
+        &self,
+    ) -> std::result::Result<
+        NativeBindingProfile,
+        horizon_client::world::counter_restore::RestoreError,
+    > {
+        match self {
+            Self::Native(frame) => frame.binding_profile(),
+            Self::Guest(frame) => {
+                frame.validate()?;
+                Ok(NativeBindingProfile::RegisteredCube)
+            }
+        }
+    }
+    fn validate(
+        &self,
+    ) -> std::result::Result<(), horizon_client::world::counter_restore::RestoreError> {
+        match self {
+            Self::Native(frame) => frame.validate(),
+            Self::Guest(frame) => frame.validate(),
+        }
+    }
+    fn encode(
+        &self,
+    ) -> std::result::Result<Vec<u8>, horizon_client::world::counter_restore::RestoreError> {
+        match self {
+            Self::Native(frame) => frame.encode(),
+            Self::Guest(frame) => frame.encode(),
+        }
+    }
+    fn decode(
+        bytes: &[u8],
+        guest: bool,
+    ) -> std::result::Result<Self, horizon_client::world::counter_restore::RestoreError> {
+        if guest {
+            GuestCounterFrameV3::decode(bytes).map(Self::Guest)
+        } else {
+            CounterFrameV2::decode(bytes).map(Self::Native)
+        }
+    }
+    fn from_world(
+        world: &horizon_client::world::World,
+    ) -> std::result::Result<Self, horizon_client::world::counter_restore::RestoreError> {
+        if world.has_persistent_guest_counter() {
+            Ok(Self::Guest(world.guest_storage_view()?.counter().clone()))
+        } else {
+            world
+                .counter_checkpoint_frame(world.game_time)
+                .map(Self::Native)
+        }
+    }
+    fn slot_bytes(
+        &self,
+        world: &horizon_client::world::World,
+        items: &horizon_client::items::Items,
+    ) -> std::result::Result<Vec<u8>, horizon_client::world::slot_restore::SlotRestoreError> {
+        if self.is_guest() {
+            world.guest_slot_checkpoint_bytes(items, world.game_time)
+        } else {
+            world.slot_checkpoint_bytes(items, world.game_time)
+        }
+    }
+    fn decode_slot(
+        &self,
+        bytes: &[u8],
+        items: &horizon_client::items::Items,
+    ) -> std::result::Result<DecodedSlotFrame, horizon_client::world::slot_restore::SlotRestoreError>
+    {
+        if self.is_guest() {
+            decode_guest_slot_frame(bytes, items)
+        } else {
+            decode_slot_frame(bytes, items)
+        }
+    }
+}
+enum CoreRecoveryState {
+    Native(RegisteredRecoveryState),
+    Guest(GuestRuntimeState),
+}
+struct CoreRecoveryReceipt {
+    epoch: u64,
+    state: CoreRecoveryState,
+}
+impl CoreRecoveryReceipt {
+    fn native_state(&self) -> &RegisteredRecoveryState {
+        match &self.state {
+            CoreRecoveryState::Native(state) => state,
+            CoreRecoveryState::Guest(_) => {
+                unreachable!("Native wrapper constructor rejects Guest execution")
+            }
+        }
+    }
+}
+pub(in crate::game) struct GuestRecoveryReceipt {
+    pub epoch: u64,
+    pub state: GuestRuntimeState,
+}
+pub(in crate::game) struct GuestNativeRecoveryParts<'a> {
+    core: PreparedSessionRecovery<'a>,
+}
+impl<'a> GuestNativeRecoveryParts<'a> {
+    pub(in crate::game) fn game_mut(&mut self) -> &mut Game<'a> {
+        &mut self.core.game
+    }
+    pub(in crate::game) fn players(&self) -> &CheckedSessionPlayers {
+        &self.core.verified.players
+    }
+    pub(in crate::game) fn validate_storage_state(&self) -> SResult<()> {
+        let CoreRecoveryState::Guest(state) = &self.core.receipt.state else {
+            return Err(fail("Guest recovery state absent"));
+        };
+        match state {
+            GuestRuntimeState::ReadyActive { counter, slot } => {
+                checked(self.core.game.world.read_persistent_counter(counter))?;
+                self.core
+                    .game
+                    .world
+                    .read_world_slot(slot)
+                    .map_err(|e| fail(format!("{e:?}")))?;
+            }
+            GuestRuntimeState::FaultedActive { receipt } => {
+                checked(self.core.game.world.validate_guest_storage_receipt(receipt))?;
+            }
+            GuestRuntimeState::ReadyDormant => {
+                let view = checked(self.core.game.world.guest_storage_view())?;
+                require(
+                    view.counter().execution.status == GuestStatus::Ready
+                        && matches!(view.counter().fields.placement, Placement::Dormant),
+                    "Guest dormant state changed",
+                )?;
+            }
+        }
+        Ok(())
+    }
+    pub(in crate::game) fn finish(mut self) -> SResult<(Box<Game<'a>>, GuestRecoveryReceipt)> {
+        self.validate_storage_state()?;
+        let counter = self.core.verified.counter.clone();
+        self.core.game.prepare_guest_image_evaluator(&counter)?;
+        verify_recovery_final(
+            &mut self.core.game,
+            &self.core.request,
+            &self.core.verified,
+            &self.core.selected,
+            self.core.clocks,
+            self.core.random,
+        )?;
+        let CoreRecoveryState::Guest(state) = self.core.receipt.state else {
+            return Err(fail("Guest recovery state mismatch"));
+        };
+        Ok((
+            self.core.game,
+            GuestRecoveryReceipt {
+                epoch: self.core.receipt.epoch,
+                state,
+            },
+        ))
+    }
+}
+impl<'a> Game<'a> {
+    fn prepare_guest_image_evaluator(&mut self, counter: &SessionCounter) -> SResult<()> {
+        #[cfg(not(feature = "mods"))]
+        {
+            let _ = counter;
+            Err(fail("Guest recovery requires mod runtime"))
+        }
+        #[cfg(feature = "mods")]
+        {
+            let SessionCounter::Guest(frame) = counter else {
+                return Err(fail("Guest image required"));
+            };
+            let catalog = self
+                .options
+                .mod_packages
+                .catalog()
+                .ok_or_else(|| fail("Guest captured catalog absent"))?;
+            require(
+                catalog.prepared().len() == 1,
+                "Guest recovery requires one captured pair",
+            )?;
+            let pair = catalog
+                .prepared()
+                .values()
+                .next()
+                .ok_or_else(|| fail("Guest pair absent"))?
+                .clone();
+            let _ = binding(self, counter)?;
+            require(
+                frame.execution.primary_owner == pair.bundle().content_owner().id,
+                "Guest recovery owner changed",
+            )?;
+            checked(
+                self.mods
+                    .mods
+                    .prepare_counter_evaluator(&frame.execution.primary_owner, pair.identity()),
+            )?;
+            checked(
+                self.mods
+                    .mods
+                    .counter_evaluator(&frame.execution.primary_owner, pair.identity()),
+            )?;
+            Ok(())
+        }
+    }
+    pub(in crate::game) fn checkpoint_registered_guest_session(
+        &mut self,
+        archive: &Path,
+        epoch: u64,
+        until: Instant,
+    ) -> SResult<CheckpointReceipt> {
+        self.checkpoint_session_profile_steps(
+            NativeBindingProfile::RegisteredCube,
+            true,
+            archive,
+            epoch,
+            until,
+            |_| Ok(()),
+        )
+    }
+    pub(in crate::game) fn prepare_registered_guest_session_checkpoint(
+        self: Box<Self>,
+        request: RecoveryRequest,
+    ) -> SResult<GuestNativeRecoveryParts<'a>> {
+        Ok(GuestNativeRecoveryParts {
+            core: self.prepare_session_checkpoint_profile_steps(
+                NativeBindingProfile::RegisteredCube,
+                true,
+                request,
+                |_, _| Ok(()),
+                #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+                None,
+            )?,
+        })
+    }
+    pub(in crate::game) fn recover_registered_guest_session_checkpoint(
+        self,
+        request: RecoveryRequest,
+        host: LanHost,
+    ) -> SResult<(Self, GuestRecoveryReceipt)> {
+        let mut parts = Box::new(self).prepare_registered_guest_session_checkpoint(request)?;
+        checked(
+            parts
+                .core
+                .game
+                .install_session_checkpoint_participants(host, &parts.core.verified.players),
+        )?;
+        let (game, receipt) = parts.finish()?;
+        Ok((*game, receipt))
+    }
 }
