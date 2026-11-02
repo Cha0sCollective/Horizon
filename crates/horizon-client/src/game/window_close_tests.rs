@@ -2,6 +2,156 @@
 //! a real display and complete pinned resources; absent inputs are failures.
 use super::*;
 
+#[test]
+fn retained_client_launch_rejects_unsupported_entry_before_acquisition() {
+    let root = fresh_root("remote-refusal");
+    assert!(!root.exists());
+    for unsupported in [
+        "--server",
+        "--dedicated",
+        "--session-file",
+        "--dev-mod",
+        "--world",
+        "--in-frame",
+        "--paired-native-window-close",
+        "--offscreen",
+    ] {
+        let args = vec![
+            "--retained-client-window".into(),
+            "127.0.0.1:25565".into(),
+            "--retained-client-root".into(),
+            root.to_string_lossy().into_owned(),
+            unsupported.into(),
+            "unused".into(),
+        ];
+        assert!(RemoteLaunch::parse(&args).is_err());
+        assert!(!root.exists());
+    }
+    for invalid in [
+        std::env::temp_dir(),
+        PathBuf::from("relative-client"),
+        PathBuf::from("/tmp/../client"),
+    ] {
+        assert!(
+            RemoteLaunch::parse(&[
+                "--retained-client-window".into(),
+                "127.0.0.1:25565".into(),
+                "--retained-client-root".into(),
+                invalid.to_string_lossy().into_owned()
+            ])
+            .is_err()
+        );
+    }
+    assert!(
+        RemoteLaunch::parse(&["--in-frame".into()])
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+#[ignore = "requires a real isolated display and pinned complete resources"]
+fn retained_client_actual_original_window_child() {
+    let root = PathBuf::from(std::env::var_os("HORIZON_RETAINED_CLIENT_ROOT").expect("fresh root"));
+    let address =
+        std::env::var("HORIZON_RETAINED_CLIENT_ADDRESS").expect("real isolated server address");
+    let resources = std::env::var("HORIZON_RETAINED_CLIENT_RESOURCES").expect("pinned resources");
+    let args = vec![
+        "--retained-client-window".into(),
+        address,
+        "--retained-client-root".into(),
+        root.to_string_lossy().into_owned(),
+        "--resources".into(),
+        resources,
+        "--width".into(),
+        "960".into(),
+        "--height".into(),
+        "540".into(),
+        "--timeout-seconds".into(),
+        "180".into(),
+    ];
+    let parsed = Options::read_from(args)
+        .expect("fixed options")
+        .expect("launch");
+    let outcome = run_remote(
+        parsed.options,
+        parsed.retained_remote.expect("selected remote recipe"),
+    );
+    match std::env::var("HORIZON_RETAINED_CLIENT_CASE").as_deref() {
+        Ok("tcp-disconnect") => assert!(
+            outcome
+                .unwrap_err()
+                .to_string()
+                .contains("ServerDisconnect")
+        ),
+        Ok("tcp-receive-failure") => assert!(outcome.unwrap_err().to_string().contains("Receive(")),
+        Ok("tcp-clean-leave") => outcome.expect("checked original window completion"),
+        _ => panic!("explicit actual window case required"),
+    }
+}
+
+#[test]
+#[ignore = "ordinary isolated server fixture; does not qualify retained server closure"]
+fn retained_client_ordinary_server_fixture_child() {
+    let root = PathBuf::from(std::env::var_os("HORIZON_TEST_RESOURCES").expect("pinned resources"));
+    let port = std::env::var("HORIZON_RETAINED_FIXTURE_PORT").expect("isolated listener port");
+    let args = vec![
+        "--resources".into(),
+        root.to_string_lossy().into_owned(),
+        "--test-terrain".into(),
+        "--control-socket".into(),
+        std::env::current_dir()
+            .unwrap()
+            .join("server-control.sock")
+            .to_string_lossy()
+            .into_owned(),
+        "--dedicated".into(),
+        "--nogui".into(),
+        "--port".into(),
+        port,
+        "--world".into(),
+        "remote-fixture".into(),
+    ];
+    let mut options = Options::read_from(args).unwrap().unwrap().options;
+    assert!(dedicated::preflight(&mut options).unwrap());
+    let settings = Settings {
+        render_distance: 2,
+        simulation_distance: 2,
+        ..Settings::default()
+    };
+    let started = Instant::now();
+    let loaded = load_resources(
+        root.clone(),
+        &root,
+        &settings,
+        started,
+        false,
+        &Progress::new(),
+        &mut |_, _| {},
+    )
+    .unwrap();
+    assert!(loaded.pack_error.is_none() && loaded.rest_loader.is_none());
+    let resources = loaded.resources;
+    let cpu = GameCpuResources::load(&root).unwrap();
+    assert!(
+        start_game(
+            &resources,
+            loaded.pack,
+            loaded.gui.unwrap(),
+            options,
+            None,
+            Audio::silent(&root),
+            root,
+            started,
+            None,
+            Some(settings),
+            Some(cpu)
+        )
+        .unwrap()
+        .is_none()
+    );
+}
+
 fn fresh_root(label: &str) -> PathBuf {
     std::env::temp_dir().join(format!("native-window-{label}-{}", std::process::id()))
 }

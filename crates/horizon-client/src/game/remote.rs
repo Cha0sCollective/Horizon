@@ -6,7 +6,8 @@
 //! clicks). The player still moves with the local physics, as the vanilla
 //! client predicts its own movement; the server stays authoritative for
 //! everything else.
-use super::remote_chunks::{ChunkDecoder, ChunkFormat, Next};
+use super::remote_chunks::{ChunkFormat, Next};
+use super::retained_remote::RemoteIo;
 use super::{Dim, Game, Mining, Screen};
 use horizon_client::first_person::{Hand, SwingAnimation};
 use horizon_client::{
@@ -107,7 +108,7 @@ enum Received {
 }
 
 pub(super) struct Remote {
-    pub session: Session,
+    pub(super) io: RemoteIo,
     pub brand: String,
     /// The server announced it runs mods' quiet commands.
     pub quiet_commands: bool,
@@ -124,7 +125,6 @@ pub(super) struct Remote {
     /// biome registry); replaced whenever one of them changes.
     pub(super) chunk_format: Arc<ChunkFormat>,
     /// Decodes chunk packets as they arrive, off the frame.
-    decoder: ChunkDecoder,
     /// Options.serverRenderDistance: the server's view distance from the
     /// login or the last chunk-cache-radius packet.
     pub(super) view_distance: i32,
@@ -449,8 +449,37 @@ impl Game<'_> {
         self.apply_settings();
         self.clear_waypoints();
         self.boss_overlay.reset();
-        self.remote = Some(Remote {
-            session,
+        self.remote = Some(Remote::fresh(
+            RemoteIo::legacy(session),
+            builtin,
+            lang,
+            view,
+            self.settings.render_distance,
+            self.settings.chat_visibility as i32,
+            player_type,
+        ));
+        // The level's TickRateManager follows the server's ticking packets.
+        self.clock = horizon_client::clock::FixedStep::client();
+        // The player's advancements and statistics are the server's.
+        self.adv = Default::default();
+        self.stats = Default::default();
+        Ok(())
+    }
+}
+
+impl Remote {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn fresh(
+        io: RemoteIo,
+        builtin: Builtin,
+        lang: Arc<Language>,
+        view: i8,
+        render_distance: i32,
+        chat_visibility: i32,
+        player_type: Option<Arc<MobType>>,
+    ) -> Self {
+        Self {
+            io,
             brand: "unknown".into(),
             quiet_commands: false,
             builtin: Arc::new(builtin),
@@ -466,8 +495,7 @@ impl Game<'_> {
                 Vec::new(),
                 7,
             )),
-            decoder: ChunkDecoder::new(),
-            view_distance: self.settings.render_distance,
+            view_distance: render_distance,
             sequence: 0,
             position_sender: Default::default(),
             last_input: 0,
@@ -476,7 +504,7 @@ impl Game<'_> {
             abilities: None,
             loaded_sent: false,
             sent_view: view,
-            sent_chat_visibility: self.settings.chat_visibility as i32,
+            sent_chat_visibility: chat_visibility,
             predictions: HashMap::new(),
             menu: None,
             menu_title: None,
@@ -526,17 +554,21 @@ impl Game<'_> {
             backlog_since: None,
             server_links: Vec::new(),
             transfer: None,
-        });
-        // The level's TickRateManager follows the server's ticking packets.
-        self.clock = horizon_client::clock::FixedStep::client();
-        // The player's advancements and statistics are the server's.
-        self.adv = Default::default();
-        self.stats = Default::default();
-        Ok(())
+        }
     }
+}
 
+impl Game<'_> {
     /// Disconnect and return to the multiplayer screen (DisconnectedScreen).
     pub(super) fn leave_server(&mut self, reason: Option<String>) -> Result<()> {
+        #[cfg(feature = "paired-packages")]
+        if self.is_retained_remote() {
+            match reason {
+                Some(reason) => self.retained_remote_request_close(reason),
+                None => self.retained_remote_request_leave(),
+            }
+            return Ok(());
+        }
         if reason.is_none() && self.integrated.as_ref().is_some_and(|s| !s.stopped()) {
             return self.begin_closing_save(false);
         }
@@ -548,7 +580,7 @@ impl Game<'_> {
         self.clear_waypoints();
         self.boss_overlay.reset();
         if let Some(mut r) = self.remote.take() {
-            r.session.disconnect();
+            r.io.existing_mut().session.disconnect();
         }
         self.server_packs_disconnect();
         self.close_dialogs();
@@ -615,7 +647,7 @@ impl Game<'_> {
 
     pub(super) fn send(&self, packet: S) {
         if let Some(r) = &self.remote {
-            r.session.send(packet);
+            r.io.send_play(packet);
         }
     }
     fn next_sequence(&mut self) -> i32 {
@@ -780,14 +812,23 @@ impl Game<'_> {
     /// Received events left for the next frame (`poll_remote`): until they
     /// are handled, the terrain the server sent is not all there.
     pub(super) fn remote_backlog(&self) -> usize {
-        self.remote.as_ref().map_or(0, |r| r.backlog.len())
+        self.remote.as_ref().map_or(0, |r| {
+            #[cfg(feature = "paired-packages")]
+            if let Some(io) = r.io.fixed() {
+                return io.pending.len()
+                    + usize::from(
+                        io.waiting || io.decoded.is_some() || io.refused_decode.is_some(),
+                    );
+            }
+            r.backlog.len()
+        })
     }
     /// A headless command oracle has a real connection but no movement tick.
     /// Acknowledge loaded terrain without predicting or sending movement.
     pub(super) fn poll_stationary_client(&mut self) -> Result<()> {
         self.poll_remote()?;
         let loaded = self.player.as_ref().is_some_and(|p| {
-            self.streaming.expect_existing().is_lit(
+            self.client_column_ready(
                 (p.position.x.floor() as i32) >> 4,
                 (p.position.z.floor() as i32) >> 4,
             )
@@ -805,17 +846,549 @@ impl Game<'_> {
     /// the next chunk packet on wait for the next frame, unless they have
     /// already waited `BACKLOG_LIMIT`. A chunk packet still decoding holds
     /// back what follows it.
+    #[cfg(feature = "paired-packages")]
+    fn enter_retained_dimension(
+        &mut self,
+        spawn: &play::SpawnInfo,
+    ) -> std::result::Result<(), String> {
+        use horizon_client::streaming::RemoteMeshProfile;
+        let r = self.remote.as_ref().ok_or("missing original remote")?;
+        let io = r.io.fixed().ok_or("not retained")?;
+        if io.login {
+            return Err("fixed remote client refuses dimension replacement".into());
+        }
+        let dimension = r.registries.dimension(spawn.dimension_type);
+        let profile = RemoteMeshProfile {
+            sky_light: dimension.has_skylight,
+            nether_shading: Dim::from_id(&spawn.dimension) == Dim::Nether,
+            obfuscated_biome_seed: spawn.seed,
+            biome_blend: self.settings.biome_blend,
+            smooth_lighting: self.settings.smooth_lighting,
+            cutout_leaves: self.settings.cutout_leaves,
+        };
+        // Actual immutable Login settings precede the first streaming worker.
+        self.streaming
+            .remote_mut()
+            .ok_or("missing original streamer")?
+            .start(profile)
+            .map_err(|e| format!("remote stream start: {e:?}"))?;
+        let r = self.remote.as_mut().unwrap();
+        r.chunk_format = Arc::new(r.chunk_format.with_dimension(&dimension));
+        r.dimension = dimension;
+        r.game_mode = spawn.game_type;
+        r.flat = spawn.flat;
+        r.loaded_sent = false;
+        r.position_sender = Default::default();
+        r.io.fixed_mut().unwrap().login = true;
+        self.world.random = horizon_core::random::LegacyRandom::new(spawn.seed);
+        self.dim = Dim::from_id(&spawn.dimension);
+        self.set_mode_id(spawn.game_type);
+        self.level.last_death = spawn
+            .last_death
+            .as_ref()
+            .map(|d| (d.dimension.clone(), d.pos));
+        Ok(())
+    }
+
+    #[cfg(feature = "paired-packages")]
+    fn handle_retained_login(&mut self, p: &play::Login) -> Result<()> {
+        if !self.remote.as_ref().unwrap().joined {
+            return Err("Login preceded Joined registry barrier".into());
+        }
+        // Fallible native start precedes all Login/player metadata changes.
+        self.enter_retained_dimension(&p.spawn)?;
+        self.level.hardcore = p.hardcore;
+        self.selected = 0;
+        let view = client_view_distance(self.settings.render_distance);
+        let r = self.remote.as_mut().unwrap();
+        r.carried = Some(0);
+        r.online_mode = p.online_mode;
+        r.entity_id = p.player_id;
+        r.view_distance = p.chunk_radius;
+        r.show_death_screen = p.show_death_screen;
+        r.sent_view = view;
+        let mut information =
+            horizon_protocol::packets::configuration::ClientInformation::new(view);
+        information.chat_visibility = self.settings.chat_visibility as i32;
+        self.send(S::ClientInformation(information));
+        Ok(())
+    }
+
+    #[cfg(feature = "paired-packages")]
+    fn dispatch_retained_packet(&mut self, packet: Box<C>) -> Result<()> {
+        if self
+            .remote
+            .as_ref()
+            .unwrap()
+            .io
+            .fixed()
+            .unwrap()
+            .applying
+            .is_some()
+        {
+            self.remote
+                .as_mut()
+                .unwrap()
+                .io
+                .fixed_mut()
+                .unwrap()
+                .pending
+                .push_front(Event::Packet(packet));
+            return Err("previous original packet is still retained".into());
+        }
+        self.remote
+            .as_mut()
+            .unwrap()
+            .io
+            .fixed_mut()
+            .unwrap()
+            .applying = Some(packet);
+        // Existing packet handlers consume data. Keep the exact original Box
+        // registered in the original Game across their fallible work/unwind;
+        // this clone is processing data, never an owner/completion substitute.
+        let processing = (**self
+            .remote
+            .as_ref()
+            .unwrap()
+            .io
+            .fixed()
+            .unwrap()
+            .applying
+            .as_ref()
+            .unwrap())
+        .clone();
+        match processing {
+            C::Login(p) => self.handle_retained_login(&p)?,
+            other => self.handle_packet(other)?,
+        }
+        if let Some(failure) = self.retained_remote_failure() {
+            return Err(failure.into());
+        }
+        drop(
+            self.remote
+                .as_mut()
+                .unwrap()
+                .io
+                .fixed_mut()
+                .unwrap()
+                .applying
+                .take(),
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "paired-packages")]
+    fn admit_retained_decoded(&mut self) -> Result<bool> {
+        use super::remote_chunks::retained::RetainedDecoded;
+        use horizon_client::streaming::RemoteRefusal;
+        let Some(decoded) = self
+            .remote
+            .as_mut()
+            .unwrap()
+            .io
+            .fixed_mut()
+            .unwrap()
+            .decoded
+            .take()
+        else {
+            return Ok(true);
+        };
+        let RetainedDecoded {
+            format,
+            packet,
+            column,
+        } = decoded;
+        if !Arc::ptr_eq(&format, &self.remote.as_ref().unwrap().chunk_format) {
+            self.remote
+                .as_mut()
+                .unwrap()
+                .io
+                .fixed_mut()
+                .unwrap()
+                .decoded = Some(RetainedDecoded {
+                format,
+                packet,
+                column,
+            });
+            return Err("retained decoder format changed before ordered delivery".into());
+        }
+        let chunk = match column {
+            Ok(chunk) => chunk,
+            Err(error) => {
+                let message = format!("remote column decode: {error}");
+                self.remote
+                    .as_mut()
+                    .unwrap()
+                    .io
+                    .fixed_mut()
+                    .unwrap()
+                    .decoded = Some(RetainedDecoded {
+                    format,
+                    packet,
+                    column: Err(error),
+                });
+                return Err(message.into());
+            }
+        };
+        let result = self
+            .streaming
+            .remote_mut()
+            .unwrap()
+            .try_insert_column(&mut self.world, chunk);
+        match result {
+            Ok(previous) => {
+                if let Some(previous) = previous {
+                    self.remote
+                        .as_mut()
+                        .unwrap()
+                        .io
+                        .fixed_mut()
+                        .unwrap()
+                        .retired_columns
+                        .push_back(previous);
+                }
+                if let C::LevelChunkWithLight(p) = &*packet {
+                    self.install_remote_block_entities(p);
+                }
+                Ok(true)
+            }
+            Err((reason, chunk)) => {
+                self.remote
+                    .as_mut()
+                    .unwrap()
+                    .io
+                    .fixed_mut()
+                    .unwrap()
+                    .decoded = Some(RetainedDecoded {
+                    format,
+                    packet,
+                    column: Ok(chunk),
+                });
+                if matches!(reason, RemoteRefusal::Busy | RemoteRefusal::Full) {
+                    Ok(false)
+                } else {
+                    Err(format!("received column refused: {reason:?}").into())
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "paired-packages")]
+    fn poll_retained_remote(&mut self) -> Result<()> {
+        use super::remote_chunks::retained::SubmissionRefusal;
+        use horizon_client::streaming::{RemoteLightOutcome, RemoteRefusal};
+        if let Some(failure) = self.retained_remote_failure() {
+            return Err(failure.into());
+        }
+        {
+            let io = self.remote.as_mut().unwrap().io.fixed_mut().unwrap();
+            if io.sealed {
+                return Ok(());
+            }
+            if io.applying.is_some() {
+                return Err("original packet retained after failed dispatch".into());
+            }
+            if io.pending.len() < 128 {
+                io.pending
+                    .extend(io.session.as_ref().unwrap().poll_events(128));
+            }
+            if io.waiting && io.decoded.is_none() {
+                io.decoded = io.decoder.as_mut().unwrap().try_next();
+                if io.decoded.is_some() {
+                    io.waiting = false;
+                } else if let Some(failure) = io
+                    .decoder
+                    .as_ref()
+                    .unwrap()
+                    .observe()
+                    .and_then(|o| o.failure)
+                {
+                    return Err(format!("original remote decoder failed: {failure:?}").into());
+                }
+            }
+        }
+        if !self.admit_retained_decoded()? {
+            return Ok(());
+        }
+        if self.remote.as_ref().unwrap().io.fixed().unwrap().waiting {
+            return Ok(());
+        }
+        if let Some(original) = self
+            .remote
+            .as_mut()
+            .unwrap()
+            .io
+            .fixed_mut()
+            .unwrap()
+            .refused_decode
+            .take()
+        {
+            let io = self.remote.as_mut().unwrap().io.fixed_mut().unwrap();
+            match io
+                .decoder
+                .as_mut()
+                .unwrap()
+                .submit(original.format, original.packet)
+            {
+                Ok(()) => io.waiting = true,
+                Err(original) => {
+                    let retry = matches!(
+                        original.reason,
+                        SubmissionRefusal::Busy | SubmissionRefusal::Full
+                    );
+                    let reason = original.reason;
+                    io.refused_decode = Some(original);
+                    if !retry {
+                        return Err(format!("original decoder input refused: {reason:?}").into());
+                    }
+                }
+            }
+            return Ok(());
+        }
+        for _ in 0..64 {
+            if let Some(failure) = self.retained_remote_failure() {
+                return Err(failure.into());
+            }
+            let Some(event) = self
+                .remote
+                .as_mut()
+                .unwrap()
+                .io
+                .fixed_mut()
+                .unwrap()
+                .pending
+                .pop_front()
+            else {
+                break;
+            };
+            match event {
+                Event::Packet(packet) if matches!(*packet, C::LevelChunkWithLight(_)) => {
+                    let r = self.remote.as_mut().unwrap();
+                    let io = r.io.fixed_mut().unwrap();
+                    if !io.login {
+                        io.pending.push_front(Event::Packet(packet));
+                        return Err("chunk preceded original Login barrier".into());
+                    }
+                    match io
+                        .decoder
+                        .as_mut()
+                        .unwrap()
+                        .submit(r.chunk_format.clone(), packet)
+                    {
+                        Ok(()) => {
+                            io.waiting = true;
+                        }
+                        Err(refused) => {
+                            let retry = matches!(
+                                refused.reason,
+                                SubmissionRefusal::Busy | SubmissionRefusal::Full
+                            );
+                            let reason = refused.reason;
+                            io.refused_decode = Some(refused);
+                            if !retry {
+                                return Err(format!("remote decoder refused: {reason:?}").into());
+                            }
+                        }
+                    }
+                    break;
+                }
+                Event::Packet(packet) if matches!(*packet, C::LightUpdate(_)) => {
+                    let C::LightUpdate(p) = &*packet else {
+                        unreachable!()
+                    };
+                    if p.light
+                        .sky
+                        .iter()
+                        .chain(&p.light.block)
+                        .any(|layer| layer.len() != 2048)
+                    {
+                        self.remote
+                            .as_mut()
+                            .unwrap()
+                            .io
+                            .fixed_mut()
+                            .unwrap()
+                            .pending
+                            .push_front(Event::Packet(packet));
+                        return Err("malformed server light layer".into());
+                    }
+                    let layers = self.remote.as_ref().unwrap().chunk_format.light(&p.light).0;
+                    match self.streaming.remote_mut().unwrap().try_apply_light(
+                        &mut self.world,
+                        (p.x, p.z),
+                        &layers,
+                    ) {
+                        Ok(RemoteLightOutcome::Replaced { previous, .. }) => self
+                            .remote
+                            .as_mut()
+                            .unwrap()
+                            .io
+                            .fixed_mut()
+                            .unwrap()
+                            .retired_columns
+                            .push_back(previous),
+                        Ok(_) => {}
+                        Err(reason) => {
+                            self.remote
+                                .as_mut()
+                                .unwrap()
+                                .io
+                                .fixed_mut()
+                                .unwrap()
+                                .pending
+                                .push_front(Event::Packet(packet));
+                            if matches!(reason, RemoteRefusal::Busy | RemoteRefusal::Full) {
+                                break;
+                            }
+                            return Err(format!("server light refused: {reason:?}").into());
+                        }
+                    }
+                }
+                Event::Packet(packet) if matches!(*packet, C::ForgetLevelChunk(_)) => {
+                    let C::ForgetLevelChunk(p) = &*packet else {
+                        unreachable!()
+                    };
+                    let [x, z] = p.pos;
+                    match self
+                        .streaming
+                        .remote_mut()
+                        .unwrap()
+                        .try_forget_column(&mut self.world, (x, z))
+                    {
+                        Ok(previous) => {
+                            if let Some(previous) = previous {
+                                self.remote
+                                    .as_mut()
+                                    .unwrap()
+                                    .io
+                                    .fixed_mut()
+                                    .unwrap()
+                                    .retired_columns
+                                    .push_back(previous);
+                            }
+                            self.world
+                                .block_entities
+                                .retain(|k, _| (k.0 >> 4, k.2 >> 4) != (x, z));
+                            if let Some(renderer) = &mut self.renderer {
+                                renderer.remove_columns([(x, z)]);
+                            }
+                        }
+                        Err(reason) => {
+                            self.remote
+                                .as_mut()
+                                .unwrap()
+                                .io
+                                .fixed_mut()
+                                .unwrap()
+                                .pending
+                                .push_front(Event::Packet(packet));
+                            if matches!(reason, RemoteRefusal::Busy | RemoteRefusal::Full) {
+                                break;
+                            }
+                            return Err(format!("forget column refused: {reason:?}").into());
+                        }
+                    }
+                }
+                Event::Joined {
+                    registries,
+                    name,
+                    uuid,
+                } => {
+                    if self.remote.as_ref().unwrap().joined {
+                        self.remote
+                            .as_mut()
+                            .unwrap()
+                            .io
+                            .fixed_mut()
+                            .unwrap()
+                            .pending
+                            .push_front(Event::Joined {
+                                registries,
+                                name,
+                                uuid,
+                            });
+                        return Err("fixed client refuses repeated configuration".into());
+                    }
+                    self.set_registries(registries);
+                    let r = self.remote.as_mut().unwrap();
+                    r.joined = true;
+                    r.profile = uuid;
+                    r.profile_name = name;
+                    r.status = "Loading terrain...".into();
+                }
+                Event::Status(status) => self.remote.as_mut().unwrap().status = status,
+                Event::Brand(brand) => self.remote.as_mut().unwrap().brand = brand,
+                Event::QuietCommands => self.remote.as_mut().unwrap().quiet_commands = true,
+                Event::ServerLinks(links) => {
+                    self.remote.as_mut().unwrap().server_links = super::server_links::trusted(links)
+                }
+                Event::ShowDialog(dialog) => self.show_dialog(&dialog),
+                Event::ClearDialog => self.clear_dialog(),
+                event @ (Event::Reconfigured(_)
+                | Event::Transfer { .. }
+                | Event::PackPush(_)
+                | Event::PackPop(_)
+                | Event::DecodeError(_)
+                | Event::Disconnected { .. }) => {
+                    let reason = match &event {
+                        Event::Disconnected { reason, .. } => {
+                            format!("remote disconnected: {reason}")
+                        }
+                        Event::DecodeError(reason) => format!("remote decode failed: {reason}"),
+                        _ => {
+                            "fixed client refuses reconfiguration, transfer or server packs".into()
+                        }
+                    };
+                    self.remote
+                        .as_mut()
+                        .unwrap()
+                        .io
+                        .fixed_mut()
+                        .unwrap()
+                        .pending
+                        .push_front(event);
+                    return Err(reason.into());
+                }
+                Event::Packet(packet) => {
+                    if matches!(*packet, C::Respawn(_))
+                        || (matches!(*packet, C::Login(_))
+                            && self.remote.as_ref().unwrap().io.fixed().unwrap().login)
+                    {
+                        self.remote
+                            .as_mut()
+                            .unwrap()
+                            .io
+                            .fixed_mut()
+                            .unwrap()
+                            .pending
+                            .push_front(Event::Packet(packet));
+                        return Err("fixed client refuses dimension/player replacement".into());
+                    }
+                    self.dispatch_retained_packet(packet)?;
+                }
+            }
+            if let Some(failure) = self.retained_remote_failure() {
+                return Err(failure.into());
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn poll_remote(&mut self) -> Result<()> {
+        #[cfg(feature = "paired-packages")]
+        if self.is_retained_remote() {
+            return self.poll_retained_remote();
+        }
         let Some(r) = self.remote.as_mut() else {
             return Ok(());
         };
         let mut events = std::mem::take(&mut r.backlog);
         // Chunk packets start decoding now; the frame that reaches one in
         // order inserts its column.
-        for event in r.session.poll() {
+        for event in r.io.existing().session.poll() {
             events.push_back(match event {
                 Event::Packet(p) if matches!(*p, C::LevelChunkWithLight(_)) => {
-                    match r.decoder.submit(r.chunk_format.clone(), p) {
+                    match r.io.existing().decoder.submit(r.chunk_format.clone(), p) {
                         None => Received::Chunk(r.chunk_format.clone()),
                         Some(p) => Received::Event(Event::Packet(p)),
                     }
@@ -839,7 +1412,8 @@ impl Game<'_> {
                 Received::Chunk(format) => {
                     // A column still decoding waits for the next frame, with
                     // what came after it, overdue or not.
-                    let Some(next) = self.remote.as_ref().map(|r| r.decoder.next()) else {
+                    let Some(next) = self.remote.as_ref().map(|r| r.io.existing().decoder.next())
+                    else {
                         break;
                     };
                     let (packet, column) = match next {
@@ -904,7 +1478,7 @@ impl Game<'_> {
                 // singleplayer" (no ServerData), so the world just closes.
                 Event::Transfer { host, port } => {
                     if let Some(r) = self.remote.as_mut()
-                        && r.session.address != "local"
+                        && r.io.address() != "local"
                     {
                         r.transfer = Some(format!("{host}:{port}"));
                     }
@@ -937,7 +1511,11 @@ impl Game<'_> {
                     // handleTransfer → ConnectScreen.startConnecting).
                     let transfer = self.remote.as_mut().and_then(|r| {
                         r.transfer.take().map(|address| {
-                            (address, r.session.name.clone(), r.session.cookies.clone())
+                            (
+                                address,
+                                r.io.existing().session.name.clone(),
+                                r.io.existing().session.cookies.clone(),
+                            )
                         })
                     });
                     if let Some((address, name, cookies)) = transfer {
@@ -1035,6 +1613,13 @@ impl Game<'_> {
     }
     /// Switch to a (possibly new) dimension: a fresh client level.
     fn enter_remote_dimension(&mut self, spawn: &play::SpawnInfo, keep_world: bool) {
+        #[cfg(feature = "paired-packages")]
+        if self.is_retained_remote() {
+            if let Err(error) = self.enter_retained_dimension(spawn) {
+                self.retained_remote_request_close(error);
+            }
+            return;
+        }
         let Some(r) = self.remote.as_mut() else {
             return;
         };
@@ -1127,6 +1712,11 @@ impl Game<'_> {
     }
     /// The columns a moved or resized storage no longer holds.
     fn drop_remote_chunks_out_of_range(&mut self) {
+        #[cfg(feature = "paired-packages")]
+        if self.is_retained_remote() {
+            // Checked forgetting is driven by the retained ordered frame path.
+            return;
+        }
         let gone: horizon_client::fast_hash::FxHashSet<(i32, i32)> = self
             .world
             .chunks
@@ -1153,6 +1743,48 @@ impl Game<'_> {
         self.world
             .block_entities
             .retain(|k, _| !gone.contains(&(k.0 >> 4, k.2 >> 4)));
+    }
+    #[cfg(feature = "paired-packages")]
+    pub(super) fn forget_retained_outside_view(&mut self) -> Result<()> {
+        use horizon_client::streaming::RemoteRefusal;
+        let gone = self
+            .world
+            .chunks
+            .keys()
+            .copied()
+            .filter(|&(x, z)| !self.remote_chunk_in_range(x, z))
+            .take(4)
+            .collect::<Vec<_>>();
+        for (x, z) in gone {
+            match self
+                .streaming
+                .remote_mut()
+                .unwrap()
+                .try_forget_column(&mut self.world, (x, z))
+            {
+                Ok(previous) => {
+                    if let Some(previous) = previous {
+                        self.remote
+                            .as_mut()
+                            .unwrap()
+                            .io
+                            .fixed_mut()
+                            .unwrap()
+                            .retired_columns
+                            .push_back(previous);
+                    }
+                    self.world
+                        .block_entities
+                        .retain(|k, _| (k.0 >> 4, k.2 >> 4) != (x, z));
+                    if let Some(renderer) = &mut self.renderer {
+                        renderer.remove_columns([(x, z)]);
+                    }
+                }
+                Err(RemoteRefusal::Busy | RemoteRefusal::Full) => break,
+                Err(reason) => return Err(format!("remote view forget refused: {reason:?}").into()),
+            }
+        }
+        Ok(())
     }
     /// `handleBlockEntityData`: the block entity at `pos`, when it is of the
     /// packet's type, loads the tag (`loadWithComponents`); an empty tag
@@ -1240,11 +1872,7 @@ impl Game<'_> {
             return;
         }
         if let Ok(dir) = std::env::current_dir() {
-            horizon_client::multiplayer::save_server_icon(
-                &dir.join("saves"),
-                &r.session.address,
-                png,
-            );
+            horizon_client::multiplayer::save_server_icon(&dir.join("saves"), r.io.address(), png);
         }
     }
     /// Keep the renderable block entities (chests, furnaces) in step with blocks.
@@ -1754,8 +2382,9 @@ impl Game<'_> {
                     r.view_distance = p.chunk_radius;
                     r.show_death_screen = p.show_death_screen;
                 }
-                self.streaming.expect_existing_mut().radius =
-                    self.settings.render_distance.min(p.chunk_radius + 1).max(2);
+                if let Ok(streaming) = self.streaming.as_existing_mut() {
+                    streaming.radius = self.settings.render_distance.min(p.chunk_radius + 1).max(2);
+                }
                 self.enter_remote_dimension(&p.spawn, false);
                 let view = client_view_distance(self.settings.render_distance);
                 if let Some(r) = self.remote.as_mut() {
@@ -2907,8 +3536,9 @@ impl Game<'_> {
             },
             C::SetPlayerTeam(p) => self.remote_team(p),
             C::SetChunkCacheRadius(p) => {
-                self.streaming.expect_existing_mut().radius =
-                    self.settings.render_distance.min(p.distance + 1).max(2);
+                if let Ok(streaming) = self.streaming.as_existing_mut() {
+                    streaming.radius = self.settings.render_distance.min(p.distance + 1).max(2);
+                }
                 if let Some(r) = self.remote.as_mut() {
                     r.view_distance = p.distance;
                 }
@@ -3622,7 +4252,7 @@ impl Game<'_> {
             (player.position.x.floor() as i32) >> 4,
             (player.position.z.floor() as i32) >> 4,
         );
-        if !self.streaming.expect_existing().is_lit(cx, cz) {
+        if !self.client_column_ready(cx, cz) {
             // LocalPlayer.tick can wait for chunks, but Minecraft.tick still
             // calls sendChanges: rotations and the 20-tick position reminder
             // must continue, as well as moves into the unloaded area.
@@ -5873,7 +6503,7 @@ impl Game<'_> {
         let atlas = &self.gui.atlas;
         let (w, h) = (batch.width, batch.height);
         batch.fill(atlas, 0.0, 0.0, w, h, rgba(20, 20, 20, 255));
-        let shown = horizon_client::net::shown_address(&r.session.address);
+        let shown = horizon_client::net::shown_address(r.io.address());
         for (i, line) in [r.status.as_str(), shown.as_str()].iter().enumerate() {
             let tw = HudBatch::text_width(atlas, line);
             batch.text(
@@ -5947,8 +6577,8 @@ impl Game<'_> {
     pub(super) fn remote_status(&self) -> Option<serde_json::Value> {
         let r = self.remote.as_ref()?;
         Some(serde_json::json!({
-            "address": horizon_client::net::shown_address(&r.session.address),
-            "name": r.session.name,
+            "address": horizon_client::net::shown_address(r.io.address()),
+            "name": r.io.name(),
             "joined": r.joined,
             // ServerboundPlayerLoadedPacket sent: the level around the
             // player is ready, and the client ticks and sends its moves.

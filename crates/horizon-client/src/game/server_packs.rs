@@ -238,6 +238,9 @@ impl Game<'_> {
     }
     /// `Minecraft.clearDownloadedResourcePacks`: every server pack goes at once.
     pub(super) fn server_packs_disconnect(&mut self) {
+        if self.is_retained_remote() {
+            return;
+        }
         self.server_packs.prompt = None;
         self.server_packs.notifiers.clear();
         self.server_packs.packs.disconnect();
@@ -288,7 +291,7 @@ impl Game<'_> {
     }
     fn send_pack_status(&self, id: u128, status: i32) {
         if let Some(r) = &self.remote {
-            r.session.send_pack_status(id, status);
+            r.io.send_pack_status(id, status);
         }
     }
 
@@ -296,6 +299,9 @@ impl Game<'_> {
     /// setting follows it, declining a required pack disconnects, and every
     /// pack it asked about is pushed.
     pub(super) fn answer_pack_prompt(&mut self, yes: bool) -> Result<()> {
+        if self.is_retained_remote() {
+            return Err("fixed retained client refuses pack acceptance".into());
+        }
         let Some(prompt) = self.server_packs.prompt.take() else {
             return Ok(());
         };
@@ -334,6 +340,9 @@ impl Game<'_> {
     /// that finished, the ones to start, a resource reload when the active
     /// packs change, and the statuses for the server.
     pub(super) fn tick_server_packs(&mut self) {
+        if self.is_retained_remote() {
+            return;
+        }
         self.server_packs.notifiers.retain_mut(PackNotifier::poll);
         // A reload waits for the world's resources (`reload_packs`).
         if self.rest_loader.is_some() || self.world_loader.is_some() {
@@ -363,6 +372,11 @@ impl Game<'_> {
         }
     }
     fn start_pack_downloads(&mut self, requests: Vec<horizon_client::server_packs::Request>) {
+        #[cfg(feature = "paired-packages")]
+        if self.is_retained_remote() {
+            self.retained_remote_request_close("fixed retained client refuses pack downloads");
+            return;
+        }
         let state = &mut self.server_packs;
         if state.queue.is_none() {
             let dir = std::env::current_dir()
@@ -404,6 +418,11 @@ impl Game<'_> {
     /// `LoadingOverlay`); `drive_pack_reload` applies it. A pack with no
     /// readable `pack.mcmeta` fails the reload at once, as `onFailure`.
     fn start_pack_reload(&mut self, load: &[(u128, PathBuf)]) {
+        #[cfg(feature = "paired-packages")]
+        if self.is_retained_remote() {
+            self.retained_remote_request_close("fixed retained client refuses server pack reload");
+            return;
+        }
         let server: Option<Vec<_>> = load
             .iter()
             .map(|(id, path)| packs::server_pack(*id, path))

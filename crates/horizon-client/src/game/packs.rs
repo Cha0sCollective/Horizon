@@ -130,6 +130,11 @@ impl Game<'_> {
     /// particle and font textures), item models, sounds, languages, GUI
     /// metadata and the cloud and world border textures.
     pub(super) fn reload_packs(&mut self) {
+        #[cfg(feature = "paired-packages")]
+        if self.is_retained_remote() {
+            self.retained_remote_request_close("fixed retained client refuses pack reload");
+            return;
+        }
         // Pack reload updates tail-owned mob metadata. Keep menus responsive
         // until those resources exist, then apply the latest selection once.
         if self.rest_loader.is_some() || self.world_loader.is_some() {
@@ -150,6 +155,9 @@ impl Game<'_> {
     /// The CPU half of the reload, safe on a worker (`PackReload` runs it):
     /// `apply_staged_pack` finishes the GPU half and the swap.
     pub(super) fn stage_selected_packs(&mut self) -> horizon_client::Result<StagedPack> {
+        if self.is_retained_remote() {
+            return Err("fixed retained client refuses pack staging".into());
+        }
         let vanilla = self.vanilla_root();
         if self.ui.vanilla_root.as_os_str().is_empty() {
             self.ui.vanilla_root = vanilla.clone();
@@ -172,6 +180,13 @@ impl Game<'_> {
     /// The render-thread half: the renderer on the new pack's textures, then
     /// the swap (`ReloadInstance`'s application listeners).
     pub(super) fn apply_staged_pack(&mut self, staged: StagedPack) -> horizon_client::Result<()> {
+        #[cfg(feature = "paired-packages")]
+        if self.is_retained_remote() {
+            self.refused_retained_packs.push(staged);
+            return Err(
+                "fixed retained client refuses staged pack replacement; input retained".into(),
+            );
+        }
         let StagedPack {
             root,
             gui,

@@ -204,14 +204,7 @@ impl Game<'_> {
             }
             return;
         };
-        let received = r.session.counters.lock().unwrap().as_ref().map(|c| {
-            let order = std::sync::atomic::Ordering::Relaxed;
-            [
-                c.bytes_in.load(order),
-                c.sent.load(order),
-                c.received.load(order),
-            ]
-        });
+        let received = r.io.network_counters();
         if let Some([bytes, sent, received]) = received {
             self.debug_charts.log_bandwidth(bytes);
             self.debug_charts.log_packets([sent, received]);
@@ -324,7 +317,7 @@ impl Game<'_> {
                 self.yaw,
                 self.pitch,
                 self.dim.id(),
-                self.streaming.expect_existing().forced.len(),
+                self.streaming.as_existing().map_or(0, |s| s.forced.len()),
             );
             let section = lines.pop().unwrap_or_default();
             if !self.reduced_debug_info() {

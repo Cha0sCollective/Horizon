@@ -134,7 +134,7 @@ impl Game<'_> {
         match click {
             Some(Click::Custom { id, payload }) => {
                 if let Some(r) = &self.remote {
-                    r.session.send_custom_click(&id, payload);
+                    r.io.send_custom_click(&id, payload);
                 }
             }
             Some(Click::RunCommand(command)) => {

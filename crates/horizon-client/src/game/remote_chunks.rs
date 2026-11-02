@@ -930,10 +930,15 @@ impl Game<'_> {
                 return;
             }
         };
-        let (x, z) = (p.x, p.z);
         self.streaming
             .expect_existing_mut()
             .insert_remote(&mut self.world, chunk);
+        self.install_remote_block_entities(p);
+    }
+
+    /// Called only after the original received column was admitted.
+    pub(super) fn install_remote_block_entities(&mut self, p: &play::LevelChunkWithLight) {
+        let (x, z) = (p.x, p.z);
         self.world
             .block_entities
             .retain(|k, _| (k.0 >> 4, k.2 >> 4) != (x, z));

@@ -193,7 +193,7 @@ pub(in crate::game) fn inventory_count(game: &Game<'_>) -> u32 {
 }
 pub(in crate::game) fn disconnect(game: &mut Game<'_>) {
     if let Some(remote) = game.remote.as_mut() {
-        remote.session.disconnect();
+        remote.io.existing_mut().session.disconnect();
     }
 }
 pub(in crate::game) fn inventory_tree(root: &Path) -> BTreeMap<String, String> {

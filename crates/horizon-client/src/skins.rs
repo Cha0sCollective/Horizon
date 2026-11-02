@@ -211,6 +211,7 @@ pub enum Resolve {
 /// at most 256 entries kept 10 minutes after their last use, fetched on
 /// background threads.
 pub struct Resolver {
+    fetch: bool,
     entries: std::collections::HashMap<NameOrId, Entry>,
     done: std::sync::mpsc::Receiver<(NameOrId, Option<ResolvedProfile>)>,
     send: std::sync::mpsc::Sender<(NameOrId, Option<ResolvedProfile>)>,
@@ -276,8 +277,16 @@ impl Default for Resolver {
 }
 impl Resolver {
     pub fn new() -> Self {
+        Self::with_fetch(true)
+    }
+    /// An immutable default-skin-only resolver. Requests acquire no fetch work.
+    pub fn without_fetch() -> Self {
+        Self::with_fetch(false)
+    }
+    fn with_fetch(fetch: bool) -> Self {
         let (send, done) = std::sync::mpsc::channel();
         Self {
+            fetch,
             entries: Default::default(),
             done,
             send,
@@ -304,6 +313,9 @@ impl Resolver {
     }
     /// How the resolution of `key` stands, starting it the first time.
     pub fn state(&mut self, key: &NameOrId) -> Resolve {
+        if !self.fetch {
+            return Resolve::Done(None);
+        }
         while let Ok((key, resolved)) = self.done.try_recv() {
             self.entries.insert(
                 key,
@@ -613,6 +625,7 @@ pub fn process_legacy_skin(width: u32, height: u32, rgba: &[u8]) -> Option<Vec<u
 /// by kind and hash as vanilla's `TextureCache`s do. A texture that can't
 /// be fetched fails, and the player keeps their default skin.
 pub struct Downloader {
+    fetch: bool,
     root: std::path::PathBuf,
     states: std::collections::HashMap<(Kind, String), Download>,
     done: std::sync::mpsc::Receiver<((Kind, String), Option<Vec<u8>>)>,
@@ -630,8 +643,16 @@ pub struct Downloader {
 const MAX_SKIN_IMAGES: usize = 1024;
 impl Downloader {
     pub fn new(root: std::path::PathBuf) -> Self {
+        Self::with_fetch(root, true)
+    }
+    /// Default skins only: no cache reads, writes, network or native fetches.
+    pub fn without_fetch(root: std::path::PathBuf) -> Self {
+        Self::with_fetch(root, false)
+    }
+    fn with_fetch(root: std::path::PathBuf, fetch: bool) -> Self {
         let (send, done) = std::sync::mpsc::channel();
         Self {
+            fetch,
             root,
             states: Default::default(),
             done,
@@ -644,6 +665,9 @@ impl Downloader {
     }
     /// How the download of `url` stands, starting it the first time.
     pub fn state(&mut self, kind: Kind, url: &str) -> Download {
+        if !self.fetch {
+            return Download::Failed;
+        }
         while let Ok((key, image)) = self.done.try_recv() {
             let state = match image {
                 Some(rgba) => {
@@ -710,6 +734,9 @@ impl Downloader {
     /// A ready skin whose atlas slot was evicted (`show_skin` answered no):
     /// its image for upload again, from memory or the disk cache.
     pub fn again(&mut self, location: &str) -> bool {
+        if !self.fetch {
+            return false;
+        }
         if self.queued.contains(location) {
             return true;
         }

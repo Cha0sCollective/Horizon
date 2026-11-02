@@ -2638,6 +2638,9 @@ impl Game<'_> {
     }
 
     pub(super) fn lan_open(&mut self, settings: LanSettings) -> Result<()> {
+        if self.is_retained_remote() {
+            return Err("fixed retained client refuses LAN publication".into());
+        }
         let port = if let Some(server) = &self.integrated {
             // ShareToLanScreen: IntegratedServer.publishServer.
             server
@@ -2711,6 +2714,9 @@ impl Game<'_> {
         host: Option<u128>,
         start: impl FnOnce(Arc<SyncData>, NetConfig) -> std::io::Result<Lan>,
     ) -> Result<LanHost> {
+        if self.is_retained_remote() {
+            return Err("fixed retained client refuses native host acquisition".into());
+        }
         if net.listen {
             self.options.mod_packages.external_network()?;
         }

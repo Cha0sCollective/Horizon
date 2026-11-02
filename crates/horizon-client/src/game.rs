@@ -169,6 +169,7 @@ mod render_tick;
 #[cfg(feature = "paired-packages")]
 mod residency_control;
 mod respawn_anchor;
+mod retained_remote;
 mod saves_control;
 mod saving;
 mod scoreboard;
@@ -351,6 +352,8 @@ struct Options {
 struct ParsedLaunch {
     options: Options,
     #[cfg(feature = "paired-packages")]
+    retained_remote: Option<window_close::RemoteLaunch>,
+    #[cfg(feature = "paired-packages")]
     native_window: Option<window_close::Launch>,
     #[cfg(feature = "paired-packages")]
     frozen: Option<integrated::managed_application::ManagedLaunch>,
@@ -371,6 +374,16 @@ impl Options {
         Self::read_from(raw_args)
     }
     fn read_from(raw_args: Vec<String>) -> Result<Option<ParsedLaunch>> {
+        #[cfg(feature = "paired-packages")]
+        let retained_remote = window_close::RemoteLaunch::parse(&raw_args)?;
+        #[cfg(feature = "paired-packages")]
+        let raw_args = retained_remote
+            .as_ref()
+            .map_or(raw_args.clone(), |launch| launch.ordinary_args());
+        #[cfg(not(feature = "paired-packages"))]
+        if raw_args.iter().any(|a| a.starts_with("--retained-client-")) {
+            return Err("retained client requires paired-packages".into());
+        }
         #[cfg(feature = "paired-packages")]
         let native_window = window_close::Launch::parse(&raw_args)?;
         #[cfg(feature = "paired-packages")]
@@ -558,6 +571,10 @@ impl Options {
         if let Some(launch) = &native_window {
             launch.configure(&mut o);
         }
+        #[cfg(feature = "paired-packages")]
+        if let Some(launch) = &retained_remote {
+            launch.configure(&mut o);
+        }
         // The launcher's account: online-mode servers need it. A bad file
         // only leaves the game offline.
         if let Some(path) = session_file.filter(|p| !p.is_empty()) {
@@ -571,6 +588,8 @@ impl Options {
         }
         Ok(Some(ParsedLaunch {
             options: o,
+            #[cfg(feature = "paired-packages")]
+            retained_remote,
             #[cfg(feature = "paired-packages")]
             native_window,
             #[cfg(feature = "paired-packages")]
@@ -2254,6 +2273,8 @@ struct Game<'a> {
     /// `ProfileResolver.Cached`: `Dynamic` profiles (name- or id-only heads
     /// and mannequins) resolve through the services in the background.
     skin_profiles: RefCell<horizon_client::skins::Resolver>,
+    #[cfg(feature = "paired-packages")]
+    refused_retained_packs: Vec<packs::StagedPack>,
     skin_slots: Vec<(String, usize)>,
     /// Atlas trim slots in use: (sprite name, slot), least recently drawn first.
     trim_slots: Vec<(String, usize)>,
@@ -2910,6 +2931,7 @@ impl Game<'_> {
         }
     }
     fn particle_sprite(&self, state: BlockStateId, pos: [i32; 3]) -> Option<(String, u32)> {
+        let (biome_zoom, biome_blend) = self.client_biome_profile()?;
         let sprite = Self::block_particle_sprite(&self.pack, state)?;
         let chunks = &self.world.chunks;
         let (cx, cz) = (pos[0] >> 4, pos[2] >> 4);
@@ -2929,8 +2951,8 @@ impl Game<'_> {
                 pos,
                 &region,
                 self.res.biomes(),
-                self.streaming.expect_existing().biome_zoom,
-                self.streaming.expect_existing().biome_blend,
+                biome_zoom,
+                biome_blend,
             )
             .unwrap_or(0xFFFFFF);
         Some((sprite, tint))
@@ -9353,6 +9375,9 @@ impl Game<'_> {
         create: Option<&horizon_client::title::WorldOptions>,
         identity_intent: world_loading::host_identity::IdentityIntent,
     ) -> Result<()> {
+        if self.is_retained_remote() {
+            return Err("fixed retained client refuses native world entry".into());
+        }
         world_loading::world_data_used();
         #[cfg(feature = "mods")]
         self.options.mod_packages.check_running(&self.mods.mods)?;
@@ -9605,6 +9630,9 @@ impl Game<'_> {
     /// Change dimension through a portal (Entity.changeDimension with
     /// PortalForcer placement once the destination has loaded).
     fn enter_dimension(&mut self, target: Dim) -> Result<()> {
+        if self.is_retained_remote() {
+            return Err("fixed retained client refuses native dimension entry".into());
+        }
         let Some(player) = self.player.take() else {
             return Ok(());
         };
@@ -9848,6 +9876,9 @@ impl Game<'_> {
     }
 
     fn save_for_exit_attempt(&mut self) -> Result<()> {
+        if self.is_retained_remote() {
+            return Err("retained client exit requires its original window close owner".into());
+        }
         // Native application termination can bypass CloseRequested. Finish any
         // save screen synchronously here, before the process can go away.
         while self.pending_save.is_some() {
@@ -9873,12 +9904,17 @@ impl Game<'_> {
         self.save_game()?;
         if let Some(mut remote) = self.remote.take() {
             // Minecraft.disconnect closes the connection, so the host sees a clean leave.
-            remote.session.disconnect();
+            remote.io.existing_mut().session.disconnect();
         }
         self.saved_for_exit = true;
         Ok(())
     }
     fn close_world(&mut self) -> Result<()> {
+        #[cfg(feature = "paired-packages")]
+        if self.is_retained_remote() {
+            self.retained_remote_request_leave();
+            return Ok(());
+        }
         self.clear_waypoints();
         self.begin_closing_save(false)
     }
@@ -11208,6 +11244,11 @@ impl Game<'_> {
         )
     }
     fn apply_settings(&mut self) {
+        #[cfg(feature = "paired-packages")]
+        if self.is_retained_remote() {
+            self.retained_remote_request_close("fixed retained client refuses settings changes");
+            return;
+        }
         // LocalPlayer.refreshChatAbilities: the chat shows what the Chat option allows.
         let abilities = self.chat_abilities();
         self.ui.chat.set_abilities(&self.gui.atlas.font, abilities);
@@ -11945,6 +11986,9 @@ impl Game<'_> {
     /// generated chunk is saved, hundreds at a time, encoded and written on
     /// the region writer meanwhile.
     fn save_game_with(&mut self, wait: bool) -> Result<()> {
+        if self.is_retained_remote() {
+            return Err("remote client has no native storage authority".into());
+        }
         if self.remote.is_some() {
             return Ok(());
         }
@@ -12101,15 +12145,13 @@ impl Game<'_> {
                 .get(self.world.block(block[0], block[1], block[2]))
                 .solid_render;
         // The cave culling search runs on its worker while the frame is prepared.
+        let near_distance = self.terrain_distance();
         if cave_culling
             && self.title.is_none()
             && let Some(renderer) = self.renderer.as_mut()
         {
             horizon_client::spans::time("occlusion", || {
-                renderer.start_occlusion(
-                    camera,
-                    (self.streaming.expect_existing().radius * 16) as f32,
-                )
+                renderer.start_occlusion(camera, (near_distance * 16) as f32)
             });
         }
         let biome = self
@@ -12354,7 +12396,7 @@ impl Game<'_> {
             bob,
             sky,
             distance,
-            detail_distance: (self.streaming.expect_existing().radius * 16) as f32,
+            detail_distance: (self.terrain_distance() * 16) as f32,
             depth_far,
             underwater,
             title,
@@ -12377,8 +12419,7 @@ impl Game<'_> {
                     && self.darkness_fog().is_none()
                     && !self.boss_overlay.should_create_world_fog()
                     && self.potions.effects.get("blindness").is_none()
-                    && fog.environmental_end
-                        >= (self.streaming.expect_existing().radius * 16) as f32
+                    && fog.environmental_end >= (self.terrain_distance() * 16) as f32
                 {
                     (fog.render_distance_start, fog.render_distance_end) = (1e9, 2e9);
                     (fog.environmental_start, fog.environmental_end) = (1e9, 2e9);
@@ -12552,7 +12593,7 @@ impl Game<'_> {
         partial: f32,
     ) -> Option<horizon_client::gfx::BorderDraw> {
         use horizon_client::border_render::{self, BorderRenderer};
-        let distance = f64::from(self.streaming.expect_existing().radius * 16);
+        let distance = f64::from(self.terrain_distance() * 16);
         border_render::extract(
             &self.border,
             partial,
@@ -12855,6 +12896,14 @@ impl Game<'_> {
     }
     /// Only enabled LOD worlds extend the renderer's range, never simulation.
     fn terrain_distance(&self) -> i32 {
+        if self.is_retained_remote() {
+            return self
+                .remote
+                .as_ref()
+                .map_or(self.settings.render_distance, |r| r.view_distance)
+                .min(self.settings.render_distance)
+                .clamp(2, 32);
+        }
         if self.lod.is_some() {
             self.streaming
                 .expect_existing()
@@ -12902,6 +12951,13 @@ impl Game<'_> {
         }
     }
     fn update_world(&mut self) {
+        #[cfg(feature = "paired-packages")]
+        if self.is_retained_remote() {
+            if let Err(error) = self.update_retained_remote() {
+                self.retained_remote_request_close(error.to_string());
+            }
+            return;
+        }
         if let Err(e) = self.poll_remote() {
             log::warn!("Horizon: {e}");
         }
@@ -14138,10 +14194,242 @@ fn load_forcefield(root: &std::path::Path) -> (u32, u32, Vec<u8>) {
 enum InitialGameWorld {
     Legacy,
     #[cfg(feature = "paired-packages")]
+    RetainedRemote {
+        address: String,
+        name: String,
+        builtin: horizon_protocol::registry::Builtin,
+        language: Arc<horizon_protocol::text::Language>,
+    },
+    #[cfg(feature = "paired-packages")]
     Retained(Box<world_loading::ColdPreparedWorld>),
 }
 
 impl<'a> Game<'a> {
+    fn client_biome_profile(&self) -> Option<(horizon_core::biome::BiomeZoom, i32)> {
+        if let Ok(s) = self.streaming.as_existing() {
+            return Some((s.biome_zoom, s.biome_blend));
+        }
+        #[cfg(feature = "paired-packages")]
+        if let Some(profile) = self.streaming.remote().and_then(|s| s.profile()) {
+            return Some((
+                horizon_core::biome::BiomeZoom::new(profile.obfuscated_biome_seed),
+                profile.biome_blend,
+            ));
+        }
+        None
+    }
+    fn client_pending(&self) -> Option<usize> {
+        if let Ok(s) = self.streaming.as_existing() {
+            return Some(s.pending() + self.pending_uploads.len());
+        }
+        #[cfg(feature = "paired-packages")]
+        return self.streaming.remote()?.try_observe().map(|o| {
+            o.owned
+                + self.pending_uploads.len()
+                + self.remote_backlog()
+                + self.world.dirty_sections.len()
+                + self.world.dirty_light.len()
+        });
+        #[cfg(not(feature = "paired-packages"))]
+        None
+    }
+    fn client_section_pending(&self, section: (i32, i32, i32)) -> bool {
+        if let Ok(s) = self.streaming.as_existing() {
+            return s.is_meshing(section);
+        }
+        #[cfg(feature = "paired-packages")]
+        return self
+            .streaming
+            .remote()
+            .is_none_or(|s| s.mesh_pending(section));
+        #[cfg(not(feature = "paired-packages"))]
+        true
+    }
+    #[cfg(feature = "paired-packages")]
+    fn retained_remote_frame(&mut self) -> Result<bool> {
+        if let Some(error) = self.retained_remote_failure() {
+            return Err(error.into());
+        }
+        if self.retained_remote_leave_requested() {
+            return Ok(false);
+        }
+        let now = Instant::now();
+        let elapsed = now.saturating_duration_since(self.previous);
+        self.previous = now;
+        self.frame_ticks = elapsed.as_secs_f32() * 20.0;
+        self.update_retained_remote()?;
+        if let Some(error) = self.retained_remote_failure() {
+            return Err(error.into());
+        }
+        if self.retained_remote_leave_requested() {
+            return Ok(false);
+        }
+        if let Some(renderer) = &mut self.renderer {
+            for (key, mesh) in self.pending_uploads.drain(..) {
+                if self.world.chunks.contains_key(&(key.0, key.2)) {
+                    renderer.upload(key, &mesh);
+                }
+            }
+        }
+        let turn = |k| f32::from(u8::from(self.keys.contains(&k)));
+        self.yaw += (turn(KeyCode::ArrowRight) - turn(KeyCode::ArrowLeft))
+            * 90.0
+            * elapsed.as_secs_f32().min(0.1);
+        self.pitch = (self.pitch
+            + (turn(KeyCode::ArrowDown) - turn(KeyCode::ArrowUp))
+                * 90.0
+                * elapsed.as_secs_f32().min(0.1))
+        .clamp(-90.0, 90.0);
+        self.apply_mouse_look();
+        for _ in 0..self.clock.advance(elapsed) {
+            self.tick_remote()?;
+            if let Some(error) = self.retained_remote_failure() {
+                return Err(error.into());
+            }
+            if self.retained_remote_leave_requested() {
+                return Ok(false);
+            }
+            self.tick_fov();
+        }
+        let presented = self.render()?;
+        if let Some(error) = self.retained_remote_failure() {
+            return Err(error.into());
+        }
+        self.clock.end_frame(false);
+        if presented {
+            self.frames += 1;
+            if self.player.is_some() {
+                self.world_frames += 1;
+            }
+        }
+        Ok(presented)
+    }
+    #[cfg(feature = "paired-packages")]
+    fn retained_remote_input(&mut self, event: WindowEvent) -> Result<()> {
+        if self.retained_remote_failure().is_some() || self.retained_remote_leave_requested() {
+            return Ok(());
+        }
+        self.last_input = Instant::now();
+        match event {
+            WindowEvent::Focused(focused) => {
+                self.focused = focused;
+                if !focused {
+                    self.keys.clear();
+                    self.physical_keys.clear();
+                    self.left = false;
+                    self.right = false;
+                    self.capture(false);
+                }
+            }
+            WindowEvent::KeyboardInput {
+                event,
+                is_synthetic: false,
+                ..
+            } => {
+                if let PhysicalKey::Code(key) = event.physical_key {
+                    if key == KeyCode::Escape && event.state == ElementState::Pressed {
+                        self.retained_remote_request_leave();
+                        return Ok(());
+                    }
+                    if event.state == ElementState::Pressed {
+                        self.physical_keys.insert(key);
+                    } else {
+                        self.physical_keys.remove(&key);
+                    }
+                    for mapped in self.settings.keys.translate_all(key) {
+                        if let Ok(
+                            k @ (KeyCode::KeyW
+                            | KeyCode::KeyA
+                            | KeyCode::KeyS
+                            | KeyCode::KeyD
+                            | KeyCode::Space
+                            | KeyCode::ShiftLeft
+                            | KeyCode::ControlLeft
+                            | KeyCode::ArrowUp
+                            | KeyCode::ArrowDown
+                            | KeyCode::ArrowLeft
+                            | KeyCode::ArrowRight),
+                        ) = mapped
+                        {
+                            self.mapped_key(k, event.state == ElementState::Pressed, event.repeat)?;
+                        }
+                    }
+                }
+            }
+            WindowEvent::MouseInput { state, button, .. } if self.focused => {
+                if !self.captured && state == ElementState::Pressed {
+                    self.capture(true);
+                } else if self.screen == Screen::Playing {
+                    self.play_mouse(button, state == ElementState::Pressed)?;
+                }
+            }
+            _ => {}
+        }
+        if let Some(error) = self.retained_remote_failure() {
+            return Err(error.into());
+        }
+        Ok(())
+    }
+    #[cfg(feature = "paired-packages")]
+    fn retained_remote_device(&mut self, event: DeviceEvent) {
+        if self.captured
+            && self.focused
+            && self.retained_remote_failure().is_none()
+            && !self.retained_remote_leave_requested()
+            && let DeviceEvent::MouseMotion { delta: (x, y) } = event
+        {
+            self.mouse.on_move(0.0, 0.0, x, y, true, true);
+        }
+    }
+    /// Complete synchronous inputs precede the first retained actor owner.
+    #[cfg(feature = "paired-packages")]
+    #[allow(clippy::too_many_arguments)]
+    fn new_retained_remote(
+        res: &'a Arc<Resources>,
+        pack: PackResources,
+        gui: UiResources,
+        options: Options,
+        settings: Settings,
+        prepared: GameCpuResources,
+        address: String,
+        name: String,
+    ) -> Result<Self> {
+        if cfg!(feature = "controllers")
+            || settings.horizon.lod_distance != 0
+            || !settings.mods.enabled.is_empty()
+            || !settings.resource_packs.is_empty()
+            || !options.dev_mods.is_empty()
+            || options.mod_packages.has_pairs()
+            || options.server_thread
+            || options.server.is_some()
+            || options.dedicated.is_some()
+        {
+            return Err(
+                "retained client requires fixed no-LOD, no-controller, unmodified remote inputs"
+                    .into(),
+            );
+        }
+        let builtin = horizon_protocol::registry::Builtin::find(&options.resources)
+            .and_then(|p| horizon_protocol::registry::Builtin::load(&p).ok())
+            .ok_or("retained client requires complete registries")?;
+        let language = Arc::new(horizon_client::net::load_language(&options.resources));
+        let audio = Audio::silent(&options.resources);
+        Self::new_with_world(
+            res,
+            pack,
+            gui,
+            options,
+            settings,
+            audio,
+            Some(prepared),
+            InitialGameWorld::RetainedRemote {
+                address,
+                name,
+                builtin,
+                language,
+            },
+        )
+    }
     /// A game with no world open, over the loaded resources: the window's,
     /// or an integrated server's on its own thread.
     fn new(
@@ -14179,7 +14467,15 @@ impl<'a> Game<'a> {
         let root = options.resources.clone();
         let registry = pack.assets.registry;
         #[cfg(feature = "paired-packages")]
+        let preloaded_cpu = prepared.is_some();
+        // Finish fallible CPU loading before a retained Session can exist.
+        let prepared = prepared
+            .map(Ok)
+            .unwrap_or_else(|| GameCpuResources::load(&root))?;
+        #[cfg(feature = "paired-packages")]
         let mut retained_initial = None;
+        #[cfg(feature = "paired-packages")]
+        let mut remote_initial = None;
         let (world, streaming, save, level) = match initial {
             InitialGameWorld::Legacy => {
                 // Preserve ordinary construction; the explicit retained recipe
@@ -14197,8 +14493,52 @@ impl<'a> Game<'a> {
                 ));
                 (
                     World::new(res.facts().air, 0),
-                    streaming,
-                    save,
+                    streaming_owner::GameStreaming::from_existing(streaming),
+                    Some(save),
+                    Level::default(),
+                )
+            }
+            #[cfg(feature = "paired-packages")]
+            InitialGameWorld::RetainedRemote {
+                address,
+                name,
+                builtin,
+                language,
+            } => {
+                let view = settings.render_distance.clamp(2, 32) as i8;
+                // The last ordinary fallible operation. Refusal owns only its
+                // original target; no worker/decoder/stream owner yet exists.
+                let session = horizon_client::net::RetainedSession::new_offline(
+                    horizon_client::net::RetainedTarget::Address(address.clone()),
+                    horizon_client::net::RetainedSettings::offline(
+                        name.clone(),
+                        view,
+                        language.clone(),
+                    ),
+                )
+                .map_err(|r| r.reason)?;
+                // Literal one is validated by the fixed prepare contract;
+                // construction is inert and cannot acquire a native worker.
+                let stream = horizon_client::streaming::RetainedRemoteStreaming::prepare(
+                    pack.context.clone(),
+                    1,
+                )
+                .unwrap_or_else(|_| unreachable!("fixed one-worker remote preparation"));
+                remote_initial = Some(remote::Remote::fresh(
+                    retained_remote::RemoteIo::Retained(Box::new(
+                        retained_remote::RetainedIo::new(session, address, name),
+                    )),
+                    builtin,
+                    language,
+                    view,
+                    settings.render_distance,
+                    settings.chat_visibility as i32,
+                    perspective::player_type(&root),
+                ));
+                (
+                    World::new(res.facts().air, 0),
+                    streaming_owner::GameStreaming::from_retained(stream),
+                    None,
                     Level::default(),
                 )
             }
@@ -14208,7 +14548,7 @@ impl<'a> Game<'a> {
                 // Every original native input is selected before any legacy
                 // constructor, and remains in this lexical construction.
                 assert!(
-                    prepared.is_some(),
+                    preloaded_cpu,
                     "retained construction requires preloaded CPU inputs"
                 );
                 let (parts, authority) = (*parts).into_parts();
@@ -14231,12 +14571,14 @@ impl<'a> Game<'a> {
                     native_checkpoint_origin,
                     authority,
                 ));
-                (world, streaming, save, level)
+                (
+                    world,
+                    streaming_owner::GameStreaming::from_existing(streaming),
+                    Some(save),
+                    level,
+                )
             }
         };
-        let prepared = prepared
-            .map(Ok)
-            .unwrap_or_else(|| GameCpuResources::load(&root))?;
         let creative = options.creative;
         let inventory = vec![None; 36];
         let now = Instant::now();
@@ -14275,7 +14617,7 @@ impl<'a> Game<'a> {
             weather_parameters: Default::default(),
             panorama_rotation: Default::default(),
             world,
-            streaming: streaming_owner::GameStreaming::from_existing(streaming),
+            streaming,
             lod: None,
             lod_source_attempted: false,
             lod_observe: Default::default(),
@@ -14357,7 +14699,7 @@ impl<'a> Game<'a> {
             ticks: 0,
             error: None,
             message: None,
-            save: Some(save),
+            save,
             level,
             session_lock: None,
             #[cfg(feature = "paired-packages")]
@@ -14506,6 +14848,8 @@ impl<'a> Game<'a> {
                     .join("assets/skins"),
             )),
             skin_profiles: RefCell::new(horizon_client::skins::Resolver::new()),
+            #[cfg(feature = "paired-packages")]
+            refused_retained_packs: Vec::new(),
             skin_slots: Vec::new(),
             trim_slots: Vec::new(),
             cart_models: prepared.cart_models,
@@ -14631,6 +14975,16 @@ impl<'a> Game<'a> {
                 game.native_close_authority = Some(authority);
                 game.block_ticks = Ticks::new(game.level.seed as i32);
                 game.dim = Dim::Overworld;
+            }
+            if let Some(remote) = remote_initial {
+                game.remote = Some(remote);
+                game.screen = Screen::Playing;
+                game.title = None;
+                game.clock = FixedStep::client();
+                game.skin_profiles = RefCell::new(horizon_client::skins::Resolver::without_fetch());
+                game.skin_downloads = RefCell::new(
+                    horizon_client::skins::Downloader::without_fetch(root.join("assets/skins")),
+                );
             }
             game
         };
@@ -14767,7 +15121,8 @@ impl Game<'_> {
     #[cfg(feature = "paired-packages")]
     #[allow(dead_code)]
     fn begin_retained_preparation(&mut self, request: world_loading::WorldRequest) -> Result<u64> {
-        if self.retained_entry_owner.is_some()
+        if self.is_retained_remote()
+            || self.retained_entry_owner.is_some()
             || self.retained_prepare_loader.is_some()
             || self.retained_preparation.is_some()
             || self.world_loader.is_some()
@@ -16173,10 +16528,16 @@ pub fn run() -> Result<()> {
     let ParsedLaunch {
         mut options,
         #[cfg(feature = "paired-packages")]
+        retained_remote,
+        #[cfg(feature = "paired-packages")]
         native_window,
         #[cfg(feature = "paired-packages")]
         frozen,
     } = parsed;
+    #[cfg(feature = "paired-packages")]
+    if let Some(launch) = retained_remote {
+        return window_close::run_remote(options, launch);
+    }
     #[cfg(feature = "paired-packages")]
     if let Some(launch) = native_window {
         return window_close::run(options, launch);

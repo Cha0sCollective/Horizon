@@ -1,18 +1,22 @@
-//! Explicit storage for the current Game stream and the dormant retained owner.
+//! Explicit storage for existing streams and the original fixed remote owner.
 //!
-//! Every production Game factory still installs Existing. That includes legacy
-//! remote NoTerrain pools: this variant is not native checkpoint provenance.
-//! A later retained remote Game recipe must replace its reachable assertions
-//! with checked dispatch before it can install the other variant.
-#[cfg(feature = "paired-packages")]
-use horizon_client::streaming::RetainedRemoteStreaming;
+//! Existing includes legacy remote NoTerrain pools and is never native
+//! checkpoint provenance. The fixed retained client keeps its original opaque
+//! stream here through checked native closure, including all retained payloads.
 use horizon_client::streaming::Streaming;
+#[cfg(feature = "paired-packages")]
+use horizon_client::streaming::{
+    ClosedRemoteStreaming, RemoteCloseStatus, RemoteObservation, RemoteRefusal,
+    RetainedRemoteStreaming,
+};
 
 pub(super) enum GameStreaming {
     Existing(Box<Streaming>),
     #[cfg(feature = "paired-packages")]
-    #[cfg_attr(not(test), allow(dead_code))] // Deliberately no production Game installer.
-    RetainedRemote(Box<RetainedRemoteStreaming>),
+    RetainedRemote {
+        active: Option<Box<RetainedRemoteStreaming>>,
+        closed: Option<Box<ClosedRemoteStreaming>>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -27,7 +31,7 @@ impl GameStreaming {
         match self {
             Self::Existing(streaming) => Ok(streaming),
             #[cfg(feature = "paired-packages")]
-            Self::RetainedRemote(_) => Err(ExistingUnavailable),
+            Self::RetainedRemote { .. } => Err(ExistingUnavailable),
         }
     }
 
@@ -35,18 +39,18 @@ impl GameStreaming {
         match self {
             Self::Existing(streaming) => Ok(streaming),
             #[cfg(feature = "paired-packages")]
-            Self::RetainedRemote(_) => Err(ExistingUnavailable),
+            Self::RetainedRemote { .. } => Err(ExistingUnavailable),
         }
     }
 
     pub(super) fn expect_existing(&self) -> &Streaming {
         self.as_existing()
-            .expect("all current Game factories install Existing streaming")
+            .expect("this operation requires the original existing stream")
     }
 
     pub(super) fn expect_existing_mut(&mut self) -> &mut Streaming {
         self.as_existing_mut()
-            .expect("all current Game factories install Existing streaming")
+            .expect("this operation requires the original existing stream")
     }
 
     #[cfg_attr(not(all(test, feature = "paired-packages")), allow(dead_code))] // Checked consuming boundary for later adoption.
@@ -54,7 +58,7 @@ impl GameStreaming {
         match self {
             Self::Existing(streaming) => Ok(*streaming),
             #[cfg(feature = "paired-packages")]
-            original @ Self::RetainedRemote(_) => Err(original),
+            original @ Self::RetainedRemote { .. } => Err(original),
         }
     }
 
@@ -67,7 +71,7 @@ impl GameStreaming {
         match self {
             Self::Existing(current) => Ok(*std::mem::replace(current, Box::new(incoming))),
             #[cfg(feature = "paired-packages")]
-            Self::RetainedRemote(_) => Err(incoming),
+            Self::RetainedRemote { .. } => Err(incoming),
         }
     }
 
@@ -78,6 +82,75 @@ impl GameStreaming {
         let current = self.as_existing_mut()?;
         std::mem::swap(current, parked);
         Ok(())
+    }
+
+    #[cfg(feature = "paired-packages")]
+    pub(super) fn from_retained(streaming: RetainedRemoteStreaming) -> Self {
+        Self::RetainedRemote {
+            active: Some(Box::new(streaming)),
+            closed: None,
+        }
+    }
+    #[cfg(feature = "paired-packages")]
+    pub(super) fn remote(&self) -> Option<&RetainedRemoteStreaming> {
+        match self {
+            Self::RetainedRemote { active, .. } => active.as_deref(),
+            _ => None,
+        }
+    }
+    #[cfg(feature = "paired-packages")]
+    pub(super) fn remote_mut(&mut self) -> Option<&mut RetainedRemoteStreaming> {
+        match self {
+            Self::RetainedRemote { active, .. } => active.as_deref_mut(),
+            _ => None,
+        }
+    }
+    #[cfg(feature = "paired-packages")]
+    pub(super) fn remote_observation(&self) -> Option<RemoteObservation> {
+        match self {
+            Self::RetainedRemote {
+                active: Some(active),
+                ..
+            } => active.try_observe(),
+            Self::RetainedRemote {
+                closed: Some(closed),
+                ..
+            } => closed.try_observe(),
+            _ => None,
+        }
+    }
+    #[cfg(feature = "paired-packages")]
+    pub(super) fn begin_remote_close(&mut self, deadline: std::time::Instant) {
+        if let Some(active) = self.remote_mut() {
+            active.begin_close(deadline);
+        }
+    }
+    #[cfg(feature = "paired-packages")]
+    pub(super) fn poll_remote_close(&mut self) -> bool {
+        let Self::RetainedRemote { active, closed } = self else {
+            return false;
+        };
+        if let Some(original) = active.take() {
+            match (*original).try_closed() {
+                Ok(value) => *closed = Some(Box::new(value)),
+                Err(original) => *active = Some(Box::new(original)),
+            }
+        }
+        closed.is_some()
+    }
+    #[cfg(feature = "paired-packages")]
+    pub(super) fn remote_close_status(&mut self) -> Option<RemoteCloseStatus> {
+        self.remote_mut().map(RetainedRemoteStreaming::poll_close)
+    }
+    #[cfg(feature = "paired-packages")]
+    pub(super) fn retry_remote_close(
+        &mut self,
+        expected: u64,
+        deadline: std::time::Instant,
+    ) -> Result<u64, RemoteRefusal> {
+        self.remote_mut()
+            .ok_or(RemoteRefusal::State)?
+            .retry_close(expected, deadline)
     }
 }
 
@@ -190,7 +263,7 @@ mod tests {
             Ok(remote) => remote,
             Err(_) => panic!("actual inert retained preparation refused"),
         };
-        let mut slot = GameStreaming::RetainedRemote(Box::new(remote));
+        let mut slot = GameStreaming::from_retained(remote);
         assert!(matches!(slot.as_existing(), Err(ExistingUnavailable)));
         assert!(matches!(slot.as_existing_mut(), Err(ExistingUnavailable)));
         let incoming = original(&game);
@@ -213,8 +286,11 @@ mod tests {
             Ok(_) => panic!("retained slot allowed Existing extraction"),
         };
         let mut remote = match slot {
-            GameStreaming::RetainedRemote(original) => *original,
-            GameStreaming::Existing(_) => panic!("refusal replaced the original slot variant"),
+            GameStreaming::RetainedRemote {
+                active: Some(original),
+                closed: None,
+            } => *original,
+            _ => panic!("refusal changed the original slot state"),
         };
         let observation = remote
             .try_observe()

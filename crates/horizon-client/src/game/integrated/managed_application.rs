@@ -426,7 +426,7 @@ impl FrozenApplication<'_> {
             self.finished = true;
             for client in &mut self.clients {
                 if let Some(remote) = client.remote.as_mut() {
-                    remote.session.disconnect();
+                    remote.io.existing_mut().session.disconnect();
                 }
             }
             event_loop.exit();

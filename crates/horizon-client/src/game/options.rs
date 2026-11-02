@@ -30,6 +30,9 @@ impl Game<'_> {
     }
     /// `options-get` and `options-set`; None for other commands.
     pub(super) fn options_control(&mut self, words: &[&str], line: &str) -> Result<Option<Value>> {
+        if self.is_retained_remote() && words.first() == Some(&"options-set") {
+            return Err("fixed retained client refuses settings mutation".into());
+        }
         match words[0] {
             "options-get" => {
                 let file = self.settings.to_file();
@@ -95,6 +98,11 @@ impl Game<'_> {
         self.open_options_at(from_title, Page::Main);
     }
     pub(super) fn open_options_at(&mut self, from_title: bool, page: Page) {
+        #[cfg(feature = "paired-packages")]
+        if self.is_retained_remote() {
+            self.retained_remote_request_close("fixed retained client refuses options entry");
+            return;
+        }
         // Gameplay keys must not stay held behind the options screen, where
         // bindings can also change before the physical key is released.
         self.keys.clear();
@@ -112,6 +120,9 @@ impl Game<'_> {
         self.ui.options = ui;
     }
     pub(super) fn options_mouse(&mut self, pressed: bool, right: bool) -> Result<()> {
+        if self.is_retained_remote() {
+            return Err("fixed retained client refuses options input".into());
+        }
         if !pressed {
             if right {
                 return Ok(());
@@ -142,6 +153,9 @@ impl Game<'_> {
         self.handle_option_events(events)
     }
     pub(super) fn options_drag(&mut self) -> Result<()> {
+        if self.is_retained_remote() {
+            return Err("fixed retained client refuses options drag".into());
+        }
         let size = self.gui_size();
         let framebuffer = self.renderer.as_ref().map_or([1280, 720], |r| {
             [r.config.width as i32, r.config.height as i32]
@@ -161,6 +175,9 @@ impl Game<'_> {
         self.handle_option_events(events)
     }
     pub(super) fn options_key(&mut self, key: KeyCode, text: Option<&str>) -> Result<()> {
+        if self.is_retained_remote() {
+            return Err("fixed retained client refuses options key".into());
+        }
         let mut ui = std::mem::take(&mut self.ui.options);
         let events = ui.key(&mut self.settings, &self.gui.atlas, key, text);
         self.ui.options = ui;
@@ -171,11 +188,17 @@ impl Game<'_> {
         &mut self,
         shortcut: horizon_client::clipboard::EditShortcut,
     ) -> bool {
+        if self.is_retained_remote() {
+            return false;
+        }
         self.ui
             .options
             .shortcut(&self.gui.atlas, shortcut, &mut self.clipboard)
     }
     pub(super) fn options_scroll(&mut self, amount: f32) {
+        if self.is_retained_remote() {
+            return;
+        }
         let size = self.gui_size();
         self.ui
             .options
@@ -186,10 +209,16 @@ impl Game<'_> {
         self.ui.options.selected_key.is_some()
     }
     pub(super) fn options_bind_mouse(&mut self, button: MouseButton) -> Result<()> {
+        if self.is_retained_remote() {
+            return Err("fixed retained client refuses options binding".into());
+        }
         let events = self.ui.options.bind_mouse(&mut self.settings, button);
         self.handle_option_events(events)
     }
     pub(super) fn handle_option_events(&mut self, events: Vec<Event>) -> Result<()> {
+        if self.is_retained_remote() {
+            return Err("fixed retained client refuses option events".into());
+        }
         for e in events {
             match e {
                 Event::ButtonClick => self.audio.play_button_click(),

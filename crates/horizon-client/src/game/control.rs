@@ -153,6 +153,9 @@ impl Game<'_> {
         reply: &Sender<String>,
         event_loop: &ActiveEventLoop,
     ) -> Result<Option<Value>> {
+        if self.is_retained_remote() {
+            return Err("retained client uses its fixed original window control owner".into());
+        }
         let words: Vec<&str> = line.split_whitespace().collect();
         if self.pending_save.is_some() && words.first() != Some(&"quit") {
             return Err("a world save is in progress".into());
@@ -1053,14 +1056,14 @@ impl Game<'_> {
             "carts": self.remote_carts().unwrap_or_else(|| self.carts.iter().map(|c| serde_json::json!({"kind": c.kind.id(), "position": [c.position.x, c.position.y, c.position.z], "velocity": [c.velocity.x, c.velocity.y, c.velocity.z]})).collect::<Vec<_>>()),
             "riding": self.riding,
             "using": self.using,
-            "render_distance": self.streaming.expect_existing().radius,
+            "render_distance": self.terrain_distance(),
             "chunks": self.world.chunks.len(),
             "mobs": self.mobs.len(),
             "block_entities": self.world.block_entities.len(),
-            "pending_chunks": self.streaming.expect_existing().pending() + self.pending_uploads.len() + self.remote_backlog(),
-            "generated_chunks": self.streaming.expect_existing().generated_total,
-            "meshed_sections": self.streaming.expect_existing().meshed_total,
-            "streaming": self.streaming.expect_existing().stages().into_iter().map(|(k, v)| (k.to_string(), v.into())).collect::<serde_json::Map<_, _>>(),
+            "pending_chunks": self.client_pending().map(|pending| pending + if self.is_retained_remote() { 0 } else { self.remote_backlog() }),
+            "generated_chunks": self.streaming.as_existing().ok().map(|s| s.generated_total),
+            "meshed_sections": self.streaming.as_existing().ok().map(|s| s.meshed_total),
+            "streaming": self.streaming.as_existing().ok().map(|s| s.stages().into_iter().map(|(k, v)| (k.to_string(), v.into())).collect::<serde_json::Map<_, _>>()),
             "dirty_light": self.world.dirty_light.len(),
             "renderer": renderer,
             "display": self.window.as_deref().and_then(horizon_client::telemetry::monitor).map(|m| json!({

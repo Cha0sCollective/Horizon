@@ -16,6 +16,95 @@ use world_loading::{
 
 const CLOSE_WAIT: Duration = Duration::from_secs(10);
 
+pub(super) struct RemoteLaunch {
+    root: PathBuf,
+    address: String,
+    args: Vec<String>,
+}
+impl RemoteLaunch {
+    pub(super) fn parse(args: &[String]) -> Result<Option<Self>> {
+        if !args.iter().any(|a| a.starts_with("--retained-client-")) {
+            return Ok(None);
+        }
+        if !cfg!(target_os = "linux") || cfg!(feature = "controllers") {
+            return Err("retained client requires Linux with controllers disabled".into());
+        }
+        for name in [
+            "HORIZON_SESSION_FILE",
+            "HORIZON_PLAYER_NAME",
+            "HORIZON_BENCHMARK",
+            "HORIZON_COMMAND_HARNESS",
+            "HORIZON_NET_HARNESS",
+        ] {
+            if std::env::var_os(name).is_some_and(|v| !v.is_empty()) {
+                return Err(format!("retained client refuses {name}").into());
+            }
+        }
+        let (mut root, mut address) = (None, None);
+        let mut ordinary = Vec::new();
+        let mut input = args.iter();
+        while let Some(arg) = input.next() {
+            match arg.as_str() {
+                "--retained-client-window" if address.is_none() => {
+                    address = Some(
+                        input
+                            .next()
+                            .ok_or("missing retained client address")?
+                            .clone(),
+                    )
+                }
+                "--retained-client-root" if root.is_none() => {
+                    root = Some(PathBuf::from(
+                        input.next().ok_or("missing retained client root")?,
+                    ))
+                }
+                "--resources" | "--control-socket" | "--width" | "--height" | "--frames"
+                | "--timeout-seconds" => {
+                    ordinary.push(arg.clone());
+                    ordinary.push(
+                        input
+                            .next()
+                            .ok_or("missing retained client option value")?
+                            .clone(),
+                    );
+                }
+                _ => return Err(format!("unsupported retained client option {arg}").into()),
+            }
+        }
+        let root = root.ok_or("retained client needs a fresh absolute root")?;
+        if !root.is_absolute()
+            || root
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err("retained client root must be absolute without parent components".into());
+        }
+        match std::fs::symlink_metadata(&root) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            _ => return Err("retained client root must not already exist".into()),
+        }
+        ordinary.push("--in-frame".into());
+        ordinary.push("--test-terrain".into());
+        Ok(Some(Self {
+            root,
+            address: address.ok_or("missing retained client address")?,
+            args: ordinary,
+        }))
+    }
+    pub(super) fn ordinary_args(&self) -> Vec<String> {
+        self.args.clone()
+    }
+    pub(super) fn configure(&self, options: &mut Options) {
+        options.server_thread = false;
+        options.test_terrain = true;
+        options.distance = 2;
+        options.distance_override = Some(2);
+        options
+            .control
+            .get_or_insert_with(|| self.root.join("control.sock"));
+    }
+}
+
 pub(super) struct Launch {
     root: PathBuf,
     args: Vec<String>,
@@ -172,10 +261,118 @@ struct ColdState {
 }
 enum Phase<'a> {
     Running(Box<Game<'a>>),
+    RemoteRunning(Box<Game<'a>>),
+    RemoteClosing(Box<Game<'a>>),
+    RemoteReady(Box<Game<'a>>),
     Closing(Box<CloseOwner<'a>>),
     Ready(NativeReady<'a>),
     Cold(Box<ColdState>),
     Done,
+}
+
+pub(super) fn run_remote(options: Options, launch: RemoteLaunch) -> Result<()> {
+    horizon_threads::catch_retained_stop_signals();
+    let settings = Settings::load(&std::env::current_dir()?.join("options.txt"));
+    preflight(&options, &settings)?;
+    if cfg!(feature = "controllers") {
+        return Err("retained client excludes controller acquisition".into());
+    }
+    // Admit only the explicit no-LOD profile; do not normalize user settings.
+    if settings.horizon.lod_distance != 0 {
+        return Err("retained client requires LOD disabled".into());
+    }
+    let root = std::fs::canonicalize(&options.resources)?;
+    let started = Instant::now();
+    let loaded = load_resources(
+        root.clone(),
+        &root,
+        &settings,
+        started,
+        false,
+        &Progress::new(),
+        &mut |_, _| {},
+    )?;
+    if loaded.pack_error.is_some()
+        || loaded.rest_loader.is_some()
+        || std::fs::canonicalize(&loaded.root)? != root
+    {
+        return Err(
+            "retained client requires complete synchronous resources without fallback".into(),
+        );
+    }
+    let gui = loaded
+        .gui
+        .ok_or("retained client requires complete GUI bundle")?;
+    let resources = loaded.resources;
+    let cpu = GameCpuResources::load(&root)?;
+    let event_loop = new_event_loop()?;
+    std::fs::create_dir(&launch.root)?;
+    let frame_limit = options.frames;
+    let timeout = options.timeout;
+    let control_path = options
+        .control
+        .clone()
+        .ok_or("retained client control path")?;
+    let game = Game::new_retained_remote(
+        &resources,
+        loaded.pack,
+        gui,
+        options,
+        settings,
+        cpu,
+        launch.address,
+        "RetainedGuest".into(),
+    )?;
+    let mut application = Application {
+        phase: Phase::RemoteRunning(Box::new(game)),
+        construction: None,
+        control: Some(RetainedControl::prepare_window(&control_path)),
+        closed_control: None,
+        lod: None,
+        closed_lod: None,
+        attempt: 0,
+        frame_generation: 0,
+        quit: false,
+        blocked: false,
+        detail: String::new(),
+        original_error: None,
+        late_error: None,
+        terminal_failure: false,
+        exit_acknowledged: false,
+        started,
+        frames: 0,
+        frame_limit,
+        timeout,
+        timeout_observed: false,
+        unclaimed_columns: Vec::new(),
+        status_presented: false,
+        surface_occluded: false,
+        #[cfg(all(
+            test,
+            feature = "native-writer-test-control",
+            debug_assertions,
+            target_os = "linux"
+        ))]
+        test: None,
+    };
+    if let Err(error) = application.control.as_mut().unwrap().start() {
+        application.fail(error);
+    }
+    if let Phase::RemoteRunning(game) = &mut application.phase
+        && let Err(error) = game.start_retained_remote()
+    {
+        application.fail(error);
+    }
+    let outcome = event_loop.run_app(&mut application);
+    if !matches!(application.phase, Phase::Done) {
+        eprintln!("fatal: retained client event loop ended with unresolved original owners");
+        std::process::abort();
+    }
+    outcome?;
+    if let Some(error) = application.original_error.take() {
+        return Err(error.into());
+    }
+    Ok(())
 }
 
 struct Application<'a> {
@@ -534,7 +731,10 @@ pub(super) fn request_redraw(game: &Game<'_>, title: &str) {
 impl Application<'_> {
     fn view(&self) -> Presentation {
         match &self.phase {
-            Phase::Running(game) => presentation(game),
+            Phase::Running(game)
+            | Phase::RemoteRunning(game)
+            | Phase::RemoteClosing(game)
+            | Phase::RemoteReady(game) => presentation(game),
             Phase::Closing(owner) => owner.window_presentation(),
             Phase::Ready(ready) => ready.window_presentation(),
             Phase::Cold(cold) => Presentation {
@@ -568,6 +768,9 @@ impl Application<'_> {
             "control-final"
         } else {
             match self.phase {
+                Phase::RemoteRunning(_) => "remote running",
+                Phase::RemoteClosing(_) => "closing original remote actors",
+                Phase::RemoteReady(_) => "remote actors closed; Q quits",
                 Phase::Running(_) => "running fixed view: Esc closes; Q quits",
                 Phase::Closing(_) if self.lod.is_some() => "closing LOD",
                 Phase::Closing(_) => "closing native world",
@@ -578,6 +781,19 @@ impl Application<'_> {
         }
     }
     fn status_text(&self) -> String {
+        if let Phase::RemoteRunning(game) = &self.phase {
+            return format!(
+                "remote running | chunks={} sections={} frames={} | player={:?} | yaw={:.2} pitch={:.2} | Esc leaves",
+                game.world.chunks.len(),
+                game.renderer.as_ref().map_or(0, |r| r.drawn_sections),
+                game.frames,
+                game.player
+                    .as_ref()
+                    .map(|p| [p.position.x, p.position.y, p.position.z]),
+                game.yaw,
+                game.pitch
+            );
+        }
         format!(
             "{}\nAttempt {}{}\n{}\n{}",
             self.stage(),
@@ -588,8 +804,18 @@ impl Application<'_> {
             } else {
                 "R: Retry / restore status; Q: quit; Esc: close world"
             },
-            brief(&self.detail)
+            brief(&self.visible_detail())
         )
+    }
+    fn visible_detail(&self) -> String {
+        if matches!(
+            self.phase,
+            Phase::RemoteRunning(_) | Phase::RemoteClosing(_) | Phase::RemoteReady(_)
+        ) && let Some(error) = &self.original_error
+        {
+            return format!("{error}; {}", self.detail);
+        }
+        self.detail.clone()
     }
     fn fail(&mut self, error: impl Into<String>) {
         let error = error.into();
@@ -616,6 +842,19 @@ impl Application<'_> {
         }
         let phase = std::mem::replace(&mut self.phase, Phase::Done);
         self.phase = match phase {
+            Phase::RemoteRunning(mut game) => {
+                if let Some(error) = game.retained_remote_failure() {
+                    self.original_error.get_or_insert(error);
+                }
+                if let Some(error) = &self.original_error {
+                    game.retained_remote_request_close(error.clone());
+                } else {
+                    game.retained_remote_request_leave();
+                }
+                game.capture(false);
+                game.begin_retained_remote_close(now + CLOSE_WAIT);
+                Phase::RemoteClosing(game)
+            }
             Phase::Running(game) => Phase::Closing(CloseOwner::begin(
                 game,
                 CloseProfile::NativeWorld,
@@ -648,6 +887,9 @@ impl Application<'_> {
             lod.retry_close(now, CLOSE_WAIT).is_ok()
         } else {
             match &mut self.phase {
+                Phase::RemoteClosing(game) => {
+                    game.retry_retained_remote_close(expected, now + CLOSE_WAIT)
+                }
                 Phase::Closing(owner) => owner.retry(now + CLOSE_WAIT).is_ok(),
                 Phase::Cold(cold) => cold
                     .owner
@@ -687,7 +929,8 @@ impl Application<'_> {
             match request.command() {
                 WindowCommand::Status | WindowCommand::CloseStatus => {
                     let stage = self.stage();
-                    let detail = brief(&self.detail);
+                    let visible = self.visible_detail();
+                    let detail = brief(&visible);
                     let _ = request.reply(WindowReply::Status {
                         phase: if self.blocked { "blocked" } else { "active" },
                         stage,
@@ -753,6 +996,31 @@ impl Application<'_> {
             }
         }
         match &mut self.phase {
+            Phase::RemoteClosing(game) => {
+                let status = game.poll_retained_remote_close();
+                if status.attempt != self.attempt {
+                    self.blocked = true;
+                    self.detail = "original remote parent attempt mismatch; owners retained".into();
+                    return;
+                }
+                self.blocked = status.blocked;
+                if !status.detail.is_empty() {
+                    self.detail = status.detail;
+                }
+                if let Some(error) = game.retained_remote_failure() {
+                    self.original_error.get_or_insert(error);
+                }
+                if status.quiescent {
+                    let Phase::RemoteClosing(game) =
+                        std::mem::replace(&mut self.phase, Phase::Done)
+                    else {
+                        unreachable!()
+                    };
+                    self.phase = Phase::RemoteReady(game);
+                    self.blocked = false;
+                    self.status_presented = false;
+                }
+            }
             Phase::Closing(owner) => match owner.poll() {
                 CloseStatus::Pending(_) => {}
                 CloseStatus::Blocked(error) => {
@@ -795,7 +1063,7 @@ impl Application<'_> {
             }
             _ => {}
         }
-        let world_closed = matches!(self.phase, Phase::Ready(_))
+        let world_closed = matches!(self.phase, Phase::Ready(_) | Phase::RemoteReady(_))
             || matches!(&self.phase, Phase::Cold(c) if c.closed.is_some());
         if !world_closed || !self.quit || !self.unclaimed_columns.is_empty() {
             return;
@@ -831,15 +1099,19 @@ impl Application<'_> {
             if observation.native_quiescent {
                 match self.control.take().unwrap().try_closed() {
                     Ok(closed) => {
-                        self.terminal_failure = !matches!(
-                            observation.endpoint,
-                            RetainedEndpointState::Released | RetainedEndpointState::Unpublished
-                        ) || observation.failures.iter().any(|f| {
-                            !matches!(
-                                f.kind,
-                                horizon_client::control::RetainedFailureKind::Deadline
+                        self.terminal_failure |= (matches!(self.phase, Phase::RemoteReady(_))
+                            && self.original_error.is_some())
+                            || !matches!(
+                                observation.endpoint,
+                                RetainedEndpointState::Released
+                                    | RetainedEndpointState::Unpublished
                             )
-                        });
+                            || observation.failures.iter().any(|f| {
+                                !matches!(
+                                    f.kind,
+                                    horizon_client::control::RetainedFailureKind::Deadline
+                                )
+                            });
                         if self.terminal_failure {
                             self.detail = observation
                                 .failures
@@ -879,6 +1151,13 @@ impl Application<'_> {
         }
         let phase = std::mem::replace(&mut self.phase, Phase::Done);
         match phase {
+            Phase::RemoteReady(game) => {
+                // All three original actor owners are now closed and retained
+                // in this same Game. No storage/world completion is fabricated.
+                drop(game);
+                drop(self.closed_control.take());
+                event_loop.exit();
+            }
             Phase::Ready(ready) => {
                 let completion = ClientCompletion {
                     construction: self
@@ -944,6 +1223,8 @@ impl Application<'_> {
             test.before_draw();
         }
         let result = match &mut self.phase {
+            Phase::RemoteRunning(game) => game.retained_remote_frame(),
+            Phase::RemoteClosing(game) | Phase::RemoteReady(game) => draw_status(game, &stage),
             Phase::Running(game) => game.render(),
             Phase::Closing(owner) => owner.draw_window_status(&stage),
             Phase::Ready(ready) => ready.draw_window_status(&stage),
@@ -961,7 +1242,7 @@ impl Application<'_> {
         }
         match result {
             Ok(presented) => {
-                if matches!(self.phase, Phase::Running(_)) {
+                if matches!(self.phase, Phase::Running(_) | Phase::RemoteRunning(_)) {
                     if presented {
                         self.frames += 1;
                     }
@@ -975,7 +1256,10 @@ impl Application<'_> {
                     target_os = "linux"
                 ))]
                 if presented && let Some(test) = &mut self.test {
-                    test.presented(matches!(self.phase, Phase::Running(_)));
+                    test.presented(matches!(
+                        self.phase,
+                        Phase::Running(_) | Phase::RemoteRunning(_)
+                    ));
                 }
             }
             Err(error) => {
@@ -985,6 +1269,14 @@ impl Application<'_> {
         }
     }
     fn update_view(&mut self) {
+        if let Phase::RemoteRunning(game) = &self.phase {
+            if let Some(error) = game.retained_remote_failure() {
+                self.fail(error);
+            } else if game.retained_remote_leave_requested() {
+                self.begin_close(false);
+            }
+            return;
+        }
         if let Some(failure) = self.lod.as_ref().and_then(|lod| {
             lod.status()
                 .workers
@@ -1039,9 +1331,18 @@ impl ApplicationHandler for Application<'_> {
         if self.view().id.is_some() {
             return;
         }
+        let size = match &self.phase {
+            Phase::RemoteRunning(game) | Phase::RemoteClosing(game) | Phase::RemoteReady(game) => {
+                game.options.window_size
+            }
+            _ => [960, 540],
+        };
         let attributes = Window::default_attributes()
             .with_title("Horizon native window")
-            .with_inner_size(winit::dpi::LogicalSize::new(960.0, 540.0));
+            .with_inner_size(winit::dpi::LogicalSize::new(
+                f64::from(size[0]),
+                f64::from(size[1]),
+            ));
         let window = match event_loop.create_window(attributes) {
             Ok(window) => Arc::new(window),
             Err(error) => {
@@ -1050,7 +1351,10 @@ impl ApplicationHandler for Application<'_> {
             }
         };
         let result = match &mut self.phase {
-            Phase::Running(game) => {
+            Phase::Running(game)
+            | Phase::RemoteRunning(game)
+            | Phase::RemoteClosing(game)
+            | Phase::RemoteReady(game) => {
                 // Store original window even if renderer acquisition fails.
                 game.window = Some(window.clone());
                 renderer(window, &game.pack, &game.gui, game.settings.horizon.api).map(|renderer| {
@@ -1080,6 +1384,22 @@ impl ApplicationHandler for Application<'_> {
     }
     fn window_event(&mut self, _event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
         if self.view().id != Some(id) {
+            return;
+        }
+        if let Phase::RemoteRunning(game) = &mut self.phase
+            && !matches!(
+                &event,
+                WindowEvent::CloseRequested
+                    | WindowEvent::Resized(_)
+                    | WindowEvent::RedrawRequested
+                    | WindowEvent::Occluded(_)
+            )
+        {
+            let result = game.retained_remote_input(event);
+            if let Err(error) = result {
+                self.fail(error.to_string());
+            }
+            self.update_view();
             return;
         }
         match event {
@@ -1142,7 +1462,10 @@ impl ApplicationHandler for Application<'_> {
                     test.native_resizes += 1;
                 }
                 match &mut self.phase {
-                    Phase::Running(game) => resize(game, size.width, size.height),
+                    Phase::Running(game)
+                    | Phase::RemoteRunning(game)
+                    | Phase::RemoteClosing(game)
+                    | Phase::RemoteReady(game) => resize(game, size.width, size.height),
                     Phase::Closing(owner) => owner.resize_window(size.width, size.height),
                     Phase::Ready(ready) => ready.resize_window(size.width, size.height),
                     Phase::Cold(cold) => {
@@ -1155,6 +1478,12 @@ impl ApplicationHandler for Application<'_> {
             }
             WindowEvent::RedrawRequested => self.redraw(),
             _ => {}
+        }
+        self.update_view();
+    }
+    fn device_event(&mut self, _: &ActiveEventLoop, _: DeviceId, event: DeviceEvent) {
+        if let Phase::RemoteRunning(game) = &mut self.phase {
+            game.retained_remote_device(event);
         }
     }
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
@@ -1198,7 +1527,10 @@ impl ApplicationHandler for Application<'_> {
             None => title,
         };
         match &self.phase {
-            Phase::Running(game) => request_redraw(game, &title),
+            Phase::Running(game)
+            | Phase::RemoteRunning(game)
+            | Phase::RemoteClosing(game)
+            | Phase::RemoteReady(game) => request_redraw(game, &title),
             Phase::Closing(owner) => owner.redraw_window(&title),
             Phase::Ready(ready) => ready.redraw_window(&title),
             Phase::Cold(cold) => {

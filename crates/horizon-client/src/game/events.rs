@@ -182,9 +182,15 @@ impl Game<'_> {
     }
 
     fn loaded(&self) -> bool {
-        self.title.is_none()
-            && self.player.is_some()
-            && self.streaming.expect_existing().pending() + self.pending_uploads.len() == 0
+        if self.is_retained_remote() {
+            return self.player.as_ref().is_some_and(|p| {
+                self.client_column_ready(
+                    (p.position.x.floor() as i32) >> 4,
+                    (p.position.z.floor() as i32) >> 4,
+                )
+            }) && self.client_pending() == Some(0);
+        }
+        self.title.is_none() && self.player.is_some() && self.client_pending() == Some(0)
     }
 
     /// Once per event loop turn: record what changed, answer the waits that hold.

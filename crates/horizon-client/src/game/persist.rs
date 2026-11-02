@@ -1442,6 +1442,9 @@ impl Game<'_> {
     /// meanwhile: `PersistentEntitySectionManager.autoSave` stores them
     /// without `saveAll`'s flush.
     pub(super) fn save_entities(&mut self, wait: bool) -> Result<()> {
+        if self.is_retained_remote() {
+            return Err("remote client refuses native entity persistence".into());
+        }
         self.spawn_loaded_entities();
         let keys: HashSet<(i32, i32)> = self.world.chunks.keys().copied().collect();
         let chunks = self.entity_chunks(&keys, false);
@@ -1495,6 +1498,9 @@ impl Game<'_> {
     }
     /// Keep native ownership until both saving and the caller's target preparation succeed.
     pub(super) fn save_dimension_entities(&mut self) -> Result<HashSet<(i32, i32)>> {
+        if self.is_retained_remote() {
+            return Err("remote client refuses native dimension persistence".into());
+        }
         self.spawn_loaded_entities();
         let keys: HashSet<(i32, i32)> = self.world.chunks.keys().copied().collect();
         let chunks = self.entity_chunks(&keys, false);
