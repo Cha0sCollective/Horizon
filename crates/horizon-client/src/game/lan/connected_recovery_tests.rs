@@ -276,11 +276,11 @@ pub(in crate::game) fn source(fixture: &Fixture, scratch: &Scratch) -> Source {
     game.finish_open_world(prepared).unwrap();
     game.level.allow_commands = Some(true);
     assert!(game.ui.rules.set_string("spawn_mobs", "false"));
-    game.streaming.center = (0, 0);
-    game.streaming.radius = 2;
+    game.streaming.expect_existing_mut().center = (0, 0);
+    game.streaming.expect_existing_mut().radius = 2;
     let until = Instant::now() + WAIT;
     loop {
-        let _ = game.streaming.update(&mut game.world);
+        let _ = game.streaming.expect_existing_mut().update(&mut game.world);
         if (-2..=2).all(|z| (-2..=2).all(|x| game.world.chunks.contains_key(&(x, z))))
             && game.world.chunks.get(&(0, 0)).is_some_and(|c| c.lit)
         {
@@ -553,7 +553,7 @@ pub(in crate::game) fn client_matches(game: &Game<'_>, row: &SessionPlayerRow) -
         && status["loaded"] == true
         && status["joined"] == true
         && status["dimension"] == row.dimension
-        && game.streaming.is_lit(
+        && game.streaming.expect_existing().is_lit(
             (player.position.x.floor() as i32) >> 4,
             (player.position.z.floor() as i32) >> 4,
         )

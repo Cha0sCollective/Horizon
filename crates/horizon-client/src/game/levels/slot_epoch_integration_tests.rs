@@ -445,6 +445,7 @@ fn slot_epoch_native_task_conserves_ten_as_player_three_and_slot_seven() {
     restored.observe_slot_epoch_entity_owners().unwrap();
     restored
         .streaming
+        .expect_existing()
         .require_pristine_fixture_capture()
         .unwrap();
     assert_eq!(restored.world.chunks.len(), 9);
@@ -724,7 +725,10 @@ fn slot_epoch_accounted_owner_keeps_every_other_refusal() {
         game.slot_epoch_projection().unwrap();
         game.observe_slot_epoch_entity_owners().unwrap();
         game.observe_checkpoint_world_owners().unwrap();
-        game.streaming.require_pristine_fixture_capture().unwrap();
+        game.streaming
+            .expect_existing()
+            .require_pristine_fixture_capture()
+            .unwrap();
         let before = live(&game);
         let source_disk = disk(&game.world_root);
         let archive = disk(&request.archive_root);
@@ -766,12 +770,16 @@ fn slot_epoch_accounted_owner_keeps_every_other_refusal() {
     assert!(
         streaming_game
             .streaming
+            .expect_existing_mut()
             .update(&mut streaming_game.world)
             .1
             .is_empty()
     );
     assert_eq!(
-        streaming_game.streaming.require_pristine_fixture_capture(),
+        streaming_game
+            .streaming
+            .expect_existing()
+            .require_pristine_fixture_capture(),
         Err(horizon_client::streaming::CapturePristineError::PreviouslySubmitted)
     );
     streaming_game.slot_epoch_projection().unwrap();

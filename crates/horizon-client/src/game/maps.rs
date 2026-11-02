@@ -872,7 +872,7 @@ impl Game<'_> {
             return;
         };
         let dim = self.dimension_id();
-        let zoom = self.streaming.biome_zoom;
+        let zoom = self.streaming.expect_existing().biome_zoom;
         let watery_biomes: std::collections::HashSet<String> = self
             .tag_entries("worldgen/biome", "minecraft:water_on_map_outlines")
             .into_iter()

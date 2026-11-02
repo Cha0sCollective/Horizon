@@ -245,12 +245,15 @@ impl Game<'_> {
                 .is_none()
         );
         assert!(!self.agent.hold_server && !self.clock.frozen() && !self.clock.paused());
-        self.streaming.require_pristine_fixture_capture().unwrap();
+        self.streaming
+            .expect_existing()
+            .require_pristine_fixture_capture()
+            .unwrap();
         let ticks = self.ticks;
         self.tick_server(false).map_err(|error| error.to_string())?;
         assert_eq!(self.ticks, ticks + 1);
         assert_eq!(self.world.game_time, 127);
-        let before = self.streaming.observe_native_work();
+        let before = self.streaming.expect_existing().observe_native_work();
         conserved(&before);
         assert!(
             before.origins[NativeWorkOrigin::Generate as usize]
@@ -266,6 +269,7 @@ impl Game<'_> {
         let save = self.save.clone();
         let mut writer_polls = 0;
         self.streaming
+            .expect_existing_mut()
             .native_write_fence_until(
                 &mut self.world,
                 Instant::now() + Duration::from_secs(30),
@@ -278,7 +282,7 @@ impl Game<'_> {
         // The borrow has ended, but the actual Task still exclusively owns
         // Game. Reconciliation may have changed World before this baseline.
         assert_eq!(self.ticks, ticks + 1);
-        let after = self.streaming.observe_native_work();
+        let after = self.streaming.expect_existing().observe_native_work();
         conserved(&after);
         assert_eq!(
             after
@@ -289,7 +293,9 @@ impl Game<'_> {
             submitted
         );
         assert_eq!(
-            self.streaming.require_pristine_fixture_capture(),
+            self.streaming
+                .expect_existing()
+                .require_pristine_fixture_capture(),
             Err(CapturePristineError::PreviouslySubmitted)
         );
         let baseline = state(self);
@@ -303,9 +309,14 @@ impl Game<'_> {
         assert_eq!(state(self), baseline);
         assert_eq!(disk(&self.world_root), source);
         assert_eq!(disk(&archive_root), archive);
-        assert_eq!(self.streaming.observe_native_work(), after);
         assert_eq!(
-            self.streaming.require_pristine_fixture_capture(),
+            self.streaming.expect_existing().observe_native_work(),
+            after
+        );
+        assert_eq!(
+            self.streaming
+                .expect_existing()
+                .require_pristine_fixture_capture(),
             Err(CapturePristineError::PreviouslySubmitted)
         );
         Ok(NativeFenceProof {

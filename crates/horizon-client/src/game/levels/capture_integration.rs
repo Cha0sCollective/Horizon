@@ -1712,7 +1712,7 @@ impl Game<'_> {
         let mut dimensions = Vec::new();
         for dimension in [Dim::Overworld, Dim::Nether, Dim::End] {
             let (world, streaming, dropped) = if dimension == self.dim {
-                (&self.world, &self.streaming, &self.dropped)
+                (&self.world, self.streaming.expect_existing(), &self.dropped)
             } else if let Some(level) = self.levels.parked.get(&dimension) {
                 (&level.world, &level.streaming, &level.dropped)
             } else {

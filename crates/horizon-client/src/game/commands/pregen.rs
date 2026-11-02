@@ -139,7 +139,7 @@ impl Game<'_> {
                 }
                 let (progress, dim) = (task.progress(), task.dim);
                 if pause && self.dim == dim {
-                    self.streaming.set_band(None);
+                    self.streaming.expect_existing_mut().set_band(None);
                 }
                 self.feedback(
                     Text::literal(if pause { "Paused. " } else { "Continuing. " }).append(progress),
@@ -153,7 +153,7 @@ impl Game<'_> {
                     .take()
                     .ok_or_else(|| failure("No pregeneration is running"))?;
                 if self.dim == task.dim {
-                    self.streaming.set_band(None);
+                    self.streaming.expect_existing_mut().set_band(None);
                 }
                 self.feedback(Text::literal("Cancelled. ").append(task.progress()));
                 Ok(task.pregen.done as i32)
@@ -185,7 +185,7 @@ impl Game<'_> {
         // A row is done once its chunks are lit and post-processed
         // (`postprocess_chunks`, on the tick), as vanilla's are by the time
         // they are FULL: then they may unload and be saved.
-        let (streaming, chunks) = (&mut self.streaming, &self.world.chunks);
+        let (streaming, chunks) = (self.streaming.expect_existing_mut(), &self.world.chunks);
         if task.pregen.advance(|x, z| {
             streaming.is_lit(x, z)
                 && chunks
@@ -247,13 +247,15 @@ impl Game<'_> {
         // Force-loaded chunks too: decorating in vanilla's order, a chunk
         // waits for its neighbours far more often than once a tick allows.
         while self.pregen_runs_here()
-            || (!self.streaming.forced.is_empty() && self.streaming.busy())
+            || (!self.streaming.expect_existing().forced.is_empty()
+                && self.streaming.expect_existing().busy())
         {
             let now = Instant::now();
             if now >= until {
                 break;
             }
             self.streaming
+                .expect_existing_mut()
                 .wait((until - now).min(Duration::from_millis(5)));
             self.update_world();
         }

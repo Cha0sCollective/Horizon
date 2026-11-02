@@ -89,19 +89,21 @@ fn unload_source(game: &mut Game<'_>) {
     let (_, removed) = streaming.update(&mut game.world);
     assert!(removed.iter().any(|c| (c.x, c.z) == (0, 0)));
     assert!(!game.world.chunks.contains_key(&(0, 0)));
-    game.streaming = streaming;
+    game.streaming = crate::game::streaming_owner::GameStreaming::from_existing(streaming);
 }
 fn reload_source(game: &mut Game<'_>) {
-    game.streaming.center = (0, 0);
+    game.streaming.expect_existing_mut().center = (0, 0);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while !game.world.chunks.contains_key(&(0, 0)) {
-        game.streaming.update(&mut game.world);
+        game.streaming.expect_existing_mut().update(&mut game.world);
         assert!(
             std::time::Instant::now() < deadline,
             "authoritative fixture column did not reload"
         );
         if !game.world.chunks.contains_key(&(0, 0)) {
-            game.streaming.wait(std::time::Duration::from_millis(10));
+            game.streaming
+                .expect_existing_mut()
+                .wait(std::time::Duration::from_millis(10));
         }
     }
 }

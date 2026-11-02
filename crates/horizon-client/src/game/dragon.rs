@@ -889,7 +889,7 @@ impl Game<'_> {
     }
     /// The island's centre chunks are lit (the arena is "loaded").
     fn arena_loaded(&self) -> bool {
-        (-2..=1).all(|cz| (-2..=1).all(|cx| self.streaming.is_lit(cx, cz)))
+        (-2..=1).all(|cz| (-2..=1).all(|cx| self.streaming.expect_existing().is_lit(cx, cz)))
     }
     /// The player acting now: the guest whose turn it is, else the host.
     fn acting_player(&self) -> FightWho {

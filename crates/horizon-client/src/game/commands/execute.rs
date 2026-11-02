@@ -911,7 +911,8 @@ impl Game<'_> {
             // ExecuteCommand.isChunkLoaded: ENTITY_TICKING, which is past lit.
             let loaded = |p: [i32; 3]| {
                 let key = (p[0] >> 4, p[2] >> 4);
-                self.world.chunks.contains_key(&key) && self.streaming.is_lit(key.0, key.1)
+                self.world.chunks.contains_key(&key)
+                    && self.streaming.expect_existing().is_lit(key.0, key.1)
             };
             return Ok(flag(dimension == self.dim && p.is_some_and(loaded)));
         }

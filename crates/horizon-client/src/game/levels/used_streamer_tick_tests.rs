@@ -173,7 +173,10 @@ fn owned_epoch_two<'a>(fixture: &'a Fixture) -> OwnedCell<'a> {
     assert!(game.world.read_world_slot(&middle_slot).is_err());
     assert_eq!(game.world.game_time, T);
     stone_share(&game, &slot);
-    game.streaming.require_pristine_fixture_capture().unwrap();
+    game.streaming
+        .expect_existing()
+        .require_pristine_fixture_capture()
+        .unwrap();
     OwnedCell {
         original,
         middle,
@@ -409,7 +412,7 @@ fn used_streamer_actual_native_tick_observes_owners_and_preserves_refused_captur
     let middle_bytes = disk(&cell.middle.world_root);
     let original = cell.original.slot_epoch_projection().unwrap();
     let middle = cell.middle.slot_epoch_projection().unwrap();
-    let before = cell.game.streaming.observe_native_work();
+    let before = cell.game.streaming.expect_existing().observe_native_work();
     conserved(&before);
     assert!(before.origins.iter().all(|(_, c)| c.submitted == 0));
     assert!(!cell.game.agent.hold_server && !cell.game.clock.frozen() && !cell.game.clock.paused());
@@ -468,7 +471,7 @@ fn used_streamer_actual_native_tick_observes_owners_and_preserves_refused_captur
         cell.game.world.counter_domain_snapshot().unwrap().world,
         cell.source_counter.placement().world
     );
-    let after = cell.game.streaming.observe_native_work();
+    let after = cell.game.streaming.expect_existing().observe_native_work();
     conserved(&after);
     assert!(
         after.origins.iter().any(|(_, c)| c.submitted > 0),
@@ -481,7 +484,10 @@ fn used_streamer_actual_native_tick_observes_owners_and_preserves_refused_captur
             > 0
     );
     assert_eq!(
-        cell.game.streaming.require_pristine_fixture_capture(),
+        cell.game
+            .streaming
+            .expect_existing()
+            .require_pristine_fixture_capture(),
         Err(CapturePristineError::PreviouslySubmitted)
     );
     let post_tick = state(&cell.game);
@@ -549,7 +555,7 @@ fn used_streamer_actual_native_tick_observes_owners_and_preserves_refused_captur
             .read_persistent_counter(&cell.middle_counter)
             .is_err()
     );
-    let refused = cell.game.streaming.observe_native_work();
+    let refused = cell.game.streaming.expect_existing().observe_native_work();
     conserved(&refused);
     for ((origin, before), (_, after)) in after.origins.into_iter().zip(refused.origins) {
         assert_eq!(
@@ -562,7 +568,10 @@ fn used_streamer_actual_native_tick_observes_owners_and_preserves_refused_captur
         );
     }
     assert_eq!(
-        cell.game.streaming.require_pristine_fixture_capture(),
+        cell.game
+            .streaming
+            .expect_existing()
+            .require_pristine_fixture_capture(),
         Err(CapturePristineError::PreviouslySubmitted)
     );
     assert_eq!(cell.binding.state_id(), cell.game.world.block(2, 70, 2));

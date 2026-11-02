@@ -133,8 +133,10 @@ impl Game<'_> {
                 );
                 // Finish requested terrain before inspecting it, so worker
                 // timing cannot change which command positions are loaded.
-                if !self.streaming.busy()
-                    && (-1..=1).all(|dz| (-1..=1).all(|dx| self.streaming.is_lit(cx + dx, cz + dz)))
+                if !self.streaming.expect_existing().busy()
+                    && (-1..=1).all(|dz| {
+                        (-1..=1).all(|dx| self.streaming.expect_existing().is_lit(cx + dx, cz + dz))
+                    })
                 {
                     // The oracle's settle also waits for the entities saved
                     // in those chunks (areEntitiesActuallyLoadedAndTicking):
@@ -147,9 +149,9 @@ impl Game<'_> {
                 eprintln!(
                     "settle: player {:?} center {:?} chunks {} pending {}",
                     self.player.as_ref().map(|p| p.position),
-                    self.streaming.center,
+                    self.streaming.expect_existing().center,
                     self.world.chunks.len(),
-                    self.streaming.pending()
+                    self.streaming.expect_existing().pending()
                 );
             }
             if Instant::now() > deadline {

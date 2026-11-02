@@ -399,7 +399,9 @@ impl Game<'_> {
                 (trip.target.z.floor() as i32) >> 4,
             );
             if trip.dim != self.dim
-                || !(-2..=2).all(|dz| (-2..=2).all(|dx| self.streaming.is_lit(cx + dx, cz + dz)))
+                || !(-2..=2).all(|dz| {
+                    (-2..=2).all(|dx| self.streaming.expect_existing().is_lit(cx + dx, cz + dz))
+                })
             {
                 k += 1;
                 continue;

@@ -162,7 +162,9 @@ fn physical_input(game: &mut Game<'_>, state: BlockStateId) {
     while !game.world.loaded(0, 0) {
         game.update_world();
         if !game.world.loaded(0, 0) {
-            game.streaming.wait(Duration::from_millis(2));
+            game.streaming
+                .expect_existing_mut()
+                .wait(Duration::from_millis(2));
         }
         assert!(
             Instant::now() < deadline,

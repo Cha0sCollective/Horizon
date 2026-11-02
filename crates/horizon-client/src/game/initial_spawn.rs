@@ -110,8 +110,8 @@ impl Game<'_> {
         while let Some((dx, dz)) = self.spawn_spiral.current() {
             if self.spawn_spiral.tested() {
                 let (cx, cz) = (ox + dx, oz + dz);
-                if !self.streaming.is_lit(cx, cz) {
-                    self.streaming.center = (cx, cz);
+                if !self.streaming.expect_existing().is_lit(cx, cz) {
+                    self.streaming.expect_existing_mut().center = (cx, cz);
                     return Ok(None);
                 }
                 if let Some(pos) = spawn_pos_in_chunk(&self.spawn_columns(), cx, cz) {
@@ -136,7 +136,7 @@ impl Game<'_> {
         ) else {
             return Ok(());
         };
-        if !self.streaming.is_lit(cx, cz) {
+        if !self.streaming.expect_existing().is_lit(cx, cz) {
             return Ok(());
         }
         // `level.getRandom()`. Util.toShuffledList of the chunk's x and z.
@@ -235,7 +235,7 @@ impl Game<'_> {
                 SpawnCandidate::Column(x, z) => (x, z),
                 SpawnCandidate::Suggestion => (suggestion[0], suggestion[2]),
             };
-            if !self.streaming.is_lit(x >> 4, z >> 4) {
+            if !self.streaming.expect_existing().is_lit(x >> 4, z >> 4) {
                 finder.retry();
                 *state = Some(finder);
                 return Err((x >> 4, z >> 4));
@@ -259,7 +259,7 @@ impl Game<'_> {
         match self.search_spawn(suggestion, &mut state) {
             Ok(feet) => Ok(Some(feet)),
             Err(chunk) => {
-                self.streaming.center = chunk;
+                self.streaming.expect_existing_mut().center = chunk;
                 self.player_spawn = state;
                 Ok(None)
             }
@@ -302,7 +302,7 @@ impl Game<'_> {
                 SpawnCandidate::Column(x, z) => (x, z),
                 SpawnCandidate::Suggestion => (suggestion[0], suggestion[2]),
             };
-            if !self.streaming.is_lit(x >> 4, z >> 4) {
+            if !self.streaming.expect_existing().is_lit(x >> 4, z >> 4) {
                 continue;
             }
             let feet = match candidate {

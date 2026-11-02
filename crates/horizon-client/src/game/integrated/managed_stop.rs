@@ -886,15 +886,15 @@ fn new_closed_game(start: &ManagedStart) -> Result<OwnedGame<'_>, String> {
     game.finish_open_world(prepared)
         .map_err(|e| e.to_string())?;
     let _ = game.advancement_tree();
-    game.streaming.center = (start.position[0] >> 4, start.position[2] >> 4);
-    game.streaming.radius = 2;
+    game.streaming.expect_existing_mut().center = (start.position[0] >> 4, start.position[2] >> 4);
+    game.streaming.expect_existing_mut().radius = 2;
     let until = Instant::now() + start.attempt_timeout;
     loop {
-        let (_, unloaded) = game.streaming.update(&mut game.world);
+        let (_, unloaded) = game.streaming.expect_existing_mut().update(&mut game.world);
         if !unloaded.is_empty() {
             return Err("fresh managed setup unexpectedly unloaded native columns".into());
         }
-        let (x, z) = game.streaming.center;
+        let (x, z) = game.streaming.expect_existing().center;
         if (-2..=2).all(|dz| (-2..=2).all(|dx| game.world.chunks.contains_key(&(x + dx, z + dz))))
             && game.world.chunks.get(&(x, z)).is_some_and(|c| c.lit)
         {

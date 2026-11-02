@@ -324,7 +324,7 @@ impl Game<'_> {
                 self.yaw,
                 self.pitch,
                 self.dim.id(),
-                self.streaming.forced.len(),
+                self.streaming.expect_existing().forced.len(),
             );
             let section = lines.pop().unwrap_or_default();
             if !self.reduced_debug_info() {

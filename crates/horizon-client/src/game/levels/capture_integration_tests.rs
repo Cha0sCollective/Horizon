@@ -456,7 +456,7 @@ pub(super) fn setup(
         game.level.seed,
     )
     .unwrap();
-    game.streaming = streaming;
+    game.streaming = crate::game::streaming_owner::GameStreaming::from_existing(streaming);
     game.save = save;
     game.end.set_locator(locator);
     for guest in &mut game.lan.as_mut().unwrap().hub.guests {
@@ -972,7 +972,7 @@ fn capture_cell_refuses_current_owners_and_nonpristine_streamers_without_publica
                 ))]),
             )),
             8 => {
-                let _ = game.streaming.update(&mut game.world);
+                let _ = game.streaming.expect_existing_mut().update(&mut game.world);
             }
             9 => game.lan.as_mut().unwrap().hub.guests[1].dimension = Dim::Nether.id().into(),
             _ => unreachable!(),

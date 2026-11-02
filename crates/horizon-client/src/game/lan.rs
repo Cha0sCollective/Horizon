@@ -2591,7 +2591,7 @@ impl Game<'_> {
                 // has generated or loaded so far.
                 "world": {
                     "chunks": self.world.chunks.len(),
-                    "generated": self.streaming.generated_total,
+                    "generated": self.streaming.expect_existing().generated_total,
                 },
                 "guests": h.hub.guests.iter().map(|g| json!({
                     "name": g.name,
@@ -2818,7 +2818,7 @@ impl Game<'_> {
         self.lan_songs.clear();
         self.lan_critical_hits.clear();
         self.lan_cushion_breaks.clear();
-        self.streaming.extra.clear();
+        self.streaming.expect_existing_mut().extra.clear();
         if announce {
             self.system_message(Text::translate(
                 "menu.multiplayerOptions.publish.stopped",
@@ -3626,7 +3626,7 @@ impl Game<'_> {
         // covers what the player tracks (`ChunkTrackingView`, within its view
         // distance + 1) and those chunks' lit neighbours.
         let radius = host.hub.config.view_distance + 1;
-        self.streaming.extra = host
+        self.streaming.expect_existing_mut().extra = host
             .hub
             .guests
             .iter()

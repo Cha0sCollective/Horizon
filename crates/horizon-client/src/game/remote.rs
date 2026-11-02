@@ -394,7 +394,7 @@ impl Game<'_> {
         );
         streaming.remote = true;
         streaming.radius = self.settings.render_distance;
-        self.streaming = streaming;
+        self.streaming = super::streaming_owner::GameStreaming::from_existing(streaming);
         #[cfg(feature = "paired-packages")]
         self.retire_counter_trial("remote-connect");
         self.world = World::new(self.res.facts().air, 0);
@@ -567,8 +567,12 @@ impl Game<'_> {
         self.debug_charts.reset();
         self.tab_list.reset();
         self.score.board = Default::default();
-        self.streaming = Streaming::new(Arc::new(NoTerrain), self.pack.context.clone(), 1);
-        self.streaming.paused = true;
+        self.streaming = super::streaming_owner::GameStreaming::from_existing(Streaming::new(
+            Arc::new(NoTerrain),
+            self.pack.context.clone(),
+            1,
+        ));
+        self.streaming.expect_existing_mut().paused = true;
         #[cfg(feature = "paired-packages")]
         self.retire_counter_trial("remote-leave");
         self.world = World::new(self.res.facts().air, 0);
@@ -783,7 +787,7 @@ impl Game<'_> {
     pub(super) fn poll_stationary_client(&mut self) -> Result<()> {
         self.poll_remote()?;
         let loaded = self.player.as_ref().is_some_and(|p| {
-            self.streaming.is_lit(
+            self.streaming.expect_existing().is_lit(
                 (p.position.x.floor() as i32) >> 4,
                 (p.position.z.floor() as i32) >> 4,
             )
@@ -1059,8 +1063,8 @@ impl Game<'_> {
                 self.res.threads(),
             );
             streaming.remote = true;
-            streaming.radius = self.streaming.radius;
-            self.streaming = streaming;
+            streaming.radius = self.streaming.expect_existing().radius;
+            self.streaming = super::streaming_owner::GameStreaming::from_existing(streaming);
             let (time, day, weather) = (
                 self.world.game_time,
                 self.world.day_time,
@@ -1103,10 +1107,11 @@ impl Game<'_> {
             .remote
             .as_ref()
             .is_none_or(|r| r.dimension.has_skylight);
-        self.streaming.sky_light = has_sky;
-        self.streaming.nether_shading = self.dim == Dim::Nether;
+        self.streaming.expect_existing_mut().sky_light = has_sky;
+        self.streaming.expect_existing_mut().nether_shading = self.dim == Dim::Nether;
         // The seed in SpawnInfo is already the hashed one the client's BiomeManager holds.
-        self.streaming.biome_zoom = horizon_core::biome::BiomeZoom::new(spawn.seed);
+        self.streaming.expect_existing_mut().biome_zoom =
+            horizon_core::biome::BiomeZoom::new(spawn.seed);
         self.player = None;
         self.apply_settings();
     }
@@ -1134,7 +1139,11 @@ impl Game<'_> {
         }
         let mut freed = Vec::with_capacity(gone.len());
         for &(x, z) in &gone {
-            freed.extend(self.streaming.forget(&mut self.world, x, z));
+            freed.extend(
+                self.streaming
+                    .expect_existing_mut()
+                    .forget(&mut self.world, x, z),
+            );
         }
         if let Some(renderer) = self.renderer.as_mut() {
             renderer.remove_columns(gone.iter().copied());
@@ -1745,7 +1754,7 @@ impl Game<'_> {
                     r.view_distance = p.chunk_radius;
                     r.show_death_screen = p.show_death_screen;
                 }
-                self.streaming.radius =
+                self.streaming.expect_existing_mut().radius =
                     self.settings.render_distance.min(p.chunk_radius + 1).max(2);
                 self.enter_remote_dimension(&p.spawn, false);
                 let view = client_view_distance(self.settings.render_distance);
@@ -1788,7 +1797,9 @@ impl Game<'_> {
             C::LightUpdate(p) => self.remote_light_update(&p),
             C::ForgetLevelChunk(p) => {
                 let [x, z] = p.pos;
-                self.streaming.forget(&mut self.world, x, z);
+                self.streaming
+                    .expect_existing_mut()
+                    .forget(&mut self.world, x, z);
                 self.world
                     .block_entities
                     .retain(|k, _| (k.0 >> 4, k.2 >> 4) != (x, z));
@@ -2896,7 +2907,8 @@ impl Game<'_> {
             },
             C::SetPlayerTeam(p) => self.remote_team(p),
             C::SetChunkCacheRadius(p) => {
-                self.streaming.radius = self.settings.render_distance.min(p.distance + 1).max(2);
+                self.streaming.expect_existing_mut().radius =
+                    self.settings.render_distance.min(p.distance + 1).max(2);
                 if let Some(r) = self.remote.as_mut() {
                     r.view_distance = p.distance;
                 }
@@ -3610,7 +3622,7 @@ impl Game<'_> {
             (player.position.x.floor() as i32) >> 4,
             (player.position.z.floor() as i32) >> 4,
         );
-        if !self.streaming.is_lit(cx, cz) {
+        if !self.streaming.expect_existing().is_lit(cx, cz) {
             // LocalPlayer.tick can wait for chunks, but Minecraft.tick still
             // calls sendChanges: rotations and the 20-tick position reminder
             // must continue, as well as moves into the unloaded area.

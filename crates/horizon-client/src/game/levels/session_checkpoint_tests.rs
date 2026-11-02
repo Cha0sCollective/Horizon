@@ -508,6 +508,7 @@ fn all_requested(radius: i32, center: (i32, i32)) -> BTreeSet<(i32, i32)> {
 }
 fn native_counts(game: &Game<'_>, origin: NativeWorkOrigin) -> NativeWorkCounts {
     game.streaming
+        .expect_existing()
         .observe_native_work()
         .origins
         .into_iter()
@@ -516,7 +517,7 @@ fn native_counts(game: &Game<'_>, origin: NativeWorkOrigin) -> NativeWorkCounts 
         .1
 }
 fn update_native(game: &mut Game<'_>) {
-    let (_, unloaded) = game.streaming.update(&mut game.world);
+    let (_, unloaded) = game.streaming.expect_existing_mut().update(&mut game.world);
     if !unloaded.is_empty() {
         // Match Game's native unload path: retain actual returned columns and
         // attach their current native owners/metadata before releasing them.
@@ -527,7 +528,7 @@ fn update_native(game: &mut Game<'_>) {
         {
             panic!(
                 "native unloaded snapshot save: {error}; work={:#?}",
-                game.streaming.observe_native_work()
+                game.streaming.expect_existing().observe_native_work()
             );
         }
         for chunk in &unloaded {
@@ -538,9 +539,9 @@ fn update_native(game: &mut Game<'_>) {
 /// Submit ordinary native Finish work, then change its range before the next
 /// result reconciliation. The immutable work origin and fresh payload are real.
 fn submit_far_finish(game: &mut Game<'_>, far: (i32, i32), preserve_original: bool) {
-    let original_center = game.streaming.center;
-    let original_radius = game.streaming.radius;
-    let original_extra = game.streaming.extra.clone();
+    let original_center = game.streaming.expect_existing().center;
+    let original_radius = game.streaming.expect_existing().radius;
+    let original_extra = game.streaming.expect_existing().extra.clone();
     let before = native_counts(game, NativeWorkOrigin::Finish);
     assert!(
         before.queued == 0
@@ -554,21 +555,24 @@ fn submit_far_finish(game: &mut Game<'_>, far: (i32, i32), preserve_original: bo
         assert!(
             coverage.iter().all(|at| game.world.chunks.contains_key(at)),
             "original native area must already be resident; work={:#?}",
-            game.streaming.observe_native_work()
+            game.streaming.expect_existing().observe_native_work()
         );
-        game.streaming.extra.push((original_center, 0));
+        game.streaming
+            .expect_existing_mut()
+            .extra
+            .push((original_center, 0));
     }
-    game.streaming.center = far;
-    game.streaming.radius = 0;
+    game.streaming.expect_existing_mut().center = far;
+    game.streaming.expect_existing_mut().radius = 0;
     let deadline = until();
     loop {
         update_native(game);
         if native_counts(game, NativeWorkOrigin::Finish).submitted > before.submitted {
             // update drains results before submitting new Finish jobs. Do not
             // call it again until the far completion is outside the kept range.
-            game.streaming.center = original_center;
-            game.streaming.radius = original_radius;
-            game.streaming.extra = original_extra;
+            game.streaming.expect_existing_mut().center = original_center;
+            game.streaming.expect_existing_mut().radius = original_radius;
+            game.streaming.expect_existing_mut().extra = original_extra;
             // Retain a genuine returned Finish before a short writer-timeout
             // fence. wait only defers payloads; it neither schedules work nor
             // invokes the callback or activates a chunk in World.
@@ -576,16 +580,18 @@ fn submit_far_finish(game: &mut Game<'_>, far: (i32, i32), preserve_original: bo
                 assert!(
                     Instant::now() < deadline,
                     "real far Finish return; work={:#?}",
-                    game.streaming.observe_native_work()
+                    game.streaming.expect_existing().observe_native_work()
                 );
-                game.streaming.wait(Duration::from_millis(1));
+                game.streaming
+                    .expect_existing_mut()
+                    .wait(Duration::from_millis(1));
             }
             return;
         }
         assert!(
             Instant::now() < deadline,
             "real far Finish submission; work={:#?}",
-            game.streaming.observe_native_work()
+            game.streaming.expect_existing().observe_native_work()
         );
         std::thread::yield_now();
     }
@@ -594,13 +600,13 @@ fn native_fence(game: &mut Game<'_>, deadline: Instant) {
     if let Err(error) = game.session_fence(deadline) {
         panic!(
             "native fixture fence: {error}; work={:#?}",
-            game.streaming.observe_native_work()
+            game.streaming.expect_existing().observe_native_work()
         );
     }
 }
 fn residency(game: &mut Game<'_>, radius: i32, center: (i32, i32)) {
-    game.streaming.center = center;
-    game.streaming.radius = radius;
+    game.streaming.expect_existing_mut().center = center;
+    game.streaming.expect_existing_mut().radius = radius;
     if native_counts(game, NativeWorkOrigin::SaveFinishedCallback).accepted_storage_handoffs == 0 {
         assert!(
             game.world.chunks.is_empty(),
@@ -612,13 +618,13 @@ fn residency(game: &mut Game<'_>, radius: i32, center: (i32, i32)) {
         let bytes = read(&path, FILE_LIMIT).unwrap_or_else(|error| {
             panic!(
                 "actual finished native region: {error}; work={:#?}",
-                game.streaming.observe_native_work()
+                game.streaming.expect_existing().observe_native_work()
             )
         });
         assert!(
             !raw_region(&bytes).unwrap().is_empty(),
             "completed native callback must write real region records; work={:#?}",
-            game.streaming.observe_native_work()
+            game.streaming.expect_existing().observe_native_work()
         );
     }
     let required = all_requested(radius, center);
@@ -633,12 +639,12 @@ fn residency(game: &mut Game<'_>, radius: i32, center: (i32, i32)) {
         assert!(
             Instant::now() < deadline,
             "genuine native full residency; work={:#?}",
-            game.streaming.observe_native_work()
+            game.streaming.expect_existing().observe_native_work()
         );
         std::thread::yield_now();
     }
     native_fence(game, deadline);
-    let work = game.streaming.observe_native_work();
+    let work = game.streaming.expect_existing().observe_native_work();
     assert!(
         !work.accounting_fault
             && !work.receipt_mismatch
@@ -2511,7 +2517,11 @@ fn session_actual_filesystem_writer_error_is_not_published_and_previous_image_su
     let before = native_counts(&session.game, NativeWorkOrigin::SaveFinishedCallback);
     submit_far_finish(&mut session.game, (80, 80), true);
     let fence = session.game.session_fence(until());
-    let work = session.game.streaming.observe_native_work();
+    let work = session
+        .game
+        .streaming
+        .expect_existing()
+        .observe_native_work();
     assert!(
         fence.is_err(),
         "blocked actual native callback writer; work={work:#?}"
@@ -2560,6 +2570,7 @@ fn session_actual_late_finish_storage_handoff_is_closed_before_snapshot_and_retr
     let mut session = session(&fixture, "late-finish", 2, true);
     let count = |game: &Game<'_>, origin| {
         game.streaming
+            .expect_existing()
             .observe_native_work()
             .origins
             .iter()
@@ -2589,7 +2600,11 @@ fn session_actual_late_finish_storage_handoff_is_closed_before_snapshot_and_retr
     assert!(
         after.accepted_storage_handoffs > handoff.accepted_storage_handoffs,
         "late actual Finish storage handoff precedes final writer poll; work={:#?}",
-        session.game.streaming.observe_native_work()
+        session
+            .game
+            .streaming
+            .expect_existing()
+            .observe_native_work()
     );
     assert!(
         session
@@ -4450,7 +4465,7 @@ fn session_items_actual_retirement_native_capture_restore_recapture_both_roles()
         assert_eq!(total, if rich { 28 } else { 14 });
         if index == 3 {
             let far = (40, 40);
-            s.game.streaming.extra = s
+            s.game.streaming.expect_existing_mut().extra = s
                 .game
                 .world
                 .chunks
@@ -5402,7 +5417,7 @@ fn session_items_actual_entity_writer_filesystem_error_retains_drop_and_prior_im
     let _retain = RetainOnPanic::new(&fixture);
     let mut s = session_items_delivered(&fixture, "item-writer-error", false, true);
     let far = (40, 40);
-    s.game.streaming.extra = s
+    s.game.streaming.expect_existing_mut().extra = s
         .game
         .world
         .chunks
@@ -5455,7 +5470,7 @@ fn session_items_actual_delayed_native_item_column_deadline_release_and_cancella
     let _retain = RetainOnPanic::new(&fixture);
     let mut s = session_items_delivered(&fixture, "item-delayed-column", true, true);
     let far = (40, 40);
-    s.game.streaming.extra = s
+    s.game.streaming.expect_existing_mut().extra = s
         .game
         .world
         .chunks

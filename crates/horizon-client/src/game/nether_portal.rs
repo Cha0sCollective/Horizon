@@ -1386,7 +1386,9 @@ impl Game<'_> {
             let plan = self.portals.arrivals[i].plan;
             let (cx, cz) = (plan.approximate.x >> 4, plan.approximate.z >> 4);
             let ready = plan.dim == self.dim
-                && (-1..=1).all(|dz| (-1..=1).all(|dx| self.streaming.is_lit(cx + dx, cz + dz)));
+                && (-1..=1).all(|dz| {
+                    (-1..=1).all(|dx| self.streaming.expect_existing().is_lit(cx + dx, cz + dz))
+                });
             if !ready {
                 i += 1;
                 continue;

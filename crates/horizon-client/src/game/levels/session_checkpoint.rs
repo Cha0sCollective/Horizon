@@ -3557,6 +3557,7 @@ impl Game<'_> {
         let save = self.save.clone();
         checked(
             self.streaming
+                .expect_existing_mut()
                 .native_write_fence_until(&mut self.world, until, || save.writes_finished()),
         )
     }

@@ -200,6 +200,7 @@ mod stations;
 mod stats;
 mod stats_screen;
 mod storage;
+mod streaming_owner;
 mod structures;
 mod subtitle_hud;
 mod sulfur_cubes;
@@ -1896,7 +1897,7 @@ struct Game<'a> {
     weather_parameters: horizon_client::weather::ParameterCache,
     panorama_rotation: horizon_client::gfx::panorama::Rotation,
     world: World,
-    streaming: Streaming,
+    streaming: streaming_owner::GameStreaming,
     lod: Option<horizon_client::lod::Lod>,
     lod_source_attempted: bool,
     lod_observe: horizon_client::fast_hash::FxHashSet<(i32, i32)>,
@@ -2918,8 +2919,8 @@ impl Game<'_> {
                 pos,
                 &region,
                 self.res.biomes(),
-                self.streaming.biome_zoom,
-                self.streaming.biome_blend,
+                self.streaming.expect_existing().biome_zoom,
+                self.streaming.expect_existing().biome_blend,
             )
             .unwrap_or(0xFFFFFF);
         Some((sprite, tint))
@@ -3499,7 +3500,13 @@ impl Game<'_> {
             (!self.options.execution_role.is_client() || !players.is_empty()).then(|| {
                 horizon_client::ticket_levels::Sources {
                     players,
-                    forced: self.streaming.forced.iter().copied().collect(),
+                    forced: self
+                        .streaming
+                        .expect_existing()
+                        .forced
+                        .iter()
+                        .copied()
+                        .collect(),
                     view_distance: self.settings.render_distance.clamp(2, 32),
                     simulation_distance: self.settings.simulation_distance.max(2),
                 }
@@ -5317,8 +5324,10 @@ impl Game<'_> {
                 (target.x.floor() as i32) >> 4,
                 (target.z.floor() as i32) >> 4,
             );
-            self.streaming.center = (cx, cz);
-            if (-2..=2).all(|dz| (-2..=2).all(|dx| self.streaming.is_lit(cx + dx, cz + dz))) {
+            self.streaming.expect_existing_mut().center = (cx, cz);
+            if (-2..=2).all(|dz| {
+                (-2..=2).all(|dx| self.streaming.expect_existing().is_lit(cx + dx, cz + dz))
+            }) {
                 let (player, target) = self.travelling.take().ok_or("travel")?;
                 if let Some(config) = self.respawn_travel.take() {
                     drop(player);
@@ -5340,8 +5349,10 @@ impl Game<'_> {
         }
         let feet = if let Some(p) = saved {
             let (cx, cz) = ((p.x.floor() as i32) >> 4, (p.z.floor() as i32) >> 4);
-            self.streaming.center = (cx, cz);
-            if !(-1..=1).all(|dz| (-1..=1).all(|dx| self.streaming.is_lit(cx + dx, cz + dz))) {
+            self.streaming.expect_existing_mut().center = (cx, cz);
+            if !(-1..=1).all(|dz| {
+                (-1..=1).all(|dx| self.streaming.expect_existing().is_lit(cx + dx, cz + dz))
+            }) {
                 return Ok(());
             }
             self.level.position = None;
@@ -5380,8 +5391,10 @@ impl Game<'_> {
         } else {
             let s = self.spawn.unwrap_or_default();
             let (cx, cz) = ((s.x.floor() as i32) >> 4, (s.z.floor() as i32) >> 4);
-            self.streaming.center = (cx, cz);
-            if !(-1..=1).all(|dz| (-1..=1).all(|dx| self.streaming.is_lit(cx + dx, cz + dz))) {
+            self.streaming.expect_existing_mut().center = (cx, cz);
+            if !(-1..=1).all(|dz| {
+                (-1..=1).all(|dx| self.streaming.expect_existing().is_lit(cx + dx, cz + dz))
+            }) {
                 return Ok(());
             }
             let column = [s.x.floor() as i32, s.y.floor() as i32, s.z.floor() as i32];
@@ -5534,7 +5547,7 @@ impl Game<'_> {
             (player.position.x.floor() as i32) >> 4,
             (player.position.z.floor() as i32) >> 4,
         );
-        if !self.streaming.is_lit(cx, cz) {
+        if !self.streaming.expect_existing().is_lit(cx, cz) {
             return Ok(());
         }
         let playing = self.screen == Screen::Playing && self.sleeping.is_none();
@@ -9491,7 +9504,7 @@ impl Game<'_> {
         self.yaw = yaw;
         self.pitch = pitch;
         self.selected = level.selected_slot.clamp(0, 8) as usize;
-        self.streaming = streaming;
+        self.streaming = streaming_owner::GameStreaming::from_existing(streaming);
         #[cfg(feature = "paired-packages")]
         self.retire_counter_trial("world-open");
         self.world = world;
@@ -9549,8 +9562,8 @@ impl Game<'_> {
             r.clear_sections();
         }
         self.apply_settings();
-        self.streaming.sky_light = dim != Dim::Nether;
-        self.streaming.nether_shading = dim == Dim::Nether;
+        self.streaming.expect_existing_mut().sky_light = dim != Dim::Nether;
+        self.streaming.expect_existing_mut().nether_shading = dim == Dim::Nether;
         self.load_world_state();
         // Publish provenance only after the corresponding native open completed.
         #[cfg(feature = "paired-packages")]
@@ -9603,8 +9616,11 @@ impl Game<'_> {
     /// (scaled coordinates, or the End portal's fixed destination).
     pub(super) fn switch_level(&mut self, target: Dim, from: Vec3) -> Result<Vec3> {
         // Save the departing dimension's changed chunks.
-        self.save.save_forced_chunks(&self.streaming.forced)?;
-        self.streaming.save(&mut self.world, true)?;
+        self.save
+            .save_forced_chunks(&self.streaming.expect_existing().forced)?;
+        self.streaming
+            .expect_existing_mut()
+            .save(&mut self.world, true)?;
         let keys: Vec<_> = self.world.modified.iter().copied().collect();
         let chunks = self.with_entities(keys.iter().filter_map(|k| self.world.chunks.get(k)));
         self.save
@@ -9639,7 +9655,7 @@ impl Game<'_> {
         world.light_log = self.world.light_log.as_ref().map(|_| Default::default());
         // The sculk tables' watched blocks are built once per game.
         world.watched = std::mem::take(&mut self.world.watched);
-        self.streaming = streaming;
+        self.streaming = streaming_owner::GameStreaming::from_existing(streaming);
         #[cfg(feature = "paired-packages")]
         self.retire_counter_trial("dimension-switch");
         self.remove_saved_entities(&departing_entities);
@@ -9867,7 +9883,7 @@ impl Game<'_> {
         self.debug_charts.reset();
         self.boss_overlay.reset();
         self.bosses = Default::default();
-        self.streaming.paused = true;
+        self.streaming.expect_existing_mut().paused = true;
         #[cfg(feature = "paired-packages")]
         self.retire_counter_trial("world-close");
         self.world = World::new(self.res.facts().air, 0);
@@ -11181,15 +11197,15 @@ impl Game<'_> {
         // LocalPlayer.refreshChatAbilities: the chat shows what the Chat option allows.
         let abilities = self.chat_abilities();
         self.ui.chat.set_abilities(&self.gui.atlas.font, abilities);
-        self.streaming.radius = self.settings.render_distance;
+        self.streaming.expect_existing_mut().radius = self.settings.render_distance;
         // Options.biomeBlendRadius, ambientOcclusion and cutoutLeaves:
         // LevelExtractor.allChanged when they change.
-        let (s, st) = (&self.settings, &self.streaming);
+        let (s, st) = (&self.settings, self.streaming.expect_existing());
         let remesh = (s.biome_blend, s.smooth_lighting, s.cutout_leaves)
             != (st.biome_blend, st.smooth_lighting, st.cutout_leaves);
-        self.streaming.biome_blend = self.settings.biome_blend;
-        self.streaming.smooth_lighting = self.settings.smooth_lighting;
-        self.streaming.cutout_leaves = self.settings.cutout_leaves;
+        self.streaming.expect_existing_mut().biome_blend = self.settings.biome_blend;
+        self.streaming.expect_existing_mut().smooth_lighting = self.settings.smooth_lighting;
+        self.streaming.expect_existing_mut().cutout_leaves = self.settings.cutout_leaves;
         if remesh {
             self.all_sections_changed();
         }
@@ -11947,8 +11963,11 @@ impl Game<'_> {
     }
     /// Save the level in place: its changed chunks, its entities and its raids.
     fn save_level(&mut self, wait: bool) -> Result<()> {
-        self.save.save_forced_chunks(&self.streaming.forced)?;
-        self.streaming.save(&mut self.world, wait)?;
+        self.save
+            .save_forced_chunks(&self.streaming.expect_existing().forced)?;
+        self.streaming
+            .expect_existing_mut()
+            .save(&mut self.world, wait)?;
         let chunks = self.with_entities(
             self.world
                 .modified
@@ -12061,7 +12080,10 @@ impl Game<'_> {
             && let Some(renderer) = self.renderer.as_mut()
         {
             horizon_client::spans::time("occlusion", || {
-                renderer.start_occlusion(camera, (self.streaming.radius * 16) as f32)
+                renderer.start_occlusion(
+                    camera,
+                    (self.streaming.expect_existing().radius * 16) as f32,
+                )
             });
         }
         let biome = self
@@ -12306,7 +12328,7 @@ impl Game<'_> {
             bob,
             sky,
             distance,
-            detail_distance: (self.streaming.radius * 16) as f32,
+            detail_distance: (self.streaming.expect_existing().radius * 16) as f32,
             depth_far,
             underwater,
             title,
@@ -12329,7 +12351,8 @@ impl Game<'_> {
                     && self.darkness_fog().is_none()
                     && !self.boss_overlay.should_create_world_fog()
                     && self.potions.effects.get("blindness").is_none()
-                    && fog.environmental_end >= (self.streaming.radius * 16) as f32
+                    && fog.environmental_end
+                        >= (self.streaming.expect_existing().radius * 16) as f32
                 {
                     (fog.render_distance_start, fog.render_distance_end) = (1e9, 2e9);
                     (fog.environmental_start, fog.environmental_end) = (1e9, 2e9);
@@ -12442,10 +12465,10 @@ impl Game<'_> {
     }
     /// `LevelLoadTracker.serverProgress`: the player's 7x7 chunks loaded.
     fn level_load_progress(&self) -> f32 {
-        let (cx, cz) = self.streaming.center;
+        let (cx, cz) = self.streaming.expect_existing().center;
         let ready = (-3..=3)
             .flat_map(|dz| (-3..=3).map(move |dx| (cx + dx, cz + dz)))
-            .filter(|&(x, z)| self.streaming.is_lit(x, z))
+            .filter(|&(x, z)| self.streaming.expect_existing().is_lit(x, z))
             .count();
         horizon_client::level_loading::progress(ready)
     }
@@ -12469,9 +12492,9 @@ impl Game<'_> {
             }
             Reason::EndPortal => batch.fill(atlas, 0.0, 0.0, w, h, rgba(20, 20, 20, 255)),
         }
-        let (cx, cz) = self.streaming.center;
+        let (cx, cz) = self.streaming.expect_existing().center;
         let status = |x: i32, z: i32| {
-            self.streaming.latest_status(
+            self.streaming.expect_existing().latest_status(
                 &self.world,
                 cx + x - STATUS_RADIUS,
                 cz + z - STATUS_RADIUS,
@@ -12503,7 +12526,7 @@ impl Game<'_> {
         partial: f32,
     ) -> Option<horizon_client::gfx::BorderDraw> {
         use horizon_client::border_render::{self, BorderRenderer};
-        let distance = f64::from(self.streaming.radius * 16);
+        let distance = f64::from(self.streaming.expect_existing().radius * 16);
         border_render::extract(
             &self.border,
             partial,
@@ -12807,9 +12830,12 @@ impl Game<'_> {
     /// Only enabled LOD worlds extend the renderer's range, never simulation.
     fn terrain_distance(&self) -> i32 {
         if self.lod.is_some() {
-            self.streaming.radius.max(self.lod_distance() as i32)
+            self.streaming
+                .expect_existing()
+                .radius
+                .max(self.lod_distance() as i32)
         } else {
-            self.streaming.radius
+            self.streaming.expect_existing().radius
         }
     }
     fn clear_lod(&mut self) {
@@ -12838,8 +12864,8 @@ impl Game<'_> {
         }
         self.lod_source_attempted = true;
         let source = match &self.integrated {
-            Some(server) => server.call(|game| game.streaming.lod_source()),
-            None => Some(self.streaming.lod_source()),
+            Some(server) => server.call(|game| game.streaming.expect_existing().lod_source()),
+            None => Some(self.streaming.expect_existing().lod_source()),
         };
         if let Some(source) = source {
             self.lod = Some(horizon_client::lod::Lod::new(
@@ -12860,23 +12886,25 @@ impl Game<'_> {
             }
         }
         if let Some(p) = &self.player {
-            self.streaming.center = (
+            self.streaming.expect_existing_mut().center = (
                 (p.position.x.floor() as i32) >> 4,
                 (p.position.z.floor() as i32) >> 4,
             );
         }
         // The loading screen's chunk map fills ring by ring, as vanilla's.
-        self.streaming.loading =
+        self.streaming.expect_existing_mut().loading =
             self.options.execution_role.is_client() && self.loading_reason().is_some();
         self.tick_pregen();
-        let areas = self.streaming.extra.len();
+        let areas = self.streaming.expect_existing().extra.len();
         let waiting = std::mem::take(&mut self.spawn_wait);
         self.streaming
+            .expect_existing_mut()
             .extra
             .extend(waiting.into_iter().map(|chunk| (chunk, 0)));
-        let (uploads, unloaded) =
-            horizon_client::spans::time("streaming", || self.streaming.update(&mut self.world));
-        self.streaming.extra.truncate(areas);
+        let (uploads, unloaded) = horizon_client::spans::time("streaming", || {
+            self.streaming.expect_existing_mut().update(&mut self.world)
+        });
+        self.streaming.expect_existing_mut().extra.truncate(areas);
         if let Some(lod) = &mut self.lod {
             self.lod_observe
                 .extend(uploads.iter().map(|(key, _)| (key.0, key.2)));
@@ -12950,7 +12978,7 @@ impl Game<'_> {
                         .into_iter()
                         .filter(|(k, _)| chunks.contains_key(&(k.0, k.2))),
                 );
-                let centre = self.streaming.center;
+                let centre = self.streaming.expect_existing().center;
                 let far = |k: &(i32, i32, i32)| (k.0 - centre.0).pow(2) + (k.2 - centre.1).pow(2);
                 pending.sort_unstable_by_key(|(k, _)| std::cmp::Reverse(far(k)));
                 let (limit, budget) = if budgeted {
@@ -12981,14 +13009,14 @@ impl Game<'_> {
             if let (Some(lod), Some(player)) = (&mut self.lod, &self.player) {
                 let lod_distance =
                     horizon_client::graphics::lod_distance_capped(far_distance, &renderer.info);
-                lod.set_near_loading(self.streaming.busy());
+                lod.set_near_loading(self.streaming.expect_existing().busy());
                 lod.set_reduced_detail(far_reduced);
                 // The covered columns change only with the complete ones and
                 // the render area: rebuilt then, not every frame.
                 let at = (
                     renderer.lod_detail_revision(),
-                    self.streaming.center,
-                    self.streaming.radius,
+                    self.streaming.expect_existing().center,
+                    self.streaming.expect_existing().radius,
                 );
                 let covered = (self.lod_covered_at != Some(at)).then(|| {
                     self.lod_covered_at = Some(at);
@@ -13005,7 +13033,7 @@ impl Game<'_> {
                     lod.update(
                         [player.position.x, player.position.y, player.position.z],
                         self.yaw,
-                        self.streaming.radius,
+                        self.streaming.expect_existing().radius,
                         lod_distance,
                         covered,
                     )
@@ -14219,7 +14247,7 @@ impl<'a> Game<'a> {
             weather_parameters: Default::default(),
             panorama_rotation: Default::default(),
             world,
-            streaming,
+            streaming: streaming_owner::GameStreaming::from_existing(streaming),
             lod: None,
             lod_source_attempted: false,
             lod_observe: Default::default(),
@@ -15675,8 +15703,8 @@ fn write_report(game: &Game<'_>) -> Result<()> {
             "frames": game.frames,
             "elapsed_seconds": game.started.elapsed().as_secs_f64(),
             "chunks": game.world.chunks.len(),
-            "generated": game.streaming.generated_total,
-            "meshed_sections": game.streaming.meshed_total,
+            "generated": game.streaming.expect_existing().generated_total,
+            "meshed_sections": game.streaming.expect_existing().meshed_total,
             "player": game.player.as_ref().map(|p| [p.position.x, p.position.y, p.position.z]),
             "error": game.error.as_ref().map(|e| e.to_string()),
         });

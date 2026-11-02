@@ -315,10 +315,10 @@ pub(super) fn run(options: Options, launch: Launch) -> Result<()> {
             )?;
             game.player = Some(player);
             game.previous_position = Vec3::new(0.5, 100.0, 0.5);
-            game.streaming.radius = 2;
-            game.streaming.center = (0, 0);
+            game.streaming.expect_existing_mut().radius = 2;
+            game.streaming.expect_existing_mut().center = (0, 0);
             game.load_world_state();
-            let source = game.streaming.lod_source();
+            let source = game.streaming.expect_existing().lod_source();
             let capability = source.clone().retained_lod_capability();
             match RetainedLod::prepare(source, capability, game.pack.context.clone()) {
                 Ok(lod) => application.lod = Some(lod),
@@ -994,7 +994,7 @@ impl Application<'_> {
         let Phase::Running(game) = &mut self.phase else {
             return;
         };
-        let (uploads, unloaded) = game.streaming.update(&mut game.world);
+        let (uploads, unloaded) = game.streaming.expect_existing_mut().update(&mut game.world);
         // This fixed constructor admits one constant center/radius and no
         // movement/dimension/replacement commands. Unexpected unload cannot be
         // silently discarded or counted as saved: retain its original Arc and

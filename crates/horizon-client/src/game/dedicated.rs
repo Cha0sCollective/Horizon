@@ -585,7 +585,7 @@ impl Game<'_> {
         }
         self.settings.render_distance = props.view_distance.clamp(2, 32);
         self.settings.simulation_distance = props.simulation_distance.clamp(2, 32);
-        self.streaming.radius = self.settings.render_distance;
+        self.streaming.expect_existing_mut().radius = self.settings.render_distance;
         self.settle_spawn()?;
         let gate_lists = lists.clone();
         let gate: LoginGate = Arc::new(move |address, uuid, name| {
@@ -782,7 +782,7 @@ impl Game<'_> {
                     .map(|s| ((s.x.floor() as i32) >> 4, (s.z.floor() as i32) >> 4))
             });
         if let Some(c) = center {
-            self.streaming.center = c;
+            self.streaming.expect_existing_mut().center = c;
         }
     }
 

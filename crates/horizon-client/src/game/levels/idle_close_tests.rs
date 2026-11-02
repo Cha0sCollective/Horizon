@@ -82,7 +82,7 @@ fn seed_current(game: &mut Game<'_>) -> Vec<Tag> {
             ("fixture:opaque", Tag::compound([("value", Tag::Long(-73))])),
         ]),
     );
-    assert!(game.streaming.forced.is_empty());
+    assert!(game.streaming.expect_existing().forced.is_empty());
     write_dat(&tickets(&game.save.root), ticket_record(game.dim)).unwrap();
     let state = game
         .pack
@@ -271,7 +271,7 @@ fn owners(game: &Game<'_>) -> Vec<LevelOwners> {
         &game.save,
         &game.dropped,
         &game.persist,
-        &game.streaming,
+        game.streaming.expect_existing(),
     )];
     for (&dim, parked) in &game.levels.parked {
         out.push(level_owners(

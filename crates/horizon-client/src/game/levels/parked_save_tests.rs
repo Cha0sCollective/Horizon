@@ -83,6 +83,7 @@ fn seed_current(game: &mut Game<'_>) -> Vec<Tag> {
         ]),
     );
     game.streaming
+        .expect_existing_mut()
         .forced
         .insert((index as i32, -(index as i32)));
     fs::create_dir_all(&game.save.root).unwrap();
@@ -253,7 +254,7 @@ fn owners(game: &Game<'_>) -> Vec<LevelOwners> {
         &game.save,
         &game.dropped,
         &game.persist,
-        &game.streaming,
+        game.streaming.expect_existing(),
     )];
     for (&dim, parked) in &game.levels.parked {
         out.push(level_owners(

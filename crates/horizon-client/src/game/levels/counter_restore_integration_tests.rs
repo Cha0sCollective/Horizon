@@ -120,7 +120,10 @@ pub(super) fn source(
             ((time - 123) as u64, Some(time))
         );
     }
-    game.streaming.require_pristine_fixture_capture().unwrap();
+    game.streaming
+        .expect_existing()
+        .require_pristine_fixture_capture()
+        .unwrap();
     assert_eq!(
         game.capture_profile_checks(CaptureProfile::NativeCounterPatch)
             .unwrap(),
@@ -403,7 +406,7 @@ pub(super) fn loaded<'a>(
         game.level.seed,
     )
     .unwrap();
-    game.streaming = streaming;
+    game.streaming = crate::game::streaming_owner::GameStreaming::from_existing(streaming);
     game.save = save;
     game.end.set_locator(locator);
     let mut world = World::new(game.res.facts().air, game.level.seed);

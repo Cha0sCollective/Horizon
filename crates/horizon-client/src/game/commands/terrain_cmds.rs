@@ -41,7 +41,13 @@ impl Game<'_> {
         let dim = Text::literal(self.dim.id());
         match id {
             "forceload.query" if ctx.get("pos").is_none() => {
-                let mut forced: Vec<(i32, i32)> = self.streaming.forced.iter().copied().collect();
+                let mut forced: Vec<(i32, i32)> = self
+                    .streaming
+                    .expect_existing()
+                    .forced
+                    .iter()
+                    .copied()
+                    .collect();
                 forced.sort_unstable();
                 if forced.is_empty() {
                     self.command_failure(Text::translate("commands.forceload.added.none", &[dim]));
@@ -69,7 +75,7 @@ impl Game<'_> {
             "forceload.query" => {
                 let [x, z] = self.column_arg(ctx, "pos")?;
                 let key = (x >> 4, z >> 4);
-                if self.streaming.forced.contains(&key) {
+                if self.streaming.expect_existing().forced.contains(&key) {
                     self.feedback(Text::translate(
                         "commands.forceload.query.success",
                         &[chunk_text(key.0, key.1), dim],
@@ -83,7 +89,7 @@ impl Game<'_> {
                 }
             }
             "forceload.remove.all" => {
-                self.streaming.forced.clear();
+                self.streaming.expect_existing_mut().forced.clear();
                 self.feedback(Text::translate("commands.forceload.removed.all", &[dim]));
                 Ok(0)
             }
@@ -113,15 +119,17 @@ impl Game<'_> {
                 for x in cx0..=cx1 {
                     for z in cz0..=cz1 {
                         let changed = if add {
-                            self.streaming.forced.insert((x, z))
+                            self.streaming.expect_existing_mut().forced.insert((x, z))
                         } else {
-                            self.streaming.forced.remove(&(x, z))
+                            self.streaming.expect_existing_mut().forced.remove(&(x, z))
                         };
                         tracker.track(&holder(chunk_text(x, z)), i32::from(changed));
                     }
                 }
                 if add {
-                    self.streaming.rank_forced(cx0, cz0, cx1, cz1);
+                    self.streaming
+                        .expect_existing_mut()
+                        .rank_forced(cx0, cz0, cx1, cz1);
                 }
                 let (lo, hi) = (chunk_text(cx0, cz0), chunk_text(cx1, cz1));
                 let verb = if add { "added" } else { "removed" };

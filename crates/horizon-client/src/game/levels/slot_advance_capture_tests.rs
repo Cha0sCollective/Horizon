@@ -304,12 +304,17 @@ fn streamer_fixture_control() {
         streaming
             .game
             .streaming
+            .expect_existing_mut()
             .update(&mut streaming.game.world)
             .1
             .is_empty()
     );
     assert_eq!(
-        streaming.game.streaming.require_pristine_fixture_capture(),
+        streaming
+            .game
+            .streaming
+            .expect_existing()
+            .require_pristine_fixture_capture(),
         Err(horizon_client::streaming::CapturePristineError::PreviouslySubmitted)
     );
     streaming.game.observe_slot_advance_entity_owners().unwrap();
@@ -1295,7 +1300,7 @@ fn loaded_four<'a>(fixture: &'a Fixture, root: &Path) -> (Game<'a>, Vec<mpsc::Re
         game.level.seed,
     )
     .unwrap();
-    game.streaming = streaming;
+    game.streaming = crate::game::streaming_owner::GameStreaming::from_existing(streaming);
     game.save = save;
     game.end.set_locator(locator);
     let mut world = World::new(game.res.facts().air, game.level.seed);

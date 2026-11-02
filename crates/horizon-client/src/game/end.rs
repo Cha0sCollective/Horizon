@@ -689,7 +689,8 @@ impl Game<'_> {
     /// location: a podium that is later broken stays broken.
     fn ensure_exit_portal(&mut self) -> Result<()> {
         if self.travelling.is_some()
-            || !(-1..=0).all(|cz| (-1..=0).all(|cx| self.streaming.is_lit(cx, cz)))
+            || !(-1..=0)
+                .all(|cz| (-1..=0).all(|cx| self.streaming.expect_existing().is_lit(cx, cz)))
             || !self.fight_ready()
         {
             return Ok(());

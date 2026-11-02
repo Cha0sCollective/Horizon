@@ -263,7 +263,7 @@ impl Game<'_> {
         let (world, streaming, memory, dropped, orbs, boats, mobs) = if dimension == self.dim {
             (
                 &mut self.world,
-                &mut self.streaming,
+                self.streaming.expect_existing_mut(),
                 &mut self.persist,
                 &mut self.dropped,
                 &mut self.orbs,
@@ -551,7 +551,7 @@ impl Game<'_> {
     }
     fn native_level(&self, dimension: Dim) -> Option<(&World, &Streaming, &Arc<SaveDir>)> {
         if dimension == self.dim {
-            Some((&self.world, &self.streaming, &self.save))
+            Some((&self.world, self.streaming.as_existing().ok()?, &self.save))
         } else {
             self.levels
                 .parked
@@ -561,7 +561,7 @@ impl Game<'_> {
     }
     fn native_level_mut(&mut self, dimension: Dim) -> Option<(&mut World, &mut Streaming)> {
         if dimension == self.dim {
-            Some((&mut self.world, &mut self.streaming))
+            Some((&mut self.world, self.streaming.as_existing_mut().ok()?))
         } else {
             self.levels
                 .parked
@@ -1186,6 +1186,9 @@ impl Game<'_> {
 
     /// Exchange the level in place with `p`.
     fn swap_level(&mut self, p: &mut Parked) {
+        // Check the audited current Game factory invariant before changing any
+        // provenance or moving any other level owner. This is not remote dispatch.
+        self.streaming.expect_existing();
         #[cfg(feature = "paired-packages")]
         {
             // Swapping away and back must never revive initial-open provenance.
@@ -1193,7 +1196,9 @@ impl Game<'_> {
         }
         use std::mem::swap;
         swap(&mut self.world, &mut p.world);
-        swap(&mut self.streaming, &mut p.streaming);
+        self.streaming
+            .try_swap_existing(&mut p.streaming)
+            .expect("active Existing owner was checked before the level swap");
         let mut locator = self.end.locator();
         swap(&mut locator, &mut p.locator);
         self.end.set_locator(locator);
@@ -1430,7 +1435,7 @@ impl Game<'_> {
             .into_iter()
             .filter(|d| {
                 let forced = if *d == self.dim {
-                    !self.streaming.forced.is_empty()
+                    !self.streaming.expect_existing().forced.is_empty()
                 } else {
                     self.levels
                         .parked
