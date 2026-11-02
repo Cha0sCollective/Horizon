@@ -506,7 +506,9 @@ pub(super) fn native_region(path: &str) -> SResult<(bool, ChunkPos)> {
 }
 /// Retain the native decompressor and its bounds, but reject bytes it leaves
 /// behind after an otherwise valid stream. No alternate native codec is written.
-fn read_item_record(record: &horizon_world::region::ChunkRecord) -> SResult<NamedTag> {
+pub(in crate::game) fn read_item_record(
+    record: &horizon_world::region::ChunkRecord,
+) -> SResult<NamedTag> {
     let raw = checked(
         record
             .compression

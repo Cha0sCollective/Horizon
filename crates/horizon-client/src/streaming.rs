@@ -55,6 +55,20 @@ pub trait ChunkGenerator: Send + Sync + 'static {
     fn load(&self, _x: i32, _z: i32) -> Option<Chunk> {
         None
     }
+    #[cfg(feature = "paired-packages")]
+    /// The actual native storage allocation used by this producer. Unknown
+    /// providers cannot start retained workers merely by receiving a SaveDir.
+    fn retained_save(&self) -> Option<&Arc<crate::save::SaveDir>> {
+        None
+    }
+    #[cfg(feature = "paired-packages")]
+    fn retained_load(&self, x: i32, z: i32) -> crate::save::RetainedNativeLoad {
+        crate::save::RetainedNativeLoad::unavailable(x, z)
+    }
+    #[cfg(feature = "paired-packages")]
+    fn retained_proto(&self, worker: &mut Self::Worker, x: i32, z: i32) -> Proto {
+        self.proto(worker, x, z)
+    }
     /// What a loaded chunk needs from the generator before the game uses it,
     /// on the worker that loaded it.
     fn prepare_loaded(&self, _worker: &mut Self::Worker, _chunk: &Chunk) {}
@@ -326,6 +340,62 @@ impl Drop for WorkLease {
         state.accounting_fault |= !ok;
     }
 }
+#[cfg(feature = "paired-packages")]
+impl WorkLease {
+    // Retained polling has already obtained the book with try_lock. Never
+    // reacquire it through the legacy blocking reconciliation helpers.
+    fn advance_locked(&mut self, state: &mut OwnershipBook, phase: WorkPhase) {
+        if self.counted {
+            let old = state.phase(self.origin, self.phase);
+            if let Some(next) = old.checked_sub(1) {
+                *old = next;
+            } else {
+                state.accounting_fault = true;
+            }
+        }
+        self.counted = OwnershipBook::add(state.phase(self.origin, phase));
+        state.accounting_fault |= !self.counted;
+        self.phase = phase;
+    }
+    fn settle_locked(mut self, state: &mut OwnershipBook) {
+        if self.counted {
+            let old = state.phase(self.origin, self.phase);
+            if let Some(next) = old.checked_sub(1) {
+                *old = next;
+            } else {
+                state.accounting_fault = true;
+            }
+        }
+        let ok = OwnershipBook::add(&mut state.counts[self.origin as usize].disposed);
+        state.accounting_fault |= !ok;
+        self.settled = true;
+    }
+    fn new_locked(
+        book: &Arc<Mutex<OwnershipBook>>,
+        state: &mut OwnershipBook,
+        origin: NativeWorkOrigin,
+    ) -> Self {
+        let submitted = OwnershipBook::add(&mut state.counts[origin as usize].submitted);
+        let counted = OwnershipBook::add(state.phase(origin, WorkPhase::Reconciling));
+        state.accounting_fault |= !submitted || !counted;
+        Self {
+            book: book.clone(),
+            origin,
+            phase: WorkPhase::Reconciling,
+            counted,
+            settled: false,
+        }
+    }
+    fn storage_locked(&self, state: &mut OwnershipBook, accepted: bool) {
+        let c = &mut state.counts[self.origin as usize];
+        let ok = OwnershipBook::add(if accepted {
+            &mut c.accepted_storage_handoffs
+        } else {
+            &mut c.storage_errors
+        });
+        state.accounting_fault |= !ok;
+    }
+}
 struct WorkerLifetime {
     book: Arc<Mutex<OwnershipBook>>,
     initialized: bool,
@@ -381,6 +451,8 @@ impl Done {
             Self::Lit(x, z, _, seq) => ResultStamp::Lit(*x, *z, *seq),
             Self::Meshed(x, y, z, _, seq) => ResultStamp::Meshed(*x, *y, *z, *seq),
             Self::Saved(..) => ResultStamp::Saved,
+            #[cfg(feature = "paired-packages")]
+            Self::RetainedLoad(x, z, _) => ResultStamp::Generated(*x, *z),
         }
     }
 }
@@ -402,6 +474,8 @@ pub enum Done {
     Lit(i32, i32, Vec<crate::chunk::Light>, u64),
     Meshed(i32, i32, i32, SectionMesh, u64),
     Saved(Vec<((i32, i32), Proto)>, Result<(), String>),
+    #[cfg(feature = "paired-packages")]
+    RetainedLoad(i32, i32, Box<crate::save::RetainedNativeLoad>),
 }
 struct Queued {
     priority: i64,
@@ -442,6 +516,12 @@ struct Shared {
     ownership: Arc<Mutex<OwnershipBook>>,
     returned: Mutex<VecDeque<(ResultStamp, WorkLease)>>,
     queued_owners: Mutex<FxHashMap<u64, WorkLease>>,
+    #[cfg(all(
+        feature = "paired-packages",
+        feature = "native-writer-test-control",
+        debug_assertions
+    ))]
+    retained_work_gate: Mutex<Option<RetainedWorkGate>>,
     #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
     native_column_load_gate: Mutex<Option<Arc<NativeColumnLoadGate>>>,
     #[cfg(test)]
@@ -573,6 +653,7 @@ pub struct Streaming {
     light_view: Arc<dyn Fn(&Proto) -> Option<Chunk> + Send + Sync>,
     results: mpsc::Receiver<Done>,
     threads: Vec<thread::JoinHandle<()>>,
+    constructor_complete: bool,
     order: u64,
     generating: FxHashSet<(i32, i32)>,
     generation_scan: GenerationScan,
@@ -657,6 +738,380 @@ pub struct Streaming {
     /// The columns and the next row the band's decoration ranks were given
     /// for (`set_band`).
     band_ranked: Option<(i32, i32, i32)>,
+    #[cfg(feature = "paired-packages")]
+    retained: Option<RetainedStream>,
+}
+
+/// A failed spawn retains the allocation and every successfully started worker.
+pub struct StreamingStartFailure {
+    pub streaming: Streaming,
+    pub error: String,
+}
+impl std::fmt::Debug for StreamingStartFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamingStartFailure")
+            .field("error", &self.error)
+            .field("workers", &self.streaming.threads.len())
+            .finish()
+    }
+}
+
+#[cfg(feature = "paired-packages")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RetainedStreamStatus {
+    Pending,
+    NeedsFinishedColumn,
+    NeedsRefusedRead,
+    Blocked(String),
+    Complete,
+}
+
+#[cfg(feature = "paired-packages")]
+pub enum RetainedColumnDisposition {
+    StoreFresh,
+    AlreadyStored,
+}
+
+#[cfg(feature = "paired-packages")]
+pub struct RetainedColumnTicket {
+    allocation: Arc<Shared>,
+    serial: u64,
+}
+
+#[cfg(feature = "paired-packages")]
+pub struct RetainedFinishedColumn<'a> {
+    chunk: &'a Arc<Chunk>,
+    origin: NativeWorkOrigin,
+    ticket: RetainedColumnTicket,
+    evidence: Option<&'a crate::save::RetainedLoadedRecords>,
+}
+
+#[cfg(feature = "paired-packages")]
+pub struct RetainedRefusedRead<'a> {
+    load: &'a crate::save::RetainedNativeLoad,
+    ticket: RetainedColumnTicket,
+}
+#[cfg(feature = "paired-packages")]
+impl<'a> RetainedRefusedRead<'a> {
+    pub fn position(&self) -> (i32, i32) {
+        self.load.position()
+    }
+    pub fn error(&self) -> &str {
+        self.load.error().unwrap_or("retained native input refused")
+    }
+    pub fn evidence(&self) -> Option<&'a crate::save::RetainedLoadedRecords> {
+        self.load.evidence()
+    }
+    pub fn into_ticket(self) -> RetainedColumnTicket {
+        self.ticket
+    }
+}
+
+#[cfg(feature = "paired-packages")]
+impl<'a> RetainedFinishedColumn<'a> {
+    pub fn chunk(&self) -> &'a Arc<Chunk> {
+        self.chunk
+    }
+    pub fn origin(&self) -> NativeWorkOrigin {
+        self.origin
+    }
+    pub fn evidence(&self) -> Option<&'a crate::save::RetainedLoadedRecords> {
+        self.evidence
+    }
+    /// Correlation only. The caller must perform strict native validation first.
+    pub fn into_ticket(self) -> RetainedColumnTicket {
+        self.ticket
+    }
+}
+
+#[cfg(feature = "paired-packages")]
+#[must_use = "retain the producer witness until the same native writer is closed"]
+pub struct SealedStream {
+    allocation: Arc<Shared>,
+    save: Arc<crate::save::SaveDir>,
+    workers: usize,
+    pub failed_initialization: bool,
+    refusals: Vec<String>,
+}
+#[cfg(feature = "paired-packages")]
+impl SealedStream {
+    pub fn refused_reads(&self) -> &[String] {
+        &self.refusals
+    }
+}
+#[cfg(feature = "paired-packages")]
+impl std::fmt::Debug for SealedStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SealedStream")
+            .field("workers", &self.workers)
+            .field("failed_initialization", &self.failed_initialization)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "paired-packages")]
+struct RetainedStream {
+    save: Arc<crate::save::SaveDir>,
+    armed: bool,
+    workers: usize,
+    close: Option<RetainedProducerClose>,
+    startup_error: Option<String>,
+    finished_backlog: Vec<(Arc<Chunk>, Option<WorkLease>)>,
+    proto_batches: Vec<RetainedProtoBatch>,
+    #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+    start_control: Option<RetainedStreamingStartTestControl>,
+    #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+    handoff_gate: Option<Arc<RetainedHandoffGate>>,
+    #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+    test_column: Option<(i32, i32)>,
+}
+
+#[cfg(feature = "paired-packages")]
+struct RetainedProducerClose {
+    world: Option<usize>,
+    membership: Option<u64>,
+    deadline: std::time::Instant,
+    status: RetainedStreamStatus,
+    history: Vec<String>,
+    deferred: std::vec::IntoIter<Done>,
+    owners: std::iter::Peekable<std::vec::IntoIter<(usize, WorkLease)>>,
+    deferred_index: usize,
+    incoming: Option<Done>,
+    current: Option<ReceivedWork>,
+    finished: Option<(Arc<Chunk>, WorkLease)>,
+    callback: Option<WorkLease>,
+    proto_callback: Option<WorkLease>,
+    serial: u64,
+    stopped: bool,
+    joined: usize,
+    failed_initialization: bool,
+    witness_taken: bool,
+    written: Option<std::collections::hash_set::IntoIter<(i32, i32)>>,
+    proto_key: Option<(i32, i32)>,
+    proto_outcome: Option<Result<(), String>>,
+    finished_outcome: Option<Result<(), String>>,
+    proto_scan: Option<std::collections::hash_map::IntoIter<(i32, i32), Option<Proto>>>,
+    protos_checked: bool,
+    join_scan: usize,
+    finished_backlog: std::vec::IntoIter<(Arc<Chunk>, Option<WorkLease>)>,
+    proto_batches: std::vec::IntoIter<RetainedProtoBatch>,
+    proto_batch: Option<RetainedProtoBatch>,
+    save_restore: Option<RetainedSaveRestore>,
+    light_replay: Option<RetainedLightReplay>,
+    loaded: Option<crate::save::RetainedLoadedRecords>,
+    accepted_loaded: Vec<crate::save::RetainedLoadedRecords>,
+    finished_stored: bool,
+    ack_cursor: usize,
+    ack_error: Option<String>,
+    writer_acknowledged: bool,
+    refused: Option<RetainedRefusedReadOwner>,
+    refused_inputs: Vec<RetainedRefusedInput>,
+    refusal_errors: Vec<String>,
+}
+
+#[cfg(feature = "paired-packages")]
+struct RetainedRefusedReadOwner {
+    position: (i32, i32),
+    load: Box<crate::save::RetainedNativeLoad>,
+    owner: WorkLease,
+}
+
+#[cfg(feature = "paired-packages")]
+enum RetainedRefusedInput {
+    Raw(Box<crate::save::RetainedNativeLoad>),
+    Loaded {
+        _chunk: Arc<Chunk>,
+        records: crate::save::RetainedLoadedRecords,
+    },
+}
+#[cfg(feature = "paired-packages")]
+impl RetainedRefusedInput {
+    fn records(&self) -> &crate::save::RetainedLoadedRecords {
+        match self {
+            Self::Raw(load) => load.evidence().unwrap(),
+            Self::Loaded { records, .. } => records,
+        }
+    }
+}
+
+#[cfg(feature = "paired-packages")]
+struct RetainedProtoBatch {
+    keys: Vec<(i32, i32)>,
+    owner: WorkLease,
+    outcome: Option<Result<(), String>>,
+    accepted: bool,
+    cleared: usize,
+}
+
+#[cfg(feature = "paired-packages")]
+struct RetainedSaveRestore {
+    protos: std::vec::IntoIter<((i32, i32), Proto)>,
+    current: Option<((i32, i32), Proto)>,
+    owner: Option<WorkLease>,
+    outcome: Result<(), String>,
+}
+
+#[cfg(feature = "paired-packages")]
+struct RetainedLightReplay {
+    x: i32,
+    z: i32,
+    snapshot: u64,
+    index: usize,
+    positions: Vec<(i32, i32, i32)>,
+    owner: Option<WorkLease>,
+}
+
+enum StreamingConstruction {
+    Legacy,
+    #[cfg(feature = "paired-packages")]
+    Retained(Arc<crate::save::SaveDir>),
+    #[cfg(all(
+        feature = "paired-packages",
+        feature = "native-writer-test-control",
+        debug_assertions
+    ))]
+    Controlled(Arc<crate::save::SaveDir>, RetainedStreamingStartTestControl),
+}
+
+#[cfg(all(
+    feature = "paired-packages",
+    feature = "native-writer-test-control",
+    debug_assertions
+))]
+struct RetainedStartGate {
+    entered: AtomicBool,
+    released: Mutex<bool>,
+    ready: Condvar,
+}
+#[cfg(all(
+    feature = "paired-packages",
+    feature = "native-writer-test-control",
+    debug_assertions
+))]
+pub struct RetainedStreamingStartTestControl {
+    hold_worker: Option<usize>,
+    fail_spawn: Option<usize>,
+    gate: Arc<RetainedStartGate>,
+    panic_worker: Option<usize>,
+}
+#[cfg(all(
+    feature = "paired-packages",
+    feature = "native-writer-test-control",
+    debug_assertions
+))]
+pub struct RetainedStreamingStartTestReceipt {
+    gate: Arc<RetainedStartGate>,
+}
+#[cfg(all(
+    feature = "paired-packages",
+    feature = "native-writer-test-control",
+    debug_assertions
+))]
+impl RetainedStreamingStartTestControl {
+    pub fn new(
+        hold_worker: Option<usize>,
+        fail_spawn: Option<usize>,
+    ) -> (Self, RetainedStreamingStartTestReceipt) {
+        let gate = Arc::new(RetainedStartGate {
+            entered: AtomicBool::new(false),
+            released: Mutex::new(false),
+            ready: Condvar::new(),
+        });
+        (
+            Self {
+                hold_worker,
+                fail_spawn,
+                gate: gate.clone(),
+                panic_worker: None,
+            },
+            RetainedStreamingStartTestReceipt { gate },
+        )
+    }
+    pub fn panic_initialization_at(&mut self, worker: usize) {
+        self.panic_worker = Some(worker);
+    }
+}
+#[cfg(all(
+    feature = "paired-packages",
+    feature = "native-writer-test-control",
+    debug_assertions
+))]
+impl RetainedStreamingStartTestReceipt {
+    pub fn entered(&self) -> bool {
+        self.gate.entered.load(Ordering::Acquire)
+    }
+    pub fn release(&mut self) {
+        *self.gate.released.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        self.gate.ready.notify_all();
+    }
+}
+#[cfg(all(
+    feature = "paired-packages",
+    feature = "native-writer-test-control",
+    debug_assertions
+))]
+impl Drop for RetainedStreamingStartTestReceipt {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+#[cfg(all(
+    feature = "paired-packages",
+    feature = "native-writer-test-control",
+    debug_assertions
+))]
+struct RetainedHandoffGate {
+    origin: NativeWorkOrigin,
+    entered: AtomicBool,
+    released: AtomicBool,
+    report_error: AtomicBool,
+}
+#[cfg(all(
+    feature = "paired-packages",
+    feature = "native-writer-test-control",
+    debug_assertions
+))]
+struct RetainedWorkGate {
+    origin: NativeWorkOrigin,
+    gate: Arc<RetainedStartGate>,
+    panic_after_release: bool,
+}
+#[cfg(all(
+    feature = "paired-packages",
+    feature = "native-writer-test-control",
+    debug_assertions
+))]
+pub struct RetainedHandoffTestReceipt {
+    gate: Arc<RetainedHandoffGate>,
+}
+#[cfg(all(
+    feature = "paired-packages",
+    feature = "native-writer-test-control",
+    debug_assertions
+))]
+impl RetainedHandoffTestReceipt {
+    pub fn entered(&self) -> bool {
+        self.gate.entered.load(Ordering::Acquire)
+    }
+    pub fn release(&mut self) {
+        self.gate.released.store(true, Ordering::Release);
+    }
+    /// A fixed negative observation after the real native callback returned Ok.
+    /// It never replaces the native storage action or manufactures success.
+    pub fn report_error_once_after_native_acceptance(&mut self) {
+        self.gate.report_error.store(true, Ordering::Release);
+    }
+}
+#[cfg(all(
+    feature = "paired-packages",
+    feature = "native-writer-test-control",
+    debug_assertions
+))]
+impl Drop for RetainedHandoffTestReceipt {
+    fn drop(&mut self) {
+        self.release();
+    }
 }
 /// Snapshot only after a scan found no missing candidates. Public range fields
 /// and `World::chunks` can change without going through Streaming, so compare
@@ -801,11 +1256,68 @@ pub struct WorkerContext {
     pub light: Arc<LightTables>,
 }
 impl Streaming {
+    fn retained_sealed(&self) -> bool {
+        #[cfg(feature = "paired-packages")]
+        {
+            self.retained.as_ref().is_some_and(|r| r.close.is_some())
+        }
+        #[cfg(not(feature = "paired-packages"))]
+        {
+            false
+        }
+    }
     pub fn new<G: ChunkGenerator>(
         generator: Arc<G>,
         context: Arc<WorkerContext>,
         threads: usize,
     ) -> Self {
+        match Self::construct(generator, context, threads, StreamingConstruction::Legacy) {
+            Ok(streaming) => streaming,
+            Err(failure) => panic!("spawn worker: {}", failure.error),
+        }
+    }
+    #[cfg(feature = "paired-packages")]
+    #[allow(clippy::result_large_err)] // The returned failure is the original partial native owner.
+    pub fn start_retained<G: ChunkGenerator>(
+        generator: Arc<G>,
+        context: Arc<WorkerContext>,
+        threads: usize,
+        save: Arc<crate::save::SaveDir>,
+    ) -> Result<Self, StreamingStartFailure> {
+        Self::construct(
+            generator,
+            context,
+            threads,
+            StreamingConstruction::Retained(save),
+        )
+    }
+    #[cfg(all(
+        feature = "paired-packages",
+        feature = "native-writer-test-control",
+        debug_assertions
+    ))]
+    #[allow(clippy::result_large_err)]
+    pub fn start_retained_with_test_control<G: ChunkGenerator>(
+        generator: Arc<G>,
+        context: Arc<WorkerContext>,
+        threads: usize,
+        save: Arc<crate::save::SaveDir>,
+        control: RetainedStreamingStartTestControl,
+    ) -> Result<Self, StreamingStartFailure> {
+        Self::construct(
+            generator,
+            context,
+            threads,
+            StreamingConstruction::Controlled(save, control),
+        )
+    }
+    #[allow(clippy::result_large_err)]
+    fn construct<G: ChunkGenerator>(
+        generator: Arc<G>,
+        context: Arc<WorkerContext>,
+        threads: usize,
+        construction: StreamingConstruction,
+    ) -> Result<Self, StreamingStartFailure> {
         let shared = Arc::new(Shared {
             queue: Mutex::new(BinaryHeap::new()),
             ready: Condvar::new(),
@@ -814,6 +1326,12 @@ impl Streaming {
             ownership: Arc::new(Mutex::new(OwnershipBook::default())),
             returned: Mutex::new(VecDeque::new()),
             queued_owners: Mutex::new(FxHashMap::default()),
+            #[cfg(all(
+                feature = "paired-packages",
+                feature = "native-writer-test-control",
+                debug_assertions
+            ))]
+            retained_work_gate: Mutex::new(None),
             #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
             native_column_load_gate: Mutex::new(None),
             #[cfg(test)]
@@ -826,12 +1344,162 @@ impl Streaming {
         let (send, results) = mpsc::channel();
         let light_tables = context.light.clone();
         let saves: Arc<dyn Saves> = generator.clone();
-        let threads = (0..threads.max(1))
-            .map(|i| {
-                let shared = shared.clone();
-                let send = send.clone();
-                let generator = generator.clone();
-                let light = context.light.clone();
+        let light_view = {
+            let generator = generator.clone();
+            Arc::new(move |p: &Proto| generator.light_view(p))
+        };
+        // This owner exists before the first native thread can be acquired.
+        let mut streaming = Self {
+            shared,
+            light_view,
+            results,
+            threads: Vec::new(),
+            constructor_complete: false,
+            order: 0,
+            generating: Default::default(),
+            generation_scan: GenerationScan::default(),
+            protos: Default::default(),
+            decorated: Default::default(),
+            decorating: 0,
+            saving: 0,
+            generation_save_error: None,
+            failed_finished: Vec::new(),
+            decoration_order: DecorationOrder::default(),
+            order_area: None,
+            queue_basis: Default::default(),
+            finishing: Default::default(),
+            decorates: generator.decorates(),
+            lighting: Default::default(),
+            meshing: Default::default(),
+            lit: Default::default(),
+            meshed: Default::default(),
+            waiting: Default::default(),
+            waiting_area: ((0, 0), 0, 0),
+            written: Default::default(),
+            saves,
+            deferred: Vec::new(),
+            deferred_owners: Vec::new(),
+            sequence: 0,
+            center: (0, 0),
+            radius: 8,
+            forced: HashSet::new(),
+            paused: false,
+            loading: false,
+            sky_light: true,
+            nether_shading: false,
+            biome_zoom: BiomeZoom::new(0),
+            biome_blend: 2,
+            smooth_lighting: true,
+            cutout_leaves: true,
+            light_tables,
+            light_log: Vec::new(),
+            light_edit_sequence: 0,
+            light_snapshots: Default::default(),
+            generated_total: 0,
+            meshed_total: 0,
+            remote: false,
+            extra: Vec::new(),
+            cover: None,
+            mesh: true,
+            band: None,
+            band_ranked: None,
+            #[cfg(feature = "paired-packages")]
+            retained: match construction {
+                StreamingConstruction::Legacy => None,
+                StreamingConstruction::Retained(save) => Some(RetainedStream {
+                    save,
+                    armed: true,
+                    workers: 0,
+                    close: None,
+                    startup_error: None,
+                    finished_backlog: Vec::new(),
+                    proto_batches: Vec::new(),
+                    #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+                    start_control: None,
+                    #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+                    handoff_gate: None,
+                    #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+                    test_column: None,
+                }),
+                #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+                StreamingConstruction::Controlled(save, control) => Some(RetainedStream {
+                    save,
+                    armed: true,
+                    workers: 0,
+                    close: None,
+                    startup_error: None,
+                    finished_backlog: Vec::new(),
+                    proto_batches: Vec::new(),
+                    start_control: Some(control),
+                    handoff_gate: None,
+                    test_column: None,
+                }),
+            },
+        };
+        #[cfg(not(feature = "paired-packages"))]
+        let _ = construction;
+        #[cfg(feature = "paired-packages")]
+        if let Some(retained) = &mut streaming.retained {
+            let error = match generator.retained_save() {
+                Some(actual) if Arc::ptr_eq(actual, &retained.save) => None,
+                Some(_) => Some("retained generator SaveDir allocation mismatch".to_owned()),
+                None => Some("generator has no retained SaveDir binding".to_owned()),
+            };
+            if let Some(error) = error {
+                retained.startup_error = Some(error.clone());
+                return Err(StreamingStartFailure { streaming, error });
+            }
+        }
+        for i in 0..threads.max(1) {
+            #[cfg(feature = "paired-packages")]
+            let retained_mode = streaming.retained.is_some();
+            #[cfg(feature = "paired-packages")]
+            let retained_save = streaming.retained.as_ref().map(|r| r.save.clone());
+            #[cfg(all(
+                feature = "paired-packages",
+                feature = "native-writer-test-control",
+                debug_assertions
+            ))]
+            let start_gate = streaming
+                .retained
+                .as_ref()
+                .and_then(|r| r.start_control.as_ref())
+                .filter(|c| c.hold_worker == Some(i))
+                .map(|c| c.gate.clone());
+            #[cfg(all(
+                feature = "paired-packages",
+                feature = "native-writer-test-control",
+                debug_assertions
+            ))]
+            let panic_initialization = streaming
+                .retained
+                .as_ref()
+                .and_then(|r| r.start_control.as_ref())
+                .is_some_and(|c| c.panic_worker == Some(i));
+            #[cfg(all(
+                feature = "paired-packages",
+                feature = "native-writer-test-control",
+                debug_assertions
+            ))]
+            let spawn_error = streaming
+                .retained
+                .as_ref()
+                .and_then(|r| r.start_control.as_ref())
+                .filter(|c| c.fail_spawn == Some(i))
+                .map(|_| std::io::Error::other("controlled native worker spawn failure"));
+            #[cfg(not(all(
+                feature = "paired-packages",
+                feature = "native-writer-test-control",
+                debug_assertions
+            )))]
+            let spawn_error: Option<std::io::Error> = None;
+            let shared = streaming.shared.clone();
+            let send = send.clone();
+            let generator = generator.clone();
+            let light = context.light.clone();
+            let spawned = if let Some(error) = spawn_error {
+                Err(error)
+            } else {
                 thread::Builder::new()
                     .name(format!("horizon-worker-{i}"))
                     .spawn(move || {
@@ -842,6 +1510,14 @@ impl Streaming {
                         };
                         // Ticks and frames come first (horizon_threads).
                         horizon_threads::behind_server();
+                        #[cfg(all(feature = "paired-packages", feature = "native-writer-test-control", debug_assertions))]
+                        if let Some(gate) = start_gate {
+                            gate.entered.store(true,Ordering::Release);
+                            let mut released = gate.released.lock().unwrap_or_else(|e| e.into_inner());
+                            while !*released { released = gate.ready.wait(released).unwrap_or_else(|e| e.into_inner()); }
+                        }
+                        #[cfg(all(feature = "paired-packages", feature = "native-writer-test-control", debug_assertions))]
+                        assert!(!panic_initialization,"controlled native initialization panic");
                         let mut worker = generator.worker();
                         lifetime.initialized();
                         // The face visibility table and its occlusion cache stay with
@@ -898,6 +1574,17 @@ impl Streaming {
                                         .unwrap();
                                 }
                             }
+                            #[cfg(all(feature = "paired-packages", feature = "native-writer-test-control", debug_assertions))]
+                            {
+                                let gate = shared.retained_work_gate.lock().unwrap_or_else(|e| e.into_inner()).as_ref().filter(|g| owner.as_ref().is_some_and(|o|o.origin==g.origin)).map(|g|(g.gate.clone(),g.panic_after_release));
+                                if let Some((gate,panic_after_release))=gate {
+                                    gate.entered.store(true,Ordering::Release);
+                                    let mut released=gate.released.lock().unwrap_or_else(|e| e.into_inner());
+                                    while !*released { released=gate.ready.wait(released).unwrap_or_else(|e|e.into_inner()); }
+                                    drop(released);
+                                    assert!(!panic_after_release,"controlled retained native held-work panic");
+                                }
+                            }
                             #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
                             {
                                 let gate = {
@@ -914,16 +1601,38 @@ impl Streaming {
                                 }
                             }
                             let done = match job {
-                                Job::Generate(x, z) => match generator.load(x, z) {
-                                    Some(chunk) => {
-                                        generator.prepare_loaded(&mut worker, &chunk);
-                                        Done::Generated(chunk)
-                                    }
-                                    None => {
-                                        let proto = generator.proto(&mut worker, x, z);
-                                        let decorated = generator.is_decorated(&proto);
-                                        Done::Proto(x, z, proto, decorated)
-                                    }
+                                Job::Generate(x, z) => {
+                                    #[cfg(feature = "paired-packages")]
+                                    let done = if retained_mode {
+                                        let load=generator.retained_load(x,z);
+                                        let correlated=load.position()==(x,z) && load.evidence().is_some_and(|evidence| evidence.position()==(x,z) && retained_save.as_ref().is_some_and(|save| Arc::ptr_eq(evidence.save(),save)));
+                                        if correlated && load.is_absent() && load.error().is_none() {
+                                            let proto=generator.retained_proto(&mut worker,x,z);
+                                            let decorated=generator.is_decorated(&proto);
+                                            Done::Proto(x,z,proto,decorated)
+                                        } else {
+                                            if correlated && load.error().is_none() && let Some(chunk)=load.chunk() {
+                                                generator.prepare_loaded(&mut worker,chunk);
+                                            }
+                                            Done::RetainedLoad(x,z,Box::new(load))
+                                        }
+                                    } else { match generator.load(x,z) {
+                                        Some(chunk)=>{generator.prepare_loaded(&mut worker,&chunk);Done::Generated(chunk)}
+                                        None=>{let proto=generator.proto(&mut worker,x,z);let decorated=generator.is_decorated(&proto);Done::Proto(x,z,proto,decorated)}
+                                    }};
+                                    #[cfg(not(feature = "paired-packages"))]
+                                    let done = match generator.load(x, z) {
+                                        Some(chunk) => {
+                                            generator.prepare_loaded(&mut worker, &chunk);
+                                            Done::Generated(chunk)
+                                        }
+                                        None => {
+                                            let proto = generator.proto(&mut worker, x, z);
+                                            let decorated = generator.is_decorated(&proto);
+                                            Done::Proto(x, z, proto, decorated)
+                                        }
+                                    };
+                                    done
                                 },
                                 Job::Decorate(x, z, mut region) => {
                                     generator.decorate(&mut worker, &mut region);
@@ -990,67 +1699,27 @@ impl Streaming {
                             }
                         }
                     })
-                    .expect("spawn worker")
-            })
-            .collect();
-        let light_view = {
-            let generator = generator.clone();
-            Arc::new(move |p: &Proto| generator.light_view(p))
-        };
-        Self {
-            shared,
-            light_view,
-            results,
-            threads,
-            order: 0,
-            generating: Default::default(),
-            generation_scan: GenerationScan::default(),
-            protos: Default::default(),
-            decorated: Default::default(),
-            decorating: 0,
-            saving: 0,
-            generation_save_error: None,
-            failed_finished: Vec::new(),
-            decoration_order: DecorationOrder::default(),
-            order_area: None,
-            queue_basis: Default::default(),
-            finishing: Default::default(),
-            decorates: generator.decorates(),
-            lighting: Default::default(),
-            meshing: Default::default(),
-            lit: Default::default(),
-            meshed: Default::default(),
-            waiting: Default::default(),
-            waiting_area: ((0, 0), 0, 0),
-            written: Default::default(),
-            saves,
-            deferred: Vec::new(),
-            deferred_owners: Vec::new(),
-            sequence: 0,
-            center: (0, 0),
-            radius: 8,
-            forced: HashSet::new(),
-            paused: false,
-            loading: false,
-            sky_light: true,
-            nether_shading: false,
-            biome_zoom: BiomeZoom::new(0),
-            biome_blend: 2,
-            smooth_lighting: true,
-            cutout_leaves: true,
-            light_tables,
-            light_log: Vec::new(),
-            light_edit_sequence: 0,
-            light_snapshots: Default::default(),
-            generated_total: 0,
-            meshed_total: 0,
-            remote: false,
-            extra: Vec::new(),
-            cover: None,
-            mesh: true,
-            band: None,
-            band_ranked: None,
+            };
+            match spawned {
+                Ok(handle) => {
+                    streaming.threads.push(handle);
+                    #[cfg(feature = "paired-packages")]
+                    if let Some(retained) = &mut streaming.retained {
+                        retained.workers += 1;
+                    }
+                }
+                Err(error) => {
+                    let error = error.to_string();
+                    #[cfg(feature = "paired-packages")]
+                    if let Some(retained) = &mut streaming.retained {
+                        retained.startup_error = Some(error.clone());
+                    }
+                    return Err(StreamingStartFailure { streaming, error });
+                }
+            }
         }
+        streaming.constructor_complete = true;
+        Ok(streaming)
     }
     /// Shares generation resources, but gives distant work its own worker state.
     pub fn lod_source(&self) -> Arc<dyn LodSource> {
@@ -1135,6 +1804,9 @@ impl Streaming {
     /// models and sprites, and rebuild every loaded section. Meshes in flight
     /// were made with the old resources; their results are dropped.
     pub fn reload_resources(&mut self, world: &mut World, context: Arc<WorkerContext>) {
+        if self.retained_sealed() {
+            return;
+        }
         *self.shared.context.write().unwrap() = context;
         self.meshing.clear();
         for &(x, z) in world.chunks.keys() {
@@ -1149,6 +1821,9 @@ impl Streaming {
     /// (`ClientPacketListener.handleLevelChunkWithLight`): nothing is
     /// relit, and it and its neighbours remesh (`enableChunkLight`).
     pub fn insert_remote(&mut self, world: &mut World, chunk: Chunk) {
+        if self.retained_sealed() {
+            return;
+        }
         let key = (chunk.x, chunk.z);
         self.lighting.remove(&key);
         self.light_snapshots.remove(&key);
@@ -1182,6 +1857,9 @@ impl Streaming {
     }
     /// A column the server unloaded (ClientboundForgetLevelChunkPacket).
     pub fn forget(&mut self, world: &mut World, x: i32, z: i32) -> Option<Arc<Chunk>> {
+        if self.retained_sealed() {
+            return None;
+        }
         self.lit.remove(&(x, z));
         self.meshed.remove(&(x, z));
         self.lighting.remove(&(x, z));
@@ -1325,6 +2003,13 @@ impl Streaming {
             if chunk.fresh {
                 let chunk = Arc::new(chunk);
                 if self.generation_save_error.is_some() {
+                    #[cfg(feature = "paired-packages")]
+                    if let Some(retained) = &mut self.retained {
+                        retained.finished_backlog.push((chunk, None));
+                    } else {
+                        self.failed_finished.push(chunk);
+                    }
+                    #[cfg(not(feature = "paired-packages"))]
                     self.failed_finished.push(chunk);
                 } else {
                     let owner = WorkLease::new(
@@ -1333,10 +2018,20 @@ impl Streaming {
                         WorkPhase::Reconciling,
                     );
                     let outcome = self.saves.save_finished(&chunk);
+                    #[cfg(feature = "paired-packages")]
+                    let outcome = self
+                        .retained_handoff_result(NativeWorkOrigin::SaveFinishedCallback, outcome);
                     owner.storage(outcome.is_ok());
                     match outcome {
                         Ok(()) => owner.settle(),
                         Err(error) => {
+                            #[cfg(feature = "paired-packages")]
+                            if let Some(retained) = &mut self.retained {
+                                retained.finished_backlog.push((chunk, Some(owner)));
+                            } else {
+                                self.failed_finished.push(chunk);
+                            }
+                            #[cfg(not(feature = "paired-packages"))]
                             self.failed_finished.push(chunk);
                             self.fail_generation_save(error);
                             // Failed or partial storage enqueue stays a named fault.
@@ -1483,6 +2178,9 @@ impl Streaming {
         &mut self,
         world: &mut World,
     ) -> (Vec<((i32, i32, i32), SectionMesh)>, Vec<Arc<Chunk>>) {
+        if self.retained_sealed() {
+            return (Vec::new(), Vec::new());
+        }
         let mut uploads = Vec::new();
         if self.paused {
             return (uploads, Vec::new());
@@ -1503,6 +2201,11 @@ impl Streaming {
             }
         }
         for ReceivedWork { done, mut owner } in deferred.into_iter().chain(received) {
+            #[cfg(feature = "paired-packages")]
+            if matches!(&done, Done::RetainedLoad(..)) {
+                self.defer(ReceivedWork { done, owner });
+                continue;
+            }
             if let Some(owner) = &mut owner {
                 owner.advance(WorkPhase::Reconciling);
             }
@@ -1573,6 +2276,10 @@ impl Streaming {
                     self.meshing.remove(&(x, sy, z));
                     self.meshed_total += 1;
                     uploads.push(((x, sy, z), mesh));
+                }
+                #[cfg(feature = "paired-packages")]
+                Done::RetainedLoad(..) => {
+                    unreachable!("retained native records remain owned for checked handoff")
                 }
             }
         }
@@ -2014,6 +2721,9 @@ impl Streaming {
     /// the IOWorker too), and those out in jobs are saved later, as they
     /// unload or at the next save.
     pub fn save(&mut self, world: &mut World, wait: bool) -> crate::Result<()> {
+        if self.retained_sealed() {
+            return Err("retained producer submissions are sealed".into());
+        }
         if !wait {
             self.reconcile_ready_save_results(world);
             self.generation_save_result()?;
@@ -2068,9 +2778,29 @@ impl Streaming {
                 WorkPhase::Reconciling,
             );
             let outcome = self.saves.save_protos(&protos);
+            #[cfg(feature = "paired-packages")]
+            let outcome =
+                self.retained_handoff_result(NativeWorkOrigin::SaveProtosCallback, outcome);
             owner.storage(outcome.is_ok());
             if outcome.is_ok() {
                 owner.settle();
+            } else {
+                #[cfg(feature = "paired-packages")]
+                if let Some(retained) = &mut self.retained {
+                    let keys = self
+                        .written
+                        .iter()
+                        .filter(|key| self.protos.get(*key).is_some_and(Option::is_some))
+                        .copied()
+                        .collect();
+                    retained.proto_batches.push(RetainedProtoBatch {
+                        keys,
+                        owner,
+                        outcome: None,
+                        accepted: false,
+                        cleared: 0,
+                    });
+                }
             }
             outcome
         };
@@ -2103,6 +2833,9 @@ impl Streaming {
         deadline: std::time::Instant,
         mut writers_finished: impl FnMut() -> crate::Result<bool>,
     ) -> crate::Result<()> {
+        if self.retained_sealed() {
+            return Err("retained producer submissions are sealed".into());
+        }
         loop {
             self.reconcile_native_fence_results(world);
             if self.native_fence_producers_closed()? {
@@ -2272,6 +3005,9 @@ impl Streaming {
     /// Proto snapshots are checked out to workers before chunk writes, just as
     /// in `save(true)`, so older generation cannot overwrite the final chunks.
     pub fn poll_save(&mut self, world: &mut World) -> crate::Result<bool> {
+        if self.retained_sealed() {
+            return Err("retained producer submissions are sealed".into());
+        }
         self.poll_save_budget(world, std::time::Duration::from_millis(2))
     }
     fn poll_save_budget(
@@ -2336,6 +3072,9 @@ impl Streaming {
     /// decorates in vanilla's order (`forced_order`), after every chunk
     /// ranked before.
     pub fn rank_forced(&mut self, x0: i32, z0: i32, x1: i32, z1: i32) {
+        if self.retained_sealed() {
+            return;
+        }
         for (x, z) in horizon_world::worldgen::decoration_order::forced_order(x0, z0, x1, z1) {
             self.decoration_order.rank_or_append(x, z);
         }
@@ -2346,6 +3085,9 @@ impl Streaming {
     /// within reach, so that a task decorates in the same order however its
     /// work is timed and shared among the workers.
     pub fn set_band(&mut self, band: Option<Band>) {
+        if self.retained_sealed() {
+            return;
+        }
         if self.band == band {
             return;
         }
@@ -2374,6 +3116,9 @@ impl Streaming {
     /// and unlit with none (those whose neighbours are all loaded are queued
     /// for light again).
     pub fn unstick_light(&mut self, world: &mut World, keys: &[(i32, i32)]) -> [usize; 3] {
+        if self.retained_sealed() {
+            return [0; 3];
+        }
         let mut counts = [0; 3];
         for &key in keys {
             if !world.chunks.contains_key(&key) {
@@ -2393,6 +3138,9 @@ impl Streaming {
     /// Wait up to `timeout` for a worker to finish a job; the next `update`
     /// takes it. A server pumps generation with this between its ticks.
     pub fn wait(&mut self, timeout: std::time::Duration) {
+        if self.retained_sealed() {
+            return;
+        }
         match self.results.recv_timeout(timeout) {
             Ok(done) => self.defer(self.received(done)),
             Err(mpsc::RecvTimeoutError::Disconnected) => self.result_disconnected(),
@@ -2400,6 +3148,1314 @@ impl Streaming {
         }
     }
 }
+#[cfg(feature = "paired-packages")]
+impl RetainedProducerClose {
+    fn block(&mut self, reason: impl Into<String>) -> RetainedStreamStatus {
+        let reason = reason.into();
+        self.history.push(reason.clone());
+        self.status = RetainedStreamStatus::Blocked(reason);
+        self.status.clone()
+    }
+}
+
+#[cfg(feature = "paired-packages")]
+impl Streaming {
+    pub fn begin_retained_close(
+        &mut self,
+        world: Option<&World>,
+        deadline: std::time::Instant,
+    ) -> Result<(), String> {
+        let retained = self
+            .retained
+            .as_mut()
+            .ok_or("streaming was not started retained")?;
+        let identity = world.map(|w| w as *const World as usize);
+        if let Some(close) = &retained.close {
+            return if close.world == identity {
+                Ok(())
+            } else {
+                Err("retained close world changed".into())
+            };
+        }
+        retained.close = Some(RetainedProducerClose {
+            world: identity,
+            membership: world.map(|w| w.chunks.membership_revision()),
+            deadline,
+            status: RetainedStreamStatus::Pending,
+            history: retained.startup_error.iter().cloned().collect(),
+            deferred: std::mem::take(&mut self.deferred).into_iter(),
+            owners: std::mem::take(&mut self.deferred_owners)
+                .into_iter()
+                .peekable(),
+            deferred_index: 0,
+            incoming: None,
+            current: None,
+            finished: None,
+            callback: None,
+            proto_callback: None,
+            serial: 0,
+            stopped: false,
+            joined: 0,
+            failed_initialization: retained.startup_error.is_some(),
+            witness_taken: false,
+            written: None,
+            proto_key: None,
+            proto_outcome: None,
+            finished_outcome: None,
+            proto_scan: None,
+            protos_checked: false,
+            join_scan: 0,
+            finished_backlog: std::mem::take(&mut retained.finished_backlog).into_iter(),
+            proto_batches: std::mem::take(&mut retained.proto_batches).into_iter(),
+            proto_batch: None,
+            save_restore: None,
+            light_replay: None,
+            loaded: None,
+            accepted_loaded: Vec::new(),
+            finished_stored: false,
+            ack_cursor: 0,
+            ack_error: None,
+            writer_acknowledged: false,
+            refused: None,
+            refused_inputs: Vec::new(),
+            refusal_errors: Vec::new(),
+        });
+        if let Some(error) = &self.generation_save_error {
+            retained.close.as_mut().unwrap().block(error.clone());
+        }
+        Ok(())
+    }
+
+    #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+    pub fn arm_retained_handoff_test_control(
+        &mut self,
+        origin: NativeWorkOrigin,
+    ) -> Result<RetainedHandoffTestReceipt, String> {
+        if !matches!(
+            origin,
+            NativeWorkOrigin::SaveProtosCallback | NativeWorkOrigin::SaveFinishedCallback
+        ) {
+            return Err("retained handoff control requires a native callback origin".into());
+        }
+        let retained = self
+            .retained
+            .as_mut()
+            .ok_or("streaming was not started retained")?;
+        if retained
+            .handoff_gate
+            .as_ref()
+            .is_some_and(|g| !g.released.load(Ordering::Acquire))
+        {
+            return Err("retained handoff control already armed".into());
+        }
+        let gate = Arc::new(RetainedHandoffGate {
+            origin,
+            entered: AtomicBool::new(false),
+            released: AtomicBool::new(false),
+            report_error: AtomicBool::new(false),
+        });
+        retained.handoff_gate = Some(gate.clone());
+        Ok(RetainedHandoffTestReceipt { gate })
+    }
+
+    fn retained_handoff_held(&self, origin: NativeWorkOrigin) -> bool {
+        #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+        if let Some(gate) = self
+            .retained
+            .as_ref()
+            .and_then(|r| r.handoff_gate.as_ref())
+            .filter(|g| g.origin == origin)
+        {
+            gate.entered.store(true, Ordering::Release);
+            return !gate.released.load(Ordering::Acquire);
+        }
+        let _ = origin;
+        false
+    }
+
+    fn retained_handoff_result(
+        &self,
+        origin: NativeWorkOrigin,
+        outcome: Result<(), String>,
+    ) -> Result<(), String> {
+        #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+        if outcome.is_ok()
+            && self
+                .retained
+                .as_ref()
+                .and_then(|r| r.handoff_gate.as_ref())
+                .filter(|g| g.origin == origin)
+                .is_some_and(|g| g.report_error.swap(false, Ordering::AcqRel))
+        {
+            return Err("controlled error observed after actual native storage acceptance".into());
+        }
+        let _ = origin;
+        outcome
+    }
+
+    #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+    pub fn arm_retained_native_work_test_control(
+        &mut self,
+        origin: NativeWorkOrigin,
+    ) -> Result<RetainedStreamingStartTestReceipt, String> {
+        if !matches!(
+            origin,
+            NativeWorkOrigin::Generate
+                | NativeWorkOrigin::Decorate
+                | NativeWorkOrigin::Finish
+                | NativeWorkOrigin::Light
+                | NativeWorkOrigin::Mesh
+                | NativeWorkOrigin::Save
+        ) {
+            return Err("native worker control requires a queued work origin".into());
+        }
+        if self.retained.is_none() {
+            return Err("streaming was not started retained".into());
+        }
+        let mut slot = self
+            .shared
+            .retained_work_gate
+            .lock()
+            .map_err(|_| "retained native control mutex poisoned")?;
+        if slot
+            .as_ref()
+            .is_some_and(|g| !g.gate.released.lock().map(|v| *v).unwrap_or(false))
+        {
+            return Err("native worker control already armed".into());
+        }
+        let gate = Arc::new(RetainedStartGate {
+            entered: AtomicBool::new(false),
+            released: Mutex::new(false),
+            ready: Condvar::new(),
+        });
+        *slot = Some(RetainedWorkGate {
+            origin,
+            gate: gate.clone(),
+            panic_after_release: false,
+        });
+        Ok(RetainedStreamingStartTestReceipt { gate })
+    }
+
+    #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+    pub fn submit_retained_native_test_column(&mut self, x: i32, z: i32) -> Result<(), String> {
+        let retained = self
+            .retained
+            .as_mut()
+            .ok_or("streaming was not started retained")?;
+        if retained.close.is_some()
+            || retained.test_column.is_some()
+            || self.generating.contains(&(x, z))
+            || self.finishing.contains(&(x, z))
+        {
+            return Err("native column test submission unavailable".into());
+        }
+        retained.test_column = Some((x, z));
+        self.generating.insert((x, z));
+        self.submit(Some((x, z)), 0, Job::Generate(x, z));
+        Ok(())
+    }
+
+    /// A fixed native TestTerrain stage advance for focused bin fixtures. Real
+    /// decorated generators must use their existing neighbour protocol instead.
+    #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+    pub fn poll_retained_native_test_finish(&mut self) -> Result<bool, String> {
+        let retained = self
+            .retained
+            .as_ref()
+            .ok_or("streaming was not started retained")?;
+        if retained.close.is_some() {
+            return Err("native column test stage is sealed".into());
+        }
+        let key = retained
+            .test_column
+            .ok_or("native column test has no original request")?;
+        if self.decorates {
+            return Err("native column test cannot skip decoration".into());
+        }
+        let done = match self.results.try_recv() {
+            Ok(done) => done,
+            Err(mpsc::TryRecvError::Empty) => return Ok(false),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                return Err("native column test producer disconnected".into());
+            }
+        };
+        let work = self.received(done);
+        match work {
+            ReceivedWork {
+                done: Done::Proto(x, z, proto, decorated),
+                mut owner,
+            } if (x, z) == key => {
+                let valid = owner.as_ref().is_some_and(|o| {
+                    o.origin == NativeWorkOrigin::Generate
+                        && Arc::ptr_eq(&o.book, &self.shared.ownership)
+                });
+                if !valid {
+                    self.defer(ReceivedWork {
+                        done: Done::Proto(x, z, proto, decorated),
+                        owner,
+                    });
+                    return Err("native column test lost its original receipt".into());
+                }
+                owner.as_mut().unwrap().advance(WorkPhase::Reconciling);
+                let _reconciliation = Reconciliation(owner);
+                self.generating.remove(&key);
+                self.finishing.insert(key);
+                self.submit(Some(key), 0, Job::Finish(proto));
+                self.retained.as_mut().unwrap().test_column = None;
+                Ok(true)
+            }
+            work => {
+                let loaded = matches!(&work.done,Done::RetainedLoad(x,z,_) if (*x,*z)==key);
+                self.defer(work);
+                if loaded {
+                    self.retained.as_mut().unwrap().test_column = None;
+                    Ok(true)
+                } else {
+                    Err("native column test observed unrelated original work".into())
+                }
+            }
+        }
+    }
+
+    pub fn retained_close_failures(&self) -> &[String] {
+        self.retained
+            .as_ref()
+            .and_then(|r| r.close.as_ref())
+            .map_or(&[], |c| c.history.as_slice())
+    }
+
+    pub fn retry_retained_close(&mut self, deadline: std::time::Instant) -> Result<(), String> {
+        let close = self
+            .retained
+            .as_mut()
+            .and_then(|r| r.close.as_mut())
+            .ok_or("retained close has not begun")?;
+        if !matches!(close.status, RetainedStreamStatus::Blocked(_)) {
+            return Err("retained close retry requires a blocked attempt".into());
+        }
+        if deadline <= std::time::Instant::now() {
+            return Err("retained close retry deadline expired".into());
+        }
+        close.deadline = deadline;
+        close.status = RetainedStreamStatus::Pending;
+        if close.proto_outcome.as_ref().is_some_and(Result::is_err) {
+            close.proto_outcome = None;
+        }
+        if close.finished_outcome.as_ref().is_some_and(Result::is_err) {
+            close.finished_outcome = None;
+        }
+        if let Some(batch) = &mut close.proto_batch
+            && batch.outcome.as_ref().is_some_and(Result::is_err)
+        {
+            batch.outcome = None;
+        }
+        Ok(())
+    }
+
+    pub fn retained_finished_column(&self) -> Option<RetainedFinishedColumn<'_>> {
+        let close = self.retained.as_ref()?.close.as_ref()?;
+        let (chunk, owner) = close.finished.as_ref()?;
+        Some(RetainedFinishedColumn {
+            chunk,
+            origin: owner.origin,
+            evidence: close.loaded.as_ref(),
+            ticket: RetainedColumnTicket {
+                allocation: self.shared.clone(),
+                serial: close.serial,
+            },
+        })
+    }
+
+    pub fn retained_refused_read(&self) -> Option<RetainedRefusedRead<'_>> {
+        let close = self.retained.as_ref()?.close.as_ref()?;
+        let refused = close.refused.as_ref()?;
+        Some(RetainedRefusedRead {
+            load: &refused.load,
+            ticket: RetainedColumnTicket {
+                allocation: self.shared.clone(),
+                serial: close.serial,
+            },
+        })
+    }
+
+    pub fn retained_refusal_errors(&self) -> &[String] {
+        self.retained
+            .as_ref()
+            .and_then(|r| r.close.as_ref())
+            .map_or(&[], |c| c.refusal_errors.as_slice())
+    }
+
+    /// Account only an original native read which produced no new output.
+    /// The input, including an optional tolerant decoded view, stays owned until
+    /// the same native writer closes and its relevant versions are checked.
+    pub fn resolve_retained_refused_read(
+        &mut self,
+        ticket: RetainedColumnTicket,
+        error: String,
+    ) -> Result<bool, String> {
+        if !Arc::ptr_eq(&ticket.allocation, &self.shared) {
+            return Err("retained read ticket allocation mismatch".into());
+        }
+        let shared = self.shared.clone();
+        let retained = self
+            .retained
+            .as_mut()
+            .ok_or("streaming was not started retained")?;
+        let close = retained
+            .close
+            .as_mut()
+            .ok_or("retained close has not begun")?;
+        if ticket.serial != close.serial {
+            return Err("retained read ticket is stale".into());
+        }
+        if matches!(
+            close.status,
+            RetainedStreamStatus::Blocked(_) | RetainedStreamStatus::Complete
+        ) {
+            return Err("retained refused read attempt is not open".into());
+        }
+        if std::time::Instant::now() >= close.deadline {
+            close.block("retained producer close deadline exceeded");
+            return Err("retained producer close deadline exceeded".into());
+        }
+        let (records, position, original_error) = if let Some(refused) = &close.refused {
+            if refused.owner.origin != NativeWorkOrigin::Generate
+                || !Arc::ptr_eq(&refused.owner.book, &shared.ownership)
+                || refused.load.position() != refused.position
+            {
+                return Err("refused input has no original native read provenance".into());
+            }
+            let Some(records) = refused.load.evidence() else {
+                close.block("unknown provider ownership cannot be disposed as a native read");
+                return Err(
+                    "unknown provider ownership cannot be disposed as a native read".into(),
+                );
+            };
+            (
+                records,
+                refused.position,
+                refused.load.error().map(str::to_owned),
+            )
+        } else if let (Some((chunk, owner)), Some(records)) = (&close.finished, &close.loaded) {
+            if owner.origin != NativeWorkOrigin::Generate
+                || !Arc::ptr_eq(&owner.book, &shared.ownership)
+                || chunk.fresh
+                || close.finished_stored
+                || close.finished_outcome.is_some()
+                || close.callback.is_some()
+            {
+                return Err(
+                    "new output or callback cannot be disposed as a refused native read".into(),
+                );
+            }
+            (records, (chunk.x, chunk.z), None)
+        } else {
+            return Err("refused read has no retained original input".into());
+        };
+        if !Arc::ptr_eq(records.save(), &retained.save) || records.position() != position {
+            close.block("refused native read save/coordinate mismatch");
+            return Err("refused native read save/coordinate mismatch".into());
+        }
+        match records.poll_current()? {
+            None => return Ok(false),
+            Some(false) => {
+                close.block("refused native read conflicts with a newer accepted write");
+                return Err("refused native read conflicts with a newer accepted write".into());
+            }
+            Some(true) => {}
+        }
+        let mut book = match shared.ownership.try_lock() {
+            Ok(book) => book,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                close.block("retained ownership mutex poisoned");
+                return Err("retained ownership mutex poisoned".into());
+            }
+        };
+        if book.accounting_fault
+            || book.receipt_mismatch
+            || book.worker_exit_fault
+            || book.result_disconnected
+            || book.counts.iter().any(|c| c.unresolved != 0)
+        {
+            close.block("refused read cannot waive a native ownership fault");
+            return Err("refused read cannot waive a native ownership fault".into());
+        }
+        let Some(next) = close.serial.checked_add(1) else {
+            close.block("retained column serial exhausted");
+            return Err("retained column serial exhausted".into());
+        };
+        close.serial = next;
+        let stored = if let Some(refused) = close.refused.take() {
+            refused.owner.settle_locked(&mut book);
+            RetainedRefusedInput::Raw(refused.load)
+        } else {
+            let (chunk, owner) = close.finished.take().unwrap();
+            owner.settle_locked(&mut book);
+            RetainedRefusedInput::Loaded {
+                _chunk: chunk,
+                records: close.loaded.take().unwrap(),
+            }
+        };
+        self.generating.remove(&position);
+        let original_error = original_error.unwrap_or(error);
+        close.refusal_errors.push(original_error.clone());
+        close.history.push(original_error);
+        close.refused_inputs.push(stored);
+        close.status = RetainedStreamStatus::Pending;
+        Ok(true)
+    }
+
+    pub fn reject_retained_finished_column(
+        &mut self,
+        ticket: RetainedColumnTicket,
+        error: String,
+    ) -> Result<(), String> {
+        if !Arc::ptr_eq(&ticket.allocation, &self.shared) {
+            return Err("retained column ticket allocation mismatch".into());
+        }
+        let close = self
+            .retained
+            .as_mut()
+            .and_then(|r| r.close.as_mut())
+            .ok_or("retained close has not begun")?;
+        if ticket.serial != close.serial || close.finished.is_none() {
+            return Err("retained column ticket is stale".into());
+        }
+        if let Some(next) = close.serial.checked_add(1) {
+            close.serial = next;
+        } else {
+            close.block("retained column serial exhausted");
+            return Err("retained column serial exhausted".into());
+        }
+        close.block(error);
+        Ok(())
+    }
+
+    /// Resolve only after the caller validates the complete borrowed native
+    /// column. No unique payload crosses this boundary, including on failure.
+    pub fn resolve_retained_finished_column(
+        &mut self,
+        ticket: RetainedColumnTicket,
+        disposition: RetainedColumnDisposition,
+    ) -> Result<bool, String> {
+        if !Arc::ptr_eq(&ticket.allocation, &self.shared) {
+            return Err("retained column ticket allocation mismatch".into());
+        }
+        let expected_save = self
+            .retained
+            .as_ref()
+            .ok_or("streaming was not started retained")?
+            .save
+            .clone();
+        #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+        let handoff_gate = self
+            .retained
+            .as_ref()
+            .and_then(|r| r.handoff_gate.as_ref())
+            .cloned();
+        let close = self
+            .retained
+            .as_mut()
+            .and_then(|r| r.close.as_mut())
+            .ok_or("retained close has not begun")?;
+        if ticket.serial != close.serial || close.finished.is_none() {
+            return Err("retained column ticket is stale".into());
+        }
+        if matches!(
+            close.status,
+            RetainedStreamStatus::Blocked(_) | RetainedStreamStatus::Complete
+        ) {
+            return Err("retained column attempt is not open".into());
+        }
+        if std::time::Instant::now() >= close.deadline {
+            close.block("retained producer close deadline exceeded");
+            return Err("retained producer close deadline exceeded".into());
+        }
+        let chunk = &close.finished.as_ref().unwrap().0;
+        match disposition {
+            RetainedColumnDisposition::AlreadyStored => {
+                let Some(evidence) = &close.loaded else {
+                    return Err("original raw native storage provenance required".into());
+                };
+                if chunk.fresh
+                    || evidence.position() != (chunk.x, chunk.z)
+                    || !Arc::ptr_eq(evidence.save(), &expected_save)
+                {
+                    return Err("loaded native provenance allocation/position mismatch".into());
+                }
+                match evidence.poll_current()? {
+                    None => return Ok(false),
+                    Some(false) => {
+                        close.block("loaded native record changed after strict validation");
+                        return Err("loaded native record changed after strict validation".into());
+                    }
+                    Some(true) => {}
+                }
+                let Some(next) = close.serial.checked_add(1) else {
+                    close.block("retained column serial exhausted");
+                    return Err("retained column serial exhausted".into());
+                };
+                close.serial = next;
+                close.finished_stored = true;
+                close.finished_outcome = Some(Ok(()));
+                return Ok(true);
+            }
+            RetainedColumnDisposition::StoreFresh if !chunk.fresh => {
+                return Err("loaded column cannot be classified fresh".into());
+            }
+            RetainedColumnDisposition::StoreFresh => {}
+        }
+        if close.finished_outcome.is_some() {
+            return Ok(false);
+        }
+        if close.callback.is_none()
+            && close.finished.as_ref().unwrap().1.origin != NativeWorkOrigin::SaveFinishedCallback
+        {
+            let mut book = match self.shared.ownership.try_lock() {
+                Ok(book) => book,
+                Err(std::sync::TryLockError::WouldBlock) => return Ok(false),
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    close.block("retained ownership mutex poisoned");
+                    return Err("retained ownership mutex poisoned".into());
+                }
+            };
+            close.callback = Some(WorkLease::new_locked(
+                &self.shared.ownership,
+                &mut book,
+                NativeWorkOrigin::SaveFinishedCallback,
+            ));
+        }
+        #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+        if let Some(gate) = handoff_gate
+            .as_ref()
+            .filter(|g| g.origin == NativeWorkOrigin::SaveFinishedCallback)
+        {
+            gate.entered.store(true, Ordering::Release);
+            if !gate.released.load(Ordering::Acquire) {
+                return Ok(false);
+            }
+        }
+        let Some(next) = close.serial.checked_add(1) else {
+            close.block("retained column serial exhausted");
+            return Err("retained column serial exhausted".into());
+        };
+        close.serial = next;
+        let outcome = self.saves.save_finished(chunk);
+        #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+        let outcome = if outcome.is_ok()
+            && handoff_gate
+                .as_ref()
+                .filter(|g| g.origin == NativeWorkOrigin::SaveFinishedCallback)
+                .is_some_and(|g| g.report_error.swap(false, Ordering::AcqRel))
+        {
+            Err("controlled error observed after actual native storage acceptance".into())
+        } else {
+            outcome
+        };
+        let accepted = outcome.is_ok();
+        close.finished_outcome = Some(outcome);
+        Ok(accepted)
+    }
+
+    pub fn poll_retained_close(&mut self, world: Option<&mut World>) -> RetainedStreamStatus {
+        let Some(retained) = &mut self.retained else {
+            return RetainedStreamStatus::Blocked("streaming was not started retained".into());
+        };
+        let Some(mut close) = retained.close.take() else {
+            return RetainedStreamStatus::Blocked("retained close has not begun".into());
+        };
+        let status = self.poll_retained_turn(&mut close, world);
+        close.status = status.clone();
+        self.retained.as_mut().unwrap().close = Some(close);
+        status
+    }
+
+    fn poll_retained_turn(
+        &mut self,
+        close: &mut RetainedProducerClose,
+        mut world: Option<&mut World>,
+    ) -> RetainedStreamStatus {
+        if matches!(
+            close.status,
+            RetainedStreamStatus::Blocked(_) | RetainedStreamStatus::Complete
+        ) {
+            return close.status.clone();
+        }
+        if close.world != world.as_deref().map(|w| w as *const World as usize)
+            || close.membership != world.as_deref().map(|w| w.chunks.membership_revision())
+        {
+            return close.block("retained close original World changed");
+        }
+        let started = std::time::Instant::now();
+        for _ in 0..16 {
+            if std::time::Instant::now() >= close.deadline {
+                return close.block("retained producer close deadline exceeded");
+            }
+            if started.elapsed() >= std::time::Duration::from_millis(2) {
+                return RetainedStreamStatus::Pending;
+            }
+            let shared = self.shared.clone();
+            let mut book = match shared.ownership.try_lock() {
+                Ok(book) => book,
+                Err(std::sync::TryLockError::WouldBlock) => return RetainedStreamStatus::Pending,
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    return close.block("retained ownership mutex poisoned");
+                }
+            };
+            let no_jobs = book.counts.iter().all(|c| c.submitted == 0);
+            if book.accounting_fault
+                || book.receipt_mismatch
+                || book.worker_exit_fault
+                || (book.result_disconnected && !no_jobs)
+                || book.counts.iter().any(|c| c.unresolved != 0)
+            {
+                return close.block("retained native ownership fault; original owners retained");
+            }
+            close.failed_initialization |= book.result_disconnected && no_jobs;
+            if close.refused.is_some() {
+                return RetainedStreamStatus::NeedsRefusedRead;
+            }
+            if let Some(replay) = &mut close.light_replay {
+                if let Some(&(seq, p)) = self.light_log.get(replay.index) {
+                    replay.index += 1;
+                    if seq > replay.snapshot
+                        && ((p.0 >> 4) - replay.x).abs() <= 1
+                        && ((p.2 >> 4) - replay.z).abs() <= 1
+                    {
+                        replay.positions.push(p);
+                    }
+                    continue;
+                }
+                if !replay.positions.is_empty() {
+                    let Some(world) = world.as_deref_mut() else {
+                        return close.block("retained light replay lost original World");
+                    };
+                    let mut changed = LightChanges::default();
+                    crate::light::relight(
+                        &mut world.chunks,
+                        &self.light_tables,
+                        self.sky_light,
+                        &replay.positions,
+                        true,
+                        &mut changed,
+                    );
+                    Self::mark_light_changes(world, &changed);
+                }
+                replay.owner.take().unwrap().settle_locked(&mut book);
+                close.light_replay = None;
+                continue;
+            }
+            if let Some(restore) = &mut close.save_restore {
+                if restore.current.is_none() {
+                    restore.current = restore.protos.next();
+                }
+                if let Some((key, proto)) = restore.current.take() {
+                    if self.protos.get(&key).is_some_and(Option::is_some) {
+                        restore.current = Some((key, proto));
+                        return close.block("retained save proto owner collision");
+                    }
+                    self.protos.insert(key, Some(proto));
+                    if restore.outcome.is_err() {
+                        self.written.insert(key);
+                    }
+                    continue;
+                }
+                restore.owner.take().unwrap().settle_locked(&mut book);
+                close.save_restore = None;
+                continue;
+            }
+            if close.finished.is_some() {
+                let Some(outcome) = close.finished_outcome.take() else {
+                    return RetainedStreamStatus::NeedsFinishedColumn;
+                };
+                if !close.finished_stored {
+                    if let Some(callback) = &close.callback {
+                        callback.storage_locked(&mut book, outcome.is_ok());
+                    } else if let Some((_, owner)) = &close.finished {
+                        owner.storage_locked(&mut book, outcome.is_ok());
+                    }
+                }
+                if let Err(error) = outcome {
+                    close.finished_outcome = Some(Err(error.clone()));
+                    return close.block(error);
+                }
+                if let Some(callback) = close.callback.take() {
+                    callback.settle_locked(&mut book);
+                }
+                let (chunk, owner) = close.finished.take().unwrap();
+                if close.finished_stored {
+                    close.accepted_loaded.push(close.loaded.take().unwrap());
+                    close.finished_stored = false;
+                }
+                let key = (chunk.x, chunk.z);
+                self.generating.remove(&key);
+                self.finishing.remove(&key);
+                owner.settle_locked(&mut book);
+                continue;
+            }
+            if close.current.is_none() {
+                if let Some(done) = close.deferred.next() {
+                    let index = close.deferred_index;
+                    close.deferred_index += 1;
+                    let owner = if close.owners.peek().is_some_and(|(at, _)| *at == index) {
+                        close.owners.next().map(|(_, owner)| owner)
+                    } else {
+                        None
+                    };
+                    close.current = Some(ReceivedWork { done, owner });
+                } else {
+                    if close.owners.peek().is_some() {
+                        return close.block("retained deferred receipt without original payload");
+                    }
+                    if close.incoming.is_none() {
+                        match self.results.try_recv() {
+                            Ok(done) => close.incoming = Some(done),
+                            Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => {}
+                        }
+                    }
+                    if let Some(done) = &close.incoming {
+                        let mut returned = match shared.returned.try_lock() {
+                            Ok(returned) => returned,
+                            Err(std::sync::TryLockError::WouldBlock) => {
+                                return RetainedStreamStatus::Pending;
+                            }
+                            Err(std::sync::TryLockError::Poisoned(_)) => {
+                                return close.block("retained returned receipt mutex poisoned");
+                            }
+                        };
+                        if !returned
+                            .front()
+                            .is_some_and(|(stamp, _)| *stamp == done.stamp())
+                        {
+                            book.receipt_mismatch = true;
+                            return close.block("retained native result receipt mismatch");
+                        }
+                        let owner = returned.pop_front().map(|(_, owner)| owner);
+                        close.current = Some(ReceivedWork {
+                            done: close.incoming.take().unwrap(),
+                            owner,
+                        });
+                    }
+                }
+            }
+            if let Some(mut work) = close.current.take() {
+                let Some(mut owner) = work.owner.take() else {
+                    close.current = Some(work);
+                    return close.block("retained native result has no original work lease");
+                };
+                let correct_origin = match &work.done {
+                    Done::Generated(_) => matches!(
+                        owner.origin,
+                        NativeWorkOrigin::Generate | NativeWorkOrigin::Finish
+                    ),
+                    Done::RetainedLoad(..) => owner.origin == NativeWorkOrigin::Generate,
+                    Done::Proto(..) => owner.origin == NativeWorkOrigin::Generate,
+                    Done::Decorated(..) => owner.origin == NativeWorkOrigin::Decorate,
+                    Done::Saved(..) => owner.origin == NativeWorkOrigin::Save,
+                    Done::Lit(..) => owner.origin == NativeWorkOrigin::Light,
+                    Done::Meshed(..) => owner.origin == NativeWorkOrigin::Mesh,
+                };
+                if !correct_origin || !Arc::ptr_eq(&owner.book, &shared.ownership) {
+                    work.owner = Some(owner);
+                    close.current = Some(work);
+                    book.receipt_mismatch = true;
+                    return close.block("retained result origin/allocation mismatch");
+                }
+                owner.advance_locked(&mut book, WorkPhase::Reconciling);
+                if world.is_none() {
+                    work.owner = Some(owner);
+                    close.current = Some(work);
+                    return close
+                        .block("retained partial constructor unexpectedly submitted native work");
+                }
+                let world = world.as_deref_mut().unwrap();
+                match work.done {
+                    Done::RetainedLoad(x, z, load) => match load.into_parts() {
+                        Ok((chunk, evidence)) => {
+                            let collision = world.chunks.contains_key(&(chunk.x, chunk.z));
+                            let valid = evidence.position() == (x, z)
+                                && (chunk.x, chunk.z) == (x, z)
+                                && Arc::ptr_eq(
+                                    evidence.save(),
+                                    &self.retained.as_ref().unwrap().save,
+                                );
+                            close.finished = Some((Arc::new(chunk), owner));
+                            close.loaded = Some(evidence);
+                            let Some(next) = close.serial.checked_add(1) else {
+                                return close.block("retained column serial exhausted");
+                            };
+                            close.serial = next;
+                            if !valid || collision {
+                                return close.block("retained loaded native allocation/coordinate/resident ambiguity");
+                            }
+                            return RetainedStreamStatus::NeedsFinishedColumn;
+                        }
+                        Err(load) => {
+                            close.refused = Some(RetainedRefusedReadOwner {
+                                position: (x, z),
+                                load,
+                                owner,
+                            });
+                            let Some(next) = close.serial.checked_add(1) else {
+                                return close.block("retained column serial exhausted");
+                            };
+                            close.serial = next;
+                            return RetainedStreamStatus::NeedsRefusedRead;
+                        }
+                    },
+                    Done::Generated(chunk) => {
+                        let collision = world.chunks.contains_key(&(chunk.x, chunk.z));
+                        close.finished = Some((Arc::new(chunk), owner));
+                        let Some(next) = close.serial.checked_add(1) else {
+                            return close.block("retained column serial exhausted");
+                        };
+                        close.serial = next;
+                        if collision {
+                            return close.block(
+                                "retained finished column collides with original resident owner",
+                            );
+                        }
+                        return RetainedStreamStatus::NeedsFinishedColumn;
+                    }
+                    Done::Proto(x, z, proto, decorated) => {
+                        if self.protos.get(&(x, z)).is_some_and(Option::is_some) {
+                            close.current = Some(ReceivedWork {
+                                done: Done::Proto(x, z, proto, decorated),
+                                owner: Some(owner),
+                            });
+                            return close.block("retained proto owner collision");
+                        }
+                        self.generating.remove(&(x, z));
+                        self.protos.insert((x, z), Some(proto));
+                        if decorated {
+                            self.decorated.insert((x, z));
+                            self.written.insert((x, z));
+                        }
+                    }
+                    Done::Decorated(x, z, region) => {
+                        let collision = (0..9).any(|i| {
+                            self.protos
+                                .get(&(x + i % 3 - 1, z + i / 3 - 1))
+                                .is_some_and(Option::is_some)
+                        });
+                        if collision || self.decorating == 0 {
+                            close.current = Some(ReceivedWork {
+                                done: Done::Decorated(x, z, region),
+                                owner: Some(owner),
+                            });
+                            return close.block("retained decoration owner/count mismatch");
+                        }
+                        self.receive_decorated(x, z, *region);
+                    }
+                    Done::Saved(protos, outcome) => {
+                        if self.saving == 0 {
+                            close.current = Some(ReceivedWork {
+                                done: Done::Saved(protos, outcome),
+                                owner: Some(owner),
+                            });
+                            return close.block("retained save owner/count mismatch");
+                        }
+                        self.saving -= 1;
+                        let error = outcome.as_ref().err().cloned();
+                        close.save_restore = Some(RetainedSaveRestore {
+                            protos: protos.into_iter(),
+                            current: None,
+                            owner: Some(owner),
+                            outcome,
+                        });
+                        if let Some(error) = error {
+                            return close.block(error);
+                        }
+                        continue;
+                    }
+                    Done::Lit(x, z, sections, seq) => {
+                        if self.lighting.get(&(x, z)) == Some(&seq) {
+                            self.lighting.remove(&(x, z));
+                            let snapshot = self.light_snapshots.remove(&(x, z)).unwrap_or(u64::MAX);
+                            if let Some(chunk) = world.chunks.get_mut(&(x, z)) {
+                                let chunk = Arc::make_mut(chunk);
+                                let first = self.lit.insert((x, z));
+                                let mut changed = LightChanges::default();
+                                if first {
+                                    apply_lighting(chunk, sections);
+                                } else {
+                                    apply_relighting(chunk, sections, &mut changed);
+                                }
+                                if (first && !chunk.light_loaded) || !changed.is_empty() {
+                                    world.modified.insert((x, z));
+                                }
+                                chunk.lit = true;
+                                Self::mark_light_changes(world, &changed);
+                                close.light_replay = Some(RetainedLightReplay {
+                                    x,
+                                    z,
+                                    snapshot,
+                                    index: 0,
+                                    positions: Vec::new(),
+                                    owner: Some(owner),
+                                });
+                                continue;
+                            }
+                        }
+                    }
+                    Done::Meshed(x, sy, z, _mesh, seq) => {
+                        if self.meshing.get(&(x, sy, z)) == Some(&seq) {
+                            self.meshing.remove(&(x, sy, z));
+                        }
+                    }
+                }
+                owner.settle_locked(&mut book);
+                continue;
+            }
+            if let Some((chunk, owner)) = close.finished_backlog.next() {
+                let collision = world
+                    .as_deref()
+                    .is_none_or(|world| world.chunks.contains_key(&(chunk.x, chunk.z)));
+                let owner = owner.unwrap_or_else(|| {
+                    WorkLease::new_locked(
+                        &shared.ownership,
+                        &mut book,
+                        NativeWorkOrigin::SaveFinishedCallback,
+                    )
+                });
+                close.finished = Some((chunk, owner));
+                let Some(next) = close.serial.checked_add(1) else {
+                    return close.block("retained column serial exhausted");
+                };
+                close.serial = next;
+                if collision {
+                    return close.block(
+                        "retained failed finished column resident/original-World ambiguity",
+                    );
+                }
+                return RetainedStreamStatus::NeedsFinishedColumn;
+            }
+            if close.proto_batch.is_none() {
+                close.proto_batch = close.proto_batches.next();
+            }
+            if let Some(batch) = &mut close.proto_batch {
+                if batch.accepted {
+                    if let Some(key) = batch.keys.get(batch.cleared) {
+                        self.written.remove(key);
+                        batch.cleared += 1;
+                        continue;
+                    }
+                    close
+                        .proto_batch
+                        .take()
+                        .unwrap()
+                        .owner
+                        .settle_locked(&mut book);
+                    continue;
+                }
+                if let Some(outcome) = batch.outcome.take() {
+                    batch.owner.storage_locked(&mut book, outcome.is_ok());
+                    match outcome {
+                        Ok(()) => {
+                            batch.accepted = true;
+                            continue;
+                        }
+                        Err(error) => {
+                            batch.outcome = Some(Err(error.clone()));
+                            return close.block(error);
+                        }
+                    }
+                }
+                // This is one original native callback batch, with its exact
+                // original keys and proto owners. Native encoding is indivisible.
+                let refs: Option<Vec<&Proto>> = batch
+                    .keys
+                    .iter()
+                    .map(|key| self.protos.get(key).and_then(Option::as_ref))
+                    .collect();
+                let Some(refs) = refs else {
+                    book.accounting_fault = true;
+                    return close.block("retained original proto callback batch lost an owner");
+                };
+                if self.retained_handoff_held(NativeWorkOrigin::SaveProtosCallback) {
+                    return RetainedStreamStatus::Pending;
+                }
+                drop(book);
+                batch.outcome = Some(self.retained_handoff_result(
+                    NativeWorkOrigin::SaveProtosCallback,
+                    self.saves.save_protos(&refs),
+                ));
+                return RetainedStreamStatus::Pending;
+            }
+            let mut active = false;
+            for counts in &book.counts {
+                let total = [
+                    counts.queued,
+                    counts.worker_held,
+                    counts.returned,
+                    counts.reconciling,
+                    counts.disposed,
+                    counts.unresolved,
+                ]
+                .into_iter()
+                .try_fold(0u64, u64::checked_add);
+                if total != Some(counts.submitted) {
+                    return close.block("retained all-origin conservation mismatch");
+                }
+                active |= counts.queued != 0
+                    || counts.worker_held != 0
+                    || counts.returned != 0
+                    || counts.reconciling != 0;
+            }
+            // The close-specific proto callback is itself a reconciling origin.
+            if active && close.proto_callback.is_none() {
+                return RetainedStreamStatus::Pending;
+            }
+            if !close.protos_checked {
+                if close.proto_scan.is_none() {
+                    close.proto_scan = Some(std::mem::take(&mut self.protos).into_iter());
+                }
+                if let Some((key, proto)) = close.proto_scan.as_mut().unwrap().next() {
+                    let missing = proto.is_none();
+                    self.protos.insert(key, proto);
+                    if missing {
+                        book.accounting_fault = true;
+                        return close
+                            .block("retained checked-out proto has no original completion");
+                    }
+                    continue;
+                }
+                close.proto_scan = None;
+                close.protos_checked = true;
+            }
+            if close.proto_key.is_none() {
+                if close.written.is_none() {
+                    close.written = Some(std::mem::take(&mut self.written).into_iter());
+                }
+                close.proto_key = close.written.as_mut().unwrap().next();
+            }
+            if let Some(key) = close.proto_key {
+                let Some(proto) = self.protos.get(&key).and_then(Option::as_ref) else {
+                    return close.block("retained written proto is not owned");
+                };
+                if let Some(outcome) = close.proto_outcome.take() {
+                    close
+                        .proto_callback
+                        .as_ref()
+                        .unwrap()
+                        .storage_locked(&mut book, outcome.is_ok());
+                    if let Err(error) = outcome {
+                        close.proto_outcome = Some(Err(error.clone()));
+                        return close.block(error);
+                    }
+                    close
+                        .proto_callback
+                        .take()
+                        .unwrap()
+                        .settle_locked(&mut book);
+                    close.proto_key = None;
+                    continue;
+                }
+                if close.proto_callback.is_none() {
+                    close.proto_callback = Some(WorkLease::new_locked(
+                        &shared.ownership,
+                        &mut book,
+                        NativeWorkOrigin::SaveProtosCallback,
+                    ));
+                }
+                if self.retained_handoff_held(NativeWorkOrigin::SaveProtosCallback) {
+                    return RetainedStreamStatus::Pending;
+                }
+                drop(book);
+                close.proto_outcome = Some(self.retained_handoff_result(
+                    NativeWorkOrigin::SaveProtosCallback,
+                    self.saves.save_protos(&[proto]),
+                ));
+                return RetainedStreamStatus::Pending;
+            }
+            if active {
+                return RetainedStreamStatus::Pending;
+            }
+            if !self.generating.is_empty()
+                || self.decorating != 0
+                || !self.finishing.is_empty()
+                || self.saving != 0
+                || !self.lighting.is_empty()
+                || !self.meshing.is_empty()
+                || !self.failed_finished.is_empty()
+            {
+                return close.block("retained native owner has no correlated completion");
+            }
+            if !close.stopped {
+                let queue = match shared.queue.try_lock() {
+                    Ok(queue) => queue,
+                    Err(std::sync::TryLockError::WouldBlock) => {
+                        return RetainedStreamStatus::Pending;
+                    }
+                    Err(std::sync::TryLockError::Poisoned(_)) => {
+                        return close.block("retained queue mutex poisoned");
+                    }
+                };
+                let queued = match shared.queued_owners.try_lock() {
+                    Ok(queued) => queued,
+                    Err(std::sync::TryLockError::WouldBlock) => {
+                        return RetainedStreamStatus::Pending;
+                    }
+                    Err(std::sync::TryLockError::Poisoned(_)) => {
+                        return close.block("retained queued owner mutex poisoned");
+                    }
+                };
+                let returned = match shared.returned.try_lock() {
+                    Ok(returned) => returned,
+                    Err(std::sync::TryLockError::WouldBlock) => {
+                        return RetainedStreamStatus::Pending;
+                    }
+                    Err(std::sync::TryLockError::Poisoned(_)) => {
+                        return close.block("retained returned receipt mutex poisoned");
+                    }
+                };
+                if !queue.is_empty() || !queued.is_empty() || !returned.is_empty() {
+                    return close.block("retained queue/receipt has unaccounted native work");
+                }
+                shared.stop.store(true, Ordering::Relaxed);
+                shared.ready.notify_all();
+                close.stopped = true;
+                drop(returned);
+                drop(queued);
+                drop(queue);
+            }
+            // Release accounting before a finished thread's TLS/destructor
+            // result is inspected. is_finished proves join cannot wait on it.
+            let zero_jobs = book.counts.iter().all(|c| c.submitted == 0);
+            close.failed_initialization |= book.worker_initialization_fault;
+            drop(book);
+            if !self.threads.is_empty() {
+                let index = close.join_scan % self.threads.len();
+                close.join_scan = close.join_scan.wrapping_add(1);
+                if !self.threads[index].is_finished() {
+                    return RetainedStreamStatus::Pending;
+                }
+                let handle = self.threads.swap_remove(index);
+                let result = handle.join();
+                close.joined += 1;
+                if result.is_err() {
+                    if zero_jobs {
+                        close.failed_initialization = true;
+                        close.history.push(
+                            "native worker initialization panicked; actual handle reaped".into(),
+                        );
+                    } else {
+                        return close.block("native worker panicked after submissions");
+                    }
+                }
+                continue;
+            }
+            if close.joined != self.retained.as_ref().unwrap().workers {
+                return close.block("retained worker membership mismatch");
+            }
+            return RetainedStreamStatus::Complete;
+        }
+        RetainedStreamStatus::Pending
+    }
+
+    pub fn take_sealed(&mut self) -> Option<SealedStream> {
+        let retained = self.retained.as_mut()?;
+        let close = retained.close.as_mut()?;
+        if close.status != RetainedStreamStatus::Complete
+            || close.witness_taken
+            || !self.threads.is_empty()
+        {
+            return None;
+        }
+        close.witness_taken = true;
+        Some(SealedStream {
+            allocation: self.shared.clone(),
+            save: retained.save.clone(),
+            workers: retained.workers,
+            failed_initialization: close.failed_initialization,
+            refusals: close.refusal_errors.clone(),
+        })
+    }
+
+    pub fn poll_retained_writer_ack(
+        &mut self,
+        writer: &crate::save::NativeWriterClosed,
+    ) -> RetainedStreamStatus {
+        let Some(retained) = &mut self.retained else {
+            return RetainedStreamStatus::Blocked("streaming was not started retained".into());
+        };
+        let Some(close) = &mut retained.close else {
+            return RetainedStreamStatus::Blocked("retained close has not begun".into());
+        };
+        if close.status != RetainedStreamStatus::Complete
+            || !Arc::ptr_eq(&retained.save, writer.save())
+        {
+            return RetainedStreamStatus::Blocked(
+                "retained writer acknowledgement allocation/producer mismatch".into(),
+            );
+        }
+        if let Some(error) = &close.ack_error {
+            return RetainedStreamStatus::Blocked(error.clone());
+        }
+        let started = std::time::Instant::now();
+        for _ in 0..16 {
+            let records = if close.ack_cursor < close.accepted_loaded.len() {
+                close.accepted_loaded.get(close.ack_cursor)
+            } else {
+                close
+                    .refused_inputs
+                    .get(close.ack_cursor - close.accepted_loaded.len())
+                    .map(RetainedRefusedInput::records)
+            };
+            let Some(records) = records else {
+                close.writer_acknowledged = true;
+                return RetainedStreamStatus::Complete;
+            };
+            let error = match records.poll_closed_current(writer) {
+                Ok(None) => return RetainedStreamStatus::Pending,
+                Ok(Some(true)) => {
+                    close.ack_cursor += 1;
+                    None
+                }
+                Ok(Some(false)) => {
+                    Some("loaded native records changed before matching writer closure".to_owned())
+                }
+                Err(error) => Some(error),
+            };
+            if let Some(error) = error {
+                close.history.push(error.clone());
+                close.ack_error = Some(error.clone());
+                return RetainedStreamStatus::Blocked(error);
+            }
+            if started.elapsed() >= std::time::Duration::from_millis(2) {
+                return RetainedStreamStatus::Pending;
+            }
+        }
+        RetainedStreamStatus::Pending
+    }
+
+    pub fn finish_retained_close(
+        &mut self,
+        witness: SealedStream,
+        writer: &crate::save::NativeWriterClosed,
+    ) -> Result<(), SealedStream> {
+        let valid = self.retained.as_ref().is_some_and(|r| {
+            r.armed
+                && Arc::ptr_eq(&r.save, writer.save())
+                && Arc::ptr_eq(&r.save, &witness.save)
+                && r.workers == witness.workers
+                && r.close.as_ref().is_some_and(|c| {
+                    c.status == RetainedStreamStatus::Complete
+                        && c.witness_taken
+                        && ((c.accepted_loaded.is_empty() && c.refused_inputs.is_empty())
+                            || c.writer_acknowledged)
+                })
+        }) && Arc::ptr_eq(&self.shared, &witness.allocation)
+            && self.threads.is_empty();
+        if !valid {
+            return Err(witness);
+        }
+        self.retained.as_mut().unwrap().armed = false;
+        Ok(())
+    }
+}
+
 /// `ChunkTrackingView.isInViewDistance`: whether the column (x, z) is drawn
 /// at this render distance around `center`, the camera's column
 /// (`SectionOcclusionGraph.isInViewDistance`). Each axis gets a column of
@@ -2672,6 +4728,25 @@ impl Ranges<'_> {
 }
 impl Drop for Streaming {
     fn drop(&mut self) {
+        #[cfg(feature = "paired-packages")]
+        if let Some(retained) = &self.retained {
+            if retained.armed {
+                use std::io::Write as _;
+                let _ = writeln!(
+                    std::io::stderr().lock(),
+                    "Horizon: unresolved retained Streaming owner relinquished"
+                );
+                std::process::abort();
+            }
+            // Explicit producer and writer acknowledgement already reaped every
+            // handle. The legacy destructor is not a retained cleanup algorithm.
+            return;
+        }
+        // Legacy new() historically panics at spawn failure before constructing
+        // a Streaming: its already-created handles are dropped, never joined.
+        if !self.constructor_complete {
+            return;
+        }
         #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
         {
             // Release even if a receipt remains externally owned. Do this before
@@ -5987,6 +8062,1111 @@ mod native_work_tests {
             drop(save); // Reap both native and writer threads.
             std::fs::remove_dir_all(root).unwrap();
         }
+    }
+
+    #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+    #[allow(clippy::type_complexity)]
+    fn retained_native_fixture(
+        label: &str,
+        hold: Option<usize>,
+        fail: Option<usize>,
+        workers: usize,
+    ) -> (
+        Result<Streaming, StreamingStartFailure>,
+        Arc<crate::save::SaveDir>,
+        Arc<crate::save::Persistent<crate::testgen::TestTerrain>>,
+        RetainedStreamingStartTestReceipt,
+        std::path::PathBuf,
+    ) {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "retained-stream-{label}-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let context = context();
+        let save = Arc::new(crate::save::SaveDir::new_retained(root.clone()));
+        let generator = Arc::new(crate::save::Persistent {
+            inner: Arc::new(
+                crate::testgen::TestTerrain::new(context.assets.registry, &context.biomes).unwrap(),
+            ),
+            save: save.clone(),
+            registry: context.assets.clone(),
+            biomes: context.biomes.clone(),
+        });
+        let (control, receipt) = RetainedStreamingStartTestControl::new(hold, fail);
+        let streaming = Streaming::start_retained_with_test_control(
+            generator.clone(),
+            context,
+            workers,
+            save.clone(),
+            control,
+        );
+        (streaming, save, generator, receipt, root)
+    }
+
+    #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+    fn reap_retained(
+        streaming: &mut Streaming,
+        mut world: Option<&mut World>,
+        save: &Arc<crate::save::SaveDir>,
+    ) -> (NativeWorkObservation, bool) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            match streaming.poll_retained_close(world.as_deref_mut()) {
+                RetainedStreamStatus::Complete => break,
+                RetainedStreamStatus::Pending => {}
+                RetainedStreamStatus::NeedsFinishedColumn => {
+                    let column = streaming.retained_finished_column().unwrap();
+                    // This unit case owns genuine fresh TestTerrain native output.
+                    // Game's strict D validation is qualified in the bin tests.
+                    let disposition = if column.evidence().is_some() {
+                        RetainedColumnDisposition::AlreadyStored
+                    } else {
+                        RetainedColumnDisposition::StoreFresh
+                    };
+                    let ticket = column.into_ticket();
+                    streaming
+                        .resolve_retained_finished_column(ticket, disposition)
+                        .unwrap();
+                }
+                RetainedStreamStatus::NeedsRefusedRead => {
+                    let read = streaming.retained_refused_read().unwrap();
+                    let error = read.error().to_owned();
+                    let ticket = read.into_ticket();
+                    streaming
+                        .resolve_retained_refused_read(ticket, error)
+                        .unwrap();
+                }
+                RetainedStreamStatus::Blocked(error) => {
+                    panic!("unexpected retained producer fault: {error}")
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "retained producer did not finish after control release"
+            );
+            std::thread::yield_now();
+        }
+        let witness = streaming.take_sealed().unwrap();
+        let failed = witness.failed_initialization;
+        let mut writer = loop {
+            if let Some(writer) = save.begin_retained_writer_close(deadline).unwrap() {
+                break writer;
+            }
+            std::thread::yield_now();
+        };
+        loop {
+            match writer.poll() {
+                crate::save::RetainedWriterStatus::Complete => break,
+                crate::save::RetainedWriterStatus::Pending => std::thread::yield_now(),
+                crate::save::RetainedWriterStatus::Blocked(error) => {
+                    panic!("unexpected retained writer fault: {error}")
+                }
+            }
+        }
+        let writer = writer.finish().unwrap();
+        loop {
+            match streaming.poll_retained_writer_ack(&writer) {
+                RetainedStreamStatus::Complete => break,
+                RetainedStreamStatus::Pending => std::thread::yield_now(),
+                status => panic!("unexpected retained writer acknowledgement: {status:?}"),
+            }
+        }
+        streaming.finish_retained_close(witness, &writer).unwrap();
+        (streaming.observe_native_work(), failed)
+    }
+
+    #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+    #[test]
+    #[ignore = "owned native resources: actual Persistent save mismatch and unknown provider rejected before normal/controlled worker spawn"]
+    fn retained_stream_constructor_rejects_mismatched_and_unknown_native_save() {
+        for unknown in [false, true] {
+            for controlled in [false, true] {
+                let unique = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos();
+                let root = std::env::temp_dir().join(format!(
+                    "retained-stream-binding-{}-{unique}",
+                    std::process::id()
+                ));
+                std::fs::create_dir_all(&root).unwrap();
+                let context = context();
+                let supplied = Arc::new(crate::save::SaveDir::new_retained(root.join("a")));
+                let actual = Arc::new(crate::save::SaveDir::new_retained(root.join("b")));
+                let terrain = Arc::new(
+                    crate::testgen::TestTerrain::new(context.assets.registry, &context.biomes)
+                        .unwrap(),
+                );
+                let generator = Arc::new(crate::save::Persistent {
+                    inner: terrain.clone(),
+                    save: actual.clone(),
+                    registry: context.assets.clone(),
+                    biomes: context.biomes.clone(),
+                });
+                let (control, mut receipt) = RetainedStreamingStartTestControl::new(Some(0), None);
+                let started = if unknown {
+                    if controlled {
+                        Streaming::start_retained_with_test_control(
+                            terrain.clone(),
+                            context,
+                            2,
+                            supplied.clone(),
+                            control,
+                        )
+                    } else {
+                        Streaming::start_retained(terrain.clone(), context, 2, supplied.clone())
+                    }
+                } else if controlled {
+                    Streaming::start_retained_with_test_control(
+                        generator.clone(),
+                        context,
+                        2,
+                        supplied.clone(),
+                        control,
+                    )
+                } else {
+                    Streaming::start_retained(generator.clone(), context, 2, supplied.clone())
+                };
+                let (mut streaming, error) = match started {
+                    Ok(streaming) => (streaming, None),
+                    Err(failure) => (failure.streaming, Some(failure.error)),
+                };
+                let workers = streaming.threads.len();
+                let entered = receipt.entered();
+                let observation = streaming.observe_native_work();
+                let no_queue = streaming.shared.queue.lock().unwrap().is_empty();
+                receipt.release();
+                streaming
+                    .begin_retained_close(None, Instant::now() + WAIT)
+                    .unwrap();
+                reap_retained(&mut streaming, None, &supplied);
+                let original_error_kept = error
+                    .as_ref()
+                    .is_some_and(|error| streaming.retained_close_failures().contains(error));
+                let deadline = Instant::now() + WAIT;
+                let mut actual_close = loop {
+                    if let Some(close) = actual.begin_retained_writer_close(deadline).unwrap() {
+                        break close;
+                    }
+                    std::thread::yield_now();
+                };
+                while actual_close.poll() != crate::save::RetainedWriterStatus::Complete {
+                    std::thread::yield_now();
+                }
+                let actual_closed = actual_close.finish().unwrap();
+                let actual_identity = Arc::ptr_eq(actual_closed.save(), &actual);
+                drop(streaming);
+                drop(generator);
+                drop(terrain);
+                drop(receipt);
+                drop(supplied);
+                drop(actual_closed);
+                drop(actual);
+                std::fs::remove_dir_all(root).unwrap();
+                assert_eq!(workers, 0);
+                assert!(!entered && no_queue && actual_identity && original_error_kept);
+                assert_eq!(observation.initialized_workers, 0);
+                assert!(
+                    observation
+                        .origins
+                        .iter()
+                        .all(|(_, counts)| counts.submitted == 0)
+                );
+                assert_eq!(
+                    error.as_deref(),
+                    Some(if unknown {
+                        "generator has no retained SaveDir binding"
+                    } else {
+                        "retained generator SaveDir allocation mismatch"
+                    })
+                );
+            }
+        }
+    }
+
+    #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+    #[test]
+    #[ignore = "owned native resources: first/later retained init, spawn failure, deadline and same-owner retry"]
+    fn retained_stream_partial_start_deadline_and_explicit_retry() {
+        for (hold, fail, workers) in [
+            (None, Some(0), 2),
+            (Some(0), Some(1), 2),
+            (Some(1), None, 2),
+        ] {
+            let (started, save, generator, mut receipt, root) =
+                retained_native_fixture("partial", hold, fail, workers);
+            let (mut streaming, spawn_failed) = match started {
+                Ok(streaming) => (streaming, false),
+                Err(failure) => (failure.streaming, true),
+            };
+            let expected_workers = fail.unwrap_or(workers);
+            let actual_workers = streaming.threads.len();
+            streaming
+                .begin_retained_close(None, Instant::now())
+                .unwrap();
+            let blocked = matches!(
+                streaming.poll_retained_close(None),
+                RetainedStreamStatus::Blocked(_)
+            );
+            streaming
+                .begin_retained_close(None, Instant::now() + WAIT)
+                .unwrap();
+            let still_blocked = matches!(
+                streaming.poll_retained_close(None),
+                RetainedStreamStatus::Blocked(_)
+            );
+            receipt.release();
+            streaming
+                .retry_retained_close(Instant::now() + Duration::from_secs(30))
+                .unwrap();
+            let (_, failed) = reap_retained(&mut streaming, None, &save);
+            let joined = streaming.threads.is_empty();
+            drop(streaming);
+            drop(generator);
+            drop(save);
+            drop(receipt);
+            std::fs::remove_dir_all(root).unwrap();
+            assert_eq!(actual_workers, expected_workers);
+            assert_eq!(failed, spawn_failed);
+            assert!(blocked && still_blocked && joined);
+        }
+    }
+
+    #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+    #[test]
+    #[ignore = "owned native resources: real queue/receipt/book contention and same allocation writer witness"]
+    fn retained_stream_mutex_contention_and_writer_identity() {
+        let (started, save, generator, mut receipt, root) =
+            retained_native_fixture("locks", Some(0), None, 1);
+        let mut streaming = started.unwrap();
+        streaming
+            .begin_retained_close(None, Instant::now() + Duration::from_secs(30))
+            .unwrap();
+        let shared = streaming.shared.clone();
+        let mut pending = Vec::new();
+        {
+            let _lock = shared.ownership.lock().unwrap();
+            pending.push(streaming.poll_retained_close(None) == RetainedStreamStatus::Pending);
+        }
+        {
+            let _lock = shared.returned.lock().unwrap();
+            pending.push(streaming.poll_retained_close(None) == RetainedStreamStatus::Pending);
+        }
+        {
+            let _lock = shared.queue.lock().unwrap();
+            pending.push(streaming.poll_retained_close(None) == RetainedStreamStatus::Pending);
+        }
+        receipt.release();
+        let observation = reap_retained(&mut streaming, None, &save).0;
+        let joined = streaming.threads.is_empty();
+        drop(streaming);
+        drop(generator);
+        drop(save);
+        drop(receipt);
+        drop(shared);
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(pending.into_iter().all(|value| value));
+        assert!(joined && observation.stopped);
+    }
+
+    #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+    #[test]
+    #[ignore = "owned native resources: actual initialization panic reaped and foreign writer witness refused"]
+    fn retained_stream_failed_initialization_and_foreign_writer_witness() {
+        let (started, save, generator, mut receipt, root) =
+            retained_native_fixture("panic-base", Some(0), Some(0), 1);
+        // Reap the genuine zero-worker partial allocation before starting the
+        // separately controlled actual panicking native worker.
+        let mut partial = match started {
+            Err(failure) => failure.streaming,
+            Ok(_) => panic!("controlled first spawn unexpectedly succeeded"),
+        };
+        partial
+            .begin_retained_close(None, Instant::now() + WAIT)
+            .unwrap();
+        receipt.release();
+        reap_retained(&mut partial, None, &save);
+        drop(partial);
+        drop(generator);
+        drop(save);
+        drop(receipt);
+        let save = Arc::new(crate::save::SaveDir::new_retained(root.join("panic")));
+        let context = context();
+        let generator = Arc::new(crate::save::Persistent {
+            inner: Arc::new(
+                crate::testgen::TestTerrain::new(context.assets.registry, &context.biomes).unwrap(),
+            ),
+            save: save.clone(),
+            registry: context.assets.clone(),
+            biomes: context.biomes.clone(),
+        });
+        let (mut control, mut receipt) = RetainedStreamingStartTestControl::new(Some(0), None);
+        control.panic_initialization_at(0);
+        let mut streaming = Streaming::start_retained_with_test_control(
+            generator.clone(),
+            context,
+            1,
+            save.clone(),
+            control,
+        )
+        .unwrap();
+        streaming
+            .begin_retained_close(None, Instant::now() + Duration::from_secs(30))
+            .unwrap();
+        receipt.release();
+        while streaming.poll_retained_close(None) != RetainedStreamStatus::Complete {
+            std::thread::yield_now();
+        }
+        let witness = streaming.take_sealed().unwrap();
+        let failed = witness.failed_initialization;
+        let other = Arc::new(crate::save::SaveDir::new_retained(root.join("other")));
+        let mut other_close = other
+            .begin_retained_writer_close(Instant::now() + WAIT)
+            .unwrap()
+            .unwrap();
+        while other_close.poll() != crate::save::RetainedWriterStatus::Complete {
+            std::thread::yield_now();
+        }
+        let other_closed = other_close.finish().unwrap();
+        let witness = streaming
+            .finish_retained_close(witness, &other_closed)
+            .unwrap_err();
+        let still_armed = streaming.retained.as_ref().unwrap().armed;
+        let mut close = save
+            .begin_retained_writer_close(Instant::now() + WAIT)
+            .unwrap()
+            .unwrap();
+        while close.poll() != crate::save::RetainedWriterStatus::Complete {
+            std::thread::yield_now();
+        }
+        let closed = close.finish().unwrap();
+        streaming.finish_retained_close(witness, &closed).unwrap();
+        let observation = streaming.observe_native_work();
+        drop(streaming);
+        drop(generator);
+        drop(save);
+        drop(receipt);
+        drop(other_closed);
+        drop(other);
+        drop(closed);
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(
+            failed && still_armed && observation.worker_initialization_fault && observation.stopped
+        );
+        assert_eq!(observation.initialized_workers, 0);
+    }
+
+    #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+    #[test]
+    #[ignore = "owned native resources: genuine mixed all-origin jobs, stale light/mesh, native writer and disk decode"]
+    fn retained_stream_all_origins_keep_native_payloads_and_reap() {
+        let (started, save, generator, mut receipt, root) =
+            retained_native_fixture("origins", Some(0), None, 1);
+        let mut streaming = started.unwrap();
+        let mut world = Box::new(world());
+        for z in -1..=1 {
+            for x in -1..=1 {
+                let proto = generator.proto(&mut (), x, z);
+                let chunk = generator.finish(proto);
+                world.chunks.insert((x, z), Arc::new(chunk));
+            }
+        }
+        let region = Streaming::region(&world, 0, 0).unwrap();
+        streaming.generating.insert((40, 40));
+        streaming.submit(None, 0, Job::Generate(40, 40));
+        let finish = generator.proto(&mut (), 30, 30);
+        streaming.finishing.insert((30, 30));
+        streaming.submit(None, 0, Job::Finish(finish));
+        let decoration: Box<[Proto; 9]> = Box::new(std::array::from_fn(|i| {
+            let key = (10 + i as i32 % 3 - 1, 10 + i as i32 / 3 - 1);
+            streaming.protos.insert(key, None);
+            generator.proto(&mut (), key.0, key.1)
+        }));
+        streaming.decorating = 1;
+        streaming.submit(None, 0, Job::Decorate(10, 10, decoration));
+        let saved = generator.proto(&mut (), 20, 20);
+        streaming.protos.insert((20, 20), None);
+        streaming.saving = 1;
+        streaming.submit(None, 0, Job::Save(vec![((20, 20), saved)]));
+        streaming.lighting.insert((0, 0), 2);
+        streaming.light_snapshots.insert((0, 0), 0);
+        streaming.submit(None, 0, Job::Light(0, 0, region.clone(), 1, true));
+        streaming.submit(None, 0, Job::Light(0, 0, region.clone(), 2, true));
+        let settings = MeshSettings {
+            nether: false,
+            zoom: BiomeZoom::new(0),
+            blend_radius: 2,
+            smooth_lighting: true,
+            cutout_leaves: true,
+        };
+        streaming.meshing.insert((0, 4, 0), 4);
+        streaming.submit(None, 0, Job::Mesh(0, 4, 0, region.clone(), 3, settings));
+        streaming.submit(None, 0, Job::Mesh(0, 4, 0, region, 4, settings));
+        let original_membership = world.chunks.membership_revision();
+        streaming
+            .begin_retained_close(Some(&world), Instant::now() + Duration::from_secs(30))
+            .unwrap();
+        let sealed_updates = streaming.update(&mut world).0.is_empty();
+        let sealed_save = streaming.save(&mut world, false).is_err();
+        let before = streaming.observe_native_work();
+        receipt.release();
+        let observation = reap_retained(&mut streaming, Some(&mut world), &save).0;
+        let loaded = save.load(30, 30, context().assets.registry, &context().biomes);
+        let disk_coordinates = loaded.as_ref().map(|c| (c.x, c.z));
+        let membership = world.chunks.membership_revision();
+        let all_origins = observation.origins.iter().all(|(_, c)| {
+            c.submitted > 0
+                && c.queued == 0
+                && c.worker_held == 0
+                && c.returned == 0
+                && c.reconciling == 0
+                && c.unresolved == 0
+                && c.disposed == c.submitted
+        });
+        drop(streaming);
+        drop(generator);
+        drop(save);
+        drop(receipt);
+        drop(world);
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(sealed_updates && sealed_save && all_origins);
+        assert_eq!(
+            before.origins[NativeWorkOrigin::Generate as usize].1.queued,
+            1
+        );
+        assert_eq!(disk_coordinates, Some((30, 30)));
+        assert_eq!(membership, original_membership);
+    }
+
+    #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+    #[allow(clippy::type_complexity)]
+    fn retained_one_job(
+        origin: NativeWorkOrigin,
+    ) -> (
+        Streaming,
+        Box<World>,
+        Arc<crate::save::SaveDir>,
+        Arc<crate::save::Persistent<crate::testgen::TestTerrain>>,
+        RetainedStreamingStartTestReceipt,
+        std::path::PathBuf,
+    ) {
+        let (started, save, generator, receipt, root) =
+            retained_native_fixture("held-origin", Some(0), None, 1);
+        let mut streaming = started.unwrap();
+        let mut world = Box::new(world());
+        let job = match origin {
+            NativeWorkOrigin::Generate => {
+                streaming.generating.insert((40, 40));
+                Job::Generate(40, 40)
+            }
+            NativeWorkOrigin::Finish => {
+                streaming.finishing.insert((30, 30));
+                Job::Finish(generator.proto(&mut (), 30, 30))
+            }
+            NativeWorkOrigin::Save => {
+                streaming.protos.insert((20, 20), None);
+                streaming.saving = 1;
+                Job::Save(vec![((20, 20), generator.proto(&mut (), 20, 20))])
+            }
+            NativeWorkOrigin::Decorate => {
+                streaming.decorating = 1;
+                let region = std::array::from_fn(|i| {
+                    let key = (10 + i as i32 % 3 - 1, 10 + i as i32 / 3 - 1);
+                    streaming.protos.insert(key, None);
+                    generator.proto(&mut (), key.0, key.1)
+                });
+                Job::Decorate(10, 10, Box::new(region))
+            }
+            NativeWorkOrigin::Light | NativeWorkOrigin::Mesh => {
+                for z in -1..=1 {
+                    for x in -1..=1 {
+                        world.chunks.insert(
+                            (x, z),
+                            Arc::new(generator.finish(generator.proto(&mut (), x, z))),
+                        );
+                    }
+                }
+                let region = Streaming::region(&world, 0, 0).unwrap();
+                if origin == NativeWorkOrigin::Light {
+                    streaming.lighting.insert((0, 0), 1);
+                    streaming.light_snapshots.insert((0, 0), 0);
+                    Job::Light(0, 0, region, 1, true)
+                } else {
+                    streaming.meshing.insert((0, 4, 0), 1);
+                    Job::Mesh(
+                        0,
+                        4,
+                        0,
+                        region,
+                        1,
+                        MeshSettings {
+                            nether: false,
+                            zoom: BiomeZoom::new(0),
+                            blend_radius: 2,
+                            smooth_lighting: true,
+                            cutout_leaves: true,
+                        },
+                    )
+                }
+            }
+            _ => unreachable!(),
+        };
+        streaming.submit(None, 0, job);
+        (streaming, world, save, generator, receipt, root)
+    }
+
+    #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+    #[test]
+    #[ignore = "owned native worldgen resources: genuine Vanilla proto Save job and close callback survive actual writer closure and native reload/restore"]
+    fn retained_stream_vanilla_proto_codec_survives_close_and_native_reload() {
+        let context = context();
+        let resources = std::env::var_os("HORIZON_TEST_RESOURCES")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../.local/horizon-client/26.3")
+            });
+        let terrain = Arc::new(
+            crate::vanillagen::VanillaTerrain::for_world(
+                &resources.join("worldgen"),
+                context.assets.registry,
+                &context.biomes,
+                187,
+                "minecraft:overworld",
+                false,
+            )
+            .unwrap(),
+        );
+        // No optional detached Ring search. Both opaque payloads come from the
+        // actual Vanilla worker and its real saved_proto projection.
+        let keys = [(0, 0), (1, 0)];
+        let mut worker = terrain.worker();
+        let job_proto = terrain.proto(&mut worker, keys[0].0, keys[0].1);
+        let close_proto = terrain.proto(&mut worker, keys[1].0, keys[1].1);
+        let expected = [
+            terrain.saved_proto(&job_proto).unwrap(),
+            terrain.saved_proto(&close_proto).unwrap(),
+        ];
+        let address = |proto: &Proto| {
+            proto.as_ref() as *const (dyn std::any::Any + Send) as *const () as usize
+        };
+        let original_addresses = [address(&job_proto), address(&close_proto)];
+        let tables = Arc::new(crate::save::SaveTables::new(&context.assets));
+        let encode = |proto: &crate::save::SavedProto| {
+            crate::save::encode_proto(
+                proto,
+                context.assets.registry,
+                &context.biomes,
+                Some(&tables),
+                crate::save::LevelShape::OVERWORLD,
+            )
+        };
+        let expected_native = expected.iter().map(encode).collect::<Vec<_>>();
+        drop(worker);
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "retained-stream-vanilla-proto-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let save = Arc::new(crate::save::SaveDir::new_retained(root.clone()));
+        let generator = Arc::new(crate::save::Persistent {
+            inner: terrain.clone(),
+            save: save.clone(),
+            registry: context.assets.clone(),
+            biomes: context.biomes.clone(),
+        });
+        let (control, mut initialization) = RetainedStreamingStartTestControl::new(Some(0), None);
+        let mut streaming = Streaming::start_retained_with_test_control(
+            generator.clone(),
+            context.clone(),
+            1,
+            save.clone(),
+            control,
+        )
+        .unwrap();
+        streaming.protos.insert(keys[0], None);
+        streaming.saving = 1;
+        streaming.submit(None, 0, Job::Save(vec![(keys[0], job_proto)]));
+        streaming.protos.insert(keys[1], Some(close_proto));
+        streaming.written.insert(keys[1]);
+        let queued_save = counts(&streaming, NativeWorkOrigin::Save).queued;
+        let mut callback = streaming
+            .arm_retained_handoff_test_control(NativeWorkOrigin::SaveProtosCallback)
+            .unwrap();
+        let mut world = Box::new(world());
+        let deadline = Instant::now() + Duration::from_secs(30);
+        streaming
+            .begin_retained_close(Some(&world), deadline)
+            .unwrap();
+        initialization.release();
+        let mut unexpected_status = false;
+        while !callback.entered() && Instant::now() < deadline {
+            if streaming.poll_retained_close(Some(&mut world)) != RetainedStreamStatus::Pending {
+                unexpected_status = true;
+                break;
+            }
+            std::thread::yield_now();
+        }
+        let callback_held = callback.entered();
+        let callback_before_acceptance = counts(&streaming, NativeWorkOrigin::SaveProtosCallback);
+        let marker_owned = streaming
+            .retained
+            .as_ref()
+            .unwrap()
+            .close
+            .as_ref()
+            .is_some_and(|close| {
+                close.proto_key == Some(keys[1]) && close.proto_callback.is_some()
+            });
+        callback.release();
+        let observation = reap_retained(&mut streaming, Some(&mut world), &save).0;
+        let returned_addresses = keys.map(|key| {
+            streaming
+                .protos
+                .get(&key)
+                .and_then(Option::as_ref)
+                .map(address)
+        });
+        let joined_and_acknowledged =
+            streaming.threads.is_empty() && !streaming.retained.as_ref().unwrap().armed;
+        let no_markers = streaming.written.is_empty()
+            && streaming
+                .retained
+                .as_ref()
+                .unwrap()
+                .close
+                .as_ref()
+                .is_some_and(|close| close.proto_key.is_none() && close.proto_callback.is_none());
+        drop(streaming);
+        drop(world);
+        drop(generator);
+        drop(save);
+        drop(initialization);
+        drop(callback);
+        // A new ordinary SaveDir has no pending snapshots from the producer.
+        // These reads must use the actual native region files written above.
+        let reopened = crate::save::SaveDir::new(root.clone());
+        reopened.tables.get_or_init(|| tables.clone());
+        let physical_matches = |a: &crate::save::SavedProto, b: &crate::save::SavedProto| {
+            (a.column.x, a.column.z, a.decorated) == (b.column.x, b.column.z, b.decorated)
+                && a.block_entities == b.block_entities
+                && a.entities == b.entities
+                && a.column.postprocess == b.column.postprocess
+                && a.column.sections.len() == b.column.sections.len()
+                && a.column
+                    .sections
+                    .iter()
+                    .zip(&b.column.sections)
+                    .all(|(a, b)| {
+                        (0..4096).all(|i| a.get(i) == b.get(i) && a.light(i) == b.light(i))
+                            && (0..64).all(|i| a.biomes.get(i) == b.biomes.get(i))
+                    })
+        };
+        let mut disk_matches = Vec::new();
+        let mut restored_matches = Vec::new();
+        let mut worker = terrain.worker();
+        for (index, key) in keys.into_iter().enumerate() {
+            if let Some(saved) =
+                reopened.load_proto(key.0, key.1, context.assets.registry, &context.biomes)
+            {
+                disk_matches.push(
+                    physical_matches(&expected[index], &saved)
+                        && encode(&saved).tag == expected_native[index].tag,
+                );
+                let mut restored = terrain.proto(&mut worker, key.0, key.1);
+                terrain.restore_proto(&mut restored, saved);
+                restored_matches.push(terrain.saved_proto(&restored).is_some_and(|saved| {
+                    physical_matches(&expected[index], &saved)
+                        && encode(&saved).tag == expected_native[index].tag
+                }));
+            } else {
+                disk_matches.push(false);
+                restored_matches.push(false);
+            }
+        }
+        drop(worker);
+        drop(reopened);
+        drop(terrain);
+        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(queued_save, 1);
+        assert!(
+            !unexpected_status
+                && callback_held
+                && marker_owned
+                && no_markers
+                && joined_and_acknowledged
+        );
+        assert_eq!(returned_addresses, original_addresses.map(Some));
+        assert_eq!(
+            (
+                callback_before_acceptance.reconciling,
+                callback_before_acceptance.accepted_storage_handoffs
+            ),
+            (1, 0)
+        );
+        for origin in [NativeWorkOrigin::Save, NativeWorkOrigin::SaveProtosCallback] {
+            let counts = observation.origins[origin as usize].1;
+            assert_eq!(
+                (
+                    counts.submitted,
+                    counts.disposed,
+                    counts.accepted_storage_handoffs
+                ),
+                (1, 1, 1)
+            );
+            assert_eq!(
+                (
+                    counts.queued,
+                    counts.worker_held,
+                    counts.returned,
+                    counts.reconciling,
+                    counts.unresolved,
+                    counts.storage_errors
+                ),
+                (0, 0, 0, 0, 0, 0)
+            );
+        }
+        assert!(observation.stopped && observation.initialized_workers == 1);
+        assert_eq!(disk_matches, [true, true]);
+        assert_eq!(restored_matches, [true, true]);
+    }
+
+    #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+    #[test]
+    #[ignore = "owned native resources: each real native job origin independently worker-held across nonwaiting close turns"]
+    fn retained_stream_each_native_job_remains_worker_held() {
+        for origin in [
+            NativeWorkOrigin::Generate,
+            NativeWorkOrigin::Decorate,
+            NativeWorkOrigin::Finish,
+            NativeWorkOrigin::Light,
+            NativeWorkOrigin::Mesh,
+            NativeWorkOrigin::Save,
+        ] {
+            let (mut streaming, mut world, save, generator, mut receipt, root) =
+                retained_one_job(origin);
+            let (entered, seen) = mpsc::channel();
+            let (release, gate) = mpsc::channel();
+            *streaming.shared.work_gate.lock().unwrap() = Some(WorkGate {
+                origin,
+                entered,
+                release: gate,
+            });
+            streaming
+                .begin_retained_close(Some(&world), Instant::now() + Duration::from_secs(30))
+                .unwrap();
+            receipt.release();
+            let entered = seen.recv_timeout(WAIT).is_ok();
+            let mut pending = true;
+            for _ in 0..3 {
+                pending &= streaming.poll_retained_close(Some(&mut world))
+                    == RetainedStreamStatus::Pending;
+            }
+            let held = counts(&streaming, origin).worker_held;
+            let _ = release.send(());
+            let observation = reap_retained(&mut streaming, Some(&mut world), &save).0;
+            drop(streaming);
+            drop(world);
+            drop(generator);
+            drop(save);
+            drop(receipt);
+            std::fs::remove_dir_all(root).unwrap();
+            assert!(entered && pending);
+            assert_eq!(held, 1);
+            assert_eq!(observation.origins[origin as usize].1.disposed, 1);
+        }
+    }
+
+    #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+    #[test]
+    #[ignore = "owned native resources: each exact native storage callback held with original payload/lease then actual writer closure"]
+    fn retained_stream_native_callbacks_retain_payload_until_acceptance() {
+        for origin in [
+            NativeWorkOrigin::SaveProtosCallback,
+            NativeWorkOrigin::SaveFinishedCallback,
+        ] {
+            let job = if origin == NativeWorkOrigin::SaveProtosCallback {
+                NativeWorkOrigin::Decorate
+            } else {
+                NativeWorkOrigin::Finish
+            };
+            let (mut streaming, mut world, save, generator, mut receipt, root) =
+                retained_one_job(job);
+            let mut gate = streaming.arm_retained_handoff_test_control(origin).unwrap();
+            streaming
+                .begin_retained_close(Some(&world), Instant::now() + Duration::from_secs(30))
+                .unwrap();
+            receipt.release();
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !gate.entered() && Instant::now() < deadline {
+                if streaming.poll_retained_close(Some(&mut world))
+                    == RetainedStreamStatus::NeedsFinishedColumn
+                {
+                    let ticket = streaming.retained_finished_column().unwrap().into_ticket();
+                    streaming
+                        .resolve_retained_finished_column(
+                            ticket,
+                            RetainedColumnDisposition::StoreFresh,
+                        )
+                        .unwrap();
+                }
+                std::thread::yield_now();
+            }
+            let entered = gate.entered();
+            let held = counts(&streaming, origin).reconciling;
+            let before = streaming
+                .retained_finished_column()
+                .map(|v| Arc::as_ptr(v.chunk()));
+            for _ in 0..3 {
+                let _ = streaming.poll_retained_close(Some(&mut world));
+            }
+            let after = streaming
+                .retained_finished_column()
+                .map(|v| Arc::as_ptr(v.chunk()));
+            gate.release();
+            let observation = reap_retained(&mut streaming, Some(&mut world), &save).0;
+            drop(streaming);
+            drop(world);
+            drop(generator);
+            drop(save);
+            drop(receipt);
+            drop(gate);
+            std::fs::remove_dir_all(root).unwrap();
+            assert!(entered && held == 1);
+            assert_eq!(before, after);
+            assert!(
+                observation.origins[origin as usize]
+                    .1
+                    .accepted_storage_handoffs
+                    > 0
+            );
+        }
+    }
+
+    #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+    #[test]
+    #[ignore = "owned native resources: pre-close native callback error keeps exact original receipt/batch and explicit retry"]
+    fn retained_stream_failed_preclose_callbacks_keep_original_receipts() {
+        for origin in [
+            NativeWorkOrigin::SaveFinishedCallback,
+            NativeWorkOrigin::SaveProtosCallback,
+        ] {
+            let (mut streaming, mut world, save, generator, mut receipt, root) =
+                if origin == NativeWorkOrigin::SaveFinishedCallback {
+                    retained_one_job(NativeWorkOrigin::Finish)
+                } else {
+                    let (started, save, generator, receipt, root) =
+                        retained_native_fixture("old-proto", Some(0), None, 1);
+                    (
+                        started.unwrap(),
+                        Box::new(world()),
+                        save,
+                        generator,
+                        receipt,
+                        root,
+                    )
+                };
+            let mut control = streaming.arm_retained_handoff_test_control(origin).unwrap();
+            control.report_error_once_after_native_acceptance();
+            control.release();
+            receipt.release();
+            let failed = if origin == NativeWorkOrigin::SaveFinishedCallback {
+                streaming.wait(WAIT);
+                streaming.save(&mut world, false).is_err()
+            } else {
+                for key in [(10, 10), (11, 10), (12, 10)] {
+                    streaming
+                        .protos
+                        .insert(key, Some(generator.proto(&mut (), key.0, key.1)));
+                    streaming.written.insert(key);
+                }
+                streaming.save(&mut world, true).is_err()
+            };
+            let original_ptr = if origin == NativeWorkOrigin::SaveFinishedCallback {
+                streaming
+                    .retained
+                    .as_ref()
+                    .unwrap()
+                    .finished_backlog
+                    .first()
+                    .map(|(chunk, _)| Arc::as_ptr(chunk) as usize)
+            } else {
+                streaming
+                    .protos
+                    .get(&(10, 10))
+                    .and_then(Option::as_ref)
+                    .and_then(|p| p.downcast_ref::<Chunk>())
+                    .map(|p| p as *const Chunk as usize)
+            };
+            let old = counts(&streaming, origin);
+            streaming
+                .begin_retained_close(Some(&world), Instant::now() + Duration::from_secs(30))
+                .unwrap();
+            let blocked = matches!(
+                streaming.poll_retained_close(Some(&mut world)),
+                RetainedStreamStatus::Blocked(_)
+            );
+            streaming
+                .retry_retained_close(Instant::now() + Duration::from_secs(30))
+                .unwrap();
+            let observation = reap_retained(&mut streaming, Some(&mut world), &save).0;
+            let error_still_observable = streaming.generation_save_error().is_some()
+                && !streaming.retained_close_failures().is_empty();
+            let proto_ptr = streaming
+                .protos
+                .get(&(10, 10))
+                .and_then(Option::as_ref)
+                .and_then(|p| p.downcast_ref::<Chunk>())
+                .map(|p| p as *const Chunk as usize);
+            let native = if origin == NativeWorkOrigin::SaveFinishedCallback {
+                save.load(30, 30, context().assets.registry, &context().biomes)
+                    .map(|c| (c.x, c.z))
+            } else {
+                None
+            };
+            drop(streaming);
+            drop(world);
+            drop(generator);
+            drop(save);
+            drop(receipt);
+            drop(control);
+            std::fs::remove_dir_all(root).unwrap();
+            assert!(failed && blocked && error_still_observable && original_ptr.is_some());
+            assert_eq!(old.reconciling, 1);
+            assert_eq!(old.unresolved, 0);
+            let after = observation.origins[origin as usize].1;
+            assert_eq!(after.storage_errors, 1);
+            assert_eq!(after.unresolved, 0);
+            assert!(after.accepted_storage_handoffs >= 1);
+            if origin == NativeWorkOrigin::SaveProtosCallback {
+                assert_eq!(original_ptr, proto_ptr);
+            } else {
+                assert_eq!(native, Some((30, 30)));
+            }
+        }
+    }
+
+    #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+    #[test]
+    #[ignore = "direct fatal exception: unresolved retained Streaming dropped during actual held initialization; expected SIGABRT"]
+    fn retained_stream_fatal_drop_while_native_initialization_held() {
+        use std::io::Write as _;
+        let (started, _save, _generator, receipt, _root) =
+            retained_native_fixture("fatal-init", Some(0), None, 1);
+        let mut streaming = started.unwrap();
+        let deadline = Instant::now() + WAIT;
+        while !receipt.entered() && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        if !receipt.entered() || streaming.threads.len() != 1 || streaming.threads[0].is_finished()
+        {
+            std::process::exit(92);
+        }
+        streaming
+            .begin_retained_close(None, Instant::now() + Duration::from_secs(30))
+            .unwrap();
+        let status = streaming.poll_retained_close(None);
+        let observation = streaming.observe_native_work();
+        if status != RetainedStreamStatus::Pending
+            || observation.initialized_workers != 0
+            || streaming.threads[0].is_finished()
+        {
+            std::process::exit(92);
+        }
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "HORIZON_RETAINED_STREAM_HELD_INIT_DROP_ARMED"
+        );
+        // Deliberate fatal fixture: the held native thread remains owned. A
+        // broken Stream guard must not fall through into SaveDir's guard.
+        drop(streaming);
+        std::process::exit(91);
+    }
+
+    #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+    #[test]
+    #[ignore = "direct fatal exception: genuine held native Finish panics, failed actual handle reaped, unresolved work stays Blocked; expected SIGABRT"]
+    fn retained_stream_fatal_held_native_work_panic_stays_blocked() {
+        use std::io::Write as _;
+        let (mut streaming, mut world, _save, _generator, mut initialization, _root) =
+            retained_one_job(NativeWorkOrigin::Finish);
+        let mut held = streaming
+            .arm_retained_native_work_test_control(NativeWorkOrigin::Finish)
+            .unwrap();
+        streaming
+            .shared
+            .retained_work_gate
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .panic_after_release = true;
+        streaming
+            .begin_retained_close(Some(&world), Instant::now() + Duration::from_secs(30))
+            .unwrap();
+        initialization.release();
+        let deadline = Instant::now() + WAIT;
+        while !held.entered() && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        if !held.entered()
+            || counts(&streaming, NativeWorkOrigin::Finish).worker_held != 1
+            || streaming.threads.len() != 1
+            || streaming.threads[0].is_finished()
+        {
+            std::process::exit(92);
+        }
+        if streaming.poll_retained_close(Some(&mut world)) != RetainedStreamStatus::Pending {
+            std::process::exit(92);
+        }
+        held.release();
+        let deadline = Instant::now() + WAIT;
+        while !streaming.threads[0].is_finished() && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        if !streaming.threads[0].is_finished() {
+            std::process::exit(92);
+        }
+        // This exceptional fixture reaps only the proven-finished failed actual
+        // handle. It never repairs/zeros the missing unique Finish payload.
+        let reaped_failed = streaming.threads.pop().unwrap().join().is_err();
+        let observation = streaming.observe_native_work();
+        let finish = observation.origins[NativeWorkOrigin::Finish as usize].1;
+        let mut blocked = true;
+        for _ in 0..3 {
+            blocked &= matches!(
+                streaming.poll_retained_close(Some(&mut world)),
+                RetainedStreamStatus::Blocked(_)
+            );
+        }
+        if !reaped_failed
+            || !blocked
+            || !observation.worker_exit_fault
+            || finish.submitted != 1
+            || finish.unresolved != 1
+            || finish.disposed != 0
+            || finish.worker_held != 0
+            || finish.returned != 0
+            || !streaming.finishing.contains(&(30, 30))
+            || streaming.take_sealed().is_some()
+        {
+            std::process::exit(92);
+        }
+        let _ = writeln!(
+            std::io::stderr().lock(),
+            "HORIZON_RETAINED_STREAM_HELD_WORK_PANIC_DROP_ARMED reaped_failed=true unresolved=1 blocked=true"
+        );
+        drop(streaming);
+        std::process::exit(91);
     }
 
     #[test]

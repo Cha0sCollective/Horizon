@@ -1427,6 +1427,16 @@ struct Game<'a> {
     rest_loader: Option<WorldRestLoader>,
     pending_entry: Option<PendingWorldEntry>,
     world_loader: Option<world_loading::WorldLoader>,
+    #[cfg(feature = "paired-packages")]
+    retained_prepare_loader: Option<world_loading::RetainedWorldLoader>,
+    #[cfg(feature = "paired-packages")]
+    retained_preparation: Option<world_loading::PreparedOutcome>,
+    #[cfg(feature = "paired-packages")]
+    retained_entry_token: u64,
+    #[cfg(feature = "paired-packages")]
+    retained_entry_owner: Option<world_loading::RetainedEntryIdentity>,
+    #[cfg(feature = "paired-packages")]
+    retained_entry_closing: bool,
     pending_pack_reload: bool,
     /// A server's resource packs (game/server_packs.rs).
     server_packs: server_packs::ServerPackState,
@@ -13664,6 +13674,16 @@ impl<'a> Game<'a> {
             rest_loader: None,
             pending_entry: None,
             world_loader: None,
+            #[cfg(feature = "paired-packages")]
+            retained_prepare_loader: None,
+            #[cfg(feature = "paired-packages")]
+            retained_preparation: None,
+            #[cfg(feature = "paired-packages")]
+            retained_entry_token: 0,
+            #[cfg(feature = "paired-packages")]
+            retained_entry_owner: None,
+            #[cfg(feature = "paired-packages")]
+            retained_entry_closing: false,
             pending_pack_reload: false,
             server_packs: Default::default(),
             link_prompt: None,
@@ -14118,6 +14138,19 @@ struct WorldRestLoader {
 }
 
 impl WorldRestLoader {
+    /// Finished-only ownership return. Pending returns this exact real handle;
+    /// a completed result (including error/panic) is harvested exactly once.
+    #[allow(dead_code)]
+    fn try_harvest(self) -> std::result::Result<std::result::Result<(), String>, Self> {
+        if !self.handle.is_finished() {
+            return Err(self);
+        }
+        Ok(self
+            .handle
+            .join()
+            .unwrap_or_else(|_| Err("world resource loader panicked".into())))
+    }
+
     fn ready(&self) -> Result<bool> {
         // No time limit: the title stays usable while this loads, and a slow
         // disk or a debug build can take minutes. A failure ends the thread
@@ -14134,6 +14167,134 @@ impl WorldRestLoader {
 }
 
 impl Game<'_> {
+    /// Dormant retained entry. This does not call world_data_used, ordinary
+    /// finish_open_world, integrated startup, or any network admission path.
+    #[cfg(feature = "paired-packages")]
+    #[allow(dead_code)]
+    fn begin_retained_preparation(&mut self, request: world_loading::WorldRequest) -> Result<u64> {
+        if self.retained_entry_owner.is_some()
+            || self.retained_prepare_loader.is_some()
+            || self.retained_preparation.is_some()
+            || self.world_loader.is_some()
+            || self.rest_loader.is_some()
+            || self.session_lock.is_some()
+            || self.pending_entry.is_some()
+        {
+            return Err("retained entry requires vacant preparation and session owners".into());
+        }
+        let token = self
+            .retained_entry_token
+            .checked_add(1)
+            .ok_or("retained entry token exhausted")?;
+        let identity = world_loading::RetainedEntryIdentity {
+            token,
+            owner: Arc::new(()),
+        };
+        let loader = world_loading::RetainedWorldLoader::start(
+            request,
+            self.res.clone(),
+            self.pack.clone(),
+            self.options.clone(),
+            self.settings.clone(),
+        )?;
+        self.retained_prepare_loader = Some(loader);
+        self.retained_entry_token = token;
+        self.retained_entry_owner = Some(identity);
+        self.retained_entry_closing = false;
+        Ok(token)
+    }
+
+    #[cfg(feature = "paired-packages")]
+    #[allow(dead_code)]
+    fn poll_retained_prepare_outcome(
+        &mut self,
+    ) -> Option<std::result::Result<world_loading::PreparedOutcome, String>> {
+        let mut result = self
+            .retained_prepare_loader
+            .as_mut()?
+            .poll_retained_outcome()?;
+        self.retained_prepare_loader = None;
+        if let Ok(outcome) = &mut result {
+            let entry = self
+                .retained_entry_owner
+                .as_ref()
+                .expect("retained initialization entry custody");
+            outcome.bind_entry_token(entry.token, entry.owner.clone());
+        }
+        Some(result)
+    }
+
+    #[cfg(feature = "paired-packages")]
+    #[allow(dead_code)]
+    fn invalidate_retained_entry(&mut self) -> Result<()> {
+        let next = self
+            .retained_entry_token
+            .checked_add(1)
+            .ok_or("retained entry token exhausted")?;
+        self.retained_entry_token = next;
+        self.retained_entry_closing = true;
+        if let Some(loader) = &mut self.retained_prepare_loader {
+            loader.request_cancel();
+        }
+        if let Some(outcome) = &mut self.retained_preparation {
+            outcome.request_cancel();
+        }
+        Ok(())
+    }
+
+    /// Only a guarded transfer seam. Fallible ordinary Game adoption remains
+    /// separate C0e work; this slot keeps the SAME armed preparation owner.
+    #[cfg(feature = "paired-packages")]
+    #[allow(dead_code)]
+    fn adopt_retained_prepared(
+        &mut self,
+        token: u64,
+        ready: world_loading::RetainedPreparedWorld,
+    ) -> std::result::Result<(), (world_loading::RetainedPreparedWorld, String)> {
+        if token != self.retained_entry_token
+            || self.retained_entry_closing
+            || self.retained_preparation.is_some()
+            || self.retained_prepare_loader.is_some()
+            || self.world_loader.is_some()
+            || self.rest_loader.is_some()
+            || self.session_lock.is_some()
+            || self.pending_entry.is_some()
+            || !self
+                .retained_entry_owner
+                .as_ref()
+                .is_some_and(|entry| entry.token == token && ready.may_adopt(entry))
+        {
+            return Err((
+                ready,
+                "retained prepared entry is stale, replaced, occupied, or closing".into(),
+            ));
+        }
+        self.retained_preparation = Some(world_loading::PreparedOutcome::Ready(ready));
+        Ok(())
+    }
+
+    /// Harvesting or refusing a prepared outcome never opens another entry.
+    /// Only the original owner's actual terminal witness releases that custody.
+    #[cfg(feature = "paired-packages")]
+    #[allow(dead_code)]
+    fn acknowledge_retained_preparation_closed(
+        &mut self,
+        closed: world_loading::PreparationClosed,
+    ) -> std::result::Result<(), world_loading::PreparationClosed> {
+        if !self
+            .retained_entry_owner
+            .as_ref()
+            .is_some_and(|entry| closed.matches_entry(entry))
+            || self.retained_prepare_loader.is_some()
+            || self.retained_preparation.is_some()
+        {
+            return Err(closed);
+        }
+        self.retained_entry_owner = None;
+        self.retained_entry_closing = true;
+        Ok(())
+    }
+
     fn defer_world_entry(&mut self, entry: PendingWorldEntry) -> Result<bool> {
         self.poll_world_rest()?;
         if self.rest_loader.is_none() && self.world_loader.is_none() {

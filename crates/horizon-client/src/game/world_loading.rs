@@ -349,6 +349,1208 @@ impl WorldLoader {
     }
 }
 
+/// The retained route is deliberately separate from ordinary world entry.
+/// A failure and a ready result carry this same lexical resource owner.
+#[cfg(feature = "paired-packages")]
+#[allow(dead_code)]
+pub(super) struct PrepareOwner {
+    armed: bool,
+    request: WorldRequest,
+    native_acquisition: Option<horizon_client::save::RetainedSessionLock>,
+    preflight: Option<host_identity::IdentityPreflight>,
+    authority_acquisition: Option<host_identity::session_authority::RetainedAuthorityAcquisition>,
+    authority: Option<host_identity::session_authority::WorldAuthority>,
+    session: Option<WorldSession>,
+    save: Option<Arc<SaveDir>>,
+    streaming: Option<Streaming>,
+    level: Option<Level>,
+    world: Option<Box<World>>,
+    rand_sequences: Option<horizon_client::random_sequences::RandomSequences>,
+    locator: Option<Arc<VanillaTerrain>>,
+    native_checkpoint_origin: Option<NativeCheckpointOrigin>,
+    original_error: Option<String>,
+    read_refusals: Vec<String>,
+    cancelled: bool,
+    entry_token: Option<RetainedEntryIdentity>,
+    close_deadline: Option<std::time::Instant>,
+    close_error: Option<String>,
+    sealed: Option<horizon_client::streaming::SealedStream>,
+    producer_acknowledged: bool,
+    writer: Option<horizon_client::save::NativeWriterClose>,
+    writer_closed: Option<horizon_client::save::NativeWriterClosed>,
+    accepted_item_uuids: std::collections::BTreeSet<[i32; 4]>,
+    #[cfg(test)]
+    control: Option<RetainedPrepareControl>,
+}
+
+#[cfg(feature = "paired-packages")]
+impl Drop for PrepareOwner {
+    fn drop(&mut self) {
+        if self.armed {
+            use std::io::Write;
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "fatal: unresolved retained preparation owner"
+            );
+            // Before fields can drop a writer, native lock, or unfinished producer.
+            std::process::abort();
+        }
+    }
+}
+
+#[cfg(feature = "paired-packages")]
+#[allow(dead_code)]
+pub(super) struct RetainedPreparedWorld {
+    owner: Box<PrepareOwner>,
+}
+#[cfg(feature = "paired-packages")]
+impl RetainedPreparedWorld {
+    pub(super) fn may_adopt(&self, entry: &RetainedEntryIdentity) -> bool {
+        !self.owner.cancelled
+            && self.owner.close_deadline.is_none()
+            && self.owner.original_error.is_none()
+            && self.owner.armed
+            && self
+                .owner
+                .entry_token
+                .as_ref()
+                .is_some_and(|original| original.matches(entry))
+    }
+}
+#[cfg(feature = "paired-packages")]
+#[allow(dead_code)]
+pub(super) struct PrepareFailure {
+    owner: Box<PrepareOwner>,
+}
+#[cfg(feature = "paired-packages")]
+#[allow(dead_code)]
+pub(super) enum PreparedOutcome {
+    Ready(RetainedPreparedWorld),
+    Failed(PrepareFailure),
+}
+#[cfg(feature = "paired-packages")]
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum PreparationCloseStatus {
+    Pending,
+    Blocked(String),
+    Complete,
+}
+#[cfg(feature = "paired-packages")]
+#[allow(dead_code)]
+pub(super) struct PreparationClosed {
+    pub original_error: Option<String>,
+    /// Failed cleanup of actual read-only input, never a successful load/save.
+    pub read_refusals: Vec<String>,
+    pub cancelled: bool,
+    entry_token: Option<RetainedEntryIdentity>,
+}
+#[cfg(feature = "paired-packages")]
+impl PreparationClosed {
+    pub(super) fn matches_entry(&self, entry: &RetainedEntryIdentity) -> bool {
+        self.entry_token
+            .as_ref()
+            .is_some_and(|original| original.matches(entry))
+    }
+}
+#[cfg(feature = "paired-packages")]
+pub(super) struct RetainedEntryIdentity {
+    pub token: u64,
+    pub owner: Arc<()>,
+}
+#[cfg(feature = "paired-packages")]
+impl RetainedEntryIdentity {
+    fn matches(&self, other: &Self) -> bool {
+        self.token == other.token && Arc::ptr_eq(&self.owner, &other.owner)
+    }
+}
+
+#[cfg(feature = "paired-packages")]
+#[allow(dead_code)]
+impl PreparedOutcome {
+    pub(super) fn owner(&self) -> &PrepareOwner {
+        match self {
+            Self::Ready(ready) => &ready.owner,
+            Self::Failed(failure) => &failure.owner,
+        }
+    }
+    pub(super) fn owner_mut(&mut self) -> &mut PrepareOwner {
+        match self {
+            Self::Ready(ready) => &mut ready.owner,
+            Self::Failed(failure) => &mut failure.owner,
+        }
+    }
+    pub(super) fn request_cancel(&mut self) {
+        self.owner_mut().cancelled = true;
+    }
+    pub(super) fn bind_entry_token(&mut self, token: u64, identity: Arc<()>) {
+        self.owner_mut().entry_token = Some(RetainedEntryIdentity {
+            token,
+            owner: identity,
+        });
+    }
+    pub(super) fn begin_close(&mut self, deadline: std::time::Instant) {
+        let owner = self.owner_mut();
+        // Repeated close/cancel intents do not constitute Retry.
+        owner.close_deadline.get_or_insert(deadline);
+    }
+    pub(super) fn poll_close(&mut self, game: &Game<'_>) -> PreparationCloseStatus {
+        self.owner_mut().poll_close(game)
+    }
+    pub(super) fn retry_close(&mut self, deadline: std::time::Instant) -> Result<()> {
+        self.owner_mut().retry_close(deadline)
+    }
+    pub(super) fn finish_close(self) -> std::result::Result<PreparationClosed, Self> {
+        if self.owner().armed {
+            return Err(self);
+        }
+        Ok(PreparationClosed {
+            original_error: self.owner().original_error.clone(),
+            read_refusals: self.owner().read_refusals.clone(),
+            cancelled: self.owner().cancelled,
+            entry_token: self
+                .owner()
+                .entry_token
+                .as_ref()
+                .map(|entry| RetainedEntryIdentity {
+                    token: entry.token,
+                    owner: entry.owner.clone(),
+                }),
+        })
+    }
+}
+
+#[cfg(feature = "paired-packages")]
+#[allow(dead_code)]
+impl PrepareOwner {
+    fn new(request: WorldRequest) -> Box<Self> {
+        Box::new(Self {
+            armed: true,
+            request,
+            native_acquisition: None,
+            preflight: None,
+            authority_acquisition: None,
+            authority: None,
+            session: None,
+            save: None,
+            streaming: None,
+            level: None,
+            world: None,
+            rand_sequences: None,
+            locator: None,
+            native_checkpoint_origin: None,
+            original_error: None,
+            read_refusals: Vec::new(),
+            cancelled: false,
+            entry_token: None,
+            close_deadline: None,
+            close_error: None,
+            sealed: None,
+            producer_acknowledged: false,
+            writer: None,
+            writer_closed: None,
+            accepted_item_uuids: Default::default(),
+            #[cfg(test)]
+            control: None,
+        })
+    }
+
+    fn prepare(
+        &mut self,
+        res: &Resources,
+        pack: &PackResources,
+        options: &Options,
+        settings: &Settings,
+    ) -> Result<()> {
+        let request = &self.request;
+        if let Some(namespace) = &request.authority_namespace {
+            if request.identity_intent != IdentityIntent::CreateNewIdentity {
+                return Err("managed reopen requires authoritative archive recovery".into());
+            }
+            namespace.check_new_world(&request.save_root)?;
+        }
+        if request.expected_checkpoint_world.is_some()
+            && request.identity_intent != IdentityIntent::RequireExistingIdentity
+        {
+            return Err("checkpoint recovery requires existing identified native world".into());
+        }
+        options.mod_packages.check_world(&request.save_root)?;
+        self.preflight =
+            host_identity::IdentityPreflight::read(&request.save_root, request.identity_intent)?;
+        // Never starts or relinquishes global PRELOAD on this dormant route.
+        horizon_client::structure_blocks::loot_data(&options.resources);
+        if self.preflight.is_none() {
+            horizon_client::save::upgrade_older_world(&request.save_root)?;
+            horizon_client::save::migrate_legacy(&request.save_root)?;
+        }
+        self.native_acquisition = Some(horizon_client::save::RetainedSessionLock::new(
+            &request.save_root,
+        ));
+        self.native_acquisition.as_mut().unwrap().acquire()?;
+        #[cfg(test)]
+        Self::test_stage(&mut self.control, RetainedPrepareStage::NativeAcquired)?;
+        if let Some(preflight) = &self.preflight {
+            preflight.recheck(&request.save_root)?;
+            if let Some(namespace) = &request.authority_namespace {
+                self.authority_acquisition =
+                    Some(preflight.retained_authority_acquisition(namespace, &request.save_root)?);
+                self.authority_acquisition.as_mut().unwrap().acquire()?;
+                self.authority = Some(preflight.finish_retained_authority(
+                    namespace,
+                    self.authority_acquisition.as_mut().unwrap(),
+                )?);
+            }
+            if let Some(expected) = request.expected_checkpoint_world {
+                preflight.require_checkpoint_world(expected)?;
+            }
+            options.mod_packages.check_world(&request.save_root)?;
+            options.mod_packages.record_world(&request.save_root)?;
+            #[cfg(test)]
+            Self::test_stage(&mut self.control, RetainedPrepareStage::IdentityFinish)?;
+            self.session = Some(preflight.finish_retained(
+                &request.save_root,
+                self.native_acquisition.as_mut().unwrap(),
+            )?);
+            if self.authority.is_some() {
+                self.session
+                    .as_mut()
+                    .unwrap()
+                    .install_authority(&mut self.authority)?;
+            }
+        } else {
+            options.mod_packages.record_world(&request.save_root)?;
+            let lock = self
+                .native_acquisition
+                .as_mut()
+                .unwrap()
+                .finish(&request.save_root)?;
+            self.session = Some(WorldSession::legacy(lock));
+        }
+        self.rand_sequences = Some(
+            horizon_client::save::read_dat(
+                &request
+                    .save_root
+                    .join("data/minecraft/random_sequences.dat"),
+            )
+            .and_then(|tag| tag.get("data").cloned())
+            .map(|data| horizon_client::random_sequences::RandomSequences::from_nbt(&data))
+            .unwrap_or_default(),
+        );
+        let existing = Level::read(&request.save_root);
+        if request.identity_intent.requires_existing() && existing.is_none() {
+            return Err("required host identity reopen: native Level could not be read; fresh-world fallback refused".into());
+        }
+        let created = existing.is_none();
+        self.level = Some(existing.unwrap_or_else(|| {
+            Level {
+                name: request
+                    .name
+                    .as_deref()
+                    .unwrap_or(&request.folder)
+                    .to_owned(),
+                seed: request.seed.unwrap_or_else(|| {
+                    let time = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_nanos() as u64);
+                    (time ^ (time >> 29)).wrapping_mul(0x9E37_79B9_7F4A_7C15) as i64
+                }),
+                creative: request.creative,
+                day_time: 0,
+                health: 20.0,
+                food: 20,
+                saturation: 5.0,
+                ..Level::default()
+            }
+        }));
+        let level = self.level.as_mut().unwrap();
+        if created && let Some(create) = &request.create {
+            level.hardcore = create.hardcore;
+            level.difficulty = horizon_client::title::DIFFICULTIES[create.difficulty()].into();
+            level.allow_commands = Some(create.commands(request.creative));
+            horizon_client::save::write_world_gen_settings_with(
+                &request.save_root,
+                level.seed,
+                create.world_gen(),
+                create.flat_settings(),
+            )?;
+            level.game_rules = create.rules.by_name();
+        }
+        if created {
+            level.allow_commands.get_or_insert(request.creative);
+        }
+        if let Some(dimension) = &options.dimension {
+            level.dimension = dimension.clone();
+            level.position = None;
+        }
+        let dim = Dim::from_id(&level.dimension);
+        let seed = level.seed;
+        self.save = Some(Arc::new(SaveDir::new_retained(
+            horizon_client::save::dimension_dir(&request.save_root, dim.id()),
+        )));
+        #[cfg(test)]
+        Self::test_stage(&mut self.control, RetainedPrepareStage::SaveAcquired)?;
+        self.prepare_streaming(res, pack, options, settings, dim, seed)?;
+        #[cfg(test)]
+        Self::test_stage(&mut self.control, RetainedPrepareStage::StreamingAcquired)?;
+        self.world = Some(Box::new(World::new(res.facts().air, seed)));
+        let world = self.world.as_mut().unwrap();
+        self.session
+            .as_mut()
+            .unwrap()
+            .bind_initial_counter_world(world, dim.id())?;
+        world.fast_lava = dim == Dim::Nether;
+        world.game_time = self.level.as_ref().unwrap().time;
+        world.day_time = options
+            .time
+            .unwrap_or(self.level.as_ref().unwrap().day_time);
+        world.weather = self.level.as_ref().unwrap().weather;
+        if let Some(weather) = options.weather.as_deref() {
+            let (rain, thunder) = (weather != "clear", weather == "thunder");
+            world.weather = horizon_client::world::Weather {
+                clear_time: if weather == "clear" { 6000 } else { 0 },
+                rain_time: 6000,
+                thunder_time: 6000,
+                raining: rain,
+                thundering: thunder,
+                rain_level: if rain { (1.0, 1.0) } else { (0.0, 0.0) },
+                thunder_level: if thunder { (1.0, 1.0) } else { (0.0, 0.0) },
+            };
+        }
+        growth::install_live_features(res, pack, options);
+        if !self.request.save_root.join("level.dat").exists() {
+            self.level
+                .as_mut()
+                .unwrap()
+                .write(&self.request.save_root)?;
+        }
+        Ok(())
+    }
+
+    fn prepare_streaming(
+        &mut self,
+        res: &Resources,
+        pack: &PackResources,
+        options: &Options,
+        settings: &Settings,
+        dim: Dim,
+        seed: i64,
+    ) -> Result<()> {
+        let save = self.save.as_ref().unwrap().clone();
+        let flat = (dim == Dim::Overworld)
+            .then(|| horizon_client::save::world_gen_settings(&self.request.save_root))
+            .flatten()
+            .and_then(|settings| {
+                horizon_client::flatgen::FlatTerrain::from_settings(
+                    &settings,
+                    pack.assets.registry,
+                    res.biomes(),
+                )
+            });
+        let started = if let Some(inner) = flat {
+            self.start_stream(
+                Arc::new(Persistent {
+                    inner: Arc::new(inner),
+                    save: save.clone(),
+                    registry: pack.assets.clone(),
+                    biomes: res.biomes().clone(),
+                }),
+                res,
+                pack,
+                save.clone(),
+            )
+        } else if options.test_terrain && dim == Dim::Overworld {
+            let inner = Arc::new(TestTerrain::new(pack.assets.registry, res.biomes())?);
+            self.native_checkpoint_origin = self
+                .session
+                .as_ref()
+                .unwrap()
+                .expected_world()
+                .is_some()
+                .then(|| NativeCheckpointOrigin {
+                    root: self.request.save_root.clone(),
+                    dimension: dim,
+                    save: Arc::downgrade(&save),
+                });
+            self.start_stream(
+                Arc::new(Persistent {
+                    inner,
+                    save: save.clone(),
+                    registry: pack.assets.clone(),
+                    biomes: res.biomes().clone(),
+                }),
+                res,
+                pack,
+                save.clone(),
+            )
+        } else {
+            let structures = horizon_client::save::WorldGen::read(&self.request.save_root)
+                .is_none_or(|world| world.structures);
+            let inner = Arc::new(VanillaTerrain::for_world(&options.resources.join("worldgen"), pack.assets.registry, res.biomes(), seed, dim.id(), structures)
+                .map_err(|error| format!("{error}\nPrepare the worldgen bundle with the launcher, or: horizon-prepare --prepare"))?);
+            // Deliberately omit only the optional detached Ring search here.
+            self.locator = Some(inner.clone());
+            self.start_stream(
+                Arc::new(Persistent {
+                    inner,
+                    save: save.clone(),
+                    registry: pack.assets.clone(),
+                    biomes: res.biomes().clone(),
+                }),
+                res,
+                pack,
+                save.clone(),
+            )
+        };
+        match started {
+            Ok(streaming) => self.streaming = Some(streaming),
+            Err(failure) => {
+                self.streaming = Some(failure.streaming);
+                return Err(failure.error.into());
+            }
+        }
+        let streaming = self.streaming.as_mut().unwrap();
+        streaming.forced = save.load_forced_chunks();
+        streaming.radius = settings.render_distance;
+        streaming.biome_blend = settings.biome_blend;
+        streaming.smooth_lighting = settings.smooth_lighting;
+        streaming.cutout_leaves = settings.cutout_leaves;
+        streaming.biome_zoom = BiomeZoom::new(obfuscate_seed(seed));
+        streaming.sky_light = dim != Dim::Nether;
+        streaming.nether_shading = dim == Dim::Nether;
+        streaming.mesh = options.execution_role.is_client();
+        Ok(())
+    }
+
+    #[allow(clippy::result_large_err)] // Exact partial Streaming owner is the agreed failure API.
+    fn start_stream<G: horizon_client::streaming::ChunkGenerator>(
+        &mut self,
+        generator: Arc<G>,
+        res: &Resources,
+        pack: &PackResources,
+        save: Arc<SaveDir>,
+    ) -> std::result::Result<Streaming, horizon_client::streaming::StreamingStartFailure> {
+        #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+        if let Some(control) = self
+            .control
+            .as_mut()
+            .and_then(|control| control.streaming.take())
+        {
+            let threads = self
+                .control
+                .as_ref()
+                .and_then(|control| control.streaming_threads)
+                .unwrap_or_else(|| res.threads());
+            return Streaming::start_retained_with_test_control(
+                generator,
+                pack.context.clone(),
+                threads,
+                save,
+                control,
+            );
+        }
+        Streaming::start_retained(generator, pack.context.clone(), res.threads(), save)
+    }
+
+    fn blocked(&mut self, error: impl Into<String>) -> PreparationCloseStatus {
+        let error = error.into();
+        self.close_error.get_or_insert_with(|| error.clone());
+        PreparationCloseStatus::Blocked(error)
+    }
+
+    fn poll_close(&mut self, game: &Game<'_>) -> PreparationCloseStatus {
+        use horizon_client::{save::RetainedWriterStatus, streaming::RetainedStreamStatus};
+        if !self.armed {
+            return PreparationCloseStatus::Complete;
+        }
+        let Some(deadline) = self.close_deadline else {
+            return PreparationCloseStatus::Pending;
+        };
+        if !self.producer_acknowledged
+            && let Some(streaming) = &mut self.streaming
+        {
+            if let Err(error) = streaming.begin_retained_close(self.world.as_deref(), deadline) {
+                return self.blocked(error);
+            }
+            if self.sealed.is_none() {
+                match streaming.poll_retained_close(self.world.as_deref_mut()) {
+                    RetainedStreamStatus::Pending => return PreparationCloseStatus::Pending,
+                    RetainedStreamStatus::Blocked(error) => return self.blocked(error),
+                    RetainedStreamStatus::NeedsRefusedRead => {
+                        let read = streaming
+                            .retained_refused_read()
+                            .expect("retained refused read requested");
+                        let error = read.error().to_owned();
+                        let ticket = read.into_ticket();
+                        match streaming.resolve_retained_refused_read(ticket, error) {
+                            Ok(_) => return PreparationCloseStatus::Pending,
+                            Err(error) => return self.blocked(error),
+                        }
+                    }
+                    RetainedStreamStatus::NeedsFinishedColumn => {
+                        let view = streaming
+                            .retained_finished_column()
+                            .expect("retained column requested");
+                        let staged = validate_retained_column(
+                            game,
+                            &self.request.save_root,
+                            self.level.as_ref(),
+                            self.world.as_deref(),
+                            self.session.as_ref(),
+                            self.save.as_ref().unwrap(),
+                            self.native_checkpoint_origin.as_ref(),
+                            &self.accepted_item_uuids,
+                            view.chunk(),
+                            view.evidence(),
+                        );
+                        let (disposition, identities) = match staged {
+                            Ok(Some(value)) => value,
+                            Ok(None) => return PreparationCloseStatus::Pending,
+                            Err(error) => {
+                                let error = error.to_string();
+                                let read_only = view.evidence().is_some()
+                                    && !view.chunk().fresh
+                                    && view.origin()
+                                        == horizon_client::streaming::NativeWorkOrigin::Generate;
+                                let ticket = view.into_ticket();
+                                if read_only {
+                                    return match streaming
+                                        .resolve_retained_refused_read(ticket, error)
+                                    {
+                                        Ok(_) => PreparationCloseStatus::Pending,
+                                        Err(error) => self.blocked(error),
+                                    };
+                                }
+                                if let Err(rejection) =
+                                    streaming.reject_retained_finished_column(ticket, error.clone())
+                                {
+                                    return self.blocked(rejection);
+                                }
+                                return self.blocked(error);
+                            }
+                        };
+                        let ticket = view.into_ticket();
+                        match streaming.resolve_retained_finished_column(ticket, disposition) {
+                            Ok(true) => self.accepted_item_uuids.extend(identities),
+                            Ok(false) => return PreparationCloseStatus::Pending,
+                            Err(error) => return self.blocked(error),
+                        }
+                        return PreparationCloseStatus::Pending;
+                    }
+                    RetainedStreamStatus::Complete => {
+                        self.sealed = streaming.take_sealed();
+                        if self.sealed.is_none() {
+                            return self.blocked("retained producer completion witness missing");
+                        }
+                        self.read_refusals = self.sealed.as_ref().unwrap().refused_reads().to_vec();
+                        if self.sealed.as_ref().unwrap().failed_initialization
+                            && self.original_error.is_none()
+                        {
+                            self.original_error = Some(
+                                streaming
+                                    .retained_close_failures()
+                                    .first()
+                                    .cloned()
+                                    .unwrap_or_else(|| {
+                                        "retained native producer initialization failed".into()
+                                    }),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        if self.writer_closed.is_none()
+            && let Some(save) = &self.save
+        {
+            if self.writer.is_none() {
+                match save.begin_retained_writer_close(deadline) {
+                    Ok(Some(writer)) => self.writer = Some(writer),
+                    Ok(None) => return PreparationCloseStatus::Pending,
+                    Err(error) => return self.blocked(error.to_string()),
+                }
+            }
+            match self.writer.as_mut().unwrap().poll() {
+                RetainedWriterStatus::Pending => return PreparationCloseStatus::Pending,
+                RetainedWriterStatus::Blocked(error) => return self.blocked(error),
+                RetainedWriterStatus::Complete => match self.writer.take().unwrap().finish() {
+                    Ok(closed) => self.writer_closed = Some(closed),
+                    Err(writer) => {
+                        self.writer = Some(writer);
+                        return self.blocked("writer finish refused after Complete");
+                    }
+                },
+            }
+        }
+        if let Some(error) = &self.close_error {
+            return PreparationCloseStatus::Blocked(error.clone());
+        }
+        if !self.producer_acknowledged
+            && let Some(streaming) = &mut self.streaming
+        {
+            let Some(closed) = &self.writer_closed else {
+                return self.blocked("producer has no matching native writer witness");
+            };
+            if !Arc::ptr_eq(closed.save(), self.save.as_ref().unwrap()) {
+                return self.blocked("native writer allocation changed");
+            }
+            match streaming.poll_retained_writer_ack(closed) {
+                RetainedStreamStatus::Pending => return PreparationCloseStatus::Pending,
+                RetainedStreamStatus::Blocked(error) => return self.blocked(error),
+                RetainedStreamStatus::Complete => {}
+                RetainedStreamStatus::NeedsFinishedColumn
+                | RetainedStreamStatus::NeedsRefusedRead => {
+                    return self.blocked("writer acknowledgement found unsettled native input");
+                }
+            }
+            let Some(sealed) = self.sealed.take() else {
+                return self.blocked("producer witness missing at acknowledgement");
+            };
+            if let Err(sealed) = streaming.finish_retained_close(sealed, closed) {
+                self.sealed = Some(sealed);
+                return self.blocked("native producer/writer acknowledgement refused");
+            }
+            self.producer_acknowledged = true;
+        }
+        // No resource owner is released until the actual producers and writer
+        // are terminal. These lock-only wrappers do not certify closure alone.
+        if let Some(acquisition) = &mut self.authority_acquisition
+            && let Err(error) = acquisition.release_lock_only()
+        {
+            return self.blocked(error.to_string());
+        }
+        if let Some(acquisition) = &mut self.native_acquisition
+            && let Err(error) = acquisition.release_lock_only()
+        {
+            return self.blocked(error.to_string());
+        }
+        self.session = None;
+        self.authority = None;
+        self.armed = false;
+        PreparationCloseStatus::Complete
+    }
+
+    fn retry_close(&mut self, deadline: std::time::Instant) -> Result<()> {
+        if self.close_error.is_none() || deadline <= std::time::Instant::now() || !self.armed {
+            return Err("preparation Retry requires a blocked owner and future deadline".into());
+        }
+        if let Some(writer) = &mut self.writer {
+            writer.retry(deadline)?;
+        } else if !self.producer_acknowledged
+            && self.sealed.is_none()
+            && let Some(streaming) = &mut self.streaming
+        {
+            streaming.retry_retained_close(deadline)?;
+        }
+        self.close_deadline = Some(deadline);
+        self.close_error = None;
+        Ok(())
+    }
+}
+
+/// The retained initialization handle is never replaced by a disposal thread.
+#[cfg(feature = "paired-packages")]
+#[allow(dead_code)]
+pub(super) struct RetainedWorldLoader {
+    handle: Option<JoinHandle<PreparedOutcome>>,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+}
+#[cfg(feature = "paired-packages")]
+impl Drop for RetainedWorldLoader {
+    fn drop(&mut self) {
+        if self.handle.is_some() {
+            use std::io::Write;
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "fatal: unresolved retained initialization handle"
+            );
+            std::process::abort();
+        }
+    }
+}
+#[cfg(feature = "paired-packages")]
+#[allow(dead_code)]
+impl RetainedWorldLoader {
+    pub(super) fn start(
+        request: WorldRequest,
+        res: Arc<Resources>,
+        pack: PackResources,
+        options: Options,
+        settings: Settings,
+    ) -> Result<Self> {
+        #[cfg(test)]
+        {
+            Self::start_inner(request, res, pack, options, settings, None)
+        }
+        #[cfg(not(test))]
+        {
+            Self::start_inner(request, res, pack, options, settings)
+        }
+    }
+    fn start_inner(
+        request: WorldRequest,
+        res: Arc<Resources>,
+        pack: PackResources,
+        options: Options,
+        settings: Settings,
+        #[cfg(test)] control: Option<RetainedPrepareControl>,
+    ) -> Result<Self> {
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let intent = cancel.clone();
+        let handle = std::thread::Builder::new()
+            .name("Retained world initialization".into())
+            .spawn(move || {
+                let mut owner = PrepareOwner::new(request);
+                #[cfg(test)]
+                {
+                    owner.control = control;
+                }
+                #[cfg(test)]
+                let gate = PrepareOwner::test_stage(
+                    &mut owner.control,
+                    RetainedPrepareStage::BeforeAcquire,
+                );
+                #[cfg(not(test))]
+                let gate: Result<()> = Ok(());
+                let result = if let Err(error) = gate {
+                    Err(error)
+                } else if intent.load(Ordering::Acquire) {
+                    Err("world initialization cancelled before acquisition".into())
+                } else {
+                    owner.prepare(&res, &pack, &options, &settings)
+                };
+                owner.cancelled = intent.load(Ordering::Acquire);
+                match result {
+                    Ok(()) => PreparedOutcome::Ready(RetainedPreparedWorld { owner }),
+                    Err(error) => {
+                        owner.original_error = Some(error.to_string());
+                        PreparedOutcome::Failed(PrepareFailure { owner })
+                    }
+                }
+            })?;
+        Ok(Self {
+            handle: Some(handle),
+            cancel,
+        })
+    }
+    pub(super) fn request_cancel(&mut self) {
+        self.cancel.store(true, Ordering::Release);
+    }
+    pub(super) fn poll_retained_outcome(
+        &mut self,
+    ) -> Option<std::result::Result<PreparedOutcome, String>> {
+        if !self
+            .handle
+            .as_ref()
+            .is_some_and(|handle| handle.is_finished())
+        {
+            return None;
+        }
+        let outcome = self
+            .handle
+            .take()
+            .unwrap()
+            .join()
+            .map_err(|_| "retained initialization worker panicked".to_owned());
+        Some(outcome.map(|mut outcome| {
+            outcome.owner_mut().cancelled |= self.cancel.load(Ordering::Acquire);
+            outcome
+        }))
+    }
+}
+
+/// Validate without publishing a native column or activating any entity. The
+/// original Arc and work lease remain inside Streaming throughout this function.
+#[cfg(feature = "paired-packages")]
+#[allow(clippy::too_many_arguments)] // Borrow disjoint guarded fields while Streaming retains the payload.
+fn validate_retained_column(
+    game: &Game<'_>,
+    root: &std::path::Path,
+    level: Option<&Level>,
+    world: Option<&World>,
+    session: Option<&WorldSession>,
+    save: &Arc<SaveDir>,
+    origin: Option<&NativeCheckpointOrigin>,
+    accepted: &std::collections::BTreeSet<[i32; 4]>,
+    chunk: &Arc<horizon_client::chunk::Chunk>,
+    evidence: Option<&horizon_client::save::RetainedLoadedRecords>,
+) -> Result<
+    Option<(
+        horizon_client::streaming::RetainedColumnDisposition,
+        std::collections::BTreeSet<[i32; 4]>,
+    )>,
+> {
+    use super::levels::session_checkpoint::{checked, fail, items, require, validate_column};
+    use horizon_client::save::LevelShape;
+    let validate = || -> super::levels::session_checkpoint::SResult<_> {
+        let level = level.ok_or_else(|| fail("late native column without original Level"))?;
+        let world = world.ok_or_else(|| fail("late native column without original World"))?;
+        let dimension = Dim::from_id(&level.dimension);
+        checked(
+            origin
+                .ok_or_else(|| fail("late column requires actual native TestTerrain provenance"))?
+                .validate(root, dimension, save),
+        )?;
+        require(
+            session.and_then(WorldSession::expected_world).is_some(),
+            "late native column has no retained identified session",
+        )?;
+        let at = (chunk.x, chunk.z);
+        require(
+            !world.chunks.contains_key(&at),
+            "late native column collides with frozen resident owner",
+        )?;
+        let tables = horizon_client::save::SaveTables::new(&game.pack.assets);
+        let encoded = if chunk.fresh {
+            require(
+                evidence.is_none(),
+                "fresh native column unexpectedly carries loaded provenance",
+            )?;
+            horizon_client::save::encode_with(
+                chunk,
+                game.pack.assets.registry,
+                game.res.biomes(),
+                Some(&tables),
+                LevelShape::OVERWORLD,
+            )
+        } else {
+            let evidence = evidence.ok_or_else(|| {
+                fail("loaded late native column requires retained original raw storage evidence")
+            })?;
+            require(
+                Arc::ptr_eq(evidence.save(), save)
+                    && evidence.position() == at
+                    && evidence.dimension_root() == save.root.as_path(),
+                "late native record allocation/coordinate/dimension mismatch",
+            )?;
+            match checked(evidence.poll_current())? {
+                None => return Ok(None),
+                Some(false) => {
+                    return Err(fail(
+                        "late native original record superseded by newer relevant storage write",
+                    ));
+                }
+                Some(true) => {}
+            }
+            let column = retained_record_tag(game, evidence.column(), at, false)?
+                .ok_or_else(|| fail("loaded late native column has proven absent column source"))?;
+            let entities = retained_record_tag(game, evidence.entities(), at, true)?;
+            let tags = match &entities {
+                None => &[][..],
+                Some(named) => {
+                    require(named.name.0.is_empty(), "native entity record named root")?;
+                    let horizon_world::nbt::Tag::Compound(values) = &named.tag else {
+                        return Err(fail("native entity record compound root"));
+                    };
+                    require(
+                        values.len() == 3
+                            && values.keys().all(|key| {
+                                ["DataVersion", "Position", "Entities"]
+                                    .iter()
+                                    .any(|allowed| {
+                                        key == &horizon_world::nbt::JavaString::from(*allowed)
+                                    })
+                            })
+                            && named.tag.get("DataVersion")
+                                == Some(&horizon_world::nbt::Tag::Int(horizon_world::DATA_VERSION))
+                            && named.tag.get("Position")
+                                == Some(&horizon_world::nbt::Tag::IntArray(vec![at.0, at.1])),
+                        "native entity record root/version/position",
+                    )?;
+                    let Some(horizon_world::nbt::Tag::List(tags)) = named.tag.get("Entities")
+                    else {
+                        return Err(fail("native entity record List required"));
+                    };
+                    tags.as_slice()
+                }
+            };
+            require(
+                tags == chunk.entities.as_slice(),
+                "late native entity source/loaded payload ownership mismatch",
+            )?;
+            if let horizon_client::save::RetainedRecordView::Pending {
+                kind: horizon_client::save::RetainedPendingKind::Chunk,
+                chunk: Some(original),
+                ..
+            } = evidence.column()
+            {
+                require(
+                    original.entities == chunk.entities,
+                    "original pending column entities were discarded by sidecar replacement",
+                )?;
+                let original_decoded = validate_column(game, &column, at, world.game_time)?;
+                validate_retained_projection(original, &column, &original_decoded)?;
+            }
+            column
+        };
+        let decoded = validate_column(game, &encoded, at, world.game_time)?;
+        validate_retained_projection(chunk, &encoded, &decoded)?;
+        require(
+            chunk.entities.len() <= items::ITEM_LIMIT,
+            "late native item count bound",
+        )?;
+        let mut identities = std::collections::BTreeSet::new();
+        let mut bytes = 0usize;
+        for tag in &chunk.entities {
+            let (uuid, row) = items::validate_item_tag(game, tag)?;
+            require(row.column == at, "late native entity column mismatch")?;
+            require(
+                identities.insert(uuid) && !accepted.contains(&uuid),
+                "duplicate late native item UUID",
+            )?;
+            require(
+                level.player_uuid != Some(uuid)
+                    && !game.persist.uuids.values().any(|known| *known == uuid),
+                "late native item/player or live UUID collision",
+            )?;
+            for (_, tags) in &world.loaded_entities {
+                for resident in tags {
+                    let (known, _) = items::validate_item_tag(game, resident)?;
+                    require(
+                        known != uuid,
+                        "late native item/frozen arrival UUID collision",
+                    )?;
+                }
+            }
+            bytes = bytes
+                .checked_add(items::exact_item_encoding(tag)?)
+                .ok_or_else(|| fail("late native item byte overflow"))?;
+            require(bytes <= 64 << 20, "late native item aggregate byte bound")?;
+        }
+        require(
+            accepted
+                .len()
+                .checked_add(identities.len())
+                .is_some_and(|count| count <= items::ITEM_LIMIT),
+            "retained native item aggregate count bound",
+        )?;
+        let disposition = if chunk.fresh {
+            horizon_client::streaming::RetainedColumnDisposition::StoreFresh
+        } else {
+            horizon_client::streaming::RetainedColumnDisposition::AlreadyStored
+        };
+        Ok(Some((disposition, identities)))
+    };
+    validate().map_err(|error| error.to_string().into())
+}
+
+#[cfg(feature = "paired-packages")]
+fn validate_retained_projection(
+    original: &horizon_client::chunk::Chunk,
+    encoded: &horizon_world::nbt::NamedTag,
+    decoded: &horizon_client::chunk::Chunk,
+) -> super::levels::session_checkpoint::SResult<()> {
+    use super::levels::session_checkpoint::require;
+    use horizon_client::chunk::SECTIONS;
+    require(
+        original.sections.len() == SECTIONS && decoded.sections.len() == SECTIONS,
+        "late native section count",
+    )?;
+    require(
+        original.block_entities.is_empty()
+            && original.block_names.is_empty()
+            && original.postprocess.is_empty()
+            && original.structure_refs.is_empty()
+            && original.structure_starts.is_empty(),
+        "late native column contains unsupported unique payload",
+    )?;
+    if let Some(extras) = &original.saved {
+        require(
+            extras.block_entities.is_empty()
+                && extras.block_entity_sources.is_empty()
+                && extras.block_entity_order.is_empty()
+                && extras.block_ticks.is_empty()
+                && extras.fluid_ticks.is_empty()
+                && extras.rolled_loot.is_empty()
+                && !extras.root.contains_key(&"entities".into()),
+            "late native saved payload projection would lose ownership",
+        )?;
+        for (key, value) in &extras.root {
+            let horizon_world::nbt::Tag::Compound(values) = &encoded.tag else {
+                return Err(super::levels::session_checkpoint::fail(
+                    "late native projected root is not Compound",
+                ));
+            };
+            require(
+                values.get(key) == Some(value),
+                "late native retained root projection changed original data",
+            )?;
+        }
+    }
+    require(
+        original.lit == decoded.lit,
+        "late native light flag projection changed",
+    )?;
+    for (before, after) in original.sections.iter().zip(&decoded.sections) {
+        for index in 0..4096 {
+            require(
+                before.blocks.get(index) == after.blocks.get(index),
+                "late native block projection changed a cell",
+            )?;
+            require(
+                before.light.get(index) == after.light.get(index),
+                "late native light projection changed a cell",
+            )?;
+        }
+        for index in 0..64 {
+            require(
+                before.biomes.get(index) == after.biomes.get(index),
+                "late native biome projection changed a cell",
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Interpret only the original factory-issued storage evidence. IO and raw
+/// header validation already ran on its native worker before any constructor.
+#[cfg(feature = "paired-packages")]
+fn retained_record_tag(
+    game: &Game<'_>,
+    record: horizon_client::save::RetainedRecordView<'_>,
+    at: (i32, i32),
+    entities: bool,
+) -> super::levels::session_checkpoint::SResult<Option<horizon_world::nbt::NamedTag>> {
+    use super::levels::session_checkpoint::{checked, fail, items, raw_nbt, require};
+    use horizon_client::save::{LevelShape, RetainedPendingKind, RetainedRecordView};
+    let slot = ((at.1 & 31) * 32 + (at.0 & 31)) as usize;
+    match record {
+        RetainedRecordView::Missing { region } => {
+            if let Some(region) = region {
+                require(
+                    !region.present().contains(&slot),
+                    "missing native slot contradicts original region locations",
+                )?;
+            }
+            Ok(None)
+        }
+        RetainedRecordView::Disk { record, region } => {
+            require(
+                region.present().contains(&slot)
+                    && region.header().len() == 8192
+                    && region.file_len() >= 8192,
+                "native disk record/header correlation",
+            )?;
+            if entities {
+                return items::read_item_record(record).map(Some);
+            }
+            raw_nbt(&checked(
+                record.compression.decode(&record.compressed, 1 << 20),
+            )?)
+            .map(Some)
+        }
+        RetainedRecordView::Refused { error, .. } => Err(fail(error)),
+        RetainedRecordView::Pending {
+            kind,
+            tag,
+            chunk,
+            registry,
+            biomes,
+            shape,
+            ..
+        } => {
+            if kind == RetainedPendingKind::Delete {
+                require(
+                    tag.is_none() && chunk.is_none(),
+                    "native pending Delete owns an unexpected projection",
+                )?;
+                return Ok(None);
+            }
+            if entities {
+                require(
+                    matches!(
+                        kind,
+                        RetainedPendingKind::Tag | RetainedPendingKind::FinishedEntities
+                    ),
+                    "native entity pending kind mismatch",
+                )?;
+                if kind == RetainedPendingKind::FinishedEntities {
+                    let source = chunk.ok_or_else(|| {
+                        fail("native pending finished entities lost original Chunk")
+                    })?;
+                    if source.entities.is_empty() {
+                        require(
+                            tag.is_none(),
+                            "empty native finished entities projected as present",
+                        )?;
+                        return Ok(None);
+                    }
+                    require(
+                        matches!(tag.and_then(|tag| tag.tag.get("Entities")), Some(horizon_world::nbt::Tag::List(tags)) if tags == &source.entities),
+                        "native pending finished entities projection changed original payload",
+                    )?;
+                }
+            } else {
+                require(
+                    matches!(kind, RetainedPendingKind::Tag | RetainedPendingKind::Chunk),
+                    "native column pending kind mismatch",
+                )?;
+                if kind == RetainedPendingKind::Chunk {
+                    require(
+                        chunk.is_some()
+                            && registry.is_some_and(|registry| {
+                                std::ptr::eq(registry, game.pack.assets.registry)
+                            })
+                            && biomes
+                                .is_some_and(|biomes| std::ptr::eq(biomes, &**game.res.biomes()))
+                            && shape == Some(LevelShape::OVERWORLD),
+                        "native pending Chunk encoding context mismatch",
+                    )?;
+                }
+            }
+            let tag = tag
+                .ok_or_else(|| fail("native pending record lost original structured projection"))?;
+            require(tag.name.0.is_empty(), "native pending record named root")?;
+            Ok(Some(tag.clone()))
+        }
+    }
+}
+
+#[cfg(all(test, feature = "paired-packages"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RetainedPrepareStage {
+    BeforeAcquire,
+    NativeAcquired,
+    IdentityFinish,
+    SaveAcquired,
+    StreamingAcquired,
+}
+#[cfg(all(test, feature = "paired-packages"))]
+struct RetainedPrepareControl {
+    stage: RetainedPrepareStage,
+    entered: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+    fail: bool,
+    #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+    streaming: Option<horizon_client::streaming::RetainedStreamingStartTestControl>,
+    #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+    streaming_threads: Option<usize>,
+}
+#[cfg(all(test, feature = "paired-packages"))]
+impl PrepareOwner {
+    fn test_stage(
+        control: &mut Option<RetainedPrepareControl>,
+        stage: RetainedPrepareStage,
+    ) -> Result<()> {
+        if let Some(control) = control
+            && control.stage == stage
+        {
+            let _ = control.entered.send(());
+            control
+                .release
+                .recv()
+                .map_err(|_| "retained preparation test release disconnected")?;
+            if control.fail {
+                return Err(format!("controlled preparation failure after {stage:?}").into());
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(all(test, feature = "paired-packages", target_os = "linux"))]
+#[path = "world_loading/retained_prepare_tests.rs"]
+mod retained_prepare_tests;
+
 /// How long the preloaded world data outlives the world screens: a player
 /// who goes back to the title or to Multiplayer and opens no world for this
 /// long gets the memory back.

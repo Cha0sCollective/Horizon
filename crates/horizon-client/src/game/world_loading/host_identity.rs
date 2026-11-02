@@ -335,6 +335,61 @@ pub(super) struct IdentityPreflight {
 }
 #[cfg(feature = "paired-packages")]
 impl IdentityPreflight {
+    /// Build custody before acquisition. No authority is acquired by this helper.
+    pub(super) fn retained_authority_acquisition(
+        &self,
+        namespace: &session_authority::AuthorityNamespace,
+        root: &Path,
+    ) -> Result<session_authority::RetainedAuthorityAcquisition> {
+        if !matches!(&self.kind, PreflightKind::New { .. }) {
+            return Err("managed reopen requires authoritative archive recovery".into());
+        }
+        namespace.check_new_world(root)?;
+        namespace.retained_acquisition(self.world)
+    }
+
+    pub(super) fn finish_retained_authority(
+        &self,
+        namespace: &session_authority::AuthorityNamespace,
+        acquisition: &mut session_authority::RetainedAuthorityAcquisition,
+    ) -> Result<session_authority::WorldAuthority> {
+        if !matches!(&self.kind, PreflightKind::New { .. }) {
+            return Err("managed reopen requires authoritative archive recovery".into());
+        }
+        acquisition.finish(namespace, self.world)
+    }
+
+    /// All identity IO precedes extraction of the original ready native lock.
+    /// On any error the caller still owns this preflight and the acquisition.
+    pub(super) fn finish_retained(
+        &self,
+        root: &Path,
+        native: &mut horizon_client::save::RetainedSessionLock,
+    ) -> Result<WorldSession> {
+        if !native.ready() {
+            return Err("retained native lock is not ready for identity finish".into());
+        }
+        if let PreflightKind::New { encoded } = &self.kind {
+            create_identity(root, encoded)?;
+        }
+        let bootstrap = match &self.kind {
+            PreflightKind::New { .. } => Some(
+                horizon_client::world::counter_restore::HostCounterBootstrap::for_new_host_world(
+                    self.world,
+                ),
+            ),
+            PreflightKind::Existing { .. } => None,
+        };
+        let lock = native.finish(root)?;
+        // No fallible work follows the take of the actual native SessionLock.
+        Ok(WorldSession {
+            _lock: lock,
+            authority: None,
+            world: Some(self.world),
+            counter_bootstrap: bootstrap,
+        })
+    }
+
     /// Called after the exact identity/native-level under-lock recheck and before
     /// any world recording or native streaming construction for recovery.
     pub(super) fn require_checkpoint_world(&self, expected: WorldId) -> Result<()> {

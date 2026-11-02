@@ -1797,7 +1797,383 @@ pub fn load_light(tag: &Tag, chunk: &mut Chunk, sky_light: bool) {
     chunk.light_loaded = true;
 }
 
+/// The existing checkpoint native-region profile. Validate original bytes before
+/// any tolerant RegionFile constructor can normalize their location table.
+#[cfg(feature = "paired-packages")]
+pub fn retained_region_locations(bytes: &[u8]) -> std::result::Result<Vec<usize>, String> {
+    let require = |ok, message: &str| if ok { Ok(()) } else { Err(message.to_owned()) };
+    require(
+        bytes.len() >= 8192 && bytes.len().is_multiple_of(4096),
+        "truncated/unaligned native region",
+    )?;
+    let mut used = vec![false; bytes.len() / 4096];
+    used[0] = true;
+    used[1] = true;
+    let mut present = Vec::new();
+    for i in 0..1024 {
+        let location = u32::from_be_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap());
+        if location == 0 {
+            continue;
+        }
+        let start = (location >> 8) as usize;
+        let sectors = (location & 255) as usize;
+        let end = start.checked_add(sectors).ok_or("region sector overflow")?;
+        require(
+            start >= 2 && sectors > 0 && end <= used.len(),
+            "invalid native region location/sector range",
+        )?;
+        require(
+            used[start..end].iter().all(|v| !*v),
+            "overlapping native region sectors",
+        )?;
+        used[start..end].fill(true);
+        let at = start * 4096;
+        let length = u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+        require(
+            length >= 1 && length <= sectors * 4096 - 4,
+            "native record payload length",
+        )?;
+        let compression = bytes[at + 4];
+        require(
+            compression & 128 == 0,
+            "external native records unsupported",
+        )?;
+        Compression::try_from(compression).map_err(|e| e.to_string())?;
+        present.push(i);
+    }
+    Ok(present)
+}
+
+#[cfg(feature = "paired-packages")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetainedPendingKind {
+    Tag,
+    Chunk,
+    FinishedEntities,
+    Delete,
+    UnsupportedPoi,
+}
+
+/// Compact immutable facts from the original validated file. Full region data
+/// is bounded during capture; unrelated payloads need not be retained per chunk.
+#[cfg(feature = "paired-packages")]
+pub struct RetainedRegionFacts {
+    header: Box<[u8]>,
+    file_len: usize,
+    present: Vec<usize>,
+}
+#[cfg(feature = "paired-packages")]
+impl RetainedRegionFacts {
+    pub fn header(&self) -> &[u8] {
+        &self.header
+    }
+    pub fn file_len(&self) -> usize {
+        self.file_len
+    }
+    pub fn present(&self) -> &[usize] {
+        &self.present
+    }
+}
+
+#[cfg(feature = "paired-packages")]
+pub enum RetainedRecordView<'a> {
+    Missing {
+        region: Option<&'a RetainedRegionFacts>,
+    },
+    Disk {
+        record: &'a ChunkRecord,
+        region: &'a RetainedRegionFacts,
+    },
+    Pending {
+        sequence: u64,
+        kind: RetainedPendingKind,
+        tag: Option<&'a NamedTag>,
+        chunk: Option<&'a Arc<Chunk>>,
+        registry: Option<&'a BlockRegistry>,
+        biomes: Option<&'a Biomes>,
+        shape: Option<LevelShape>,
+    },
+    Refused {
+        error: &'a str,
+        original_bytes: &'a [u8],
+    },
+}
+
+#[cfg(feature = "paired-packages")]
+enum RetainedRecordEvidence {
+    Missing(Option<RetainedRegionFacts>),
+    Disk(ChunkRecord, RetainedRegionFacts),
+    Pending {
+        sequence: u64,
+        original: Record,
+        projection: Option<Arc<NamedTag>>,
+    },
+    Refused {
+        error: String,
+        original_bytes: Vec<u8>,
+    },
+}
+#[cfg(feature = "paired-packages")]
+impl RetainedRecordEvidence {
+    fn view(&self) -> RetainedRecordView<'_> {
+        match self {
+            Self::Missing(region) => RetainedRecordView::Missing {
+                region: region.as_ref(),
+            },
+            Self::Disk(record, region) => RetainedRecordView::Disk { record, region },
+            Self::Refused {
+                error,
+                original_bytes,
+            } => RetainedRecordView::Refused {
+                error,
+                original_bytes,
+            },
+            Self::Pending {
+                sequence,
+                original,
+                projection,
+            } => {
+                let (kind, chunk, encoding) = match original {
+                    Record::Tag(_) => (RetainedPendingKind::Tag, None, None),
+                    Record::Chunk(chunk, encoding) => {
+                        (RetainedPendingKind::Chunk, Some(chunk), Some(encoding))
+                    }
+                    Record::FinishedEntities(chunk) => {
+                        (RetainedPendingKind::FinishedEntities, Some(chunk), None)
+                    }
+                    Record::Delete => (RetainedPendingKind::Delete, None, None),
+                    Record::Poi(chunk, _) => {
+                        (RetainedPendingKind::UnsupportedPoi, Some(chunk), None)
+                    }
+                };
+                RetainedRecordView::Pending {
+                    sequence: *sequence,
+                    kind,
+                    tag: projection.as_deref(),
+                    chunk,
+                    registry: encoding.map(|e| e.registry),
+                    biomes: encoding.map(|e| &*e.biomes),
+                    shape: encoding.map(|e| e.shape),
+                }
+            }
+        }
+    }
+    fn absent(&self) -> bool {
+        matches!(
+            self,
+            Self::Missing(_)
+                | Self::Pending {
+                    original: Record::Delete,
+                    ..
+                }
+        ) || matches!(self, Self::Pending { original: Record::FinishedEntities(chunk), projection: None, .. } if chunk.entities.is_empty())
+    }
+    fn named(&self) -> std::result::Result<Option<NamedTag>, String> {
+        match self {
+            Self::Missing(_) => Ok(None),
+            Self::Disk(record, _) => record
+                .nbt(Limits {
+                    max_bytes: 1 << 20,
+                    ..Limits::default()
+                })
+                .map(Some)
+                .map_err(|e| e.to_string()),
+            Self::Pending { projection, .. } => Ok(projection.as_deref().cloned()),
+            Self::Refused { error, .. } => Err(error.clone()),
+        }
+    }
+}
+
+/// Original storage inputs stay with the full loaded column and its work lease.
+/// Construction is private to this module; no decoded column grants provenance.
+#[cfg(feature = "paired-packages")]
+pub struct RetainedLoadedRecords {
+    save: Arc<SaveDir>,
+    position: (i32, i32),
+    column: RetainedRecordEvidence,
+    entities: RetainedRecordEvidence,
+    versions: [Option<u64>; 2],
+}
+#[cfg(feature = "paired-packages")]
+impl RetainedLoadedRecords {
+    pub fn save(&self) -> &Arc<SaveDir> {
+        &self.save
+    }
+    pub fn position(&self) -> (i32, i32) {
+        self.position
+    }
+    pub fn dimension_root(&self) -> &Path {
+        &self.save.root
+    }
+    pub fn column(&self) -> RetainedRecordView<'_> {
+        self.column.view()
+    }
+    pub fn entities(&self) -> RetainedRecordView<'_> {
+        self.entities.view()
+    }
+    /// None is contention, false is a newer relevant accepted write. Neither
+    /// permits disposition. This performs no filesystem work or waiting lock.
+    pub fn poll_current(&self) -> std::result::Result<Option<bool>, String> {
+        let state = self
+            .save
+            .retained
+            .as_ref()
+            .ok_or("retained load lacks retained writer state")?;
+        Ok(state
+            .try_read_versions(self.position)?
+            .map(|versions| versions == self.versions))
+    }
+    pub fn poll_closed_current(
+        &self,
+        closed: &NativeWriterClosed,
+    ) -> std::result::Result<Option<bool>, String> {
+        if !Arc::ptr_eq(&self.save, closed.save()) {
+            return Err("retained load/writer allocation mismatch".into());
+        }
+        self.poll_current()
+    }
+}
+
+#[cfg(feature = "paired-packages")]
+pub struct RetainedNativeLoad {
+    position: (i32, i32),
+    records: Option<RetainedLoadedRecords>,
+    chunk: Option<Chunk>,
+    absent: bool,
+    error: Option<String>,
+}
+#[cfg(feature = "paired-packages")]
+impl RetainedNativeLoad {
+    pub fn unavailable(x: i32, z: i32) -> Self {
+        Self {
+            position: (x, z),
+            records: None,
+            chunk: None,
+            absent: false,
+            error: Some("generator cannot supply retained native load evidence".into()),
+        }
+    }
+    pub fn position(&self) -> (i32, i32) {
+        self.position
+    }
+    pub fn chunk(&self) -> Option<&Chunk> {
+        self.chunk.as_ref()
+    }
+    pub fn evidence(&self) -> Option<&RetainedLoadedRecords> {
+        self.records.as_ref()
+    }
+    pub fn is_absent(&self) -> bool {
+        self.absent
+    }
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+    pub fn into_parts(
+        mut self: Box<Self>,
+    ) -> std::result::Result<(Chunk, RetainedLoadedRecords), Box<Self>> {
+        if self.error.is_some() || self.absent || self.chunk.is_none() || self.records.is_none() {
+            return Err(self);
+        }
+        Ok((self.chunk.take().unwrap(), self.records.take().unwrap()))
+    }
+}
+
 type RegionCache = Mutex<HashMap<(i32, i32), Option<Arc<Mutex<RegionFile>>>>>;
+#[cfg(feature = "paired-packages")]
+fn retained_disk_record(
+    root: &Path,
+    cache: &RegionCache,
+    folder: &str,
+    x: i32,
+    z: i32,
+) -> RetainedRecordEvidence {
+    use std::io::Read;
+    const LIMIT: u64 = 32 << 20;
+    let refused = |error: String, original_bytes: Vec<u8>| RetainedRecordEvidence::Refused {
+        error,
+        original_bytes,
+    };
+    // The same map/file mutexes serialize host writers. A negative cache entry
+    // is NOT absence: always inspect the actual file. No RegionFile is opened.
+    let regions = match cache.lock() {
+        Ok(regions) => regions,
+        Err(_) => return refused("retained native region cache poisoned".into(), Vec::new()),
+    };
+    let cached = regions
+        .get(&(x >> 5, z >> 5))
+        .and_then(|entry| entry.clone());
+    let _file_guard = match cached.as_ref().map(|file| file.lock()).transpose() {
+        Ok(guard) => guard,
+        Err(_) => return refused("retained native region file poisoned".into(), Vec::new()),
+    };
+    let path = region_path(root, folder, x >> 5, z >> 5);
+    match fs::symlink_metadata(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return RetainedRecordEvidence::Missing(None);
+        }
+        Err(e) => return refused(e.to_string(), Vec::new()),
+        Ok(meta) if !meta.is_file() || meta.file_type().is_symlink() => {
+            return refused(
+                "retained native record is not a regular unlinked file".into(),
+                Vec::new(),
+            );
+        }
+        Ok(_) => {}
+    }
+    let mut file = match fs::File::open(&path) {
+        Ok(file) => file,
+        Err(e) => return refused(e.to_string(), Vec::new()),
+    };
+    let size = match file.metadata() {
+        Ok(meta) if meta.len() <= LIMIT => meta.len(),
+        Ok(_) => {
+            return refused(
+                "retained native region exceeds existing file bound".into(),
+                Vec::new(),
+            );
+        }
+        Err(e) => return refused(e.to_string(), Vec::new()),
+    };
+    let mut bytes = Vec::with_capacity(size as usize);
+    if let Err(e) = (&mut file).take(LIMIT + 1).read_to_end(&mut bytes) {
+        return refused(e.to_string(), bytes);
+    }
+    if bytes.len() as u64 != size || file.metadata().map(|m| m.len()).ok() != Some(size) {
+        return refused(
+            "retained native region changed during bounded read".into(),
+            bytes,
+        );
+    }
+    let present = match retained_region_locations(&bytes) {
+        Ok(present) => present,
+        Err(error) => return refused(error, bytes),
+    };
+    let facts = RetainedRegionFacts {
+        header: bytes[..8192].to_vec().into_boxed_slice(),
+        file_len: bytes.len(),
+        present,
+    };
+    let index = x.rem_euclid(32) as usize + z.rem_euclid(32) as usize * 32;
+    if !facts.present.contains(&index) {
+        return RetainedRecordEvidence::Missing(Some(facts));
+    }
+    let location = u32::from_be_bytes(bytes[index * 4..index * 4 + 4].try_into().unwrap());
+    let at = (location >> 8) as usize * 4096;
+    let length = u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+    let compression = Compression::try_from(bytes[at + 4]).expect("validated original compression");
+    let timestamp = u32::from_be_bytes(
+        bytes[4096 + index * 4..4100 + index * 4]
+            .try_into()
+            .unwrap(),
+    );
+    let record = ChunkRecord {
+        compression,
+        compressed: bytes[at + 5..at + 4 + length].to_vec(),
+        timestamp,
+    };
+    RetainedRecordEvidence::Disk(record, facts)
+}
+
 /// The region file at `path` through the cache, which readers and the writer
 /// share, so a read never sees a header older than the sectors it points to.
 /// `create` makes a missing file (for a write); otherwise a missing file is
@@ -2314,6 +2690,166 @@ impl SaveDir {
         let mut chunk = decode_with(&root, registry, biomes, tables)?;
         load_light(&root.tag, &mut chunk, self.shape.sky_light);
         Some(chunk)
+    }
+    #[cfg(feature = "paired-packages")]
+    fn retained_native_load(
+        self: &Arc<Self>,
+        x: i32,
+        z: i32,
+        registry: &BlockRegistry,
+        biomes: &Biomes,
+    ) -> RetainedNativeLoad {
+        let position = (x, z);
+        let mut result = RetainedNativeLoad {
+            position,
+            records: None,
+            chunk: None,
+            absent: false,
+            error: None,
+        };
+        let refused = |error: &str| RetainedRecordEvidence::Refused {
+            error: error.into(),
+            original_bytes: Vec::new(),
+        };
+        let pending = match self.pending.lock() {
+            Ok(pending) => pending,
+            Err(_) => {
+                result.records = Some(RetainedLoadedRecords {
+                    save: self.clone(),
+                    position,
+                    column: refused("retained native pending map poisoned"),
+                    entities: refused("retained native pending map poisoned"),
+                    versions: [None, None],
+                });
+                result.error = Some("retained native pending map poisoned".into());
+                return result;
+            }
+        };
+        // Clone actual original owners together, before their worker projections.
+        let column_pending = pending.get(&(Folder::Region, x, z)).cloned();
+        let entities_pending = pending.get(&(Folder::Entities, x, z)).cloned();
+        let state = self.retained.as_ref();
+        let versions = state
+            .ok_or_else(|| "retained native load requires retained writer state".to_owned())
+            .and_then(|state| state.read_versions(position));
+        let capture = |folder: &str, cache: &RegionCache, original: Option<(u64, Record)>| {
+            if let Some((sequence, original)) = original {
+                let projection = original.tag();
+                RetainedRecordEvidence::Pending {
+                    sequence,
+                    original,
+                    projection,
+                }
+            } else {
+                retained_disk_record(&self.root, cache, folder, x, z)
+            }
+        };
+        let column = capture("region", &self.regions, column_pending);
+        let entities = capture("entities", &self.entity_regions, entities_pending);
+        let mut error = versions.as_ref().err().cloned();
+        let stamps = versions.unwrap_or([None, None]);
+        for (index, evidence) in [&column, &entities].into_iter().enumerate() {
+            if let RetainedRecordEvidence::Pending { sequence, .. } = evidence
+                && stamps[index] != Some(*sequence)
+            {
+                error.get_or_insert_with(|| {
+                    "retained pending owner/latest sequence mismatch".into()
+                });
+            }
+        }
+        if let Some(state) = state {
+            match state.read_versions(position) {
+                Ok(after) if after == stamps => {}
+                Ok(_) => {
+                    error.get_or_insert_with(|| {
+                        "retained native accepted sequence changed during capture".into()
+                    });
+                }
+                Err(e) => {
+                    error.get_or_insert(e);
+                }
+            }
+        }
+        drop(pending);
+        result.records = Some(RetainedLoadedRecords {
+            save: self.clone(),
+            position,
+            column,
+            entities,
+            versions: stamps,
+        });
+        if error.is_some() {
+            result.error = error;
+            return result;
+        }
+        let records = result.records.as_ref().unwrap();
+        let decoded = (|| -> std::result::Result<(), String> {
+            if matches!(
+                records.column.view(),
+                RetainedRecordView::Pending {
+                    kind: RetainedPendingKind::FinishedEntities
+                        | RetainedPendingKind::UnsupportedPoi,
+                    ..
+                }
+            ) || matches!(
+                records.entities.view(),
+                RetainedRecordView::Pending {
+                    kind: RetainedPendingKind::Chunk | RetainedPendingKind::UnsupportedPoi,
+                    ..
+                }
+            ) {
+                return Err("retained pending record is in the wrong native folder".into());
+            }
+            let root = records.column.named()?;
+            if root.is_none() {
+                if !records.column.absent() || !records.entities.absent() {
+                    return Err("retained absent column has non-absent entity evidence".into());
+                }
+                result.absent = true;
+                return Ok(());
+            }
+            let root = root.unwrap();
+            if !matches!(root.tag.get("Status"), Some(Tag::String(status)) if status == &JavaString::from("minecraft:full"))
+            {
+                return Err(
+                    "retained present proto/unsupported status cannot fall back to generation"
+                        .into(),
+                );
+            }
+            let tables = self.tables.get().map(|tables| &**tables);
+            let chunk = decode_with(&root, registry, biomes, tables)
+                .ok_or("retained native full decoder refused; generation forbidden")?;
+            // Install the complete decoded owner before fallible sidecar work.
+            result.chunk = Some(chunk);
+            let chunk = result.chunk.as_mut().unwrap();
+            if (chunk.x, chunk.z) != position {
+                return Err(
+                    "retained original column coordinates differ from requested native slot".into(),
+                );
+            }
+            load_light(&root.tag, chunk, self.shape.sky_light);
+            if let Some(sidecar) = records.entities.named()? {
+                if sidecar.tag.get("DataVersion") != Some(&Tag::Int(DATA_VERSION))
+                    || sidecar.tag.get("Position") != Some(&Tag::IntArray(vec![x, z]))
+                {
+                    return Err("retained native entity sidecar version/position mismatch".into());
+                }
+                let Some(Tag::List(entities)) = sidecar.tag.get("Entities") else {
+                    return Err("retained native entity sidecar lacks Entities list".into());
+                };
+                // Never replace/discard an embedded legacy entity list. The Game
+                // strict profile checks original roots and all duplicate facts.
+                chunk.entities.extend(entities.iter().cloned());
+            }
+            for section in &mut chunk.sections {
+                Arc::make_mut(section).compact();
+            }
+            Ok(())
+        })();
+        if let Err(error) = decoded {
+            result.error = Some(error);
+        }
+        result
     }
     /// A proto chunk saved before it became final (`decode_proto`).
     pub fn load_proto(
@@ -2836,6 +3372,52 @@ mod retained_writer {
         before_io: Arc<Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>>,
     }
     impl State {
+        fn load_versions(
+            ledger: &Ledger,
+            (x, z): (i32, i32),
+        ) -> std::result::Result<[Option<u64>; 2], String> {
+            if let Some(fault) = &ledger.fault {
+                return Err(fault.clone());
+            }
+            if ledger.error_corrupt {
+                return Err("retained load writer error witness is corrupt".into());
+            }
+            Ok([
+                ledger
+                    .expected
+                    .get(&(Folder::Region, x, z))
+                    .map(|row| row.seq),
+                ledger
+                    .expected
+                    .get(&(Folder::Entities, x, z))
+                    .map(|row| row.seq),
+            ])
+        }
+        // Read-only original-input correlation; never alters admission, receipts,
+        // error history or retry. Worker capture already holds pending first,
+        // matching Context::verify_latest's established lock order.
+        pub(super) fn read_versions(
+            &self,
+            position: (i32, i32),
+        ) -> std::result::Result<[Option<u64>; 2], String> {
+            let ledger = self
+                .ledger
+                .lock()
+                .map_err(|_| "retained load writer ledger poisoned")?;
+            Self::load_versions(&ledger, position)
+        }
+        pub(super) fn try_read_versions(
+            &self,
+            position: (i32, i32),
+        ) -> std::result::Result<Option<[Option<u64>; 2]>, String> {
+            match self.ledger.try_lock() {
+                Ok(ledger) => Self::load_versions(&ledger, position).map(Some),
+                Err(std::sync::TryLockError::WouldBlock) => Ok(None),
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    Err("retained load writer ledger poisoned".into())
+                }
+            }
+        }
         fn new() -> Self {
             Self {
                 admission: Mutex::new(Admission {
@@ -7114,6 +7696,24 @@ impl<G: ChunkGenerator> ChunkGenerator for Persistent<G> {
         chunk.entities = self.save.load_entities(x, z);
         Some(chunk)
     }
+    #[cfg(feature = "paired-packages")]
+    fn retained_save(&self) -> Option<&Arc<SaveDir>> {
+        Some(&self.save)
+    }
+    #[cfg(feature = "paired-packages")]
+    fn retained_load(&self, x: i32, z: i32) -> RetainedNativeLoad {
+        self.save
+            .tables
+            .get_or_init(|| Arc::new(SaveTables::new(&self.registry)));
+        self.save
+            .retained_native_load(x, z, self.registry.registry, &self.biomes)
+    }
+    #[cfg(feature = "paired-packages")]
+    fn retained_proto(&self, worker: &mut G::Worker, x: i32, z: i32) -> crate::streaming::Proto {
+        // Called only after genuine retained absence. Do not re-enter the
+        // ordinary tolerant load_proto/regeneration route.
+        self.inner.proto(worker, x, z)
+    }
     fn lod_surface(&self, worker: &mut G::Worker, x: i32, z: i32) -> Option<crate::lod::Surface> {
         // Resident/visited summaries override this procedural fallback in the LOD cache.
         self.inner.lod_surface(worker, x, z)
@@ -10140,6 +10740,390 @@ mod tests {
             );
         }
         fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(all(test, feature = "paired-packages"))]
+mod retained_native_load_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+    struct Resources {
+        assets: Arc<crate::assets::Assets>,
+        biomes: Arc<Biomes>,
+    }
+    fn resources() -> &'static Resources {
+        static RESOURCES: OnceLock<Resources> = OnceLock::new();
+        RESOURCES.get_or_init(|| {
+            let root = PathBuf::from(
+                std::env::var_os("HORIZON_TEST_RESOURCES").expect("pinned resources required"),
+            );
+            Resources {
+                assets: Arc::new(crate::assets::Assets::load(&root).expect("actual assets")),
+                biomes: Arc::new(Biomes::load(&root).expect("actual biomes")),
+            }
+        })
+    }
+    struct Scratch(PathBuf);
+    impl Scratch {
+        fn new(label: &str) -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "retained-raw-load-{}-{}-{label}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            if !std::thread::panicking() {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+    }
+    fn new_save(root: &Scratch) -> Arc<SaveDir> {
+        Arc::new(SaveDir::new_retained(root.0.clone()))
+    }
+    fn close(save: &Arc<SaveDir>) -> NativeWriterClosed {
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let mut close = loop {
+            if let Some(close) = save.begin_retained_writer_close(deadline).unwrap() {
+                break close;
+            }
+            std::thread::yield_now();
+        };
+        loop {
+            if close.poll() == RetainedWriterStatus::Complete {
+                return close.finish().unwrap();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "retained test writer did not close: {close:?}"
+            );
+            std::thread::yield_now();
+        }
+    }
+    fn column(x: i32, z: i32) -> (Arc<Chunk>, NamedTag) {
+        let resources = resources();
+        let mut chunk = Chunk::empty(x, z);
+        chunk.set(
+            1,
+            65,
+            1,
+            resources
+                .assets
+                .registry
+                .default_state("minecraft:stone")
+                .unwrap()
+                .0,
+        );
+        let chunk = Arc::new(chunk);
+        let tag = encode_with(
+            &chunk,
+            resources.assets.registry,
+            &resources.biomes,
+            None,
+            LevelShape::OVERWORLD,
+        );
+        (chunk, tag)
+    }
+    fn seed(root: &Scratch, folder: &str, at: (i32, i32), record: &ChunkRecord) {
+        let path = region_path(&root.0, folder, at.0 >> 5, at.1 >> 5);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut region = RegionFile::open_writable(path, true).unwrap();
+        region.write(ChunkPos::new(at.0, at.1), record).unwrap();
+        region.sync().unwrap();
+    }
+    fn record(tag: &NamedTag) -> ChunkRecord {
+        ChunkRecord::from_nbt(tag, Compression::Zlib, 7, Limits::default()).unwrap()
+    }
+    fn load(save: &Arc<SaveDir>, x: i32, z: i32) -> RetainedNativeLoad {
+        let resources = resources();
+        save.retained_native_load(x, z, resources.assets.registry, &resources.biomes)
+    }
+    #[test]
+    fn retained_header_reuses_closed_native_location_profile() {
+        let mut valid = vec![0; 12288];
+        valid[..4].copy_from_slice(&513u32.to_be_bytes());
+        valid[8192..8196].copy_from_slice(&1u32.to_be_bytes());
+        valid[8196] = 3;
+        assert_eq!(retained_region_locations(&valid).unwrap(), vec![0]);
+        let mut cases = vec![vec![0; 8191], vec![0; 8193]];
+        let mut overlap = valid.clone();
+        overlap[4..8].copy_from_slice(&513u32.to_be_bytes());
+        cases.push(overlap);
+        let mut header = valid.clone();
+        header[..4].copy_from_slice(&257u32.to_be_bytes());
+        cases.push(header);
+        let mut outside = valid.clone();
+        outside[..4].copy_from_slice(&769u32.to_be_bytes());
+        cases.push(outside);
+        let mut zero = valid.clone();
+        zero[8192..8196].fill(0);
+        cases.push(zero);
+        let mut long = valid.clone();
+        long[8192..8196].copy_from_slice(&4093u32.to_be_bytes());
+        cases.push(long);
+        let mut external = valid.clone();
+        external[8196] = 131;
+        cases.push(external);
+        let mut compression = valid;
+        compression[8196] = 127;
+        cases.push(compression);
+        assert!(
+            cases
+                .iter()
+                .all(|bytes| retained_region_locations(bytes).is_err())
+        );
+    }
+    #[test]
+    #[ignore = "actual pinned resource native read capture"]
+    fn retained_disk_full_and_sidecar_keep_original_compressed_records() {
+        let root = Scratch::new("disk");
+        let (_, tag) = column(-1, 2);
+        let native = record(&tag);
+        seed(&root, "region", (-1, 2), &native);
+        let entity = Tag::compound([
+            ("id", string("minecraft:item")),
+            ("retained_marker", Tag::Int(17)),
+        ]);
+        let sidecar = record(&entity_record(-1, 2, vec![entity.clone()]).unwrap());
+        seed(&root, "entities", (-1, 2), &sidecar);
+        let save = new_save(&root);
+        let loaded = load(&save, -1, 2);
+        let captured = loaded.error().is_none()
+            && loaded
+                .chunk()
+                .is_some_and(|chunk| chunk.entities == [entity]);
+        let evidence = loaded.evidence().unwrap();
+        let raw = matches!(evidence.column(), RetainedRecordView::Disk { record, region }
+            if record.compressed == native.compressed && record.timestamp == 7 && region.header().len() == 8192 && region.present().contains(&95));
+        let entities = matches!(evidence.entities(), RetainedRecordView::Disk { record, .. } if record.compressed == sidecar.compressed);
+        let closed = close(&save);
+        assert!(captured && raw && entities);
+        assert_eq!(evidence.poll_closed_current(&closed).unwrap(), Some(true));
+    }
+    #[test]
+    #[ignore = "actual pinned resource native absence/orphan/proto read capture"]
+    fn retained_absence_orphan_and_present_proto_are_distinct() {
+        let root = Scratch::new("absence");
+        let save = new_save(&root);
+        let absent = load(&save, 0, 0);
+        let genuine = absent.is_absent() && absent.error().is_none();
+        let closed = close(&save);
+        assert!(genuine);
+        drop(closed);
+        drop(absent);
+        drop(save);
+        let root = Scratch::new("orphan");
+        let sidecar = record(
+            &entity_record(
+                0,
+                0,
+                vec![Tag::compound([("id", string("minecraft:item"))])],
+            )
+            .unwrap(),
+        );
+        seed(&root, "entities", (0, 0), &sidecar);
+        let save = new_save(&root);
+        let orphan = load(&save, 0, 0);
+        let refused = !orphan.is_absent()
+            && orphan.error().is_some()
+            && matches!(
+                orphan.evidence().unwrap().entities(),
+                RetainedRecordView::Disk { .. }
+            );
+        let _closed = close(&save);
+        assert!(refused);
+        let root = Scratch::new("proto");
+        let (_, mut tag) = column(0, 0);
+        put(&mut tag.tag, "Status", string("minecraft:features"));
+        seed(&root, "region", (0, 0), &record(&tag));
+        let save = new_save(&root);
+        let proto = load(&save, 0, 0);
+        let refused = !proto.is_absent()
+            && proto.chunk().is_none()
+            && proto.error().is_some_and(|e| e.contains("proto"));
+        let _closed = close(&save);
+        assert!(refused);
+    }
+    #[test]
+    #[ignore = "actual pinned resource cached-negative and original header capture"]
+    fn retained_negative_cache_reprobes_and_bad_header_is_never_normalized() {
+        let root = Scratch::new("negative-cache");
+        let save = new_save(&root);
+        save.regions.lock().unwrap().insert((0, 0), None);
+        let (_, tag) = column(0, 0);
+        seed(&root, "region", (0, 0), &record(&tag));
+        let loaded = load(&save, 0, 0);
+        let recovered = loaded.error().is_none() && loaded.chunk().is_some();
+        let path = region_path(&root.0, "region", 0, 0);
+        let mut bad = fs::read(&path).unwrap();
+        bad[..4].copy_from_slice(&257u32.to_be_bytes());
+        fs::write(&path, &bad).unwrap();
+        let refused = load(&save, 0, 0);
+        let original = matches!(refused.evidence().unwrap().column(), RetainedRecordView::Refused { original_bytes, .. } if original_bytes == bad);
+        let untouched = fs::read(&path).unwrap() == bad
+            && save
+                .regions
+                .lock()
+                .unwrap()
+                .get(&(0, 0))
+                .is_some_and(Option::is_none);
+        let _closed = close(&save);
+        assert!(
+            recovered && original && untouched && !refused.is_absent() && refused.error().is_some()
+        );
+    }
+    #[test]
+    #[ignore = "actual pinned resource malformed native input custody"]
+    fn retained_bad_nbt_and_sidecar_preserve_original_and_decoded_owner() {
+        let root = Scratch::new("wrong-column-position");
+        let (_, tag) = column(1, 0);
+        seed(&root, "region", (0, 0), &record(&tag));
+        let save = new_save(&root);
+        let loaded = load(&save, 0, 0);
+        let kept = loaded
+            .chunk()
+            .is_some_and(|chunk| (chunk.x, chunk.z) == (1, 0))
+            && loaded
+                .error()
+                .is_some_and(|error| error.contains("coordinates"))
+            && !loaded.is_absent();
+        let _closed = close(&save);
+        assert!(kept);
+        let root = Scratch::new("bad-nbt");
+        let bad = ChunkRecord {
+            compression: Compression::None,
+            compressed: vec![255, 0, 0],
+            timestamp: 7,
+        };
+        seed(&root, "region", (0, 0), &bad);
+        let save = new_save(&root);
+        let loaded = load(&save, 0, 0);
+        let kept = loaded.error().is_some()
+            && !loaded.is_absent()
+            && matches!(loaded.evidence().unwrap().column(), RetainedRecordView::Disk { record, .. } if record.compressed == bad.compressed);
+        let _closed = close(&save);
+        assert!(kept);
+        let root = Scratch::new("bad-sidecar");
+        let (_, tag) = column(0, 0);
+        seed(&root, "region", (0, 0), &record(&tag));
+        let sidecar = entity_record(
+            1,
+            0,
+            vec![Tag::compound([("id", string("minecraft:item"))])],
+        )
+        .unwrap();
+        seed(&root, "entities", (0, 0), &record(&sidecar));
+        let save = new_save(&root);
+        let loaded = load(&save, 0, 0);
+        let kept = loaded.error().is_some()
+            && loaded.chunk().is_some()
+            && matches!(
+                loaded.evidence().unwrap().entities(),
+                RetainedRecordView::Disk { .. }
+            );
+        let _closed = close(&save);
+        assert!(kept);
+    }
+    #[test]
+    #[ignore = "actual pinned resource pending original owners and native writer receipts"]
+    fn retained_pending_owners_tag_delete_and_relevant_sequences() {
+        let root = Scratch::new("pending");
+        let save = new_save(&root);
+        let resources = resources();
+        let (original, tag) = column(0, 0);
+        let encoding = Arc::new(Encoding {
+            registry: resources.assets.registry,
+            biomes: resources.biomes.clone(),
+            tables: None,
+            shape: LevelShape::OVERWORLD,
+        });
+        let (entered, observed) = mpsc::channel();
+        let (release, wait) = mpsc::channel();
+        save.native_fence_writer_step(move || {
+            let _ = entered.send(());
+            let _ = wait.recv_timeout(Duration::from_secs(120));
+        });
+        let queued = save
+            .queue(
+                Folder::Region,
+                vec![((0, 0), Record::Chunk(original.clone(), encoding))],
+                false,
+            )
+            .is_ok();
+        let held = observed.recv_timeout(Duration::from_secs(120)).is_ok();
+        let entities = save
+            .queue(
+                Folder::Entities,
+                vec![((0, 0), Record::FinishedEntities(original.clone()))],
+                false,
+            )
+            .is_ok();
+        let loaded = load(&save, 0, 0);
+        let owner = loaded.evidence().is_some_and(|e| matches!(e.column(), RetainedRecordView::Pending { kind: RetainedPendingKind::Chunk, chunk: Some(c), .. } if Arc::ptr_eq(c, &original)));
+        let (_, other) = column(1, 0);
+        let unrelated = save
+            .queue(
+                Folder::Region,
+                vec![((1, 0), Record::Tag(Arc::new(other)))],
+                false,
+            )
+            .is_ok();
+        let current = loaded.evidence().and_then(|e| e.poll_current().ok()) == Some(Some(true));
+        let replacement = Arc::new(tag);
+        let changed = save
+            .queue(
+                Folder::Region,
+                vec![((0, 0), Record::Tag(replacement.clone()))],
+                false,
+            )
+            .is_ok();
+        let stale = loaded.evidence().and_then(|e| e.poll_current().ok()) == Some(Some(false));
+        let replaced = load(&save, 0, 0);
+        let tag_owner = replaced.evidence().is_some_and(|e| matches!(e.column(), RetainedRecordView::Pending { kind: RetainedPendingKind::Tag, tag: Some(t), .. } if std::ptr::eq(t, &*replacement)));
+        let deleted = save
+            .queue(Folder::Region, vec![((0, 0), Record::Delete)], false)
+            .is_ok()
+            && save
+                .queue(Folder::Entities, vec![((0, 0), Record::Delete)], false)
+                .is_ok();
+        let absent = load(&save, 0, 0);
+        let true_delete = absent.is_absent() && absent.error().is_none();
+        let _ = release.send(()); // Reap actual writer before any assertions.
+        let closed = close(&save);
+        assert!(
+            queued
+                && held
+                && entities
+                && owner
+                && unrelated
+                && current
+                && changed
+                && stale
+                && tag_owner
+                && deleted
+                && true_delete
+        );
+        assert_eq!(
+            absent
+                .evidence()
+                .unwrap()
+                .poll_closed_current(&closed)
+                .unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            loaded
+                .evidence()
+                .unwrap()
+                .poll_closed_current(&closed)
+                .unwrap(),
+            Some(false)
+        );
     }
 }
 

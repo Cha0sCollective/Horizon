@@ -695,7 +695,7 @@ impl NbtScan<'_> {
         Ok(())
     }
 }
-fn raw_nbt(raw: &[u8]) -> SResult<NamedTag> {
+pub(in crate::game) fn raw_nbt(raw: &[u8]) -> SResult<NamedTag> {
     raw_nbt_profile(raw, false)
 }
 fn raw_item_nbt(raw: &[u8]) -> SResult<NamedTag> {
@@ -802,48 +802,7 @@ fn player_path(row: &PlayerDescriptor, kind: &str) -> String {
 
 /// Read ALL raw locations before `RegionFile::open` can pad/erase corrupt ones.
 fn raw_region(bytes: &[u8]) -> SResult<Vec<usize>> {
-    require(
-        bytes.len() >= 8192 && bytes.len().is_multiple_of(4096),
-        "truncated/unaligned native region",
-    )?;
-    let mut used = vec![false; bytes.len() / 4096];
-    used[0] = true;
-    used[1] = true;
-    let mut present = Vec::new();
-    for i in 0..1024 {
-        let location = u32::from_be_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap());
-        if location == 0 {
-            continue;
-        }
-        let start = (location >> 8) as usize;
-        let sectors = (location & 255) as usize;
-        let end = start
-            .checked_add(sectors)
-            .ok_or_else(|| fail("region sector overflow"))?;
-        require(
-            start >= 2 && sectors > 0 && end <= used.len(),
-            "invalid native region location/sector range",
-        )?;
-        require(
-            used[start..end].iter().all(|v| !*v),
-            "overlapping native region sectors",
-        )?;
-        used[start..end].fill(true);
-        let at = start * 4096;
-        let length = u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
-        require(
-            length >= 1 && length <= sectors * 4096 - 4,
-            "native record payload length",
-        )?;
-        let compression = bytes[at + 4];
-        require(
-            compression & 128 == 0,
-            "external native records unsupported",
-        )?;
-        checked(Compression::try_from(compression))?;
-        present.push(i);
-    }
-    Ok(present)
+    horizon_client::save::retained_region_locations(bytes).map_err(fail)
 }
 fn packed(
     tag: &Tag,
@@ -898,7 +857,7 @@ fn packed(
     }
     Ok(())
 }
-fn validate_column(
+pub(in crate::game) fn validate_column(
     game: &Game<'_>,
     named: &NamedTag,
     position: (i32, i32),
