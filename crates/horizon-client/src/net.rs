@@ -968,9 +968,17 @@ mod retained_client {
         Blocked,
         Quiescent,
     }
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum RetainedRetryRefusal {
+        State,
+        Attempt,
+        Deadline,
+        Exhausted,
+    }
     #[derive(Clone, Debug)]
     pub struct RetainedObservation {
         pub close: RetainedClose,
+        pub attempt: u64,
         pub started: bool,
         pub acquired: bool,
         pub reader_registered: bool,
@@ -1040,6 +1048,7 @@ mod retained_client {
         counters: Option<Arc<Counters>>,
         stopped: bool,
         deadline: Option<Instant>,
+        attempt: u64,
         started: bool,
         acquired: bool,
         reader: Option<JoinHandle<RetainedOutcome>>,
@@ -1298,6 +1307,7 @@ mod retained_client {
                         counters: None,
                         stopped: false,
                         deadline: None,
+                        attempt: 0,
                         started: false,
                         acquired: false,
                         reader: None,
@@ -1441,20 +1451,48 @@ mod retained_client {
             };
             self.owner.admit_locked(&mut s, body, false)
         }
-        pub fn begin_close(&mut self, budget: Duration) -> RetainedClose {
-            self.owner
-                .lock()
-                .deadline
-                .get_or_insert_with(|| Instant::now() + budget);
+        pub fn begin_close(&mut self, deadline: Instant) -> RetainedClose {
+            {
+                let mut s = self.owner.lock();
+                if s.deadline.is_none() {
+                    // Keep the parent's exact instant, including an already
+                    // expired first wait. Lock acquisition cannot renew it.
+                    s.deadline = Some(deadline);
+                    s.attempt = 1;
+                }
+            }
             self.owner.stop();
             self.poll_close()
         }
-        pub fn retry_close(&mut self, budget: Duration) -> RetainedClose {
-            if self.owner.lock().stopped {
-                self.owner.lock().deadline = Some(Instant::now() + budget);
-                self.owner.stop();
-            }
-            self.poll_close()
+        pub fn retry_close(
+            &mut self,
+            expected_attempt: u64,
+            deadline: Instant,
+        ) -> Result<u64, RetainedRetryRefusal> {
+            let attempt = {
+                let mut s = self.owner.lock();
+                let now = Instant::now();
+                // A refused Retry must not even reap a finished handle. The
+                // caller polls checked joins separately on this same owner.
+                if close_state_at(&s, now) != RetainedClose::Blocked {
+                    return Err(RetainedRetryRefusal::State);
+                }
+                if expected_attempt != s.attempt {
+                    return Err(RetainedRetryRefusal::Attempt);
+                }
+                if deadline <= now {
+                    return Err(RetainedRetryRefusal::Deadline);
+                }
+                let next = s
+                    .attempt
+                    .checked_add(1)
+                    .ok_or(RetainedRetryRefusal::Exhausted)?;
+                s.deadline = Some(deadline);
+                s.attempt = next;
+                next
+            };
+            self.owner.stop();
+            Ok(attempt)
         }
         pub fn poll_close(&mut self) -> RetainedClose {
             // Only positively finished original handles are taken. No lock is
@@ -1529,6 +1567,9 @@ mod retained_client {
         }
     }
     fn close_state(s: &State) -> RetainedClose {
+        close_state_at(s, Instant::now())
+    }
+    fn close_state_at(s: &State, now: Instant) -> RetainedClose {
         if !s.stopped {
             RetainedClose::Open
         } else if s.reader.is_none()
@@ -1537,7 +1578,7 @@ mod retained_client {
             && (!s.writer_registered || s.writer_joined)
         {
             RetainedClose::Quiescent
-        } else if s.deadline.is_some_and(|d| Instant::now() >= d) {
+        } else if s.deadline.is_some_and(|d| now >= d) {
             RetainedClose::Blocked
         } else {
             RetainedClose::Closing
@@ -1546,6 +1587,7 @@ mod retained_client {
     fn observation(s: &State) -> RetainedObservation {
         RetainedObservation {
             close: close_state(s),
+            attempt: s.attempt,
             started: s.started,
             acquired: s.acquired,
             reader_registered: s.reader_registered,
@@ -2059,7 +2101,7 @@ mod retained_client {
             }
             fn close(&mut self) -> ClosedSession {
                 self.release();
-                self.session().begin_close(WAIT);
+                self.session().begin_close(Instant::now() + WAIT);
                 let _ = self.wait(|o| o.close == RetainedClose::Quiescent);
                 let session = self.0.take().expect("fixture owner");
                 match session.try_closed() {
@@ -2284,7 +2326,7 @@ mod retained_client {
                 match RetainedSession::new_offline(RetainedTarget::Memory(client), settings) {
                     Err(e) => e,
                     Ok(mut s) => {
-                        s.begin_close(WAIT);
+                        s.begin_close(Instant::now() + WAIT);
                         let mut f = Fixture(Some(s));
                         f.close();
                         panic!("invalid name accepted");
@@ -2308,7 +2350,7 @@ mod retained_client {
             let excluded = match excluded {
                 Err(e) => matches!(e.target, RetainedTarget::Address(_)),
                 Ok(mut s) => {
-                    s.begin_close(WAIT);
+                    s.begin_close(Instant::now() + WAIT);
                     Fixture(Some(s)).close();
                     false
                 }
@@ -2319,12 +2361,13 @@ mod retained_client {
         #[test]
         fn retained_close_before_start_owns_original_pipe() {
             let (mut f, mut peer) = Fixture::pipe();
-            let state = f.session().begin_close(Duration::ZERO);
+            let state = f.session().begin_close(Instant::now());
             let refused = f.session().start();
             let received = peer.recv();
             let closed = f.close();
             peer.writer.shutdown();
             assert_eq!(state, RetainedClose::Quiescent);
+            assert_eq!(closed.observe().attempt, 1);
             assert!(refused.is_err() && received.is_err());
             assert!(!closed.observe().reader_registered);
         }
@@ -2384,15 +2427,26 @@ mod retained_client {
                     "late registration gate after actual address acquisition",
                 )?;
                 let original = f.owner().lock().reader.as_ref().map(|h| h.thread().id());
+                let first_deadline = Instant::now();
                 check(
-                    f.session().begin_close(Duration::ZERO) == RetainedClose::Blocked,
+                    f.session().begin_close(first_deadline) == RetainedClose::Blocked,
                     "deadline cannot cancel acquisition",
                 )?;
+                {
+                    let s = f.owner().lock();
+                    check(
+                        s.deadline == Some(first_deadline) && s.attempt == 1,
+                        "exact first deadline before late registration",
+                    )?;
+                }
                 check(
                     !f.session().observe().acquired,
                     "no acquisition receipt before registration",
                 )?;
-                f.session().retry_close(WAIT);
+                check(
+                    f.session().retry_close(1, Instant::now() + WAIT) == Ok(2),
+                    "current late-registration Retry",
+                )?;
                 check(
                     f.owner().lock().reader.as_ref().map(|h| h.thread().id()) == original,
                     "retry replaced original actor",
@@ -2421,23 +2475,150 @@ mod retained_client {
                 check(f.reached(), "registered gate")?;
                 let original = f.owner().lock().reader.as_ref().map(|h| h.thread().id());
                 check(
-                    f.session().begin_close(Duration::ZERO) == RetainedClose::Blocked,
+                    f.session().retry_close(0, Instant::now() + WAIT)
+                        == Err(RetainedRetryRefusal::State),
+                    "Retry before explicit begin refuses",
+                )?;
+                {
+                    let s = f.owner().lock();
+                    check(
+                        s.deadline.is_none() && s.attempt == 0 && !s.stopped,
+                        "pre-begin refusal unchanged",
+                    )?;
+                }
+                let first_deadline = Instant::now();
+                check(
+                    f.session().begin_close(first_deadline) == RetainedClose::Blocked,
                     "actual unfinished original",
                 )?;
-                for _ in 0..3 {
-                    f.session().poll_close();
-                    f.session().retry_close(Duration::ZERO);
+                f.session().begin_close(Instant::now() + WAIT);
+                {
+                    let s = f.owner().lock();
+                    check(
+                        s.deadline == Some(first_deadline) && s.attempt == 1,
+                        "repeated begin preserves exact first instant and attempt",
+                    )?;
+                }
+                check(
+                    f.session().retry_close(0, Instant::now() + WAIT)
+                        == Err(RetainedRetryRefusal::Attempt),
+                    "stale blocked attempt refuses",
+                )?;
+                {
+                    let s = f.owner().lock();
+                    check(
+                        s.deadline == Some(first_deadline) && s.attempt == 1,
+                        "stale refusal unchanged",
+                    )?;
+                }
+                check(
+                    f.session().retry_close(1, Instant::now())
+                        == Err(RetainedRetryRefusal::Deadline),
+                    "expired replacement refuses",
+                )?;
+                {
+                    let s = f.owner().lock();
+                    check(
+                        s.deadline == Some(first_deadline) && s.attempt == 1,
+                        "deadline refusal unchanged",
+                    )?;
+                }
+                // Fixed counter exhaustion injection on the original held
+                // actor; no replacement handle, endpoint or native worker.
+                f.owner().lock().attempt = u64::MAX;
+                check(
+                    f.session().retry_close(u64::MAX, Instant::now() + WAIT)
+                        == Err(RetainedRetryRefusal::Exhausted),
+                    "checked attempt exhaustion refuses",
+                )?;
+                {
+                    let s = f.owner().lock();
+                    check(
+                        s.deadline == Some(first_deadline) && s.attempt == u64::MAX,
+                        "exhaustion refusal unchanged",
+                    )?;
+                }
+                f.owner().lock().attempt = 1;
+                let next_deadline = Instant::now() + WAIT;
+                check(
+                    f.session().retry_close(1, next_deadline) == Ok(2),
+                    "current Retry extends waiting",
+                )?;
+                check(
+                    f.session().retry_close(2, Instant::now() + WAIT)
+                        == Err(RetainedRetryRefusal::State),
+                    "unexpired current attempt refuses early Retry",
+                )?;
+                f.session().begin_close(first_deadline);
+                {
+                    let s = f.owner().lock();
+                    check(
+                        s.deadline == Some(next_deadline) && s.attempt == 2 && s.stopped,
+                        "early refusal and repeated begin preserve current wait and fence",
+                    )?;
                 }
                 check(
                     f.owner().lock().reader.as_ref().map(|h| h.thread().id()) == original,
                     "same actor",
                 )?;
-                check(peer.recv().is_err(), "early registered native interruption")
+                check(peer.recv().is_err(), "early registered native interruption")?;
+                f.release();
+                let finished_by = Instant::now() + WAIT;
+                loop {
+                    if f.owner()
+                        .lock()
+                        .reader
+                        .as_ref()
+                        .is_some_and(JoinHandle::is_finished)
+                    {
+                        break;
+                    }
+                    check(
+                        Instant::now() < finished_by,
+                        "original reader failed to finish",
+                    )?;
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                check(
+                    matches!(
+                        f.session().retry_close(0, Instant::now() + WAIT),
+                        Err(RetainedRetryRefusal::State | RetainedRetryRefusal::Attempt)
+                    ),
+                    "finished but unjoined original refuses invalid Retry",
+                )?;
+                {
+                    let s = f.owner().lock();
+                    check(
+                        !s.reader_joined
+                            && s.reader.as_ref().is_some_and(JoinHandle::is_finished)
+                            && s.deadline == Some(next_deadline)
+                            && s.attempt == 2,
+                        "refused Retry did not consume the finished native handle",
+                    )?;
+                }
+                check(
+                    f.wait(|o| o.close == RetainedClose::Quiescent),
+                    "original reader checked joined",
+                )?;
+                check(
+                    f.session().retry_close(2, Instant::now() + WAIT)
+                        == Err(RetainedRetryRefusal::State),
+                    "genuine joined completion refuses Retry",
+                )?;
+                {
+                    let s = f.owner().lock();
+                    check(
+                        s.deadline == Some(next_deadline) && s.attempt == 2 && s.reader_joined,
+                        "joined refusal unchanged",
+                    )?;
+                }
+                Ok(())
             })();
             let closed = f.close();
             peer.writer.shutdown();
             assert!(result.is_ok(), "{result:?}");
             assert!(closed.observe().reader_joined);
+            assert_eq!(closed.observe().attempt, 2);
             assert_eq!(
                 closed
                     .observe()
@@ -2462,17 +2643,31 @@ mod retained_client {
                     matches!(f.owner().lock().input, Some(RetainedTarget::Memory(_))),
                     "original input remains registered",
                 )?;
+                let first_deadline = Instant::now();
                 check(
-                    f.session().begin_close(Duration::ZERO) == RetainedClose::Blocked,
+                    f.session().begin_close(first_deadline) == RetainedClose::Blocked,
                     "pending setup not finished",
                 )?;
                 let deadline = f.owner().lock().deadline;
-                f.session().begin_close(WAIT);
+                f.session().begin_close(Instant::now() + WAIT);
+                {
+                    let s = f.owner().lock();
+                    check(
+                        deadline == Some(first_deadline)
+                            && s.deadline == deadline
+                            && s.attempt == 1,
+                        "repeated begin_close cannot renew deadline",
+                    )?;
+                }
                 check(
-                    f.owner().lock().deadline == deadline,
-                    "repeated begin_close cannot renew deadline",
+                    f.session().retry_close(1, Instant::now())
+                        == Err(RetainedRetryRefusal::Deadline),
+                    "pending input refuses expired replacement",
                 )?;
-                f.session().retry_close(Duration::ZERO);
+                check(
+                    f.session().retry_close(1, Instant::now() + WAIT) == Ok(2),
+                    "pending original current Retry",
+                )?;
                 check(
                     f.owner().lock().reader.as_ref().map(|h| h.thread().id()) == original,
                     "retry keeps original setup actor",
@@ -2791,7 +2986,7 @@ mod retained_client {
                     "active+queued budget",
                 )
             })();
-            f.session().begin_close(WAIT);
+            f.session().begin_close(Instant::now() + WAIT);
             f.release();
             peer.writer.shutdown();
             let closed = f.close();
@@ -2955,7 +3150,7 @@ mod retained_client {
                     "same active frame remains",
                 )
             })();
-            f.session().begin_close(WAIT);
+            f.session().begin_close(Instant::now() + WAIT);
             let _ = observer.shutdown(Shutdown::Both);
             drop(observer);
             peer.writer.shutdown();
@@ -3103,7 +3298,15 @@ mod retained_client {
                     "reader panic terminal",
                 )?;
                 for _ in 0..3 {
-                    f.session().retry_close(WAIT);
+                    check(
+                        f.session().retry_close(0, Instant::now() + WAIT)
+                            == Err(RetainedRetryRefusal::State),
+                        "panic stop alone does not issue a close attempt",
+                    )?;
+                    check(
+                        f.session().observe().attempt == 0,
+                        "pre-begin panic refusal preserves attempt",
+                    )?;
                     f.session().poll_close();
                 }
                 check(
@@ -3125,6 +3328,7 @@ mod retained_client {
             let empty = closed.poll_events(1);
             assert!(result.is_ok(), "{result:?}");
             assert!(closed.observe().reader_joined && closed.observe().writer_joined);
+            assert_eq!(closed.observe().attempt, 1);
             assert!(queued.len() <= 1 && empty.is_empty());
             assert!(
                 queued
