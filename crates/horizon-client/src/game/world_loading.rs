@@ -37,6 +37,7 @@ pub(in crate::game) struct NativeCheckpointOrigin {
     root: PathBuf,
     dimension: Dim,
     save: std::sync::Weak<SaveDir>,
+    identity: Arc<()>,
 }
 #[cfg(feature = "paired-packages")]
 impl NativeCheckpointOrigin {
@@ -58,6 +59,79 @@ impl NativeCheckpointOrigin {
             return Err("native session checkpoint provider provenance mismatch".into());
         }
         Ok(())
+    }
+}
+
+/// Issued only with the successful cold factory's original native inputs.
+/// This permits the three fixed C0d close projections, never world mutation or
+/// guest/domain authority. Neither observations nor a Game can mint this owner.
+#[cfg(feature = "paired-packages")]
+pub(super) struct NativeCloseAuthority {
+    save: std::sync::Weak<SaveDir>,
+    world: horizon_client::world::counter_restore::WorldId,
+    root: PathBuf,
+    dimension: Dim,
+    level_dimension: String,
+    origin: std::sync::Weak<()>,
+}
+
+#[cfg(feature = "paired-packages")]
+impl NativeCloseAuthority {
+    pub(super) fn authorizes(&self, game: &Game<'_>) -> bool {
+        game.options.execution_role.is_client()
+            && game.options.test_terrain
+            && !game.options.server_thread
+            && game.options.server.is_none()
+            && game.options.dedicated.is_none()
+            && game.options.dimension.is_none()
+            && game.remote.is_none()
+            && game.integrated.is_none()
+            && game.lan.is_none()
+            && game.serving.is_none()
+            && game.lan_acting.is_none()
+            && game.world_root == self.root
+            && game.dim == self.dimension
+            && game.level.dimension == self.level_dimension
+            && self.dimension == Dim::Overworld
+            && game
+                .session_lock
+                .as_ref()
+                .and_then(WorldSession::expected_world)
+                == Some(&self.world)
+            && self
+                .save
+                .upgrade()
+                .is_some_and(|save| Arc::ptr_eq(&save, &game.save))
+            && game
+                .native_checkpoint_origin
+                .as_ref()
+                .is_some_and(|origin| {
+                    self.origin
+                        .upgrade()
+                        .is_some_and(|identity| Arc::ptr_eq(&identity, &origin.identity))
+                        && origin
+                            .validate(&self.root, self.dimension, &game.save)
+                            .is_ok()
+                })
+    }
+}
+
+/// Joint, non-Clone transfer into the private initial-Game recipe. Borrowing its
+/// prepared view cannot separate or reconstruct the close authority.
+#[cfg(feature = "paired-packages")]
+pub(super) struct ColdPreparedWorld {
+    prepared: PreparedWorld,
+    authority: NativeCloseAuthority,
+}
+
+#[cfg(feature = "paired-packages")]
+impl ColdPreparedWorld {
+    pub(super) fn prepared(&self) -> &PreparedWorld {
+        &self.prepared
+    }
+
+    pub(super) fn into_parts(self) -> (PreparedWorld, NativeCloseAuthority) {
+        (self.prepared, self.authority)
     }
 }
 
@@ -416,17 +490,9 @@ impl RetainedPreparedWorld {
                 .as_ref()
                 .is_some_and(|original| original.matches(entry))
     }
-    /// Fixed cold-fixture transfer only. Ordinary startup retains its separate
-    /// guarded adoption path; no live legacy world may be replaced through this.
-    #[cfg(all(
-        test,
-        feature = "paired-packages",
-        feature = "native-writer-test-control",
-        debug_assertions
-    ))]
-    pub(in crate::game) fn into_cold_prepared_for_test(
-        mut self,
-    ) -> std::result::Result<PreparedWorld, Self> {
+    /// Complete original-owner transfer shared by the fixed production cold
+    /// constructor and its fixture. Neither caller replaces an existing Game.
+    fn into_cold_parts(mut self) -> std::result::Result<PreparedWorld, Self> {
         let owner = &self.owner;
         if !owner.armed
             || owner.cancelled
@@ -483,6 +549,19 @@ impl RetainedPreparedWorld {
         self.owner.armed = false;
         Ok(prepared)
     }
+
+    /// Existing fixture compatibility; production uses ColdPreparation instead.
+    #[cfg(all(
+        test,
+        feature = "paired-packages",
+        feature = "native-writer-test-control",
+        debug_assertions
+    ))]
+    pub(in crate::game) fn into_cold_prepared_for_test(
+        self,
+    ) -> std::result::Result<PreparedWorld, Self> {
+        self.into_cold_parts()
+    }
 }
 #[cfg(feature = "paired-packages")]
 #[allow(dead_code)]
@@ -494,6 +573,114 @@ pub(super) struct PrepareFailure {
 pub(super) enum PreparedOutcome {
     Ready(RetainedPreparedWorld),
     Failed(PrepareFailure),
+}
+
+/// The production cold constructor never exposes a streamer or admits a chunk
+/// job. Its failed/ready outcome keeps the original acquisitions until either
+/// the complete transfer or the actual preparation-close protocol finishes.
+#[cfg(feature = "paired-packages")]
+pub(super) struct ColdPreparation {
+    outcome: PreparedOutcome,
+}
+
+#[cfg(feature = "paired-packages")]
+impl ColdPreparation {
+    pub(super) fn prepare(
+        request: WorldRequest,
+        res: &Resources,
+        pack: &PackResources,
+        options: &Options,
+        settings: &Settings,
+        entry: &RetainedEntryIdentity,
+    ) -> Self {
+        let mut owner = PrepareOwner::new(request);
+        owner.entry_token = Some(RetainedEntryIdentity {
+            token: entry.token,
+            owner: entry.owner.clone(),
+        });
+        // This fixed profile produces initial NativeWorld provenance, not an
+        // ordinary reopen, parked level, managed authority or vanilla provider.
+        // Refuse those inputs before any native lock/storage acquisition.
+        let result = if owner.request.identity_intent != IdentityIntent::CreateNewIdentity
+            || owner.request.authority_namespace.is_some()
+            || owner.request.expected_checkpoint_world.is_some()
+            || !options.test_terrain
+            || options.dimension.is_some()
+            || !options.execution_role.is_client()
+            || options.server_thread
+        {
+            Err("cold retained preparation requires a new identified in-frame native TestTerrain world".into())
+        } else {
+            owner.prepare(res, pack, options, settings)
+        };
+        let outcome = match result {
+            Ok(()) => PreparedOutcome::Ready(RetainedPreparedWorld { owner }),
+            Err(error) => {
+                owner.original_error = Some(error.to_string());
+                PreparedOutcome::Failed(PrepareFailure { owner })
+            }
+        };
+        Self { outcome }
+    }
+
+    pub(super) fn original_error(&self) -> Option<&str> {
+        self.outcome.owner().original_error.as_deref()
+    }
+
+    pub(super) fn into_prepared(
+        self,
+        entry: &RetainedEntryIdentity,
+    ) -> std::result::Result<ColdPreparedWorld, Self> {
+        let outcome = match self.outcome {
+            PreparedOutcome::Ready(ready) if ready.may_adopt(entry) => {
+                match ready.into_cold_parts() {
+                    Ok(prepared) => {
+                        // The complete original cold transfer and exact entry
+                        // checks precede issuance. No other constructor issues
+                        // this capability, including the raw fixture transfer.
+                        let authority = NativeCloseAuthority {
+                            save: Arc::downgrade(&prepared.save),
+                            world: *prepared.session_lock.expected_world().unwrap(),
+                            root: prepared.save_root.clone(),
+                            dimension: Dim::from_id(&prepared.level.dimension),
+                            level_dimension: prepared.level.dimension.clone(),
+                            origin: Arc::downgrade(
+                                &prepared.native_checkpoint_origin.as_ref().unwrap().identity,
+                            ),
+                        };
+                        return Ok(ColdPreparedWorld {
+                            prepared,
+                            authority,
+                        });
+                    }
+                    Err(ready) => PreparedOutcome::Ready(ready),
+                }
+            }
+            outcome => outcome,
+        };
+        Err(Self { outcome })
+    }
+
+    pub(super) fn begin_close(&mut self, deadline: std::time::Instant) {
+        self.outcome.begin_close(deadline);
+    }
+
+    pub(super) fn poll_close(&mut self) -> PreparationCloseStatus {
+        // PrepareOwner::prepare starts original workers but never calls update
+        // or queues a chunk job. This wrapper exposes no operation that can do
+        // either; a surprise finished column is retained and blocks below.
+        self.outcome.owner_mut().poll_close_with_game(None)
+    }
+
+    pub(super) fn retry_close(&mut self, deadline: std::time::Instant) -> Result<()> {
+        self.outcome.retry_close(deadline)
+    }
+
+    pub(super) fn finish_close(self) -> std::result::Result<PreparationClosed, Self> {
+        self.outcome
+            .finish_close()
+            .map_err(|outcome| Self { outcome })
+    }
 }
 #[cfg(feature = "paired-packages")]
 #[allow(dead_code)]
@@ -835,6 +1022,7 @@ impl PrepareOwner {
                     root: self.request.save_root.clone(),
                     dimension: dim,
                     save: Arc::downgrade(&save),
+                    identity: Arc::new(()),
                 });
             self.start_stream(
                 Arc::new(Persistent {
@@ -923,6 +1111,10 @@ impl PrepareOwner {
     }
 
     fn poll_close(&mut self, game: &Game<'_>) -> PreparationCloseStatus {
+        self.poll_close_with_game(Some(game))
+    }
+
+    fn poll_close_with_game(&mut self, game: Option<&Game<'_>>) -> PreparationCloseStatus {
         use horizon_client::{save::RetainedWriterStatus, streaming::RetainedStreamStatus};
         if !self.armed {
             return PreparationCloseStatus::Complete;
@@ -952,6 +1144,14 @@ impl PrepareOwner {
                         }
                     }
                     RetainedStreamStatus::NeedsFinishedColumn => {
+                        let Some(game) = game else {
+                            // No ticket is taken or payload discarded. A cold
+                            // preparation cannot silently treat unexpected work
+                            // as a validated native column or forge a Game.
+                            return self.blocked(
+                                "cold retained preparation has an unexpected finished column",
+                            );
+                        };
                         let view = streaming
                             .retained_finished_column()
                             .expect("retained column requested");
@@ -1927,6 +2127,7 @@ fn make_native_streaming(
                 root: world_root.to_path_buf(),
                 dimension: dim,
                 save: Arc::downgrade(&save),
+                identity: Arc::new(()),
             });
         }
         Streaming::new(

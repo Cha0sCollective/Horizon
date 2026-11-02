@@ -531,6 +531,9 @@ pub struct Renderer {
     block_entity_revision: u64,
     /// VisGraph face connectivity per meshed section (cave culling).
     occlusion: occlusion::Occlusion,
+    /// Issued only by the fixed constructor that never acquires a CPU helper.
+    #[cfg(feature = "paired-packages")]
+    inline_occlusion: Option<InlineOcclusionConstruction>,
     /// Resolution scale and FXAA (Horizon settings).
     world_post: world_post::Post,
     /// HDR output (Horizon setting): `Some` while the swapchain is HDR.
@@ -1030,6 +1033,16 @@ impl Renderer {
         [self.arena.bytes(), vertices * stride]
     }
 }
+#[derive(Clone, Copy)]
+enum CpuOcclusionConstruction {
+    Background,
+    #[cfg(feature = "paired-packages")]
+    Inline,
+}
+
+#[cfg(feature = "paired-packages")]
+struct InlineOcclusionConstruction;
+
 impl Renderer {
     pub async fn new(
         window: Arc<Window>,
@@ -1048,6 +1061,101 @@ impl Renderer {
         prepared: Option<PreparedTextures>,
         previous: Option<&Self>,
         api: GraphicsApi,
+    ) -> Result<Self> {
+        Self::new_with_cpu_occlusion(
+            window,
+            offscreen,
+            sprite_pixels,
+            sprite_size,
+            sprite_minimum_size,
+            layers,
+            sprite_mips,
+            animations,
+            hud_atlas,
+            glint,
+            glint_armor,
+            forcefield,
+            panorama_faces,
+            prepared,
+            previous,
+            api,
+            CpuOcclusionConstruction::Background,
+        )
+        .await
+    }
+
+    /// A fresh renderer whose CPU occlusion searches always run inline. The
+    /// choice precedes native helper acquisition, not a setting applied later.
+    /// Existing renderers cannot be upgraded or replaced through this path.
+    #[cfg(feature = "paired-packages")]
+    pub async fn new_inline_occlusion(
+        window: Arc<Window>,
+        offscreen: bool,
+        sprite_pixels: &[u8],
+        sprite_size: u32,
+        sprite_minimum_size: u32,
+        layers: u32,
+        sprite_mips: &[crate::mipmap::Settings],
+        animations: &[SpriteAnimation],
+        hud_atlas: (&[u8], u32, u32),
+        glint: (&[u8], u32, u32),
+        glint_armor: (&[u8], u32, u32),
+        forcefield: (&[u8], u32),
+        panorama_faces: &panorama::Faces,
+        prepared: Option<PreparedTextures>,
+        previous: Option<&Self>,
+        api: GraphicsApi,
+    ) -> Result<Self> {
+        if previous.is_some() {
+            return Err("inline CPU occlusion requires fresh renderer construction".into());
+        }
+        Self::new_with_cpu_occlusion(
+            window,
+            offscreen,
+            sprite_pixels,
+            sprite_size,
+            sprite_minimum_size,
+            layers,
+            sprite_mips,
+            animations,
+            hud_atlas,
+            glint,
+            glint_armor,
+            forcefield,
+            panorama_faces,
+            prepared,
+            None,
+            api,
+            CpuOcclusionConstruction::Inline,
+        )
+        .await
+    }
+
+    /// Constructor provenance only. This is neither GPU completion nor a
+    /// driver-thread quiescence witness, and no method can enable it later.
+    #[cfg(feature = "paired-packages")]
+    pub fn has_inline_occlusion_provenance(&self) -> bool {
+        self.inline_occlusion.is_some()
+    }
+
+    async fn new_with_cpu_occlusion(
+        window: Arc<Window>,
+        offscreen: bool,
+        sprite_pixels: &[u8],
+        sprite_size: u32,
+        sprite_minimum_size: u32,
+        layers: u32,
+        sprite_mips: &[crate::mipmap::Settings],
+        animations: &[SpriteAnimation],
+        hud_atlas: (&[u8], u32, u32),
+        glint: (&[u8], u32, u32),
+        glint_armor: (&[u8], u32, u32),
+        forcefield: (&[u8], u32),
+        panorama_faces: &panorama::Faces,
+        prepared: Option<PreparedTextures>,
+        previous: Option<&Self>,
+        api: GraphicsApi,
+        cpu_occlusion: CpuOcclusionConstruction,
     ) -> Result<Self> {
         let split = sprite_split();
         if layers > split * SPRITE_ARRAYS {
@@ -2638,7 +2746,20 @@ impl Renderer {
             shadow_runs: page_runs::PageRuns::default(),
             block_entities: Default::default(),
             block_entity_revision: next_block_entity_revision(),
-            occlusion: occlusion::Occlusion::new(crate::chunk::MIN_Y, crate::chunk::HEIGHT / 16),
+            occlusion: match cpu_occlusion {
+                CpuOcclusionConstruction::Background => {
+                    occlusion::Occlusion::new(crate::chunk::MIN_Y, crate::chunk::HEIGHT / 16)
+                }
+                #[cfg(feature = "paired-packages")]
+                CpuOcclusionConstruction::Inline => {
+                    occlusion::Occlusion::new_inline(crate::chunk::MIN_Y, crate::chunk::HEIGHT / 16)
+                }
+            },
+            #[cfg(feature = "paired-packages")]
+            inline_occlusion: match cpu_occlusion {
+                CpuOcclusionConstruction::Background => None,
+                CpuOcclusionConstruction::Inline => Some(InlineOcclusionConstruction),
+            },
             world_post,
             hdr: None,
             hdr_output,

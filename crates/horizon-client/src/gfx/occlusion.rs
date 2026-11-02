@@ -504,13 +504,24 @@ pub struct Occlusion {
 impl Occlusion {
     /// The world's lowest block y and its height in sections.
     pub fn new(min_y: i32, sections: i32) -> Self {
+        Self::with_worker(min_y, sections, Worker::spawn(min_y, sections))
+    }
+
+    /// Fixed construction without a native CPU helper. Searches use the
+    /// existing inline path throughout this object's lifetime.
+    #[cfg(feature = "paired-packages")]
+    pub fn new_inline(min_y: i32, sections: i32) -> Self {
+        Self::with_worker(min_y, sections, None)
+    }
+
+    fn with_worker(min_y: i32, sections: i32, worker: Option<Worker>) -> Self {
         Self {
             columns: Columns::new(min_y, sections),
             edits: Vec::new(),
             dirty: true,
             graph: None,
             spare: Graph::default(),
-            worker: Worker::spawn(min_y, sections),
+            worker,
             running: None,
             discard: false,
             searched: None,
@@ -1225,5 +1236,31 @@ mod tests {
             assert_eq!(graph.directions, local.directions);
             assert_eq!(graph.entered, local.entered);
         }
+    }
+
+    #[cfg(feature = "paired-packages")]
+    #[test]
+    fn inline_constructor_searches_without_native_worker() {
+        let mut o = Occlusion::new_inline(0, 6);
+        assert!(o.worker.is_none());
+        random_world(&mut o, 0x9e37_79b9, 800, 6);
+        for from in [(0, 2, 0), (3, 0, -2), (-5, 5, 4)] {
+            let camera = at(from);
+            o.update(camera, 6);
+            assert!(o.worker.is_none());
+            assert!(o.running.is_none());
+            assert_eq!(o.searched, Some((from, 6)));
+            let mut expected = Graph::default();
+            expected.search(&o.columns, camera, 6, &mut Vec::new(), &mut VecDeque::new());
+            let actual = o.graph.as_ref().expect("inline search completed");
+            assert_eq!(actual.directions, expected.directions);
+            assert_eq!(actual.entered, expected.entered);
+        }
+        o.clear();
+        o.update(at((0, 1, 0)), 2);
+        assert!(o.worker.is_none());
+        assert!(o.running.is_none());
+        assert!(o.contains((2, 1, 2)));
+        assert!(!o.contains((3, 1, 0)));
     }
 }

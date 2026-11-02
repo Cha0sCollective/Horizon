@@ -928,6 +928,55 @@ impl NativeReady<'_> {
     pub(super) fn observe(&self) -> CloseObservation {
         self.owner.observe()
     }
+    pub(super) fn window_presentation(&self) -> super::window_close::Presentation {
+        self.owner.window_presentation()
+    }
+    pub(super) fn resize_window(&mut self, width: u32, height: u32) {
+        self.owner.resize_window(width, height);
+    }
+    pub(super) fn redraw_window(&self, title: &str) {
+        self.owner.redraw_window(title);
+    }
+    pub(super) fn draw_window_status(&mut self, text: &str) -> horizon_client::Result<bool> {
+        self.owner.draw_window_status(text)
+    }
+    /// Distinct from dormant disposal: the constructor-bound client handoff
+    /// owns original library closures, and this owner still holds the original
+    /// renderer/window until their owning-thread destruction below.
+    pub(super) fn try_dispose_window(
+        mut self,
+        completion: super::window_close::ClientCompletion,
+    ) -> Result<NativeDisposed, (Self, super::window_close::ClientCompletion, String)> {
+        let game = self.owner.game.as_ref().unwrap();
+        let absent = game.lan.is_none()
+            && game.remote.is_none()
+            && game.integrated.is_none()
+            && game.serving.is_none()
+            && game.friends.is_none()
+            && game.control.is_none()
+            && game.world_loader.is_none()
+            && game.rest_loader.is_none()
+            && game.retained_prepare_loader.is_none()
+            && game.retained_preparation.is_none()
+            && game.retained_entry_owner.is_none()
+            && game.pending_entry.is_none()
+            && game.pending_save.is_none()
+            && game.adv.pending_tree.is_none()
+            && game.lod.is_none();
+        if !self.owner.native_ready_proven() || !absent || !completion.matches(game) {
+            return Err((
+                self,
+                completion,
+                "original window/client/native completion incomplete".into(),
+            ));
+        }
+        self.owner.armed = false;
+        // winit invokes this fixed transition on the renderer/window owning
+        // thread. No GPU-driver quiescence or hard Drop latency is asserted.
+        drop(self.owner.game.take());
+        drop(completion);
+        Ok(NativeDisposed { _native_only: () })
+    }
     pub(super) fn try_dispose_dormant(mut self) -> Result<NativeDisposed, (Self, String)> {
         if !self.owner.native_ready_proven()
             || !dormant_async_owners_absent(self.owner.game.as_ref().unwrap(), false)
@@ -1117,6 +1166,43 @@ pub(super) struct CloseOwner<'window> {
     read_control: Option<super::levels::session_checkpoint::CoherentImageTestControl>,
 }
 impl<'window> CloseOwner<'window> {
+    pub(super) fn window_presentation(&self) -> super::window_close::Presentation {
+        super::window_close::presentation(self.game.as_ref().unwrap())
+    }
+    pub(super) fn resize_window(&mut self, width: u32, height: u32) {
+        super::window_close::resize(self.game.as_mut().unwrap(), width, height);
+    }
+    pub(super) fn redraw_window(&self, title: &str) {
+        super::window_close::request_redraw(self.game.as_ref().unwrap(), title);
+    }
+    pub(super) fn draw_window_status(&mut self, text: &str) -> horizon_client::Result<bool> {
+        super::window_close::draw_status(self.game.as_mut().unwrap(), text)
+    }
+    /// Startup failure can enter close before winit's first resumed callback.
+    /// This fixed original presentation recipe cannot mutate frozen world data.
+    pub(super) fn create_window_presentation(
+        &mut self,
+        window: Arc<winit::window::Window>,
+    ) -> horizon_client::Result<()> {
+        let game = self.game.as_mut().unwrap();
+        if game.window.is_some() || game.renderer.is_some() {
+            return Err("original close presentation was already acquired".into());
+        }
+        game.window = Some(window.clone());
+        game.renderer = Some(super::window_close::renderer(
+            window,
+            &game.pack,
+            &game.gui,
+            game.settings.horizon.api,
+        )?);
+        Ok(())
+    }
+    #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+    pub(super) fn hold_window_native_io_for_test(&mut self) -> WindowIoTestGate {
+        let (control, receipt) = MetadataTestControl::new(MetadataTestAction::HoldBeforeIo);
+        self.metadata.control = Some(control);
+        WindowIoTestGate(receipt)
+    }
     pub(super) fn begin(
         game: Box<Game<'window>>,
         profile: CloseProfile,
@@ -2017,6 +2103,17 @@ struct MetadataTestState {
 pub(in crate::game) struct MetadataTestControl(Arc<MetadataTestState>);
 #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
 struct MetadataTestReceipt(Arc<MetadataTestState>);
+#[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+pub(super) struct WindowIoTestGate(MetadataTestReceipt);
+#[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+impl WindowIoTestGate {
+    pub(super) fn entered(&self) -> bool {
+        self.0.entered()
+    }
+    pub(super) fn release(&self) {
+        self.0.release();
+    }
+}
 #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
 impl MetadataTestControl {
     fn new(action: MetadataTestAction) -> (Self, MetadataTestReceipt) {

@@ -218,6 +218,8 @@ mod villagers;
 mod wandering_trader;
 mod win;
 mod wind;
+#[cfg(feature = "paired-packages")]
+mod window_close;
 mod wither;
 mod world_loading;
 mod zombie_reinforcements;
@@ -348,6 +350,8 @@ struct Options {
 struct ParsedLaunch {
     options: Options,
     #[cfg(feature = "paired-packages")]
+    native_window: Option<window_close::Launch>,
+    #[cfg(feature = "paired-packages")]
     frozen: Option<integrated::managed_application::ManagedLaunch>,
 }
 impl Options {
@@ -366,6 +370,19 @@ impl Options {
         Self::read_from(raw_args)
     }
     fn read_from(raw_args: Vec<String>) -> Result<Option<ParsedLaunch>> {
+        #[cfg(feature = "paired-packages")]
+        let native_window = window_close::Launch::parse(&raw_args)?;
+        #[cfg(feature = "paired-packages")]
+        let raw_args = native_window
+            .as_ref()
+            .map_or(raw_args.clone(), |launch| launch.ordinary_args());
+        #[cfg(not(feature = "paired-packages"))]
+        if raw_args
+            .iter()
+            .any(|arg| arg.starts_with("--paired-native-window-close"))
+        {
+            return Err("native window close requires paired-packages".into());
+        }
         #[cfg(feature = "paired-packages")]
         let frozen = integrated::managed_application::ManagedLaunch::parse(&raw_args)?;
         #[cfg(feature = "paired-packages")]
@@ -536,6 +553,10 @@ impl Options {
         if let Some(launch) = &frozen {
             launch.configure(&mut o);
         }
+        #[cfg(feature = "paired-packages")]
+        if let Some(launch) = &native_window {
+            launch.configure(&mut o);
+        }
         // The launcher's account: online-mode servers need it. A bad file
         // only leaves the game offline.
         if let Some(path) = session_file.filter(|p| !p.is_empty()) {
@@ -549,6 +570,8 @@ impl Options {
         }
         Ok(Some(ParsedLaunch {
             options: o,
+            #[cfg(feature = "paired-packages")]
+            native_window,
             #[cfg(feature = "paired-packages")]
             frozen,
         }))
@@ -1610,6 +1633,15 @@ impl NativeLevelInput {
 
 #[cfg(feature = "paired-packages")]
 impl Game<'_> {
+    /// Constructor-issued in-frame close permission is confined to these native
+    /// close gates. Its presence fixes that world's admitted mode; changing the
+    /// role cannot fall back to the ordinary server rule.
+    fn native_close_owner_authorized(&self) -> bool {
+        match &self.native_close_authority {
+            Some(authority) => authority.authorizes(self),
+            None => !self.options.execution_role.is_client(),
+        }
+    }
     /// Run only after old-source preflight, before capturing native entities or
     /// metadata expectations. Repeating it never generates a replacement UUID.
     #[cfg(all(
@@ -1630,7 +1662,7 @@ impl Game<'_> {
     ) -> std::result::Result<NativeIdentityPreparation, String> {
         if self.remote.is_some()
             || self.integrated.is_some()
-            || self.options.execution_role.is_client()
+            || !self.native_close_owner_authorized()
             || self.lan_acting.is_some()
         {
             return Err(
@@ -1707,7 +1739,7 @@ impl Game<'_> {
     ) -> std::result::Result<(NativeLevelExpected, NativeLevelInput), String> {
         if self.remote.is_some()
             || self.integrated.is_some()
-            || self.options.execution_role.is_client()
+            || !self.native_close_owner_authorized()
             || self.lan_acting.is_some()
             || self.level.player_uuid.is_none()
         {
@@ -1780,7 +1812,7 @@ impl Game<'_> {
             || self.world_root != expected.root
             || self.remote.is_some()
             || self.integrated.is_some()
-            || self.options.execution_role.is_client()
+            || !self.native_close_owner_authorized()
             || self.lan_acting.is_some()
             || post.owner_projected != expected.owner_projected
             || [
@@ -1992,6 +2024,8 @@ struct Game<'a> {
     session_lock: Option<world_loading::host_identity::WorldSession>,
     #[cfg(feature = "paired-packages")]
     native_checkpoint_origin: Option<world_loading::NativeCheckpointOrigin>,
+    #[cfg(feature = "paired-packages")]
+    native_close_authority: Option<world_loading::NativeCloseAuthority>,
     audio: Audio,
     music: horizon_client::music::MusicManager,
     ambience: horizon_client::ambience::Ambience,
@@ -14045,6 +14079,12 @@ fn load_forcefield(root: &std::path::Path) -> (u32, u32, Vec<u8>) {
         .filter(|(w, h, _)| w == h && w.is_power_of_two())
         .unwrap_or((1, 1, vec![0; 4]))
 }
+enum InitialGameWorld {
+    Legacy,
+    #[cfg(feature = "paired-packages")]
+    Retained(Box<world_loading::ColdPreparedWorld>),
+}
+
 impl<'a> Game<'a> {
     /// A game with no world open, over the loaded resources: the window's,
     /// or an integrated server's on its own thread.
@@ -14057,25 +14097,90 @@ impl<'a> Game<'a> {
         audio: Audio,
         prepared: Option<GameCpuResources>,
     ) -> Result<Self> {
+        Self::new_with_world(
+            res,
+            pack,
+            gui,
+            options,
+            settings,
+            audio,
+            prepared,
+            InitialGameWorld::Legacy,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_world(
+        res: &'a Arc<Resources>,
+        pack: PackResources,
+        gui: UiResources,
+        options: Options,
+        settings: Settings,
+        audio: Audio,
+        prepared: Option<GameCpuResources>,
+        initial: InitialGameWorld,
+    ) -> Result<Self> {
         let root = options.resources.clone();
         let registry = pack.assets.registry;
-        // Until a world is opened the streamer is idle.
-        let mut streaming = Streaming::new(
-            Arc::new(TestTerrain::new(registry, res.biomes())?),
-            pack.context.clone(),
-            1,
-        );
-        streaming.paused = true;
-        let level = Level::default();
-        let save = Arc::new(SaveDir::new(
-            std::env::current_dir()?
-                .join("saves")
-                .join(".horizon-title"),
-        ));
+        #[cfg(feature = "paired-packages")]
+        let mut retained_initial = None;
+        let (world, streaming, save, level) = match initial {
+            InitialGameWorld::Legacy => {
+                // Preserve ordinary construction; the explicit retained recipe
+                // never enters this native title-worker branch.
+                let mut streaming = Streaming::new(
+                    Arc::new(TestTerrain::new(registry, res.biomes())?),
+                    pack.context.clone(),
+                    1,
+                );
+                streaming.paused = true;
+                let save = Arc::new(SaveDir::new(
+                    std::env::current_dir()?
+                        .join("saves")
+                        .join(".horizon-title"),
+                ));
+                (
+                    World::new(res.facts().air, 0),
+                    streaming,
+                    save,
+                    Level::default(),
+                )
+            }
+            #[cfg(feature = "paired-packages")]
+            InitialGameWorld::Retained(parts) => {
+                // The sole production caller supplies preloaded CPU data.
+                // Every original native input is selected before any legacy
+                // constructor, and remains in this lexical construction.
+                assert!(
+                    prepared.is_some(),
+                    "retained construction requires preloaded CPU inputs"
+                );
+                let (parts, authority) = (*parts).into_parts();
+                let world_loading::PreparedWorld {
+                    save_root,
+                    level,
+                    world,
+                    streaming,
+                    save,
+                    session_lock,
+                    rand_sequences,
+                    locator,
+                    native_checkpoint_origin,
+                } = parts;
+                retained_initial = Some((
+                    save_root,
+                    session_lock,
+                    rand_sequences,
+                    locator,
+                    native_checkpoint_origin,
+                    authority,
+                ));
+                (world, streaming, save, level)
+            }
+        };
         let prepared = prepared
             .map(Ok)
             .unwrap_or_else(|| GameCpuResources::load(&root))?;
-        let world = World::new(res.facts().air, 0);
         let creative = options.creative;
         let inventory = vec![None; 36];
         let now = Instant::now();
@@ -14085,7 +14190,7 @@ impl<'a> Game<'a> {
             &gui.atlas.sprites,
             &gui.atlas.translucent,
         );
-        Ok(Game {
+        let game = Game {
             res: res.clone(),
             rest_loader: None,
             pending_entry: None,
@@ -14201,6 +14306,8 @@ impl<'a> Game<'a> {
             session_lock: None,
             #[cfg(feature = "paired-packages")]
             native_checkpoint_origin: None,
+            #[cfg(feature = "paired-packages")]
+            native_close_authority: None,
             audio,
             music: {
                 // The manager starts with the saved option (MusicManager's constructor).
@@ -14455,7 +14562,23 @@ impl<'a> Game<'a> {
             camera_type: Default::default(),
             fangs: Default::default(),
             player_model: None,
-        })
+        };
+        #[cfg(feature = "paired-packages")]
+        let game = {
+            let mut game = game;
+            if let Some((root, session, random, locator, origin, authority)) = retained_initial {
+                game.world_root = root;
+                game.session_lock = Some(session);
+                game.rand_sequences = random;
+                game.end.set_locator(locator);
+                game.native_checkpoint_origin = origin;
+                game.native_close_authority = Some(authority);
+                game.block_ticks = Ticks::new(game.level.seed as i32);
+                game.dim = Dim::Overworld;
+            }
+            game
+        };
+        Ok(game)
     }
 }
 
@@ -15994,8 +16117,14 @@ pub fn run() -> Result<()> {
     let ParsedLaunch {
         mut options,
         #[cfg(feature = "paired-packages")]
+        native_window,
+        #[cfg(feature = "paired-packages")]
         frozen,
     } = parsed;
+    #[cfg(feature = "paired-packages")]
+    if let Some(launch) = native_window {
+        return window_close::run(options, launch);
+    }
     #[cfg(feature = "paired-packages")]
     if let Some(launch) = frozen {
         return run_managed_frozen(options, launch);

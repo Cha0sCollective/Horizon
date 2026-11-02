@@ -368,8 +368,16 @@ fn serve(stream: Stream, sender: &mpsc::Sender<Request>) {
 pub use retained::{
     ClosedControl, RetainedControl, RetainedControlObservation, RetainedControlPhase,
     RetainedControlStatus, RetainedEndpointState, RetainedFailure, RetainedFailureKind,
-    RetainedSender, RetainedWorkerStage,
+    RetainedSender, RetainedWorkerStage, WindowCommand, WindowFrameObservation, WindowReply,
+    WindowReplyRefusal, WindowRequest,
 };
+
+#[cfg(all(
+    feature = "paired-packages",
+    feature = "native-writer-test-control",
+    debug_assertions
+))]
+pub use retained::WindowCleanupHold;
 
 /// Dormant, original-constructor ownership. This does not adopt a legacy `Server`.
 #[cfg(feature = "paired-packages")]
@@ -381,6 +389,12 @@ mod retained {
         net::Shutdown,
         sync::{Mutex, MutexGuard, Weak},
         time::{Duration, Instant},
+    };
+
+    #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+    pub use window::WindowCleanupHold;
+    pub use window::{
+        WindowCommand, WindowFrameObservation, WindowReply, WindowReplyRefusal, WindowRequest,
     };
 
     fn lock<T>(value: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -497,6 +511,8 @@ mod retained {
     struct Group {
         sealed: AtomicBool,
         cleanup_requested: AtomicBool,
+        path: PathBuf,
+        window: Option<Arc<window::WindowGroup>>,
         registry: Mutex<Registry>,
         acquisition: Arc<Mutex<Acquisition>>,
         #[cfg(test)]
@@ -562,6 +578,7 @@ mod retained {
         publication_written: usize,
         token: String,
         accepted: Option<Arc<ClientInput>>,
+        window_reservation: Option<window::SlotId>,
     }
 
     enum NativeListener {
@@ -629,6 +646,7 @@ mod retained {
     }
 
     struct ClientInput {
+        window: Option<Arc<window::WindowClient>>,
         token: Option<String>,
         io: Mutex<ClientIo>,
         stage: AtomicUsize,
@@ -650,6 +668,7 @@ mod retained {
     }
 
     struct PendingReply {
+        window: Option<Arc<window::WindowPending>>,
         state: Mutex<ReplyState>,
         observed: AtomicBool,
         delivered: AtomicBool,
@@ -717,12 +736,79 @@ mod retained {
             Self::prepare_input(None)
         }
 
+        /// The fixed window profile is selected before any native acquisition.
+        /// It admits no local/raw requests and requires explicit frame grants.
+        pub fn prepare_window(path: &Path) -> Self {
+            let mut owner = Self::prepare(path);
+            Arc::get_mut(&mut owner.group).unwrap().window =
+                Some(Arc::new(window::WindowGroup::new()));
+            owner
+        }
+
+        pub fn path(&self) -> &Path {
+            &self.group.path
+        }
+
+        /// Native connections, including incomplete authentication; never a close proof.
+        pub fn connected_clients(&self) -> usize {
+            lock(&self.group.registry)
+                .clients
+                .iter()
+                .filter(|client| !client.input.fd_retired.load(Ordering::Acquire))
+                .count()
+        }
+
+        pub fn grant_window_frame(&mut self, generation: u64) -> WindowFrameObservation {
+            self.poll_close();
+            match &self.group.window {
+                Some(window) if !self.group.sealed.load(Ordering::Acquire) => {
+                    window.grant(generation)
+                }
+                Some(window) => window.observe(false),
+                None => WindowFrameObservation::unsupported(),
+            }
+        }
+
+        pub fn window_observation(&self) -> WindowFrameObservation {
+            self.group
+                .window
+                .as_ref()
+                .map_or_else(WindowFrameObservation::unsupported, |window| {
+                    window.observe(false)
+                })
+        }
+
+        /// Fixed qualification control of this original cleanup actor only.
+        #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+        pub fn arm_window_cleanup_hold(&mut self) -> Result<WindowCleanupHold, String> {
+            if lock(&self.group.registry).started || self.group.sealed.load(Ordering::Acquire) {
+                return Err("window cleanup hold requires original prepared owner".into());
+            }
+            self.group
+                .window
+                .as_ref()
+                .ok_or("window cleanup hold requires fixed window construction")?
+                .arm_cleanup_hold()
+        }
+
+        pub fn try_recv_window(&mut self) -> Option<WindowRequest> {
+            let window = self.group.window.as_ref()?;
+            if self.group.sealed.load(Ordering::Acquire) {
+                return None;
+            }
+            let request = window.take_request()?;
+            lock(&self.group.registry).handed += 1;
+            Some(request)
+        }
+
         fn prepare_input(path: Option<PathBuf>) -> Self {
             let local = path.is_none();
             Self {
                 group: Arc::new(Group {
                     sealed: AtomicBool::new(false),
                     cleanup_requested: AtomicBool::new(false),
+                    path: path.clone().unwrap_or_default(),
+                    window: None,
                     registry: Mutex::new(Registry {
                         phase: RetainedControlPhase::Prepared,
                         started: false,
@@ -755,6 +841,7 @@ mod retained {
                         publication_written: 0,
                         token: String::new(),
                         accepted: None,
+                        window_reservation: None,
                     })),
                     #[cfg(test)]
                     test: TestControl::default(),
@@ -796,7 +883,7 @@ mod retained {
 
         pub fn try_recv(&mut self) -> Option<Request> {
             let mut registry = lock(&self.group.registry);
-            if self.group.sealed.load(Ordering::Acquire) {
+            if self.group.window.is_some() || self.group.sealed.load(Ordering::Acquire) {
                 return None;
             }
             let request = registry.queue.pop_front()?;
@@ -897,6 +984,11 @@ mod retained {
                     registry.cleanup_done = true;
                 }
                 if outcome.is_err() {
+                    if let Actor::Client(index) = actor
+                        && let Some(window) = &registry.clients[index].input.window
+                    {
+                        window.failed.store(true, Ordering::Release);
+                    }
                     registry.failures.push(RetainedFailure {
                         stage: actor.stage(),
                         kind: RetainedFailureKind::Panicked,
@@ -971,7 +1063,7 @@ mod retained {
     impl RetainedSender {
         pub fn try_send(&self, request: Request) -> Result<(), Request> {
             let mut registry = lock(&self.group.registry);
-            if self.group.sealed.load(Ordering::Acquire) {
+            if self.group.window.is_some() || self.group.sealed.load(Ordering::Acquire) {
                 return Err(request);
             }
             registry.queue.push_back(request);
@@ -1184,6 +1276,10 @@ mod retained {
     }
 
     fn listener_worker(group: Weak<Group>) {
+        if group.upgrade().is_some_and(|owner| owner.window.is_some()) {
+            window::listener_worker(group);
+            return;
+        }
         let Some(owner) = group.upgrade() else { return };
         let acquisition = owner.acquisition.clone();
         drop(owner);
@@ -1240,6 +1336,7 @@ mod retained {
                             None
                         };
                         input.accepted = Some(Arc::new(ClientInput {
+                            window: None,
                             token,
                             io: Mutex::new(ClientIo {
                                 socket: Some(NativeSocket(stream)),
@@ -1402,7 +1499,11 @@ mod retained {
         let Some(owner) = group.upgrade() else { return };
         let input = lock(&owner.registry).clients[index].input.clone();
         drop(owner);
-        client_worker_inner(&group, &input);
+        if input.window.is_some() {
+            window::client_worker(&group, &input);
+        } else {
+            client_worker_inner(&group, &input);
+        }
         // This is the last native IO actor for this connection. Normal EOF,
         // authentication refusal and stop retire both descriptors here, even
         // while the parent/sender clones remain alive. Panic bypasses this;
@@ -1487,6 +1588,7 @@ mod retained {
                 }
                 let (reply, receiver) = mpsc::channel();
                 let pending = Arc::new(PendingReply {
+                    window: None,
                     state: Mutex::new(ReplyState {
                         receiver,
                         text: None,
@@ -1674,6 +1776,11 @@ mod retained {
         drop(owner);
         #[cfg(test)]
         test_gate(&group, TestPoint::Cleanup);
+        if let Some(owner) = group.upgrade()
+            && let Some(window) = &owner.window
+        {
+            window::harvest_retired(&owner, window);
+        }
         for (index, client) in clients {
             retire_client_socket(&group, index, &client);
         }
@@ -1700,6 +1807,12 @@ mod retained {
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
             }
+        }
+        #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+        if let Some(owner) = group.upgrade()
+            && let Some(window) = &owner.window
+        {
+            window.wait_cleanup_hold();
         }
         let result = {
             let mut input = lock(&acquisition);
@@ -1794,6 +1907,2023 @@ mod retained {
         })?;
         input.owns_path = false;
         Ok(Some(RetainedEndpointState::Released))
+    }
+
+    /// Fixed window-only policy. Native actors own all IO; grants are credits,
+    /// never callbacks, jobs, socket handles, or a public executor.
+    mod window {
+        use super::*;
+        #[cfg(test)]
+        use std::sync::atomic::AtomicU64;
+
+        const SLOTS: usize = 8;
+        const LINE: usize = 4096;
+        const BUFFER: usize = LINE + 2;
+        const OUTPUT: usize = 1024 * 1024;
+        const TOTAL_OUTPUT: usize = SLOTS * OUTPUT;
+        const OPERATION: Duration = Duration::from_secs(10);
+        const TURN: Duration = Duration::from_millis(2);
+
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        pub enum WindowCommand {
+            Status,
+            CloseStatus,
+            Close { quit: bool },
+            Retry { expected_attempt: u64 },
+            Unsupported,
+        }
+
+        pub enum WindowReply<'a> {
+            Status {
+                phase: &'a str,
+                stage: &'a str,
+                attempt: u64,
+                detail: &'a str,
+                world_closed: bool,
+                control_sealed: bool,
+            },
+            Admission {
+                accepted: bool,
+                attempt: u64,
+            },
+            Error {
+                message: &'a str,
+            },
+        }
+
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        pub enum WindowReplyRefusal {
+            TooLarge,
+            Budget,
+            Allocation,
+            Disconnected,
+        }
+
+        /// No raw reply Sender escapes. Dropping a request resolves its one-shot
+        /// ticket; the actual receiver stays owned until native observation.
+        pub struct WindowRequest {
+            line: String,
+            command: WindowCommand,
+            reply: Option<mpsc::Sender<String>>,
+            pending: Arc<WindowPending>,
+            owner: Weak<WindowGroup>,
+        }
+
+        impl WindowRequest {
+            pub fn line(&self) -> &str {
+                &self.line
+            }
+            pub fn command(&self) -> WindowCommand {
+                self.command
+            }
+
+            pub fn reply(mut self, reply: WindowReply<'_>) -> Result<(), WindowReplyRefusal> {
+                let owner = self
+                    .owner
+                    .upgrade()
+                    .ok_or(WindowReplyRefusal::Disconnected)?;
+                let text = encode(&owner, &self.pending, reply)?;
+                match self.reply.take().unwrap().send(text) {
+                    Ok(()) => Ok(()),
+                    Err(error) => {
+                        drop(error.0);
+                        release_reply(&owner, &self.pending);
+                        Err(WindowReplyRefusal::Disconnected)
+                    }
+                }
+            }
+        }
+
+        impl Drop for WindowRequest {
+            fn drop(&mut self) {
+                // The channel's actual disconnect is observed by a native actor.
+                self.reply.take();
+                self.pending.ticket_live.store(false, Ordering::Release);
+            }
+        }
+
+        #[derive(Clone, Debug)]
+        pub struct WindowFrameObservation {
+            pub supported: bool,
+            pub generation: u64,
+            pub grant_accepted: bool,
+            pub total_starts: usize,
+            pub listener_starts: usize,
+            pub client_starts: [usize; SLOTS],
+            pub lifetime_starts: usize,
+            pub write_would_block: usize,
+            pub deadline_expired: bool,
+            pub reserved_slots: usize,
+            pub live_slots: usize,
+            pub pending_requests: usize,
+            pub queued_requests: usize,
+            pub reserved_response_bytes: usize,
+            pub canceled_reply_bytes: usize,
+            pub expired_operations: usize,
+            pub retired_slots: usize,
+        }
+
+        impl WindowFrameObservation {
+            pub(super) fn unsupported() -> Self {
+                Self {
+                    supported: false,
+                    generation: 0,
+                    grant_accepted: false,
+                    total_starts: 0,
+                    listener_starts: 0,
+                    client_starts: [0; SLOTS],
+                    lifetime_starts: 0,
+                    write_would_block: 0,
+                    deadline_expired: false,
+                    reserved_slots: 0,
+                    live_slots: 0,
+                    pending_requests: 0,
+                    queued_requests: 0,
+                    reserved_response_bytes: 0,
+                    canceled_reply_bytes: 0,
+                    expired_operations: 0,
+                    retired_slots: 0,
+                }
+            }
+        }
+
+        pub(super) struct WindowGroup {
+            state: Mutex<WindowState>,
+            // Native IO holds this separate mutex for one nonblocking syscall.
+            // The UI ONLY try_locks it, and observes the separately published
+            // immutable ledger; it never waits behind a native operation.
+            native: Mutex<Option<Arc<FrameLedger>>>,
+            bytes: AtomicUsize,
+            starts: AtomicUsize,
+            write_blocks: AtomicUsize,
+            canceled: AtomicUsize,
+            expired: AtomicUsize,
+            retired: AtomicUsize,
+            pending: AtomicUsize,
+            #[cfg(test)]
+            time_offset: AtomicU64,
+            #[cfg(test)]
+            retirement: TestGate,
+            #[cfg(test)]
+            auth_bulk_read: TestGate,
+            #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+            cleanup_hold: Mutex<Option<Arc<WindowCleanupGate>>>,
+        }
+
+        #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+        struct WindowCleanupGate {
+            entered: AtomicBool,
+            release: AtomicBool,
+        }
+
+        #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+        pub struct WindowCleanupHold {
+            gate: Arc<WindowCleanupGate>,
+        }
+
+        #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+        impl WindowCleanupHold {
+            pub fn entered(&self) -> bool {
+                self.gate.entered.load(Ordering::Acquire)
+            }
+            pub fn release(&self) {
+                self.gate.release.store(true, Ordering::Release);
+            }
+        }
+
+        #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+        impl Drop for WindowCleanupHold {
+            fn drop(&mut self) {
+                self.release();
+            }
+        }
+
+        struct WindowState {
+            slots: [Option<Slot>; SLOTS],
+            generations: [u64; SLOTS],
+            requests: VecDeque<WindowRequest>,
+            frame: Option<Arc<FrameLedger>>,
+        }
+
+        struct FrameLedger {
+            generation: u64,
+            deadline: Instant,
+            total: AtomicUsize,
+            listener: AtomicUsize,
+            clients: [AtomicUsize; SLOTS],
+        }
+
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        pub(super) struct SlotId {
+            index: usize,
+            generation: u64,
+        }
+
+        struct Slot {
+            id: SlotId,
+            client: Option<usize>,
+        }
+
+        pub(super) struct WindowClient {
+            id: SlotId,
+            io: Mutex<WindowIo>,
+            pub(super) failed: AtomicBool,
+        }
+
+        struct WindowIo {
+            buffer: Option<Box<[u8; BUFFER]>>,
+            used: usize,
+            first_byte: Option<Instant>,
+            authenticated: bool,
+            auth_started: Instant,
+            auth_output: Option<String>,
+            auth_reserved: usize,
+            written: usize,
+            eof: bool,
+            pending: Option<Arc<PendingReply>>,
+            response_started: Option<Instant>,
+        }
+
+        pub(super) struct WindowPending {
+            id: SlotId,
+            bytes: AtomicUsize,
+            ticket_live: AtomicBool,
+        }
+
+        impl WindowGroup {
+            pub(super) fn new() -> Self {
+                Self {
+                    state: Mutex::new(WindowState {
+                        slots: std::array::from_fn(|_| None),
+                        generations: [0; SLOTS],
+                        requests: VecDeque::with_capacity(SLOTS),
+                        frame: None,
+                    }),
+                    native: Mutex::new(None),
+                    bytes: AtomicUsize::new(0),
+                    starts: AtomicUsize::new(0),
+                    write_blocks: AtomicUsize::new(0),
+                    canceled: AtomicUsize::new(0),
+                    expired: AtomicUsize::new(0),
+                    retired: AtomicUsize::new(0),
+                    pending: AtomicUsize::new(0),
+                    #[cfg(test)]
+                    time_offset: AtomicU64::new(0),
+                    #[cfg(test)]
+                    retirement: TestGate::default(),
+                    #[cfg(test)]
+                    auth_bulk_read: TestGate::default(),
+                    #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+                    cleanup_hold: Mutex::new(None),
+                }
+            }
+
+            #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+            pub(super) fn arm_cleanup_hold(&self) -> Result<WindowCleanupHold, String> {
+                let mut slot = lock(&self.cleanup_hold);
+                if slot.is_some() {
+                    return Err("original window cleanup hold already armed".into());
+                }
+                let gate = Arc::new(WindowCleanupGate {
+                    entered: AtomicBool::new(false),
+                    release: AtomicBool::new(false),
+                });
+                *slot = Some(gate.clone());
+                Ok(WindowCleanupHold { gate })
+            }
+
+            #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+            pub(super) fn wait_cleanup_hold(&self) {
+                let gate = lock(&self.cleanup_hold).clone();
+                if let Some(gate) = gate {
+                    gate.entered.store(true, Ordering::Release);
+                    while !gate.release.load(Ordering::Acquire) {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                }
+            }
+
+            fn now(&self) -> Instant {
+                #[cfg(test)]
+                {
+                    Instant::now() + Duration::from_millis(self.time_offset.load(Ordering::Acquire))
+                }
+                #[cfg(not(test))]
+                {
+                    Instant::now()
+                }
+            }
+
+            pub(super) fn grant(&self, generation: u64) -> WindowFrameObservation {
+                let Ok(mut native) = self.native.try_lock() else {
+                    return self.observe(false);
+                };
+                if native
+                    .as_ref()
+                    .is_some_and(|frame| generation <= frame.generation)
+                {
+                    return self.observe(false);
+                }
+                let frame = Arc::new(FrameLedger {
+                    generation,
+                    deadline: self.now() + TURN,
+                    total: AtomicUsize::new(0),
+                    listener: AtomicUsize::new(0),
+                    clients: std::array::from_fn(|_| AtomicUsize::new(0)),
+                });
+                *native = Some(frame.clone());
+                lock(&self.state).frame = Some(frame);
+                drop(native);
+                self.observe(true)
+            }
+
+            pub(super) fn observe(&self, accepted: bool) -> WindowFrameObservation {
+                let state = lock(&self.state);
+                let mut result = WindowFrameObservation::unsupported();
+                result.supported = true;
+                result.grant_accepted = accepted;
+                result.reserved_slots = state
+                    .slots
+                    .iter()
+                    .flatten()
+                    .filter(|slot| slot.client.is_none())
+                    .count();
+                result.live_slots = state
+                    .slots
+                    .iter()
+                    .flatten()
+                    .filter(|slot| slot.client.is_some())
+                    .count();
+                result.queued_requests = state.requests.len();
+                result.pending_requests = self.pending.load(Ordering::Acquire);
+                if let Some(frame) = &state.frame {
+                    result.generation = frame.generation;
+                    result.deadline_expired = self.now() >= frame.deadline;
+                    result.total_starts = frame.total.load(Ordering::Acquire);
+                    result.listener_starts = frame.listener.load(Ordering::Acquire);
+                    result.client_starts =
+                        std::array::from_fn(|index| frame.clients[index].load(Ordering::Acquire));
+                }
+                result.lifetime_starts = self.starts.load(Ordering::Acquire);
+                result.write_would_block = self.write_blocks.load(Ordering::Acquire);
+                result.reserved_response_bytes = self.bytes.load(Ordering::Acquire);
+                result.canceled_reply_bytes = self.canceled.load(Ordering::Acquire);
+                result.expired_operations = self.expired.load(Ordering::Acquire);
+                result.retired_slots = self.retired.load(Ordering::Acquire);
+                result
+            }
+
+            pub(super) fn take_request(&self) -> Option<WindowRequest> {
+                lock(&self.state).requests.pop_front()
+            }
+
+            fn reserve_slot(&self) -> Option<SlotId> {
+                let mut state = lock(&self.state);
+                let index = state.slots.iter().position(Option::is_none)?;
+                let generation = state.generations[index].checked_add(1)?;
+                state.generations[index] = generation;
+                let id = SlotId { index, generation };
+                state.slots[index] = Some(Slot { id, client: None });
+                Some(id)
+            }
+
+            fn release_slot(&self, id: SlotId) {
+                let mut state = lock(&self.state);
+                if state.slots[id.index]
+                    .as_ref()
+                    .is_some_and(|slot| slot.id == id)
+                {
+                    state.slots[id.index] = None;
+                    self.retired.fetch_add(1, Ordering::Release);
+                }
+            }
+
+            fn reserve_bytes(&self, size: usize) -> bool {
+                // Keep the workspace MSRV: try_update is newer, while its old
+                // name is deprecated by the pinned development compiler.
+                let mut current = self.bytes.load(Ordering::Acquire);
+                loop {
+                    let Some(total) = current
+                        .checked_add(size)
+                        .filter(|total| *total <= TOTAL_OUTPUT)
+                    else {
+                        return false;
+                    };
+                    match self.bytes.compare_exchange_weak(
+                        current,
+                        total,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    ) {
+                        Ok(_) => return true,
+                        Err(observed) => current = observed,
+                    }
+                }
+            }
+
+            fn credit<'a>(
+                &'a self,
+                slot: Option<SlotId>,
+            ) -> Option<MutexGuard<'a, Option<Arc<FrameLedger>>>> {
+                let native = self.native.try_lock().ok()?;
+                let frame = native.as_ref()?;
+                let counter = match slot {
+                    Some(id) => &frame.clients[id.index],
+                    None => &frame.listener,
+                };
+                let limit = if slot.is_some() { 3 } else { 8 };
+                if self.now() >= frame.deadline
+                    || counter.load(Ordering::Acquire) >= limit
+                    || frame.total.load(Ordering::Acquire) >= 32
+                {
+                    return None;
+                }
+                counter.fetch_add(1, Ordering::Release);
+                frame.total.fetch_add(1, Ordering::Release);
+                self.starts.fetch_add(1, Ordering::Release);
+                Some(native)
+            }
+
+            fn accept(&self, listener: &NativeListener) -> Option<io::Result<Stream>> {
+                let _credit = self.credit(None)?;
+                Some(listener.accept())
+            }
+
+            fn read(
+                &self,
+                id: SlotId,
+                socket: &NativeSocket,
+                bytes: &mut [u8],
+            ) -> Option<io::Result<usize>> {
+                let _credit = self.credit(Some(id))?;
+                Some(socket.read(bytes))
+            }
+
+            fn write(
+                &self,
+                id: SlotId,
+                socket: &NativeSocket,
+                bytes: &[u8],
+            ) -> Option<io::Result<usize>> {
+                let _credit = self.credit(Some(id))?;
+                Some(socket.write(bytes))
+            }
+        }
+
+        fn command(line: &str) -> WindowCommand {
+            let mut words = line.split_whitespace();
+            match (words.next(), words.next(), words.next()) {
+                (Some("status"), None, None) => WindowCommand::Status,
+                (Some("close-status"), None, None) => WindowCommand::CloseStatus,
+                (Some("close" | "world-leave"), None, None) => WindowCommand::Close { quit: false },
+                (Some("quit"), None, None) => WindowCommand::Close { quit: true },
+                (Some("close-retry"), Some(attempt), None) => attempt
+                    .parse()
+                    .map_or(WindowCommand::Unsupported, |expected_attempt| {
+                        WindowCommand::Retry { expected_attempt }
+                    }),
+                _ => WindowCommand::Unsupported,
+            }
+        }
+
+        fn quoted_size(value: &str) -> Option<usize> {
+            if value.len() > OUTPUT {
+                return None;
+            }
+            value.bytes().try_fold(2usize, |size, byte| {
+                size.checked_add(match byte {
+                    b'"' | b'\\' | b'\n' | b'\r' | b'\t' | 8 | 12 => 2,
+                    0..=31 => 6,
+                    _ => 1,
+                })
+                .filter(|size| *size <= OUTPUT)
+            })
+        }
+
+        fn digits(mut value: u64) -> usize {
+            let mut count = 1;
+            while value >= 10 {
+                value /= 10;
+                count += 1;
+            }
+            count
+        }
+
+        fn bool_size(value: bool) -> usize {
+            if value { 4 } else { 5 }
+        }
+
+        fn reply_size(reply: &WindowReply<'_>) -> Option<usize> {
+            match reply {
+                WindowReply::Status {
+                    phase,
+                    stage,
+                    attempt,
+                    detail,
+                    world_closed,
+                    control_sealed,
+                } => {
+                    let fixed = "{\"phase\":,\"stage\":,\"attempt\":,\"detail\":,\"world_closed\":,\"control_sealed\":}\n".len();
+                    fixed
+                        .checked_add(quoted_size(phase)?)?
+                        .checked_add(quoted_size(stage)?)?
+                        .checked_add(digits(*attempt))?
+                        .checked_add(quoted_size(detail)?)?
+                        .checked_add(bool_size(*world_closed))?
+                        .checked_add(bool_size(*control_sealed))
+                }
+                WindowReply::Admission { accepted, attempt } => {
+                    "{\"ok\":true,\"accepted\":,\"attempt\":}\n"
+                        .len()
+                        .checked_add(bool_size(*accepted))?
+                        .checked_add(digits(*attempt))
+                }
+                WindowReply::Error { message } => {
+                    "{\"error\":}\n".len().checked_add(quoted_size(message)?)
+                }
+            }
+        }
+
+        fn quote(out: &mut String, value: &str) {
+            use std::fmt::Write as _;
+            out.push('"');
+            for character in value.chars() {
+                match character {
+                    '"' => out.push_str("\\\""),
+                    '\\' => out.push_str("\\\\"),
+                    '\n' => out.push_str("\\n"),
+                    '\r' => out.push_str("\\r"),
+                    '\t' => out.push_str("\\t"),
+                    '\u{8}' => out.push_str("\\b"),
+                    '\u{c}' => out.push_str("\\f"),
+                    '\0'..='\u{1f}' => {
+                        let _ = write!(out, "\\u{:04x}", character as u32);
+                    }
+                    _ => out.push(character),
+                }
+            }
+            out.push('"');
+        }
+
+        fn release_reply(owner: &WindowGroup, pending: &WindowPending) {
+            let bytes = pending.bytes.swap(0, Ordering::AcqRel);
+            owner.bytes.fetch_sub(bytes, Ordering::AcqRel);
+        }
+
+        fn encode(
+            owner: &WindowGroup,
+            pending: &WindowPending,
+            reply: WindowReply<'_>,
+        ) -> Result<String, WindowReplyRefusal> {
+            use std::fmt::Write as _;
+            if !lock(&owner.state).slots[pending.id.index]
+                .as_ref()
+                .is_some_and(|slot| slot.id == pending.id)
+            {
+                return Err(WindowReplyRefusal::Disconnected);
+            }
+            let size = reply_size(&reply)
+                .filter(|size| *size <= OUTPUT)
+                .ok_or(WindowReplyRefusal::TooLarge)?;
+            if !owner.reserve_bytes(size) {
+                return Err(WindowReplyRefusal::Budget);
+            }
+            pending.bytes.store(size, Ordering::Release);
+            let mut out = String::new();
+            if out.try_reserve_exact(size).is_err() {
+                release_reply(owner, pending);
+                return Err(WindowReplyRefusal::Allocation);
+            }
+            match reply {
+                WindowReply::Status {
+                    phase,
+                    stage,
+                    attempt,
+                    detail,
+                    world_closed,
+                    control_sealed,
+                } => {
+                    out.push_str("{\"phase\":");
+                    quote(&mut out, phase);
+                    out.push_str(",\"stage\":");
+                    quote(&mut out, stage);
+                    let _ = write!(out, ",\"attempt\":{attempt},\"detail\":");
+                    quote(&mut out, detail);
+                    let _ = writeln!(
+                        out,
+                        ",\"world_closed\":{world_closed},\"control_sealed\":{control_sealed}}}"
+                    );
+                }
+                WindowReply::Admission { accepted, attempt } => {
+                    let _ = writeln!(
+                        out,
+                        "{{\"ok\":true,\"accepted\":{accepted},\"attempt\":{attempt}}}"
+                    );
+                }
+                WindowReply::Error { message } => {
+                    out.push_str("{\"error\":");
+                    quote(&mut out, message);
+                    out.push_str("}\n");
+                }
+            }
+            debug_assert_eq!(size, out.len());
+            Ok(out)
+        }
+
+        fn native_failure(
+            group: &Weak<Group>,
+            client: &WindowClient,
+            stage: RetainedWorkerStage,
+            error: &io::Error,
+        ) {
+            if sealed(group) {
+                return;
+            }
+            client.failed.store(true, Ordering::Release);
+            record_failure(group, stage, error);
+        }
+
+        pub(super) fn listener_worker(group: Weak<Group>) {
+            let Some(owner) = group.upgrade() else { return };
+            let acquisition = owner.acquisition.clone();
+            let window = owner.window.as_ref().unwrap().clone();
+            drop(owner);
+            #[cfg(test)]
+            test_gate(&group, TestPoint::Acquisition);
+            if sealed(&group) {
+                return;
+            }
+            let result = acquire_endpoint(&mut lock(&acquisition));
+            if let Err(error) = result {
+                if let Some(owner) = group.upgrade() {
+                    let mut registry = lock(&owner.registry);
+                    let exists = error.kind() == io::ErrorKind::AlreadyExists;
+                    registry.endpoint = if exists {
+                        RetainedEndpointState::Refused
+                    } else {
+                        RetainedEndpointState::Failed
+                    };
+                    registry.failures.push(RetainedFailure {
+                        stage: RetainedWorkerStage::Acquisition,
+                        kind: if exists {
+                            RetainedFailureKind::EndpointExists
+                        } else {
+                            RetainedFailureKind::NativeIo(error.kind())
+                        },
+                        detail: error.to_string(),
+                    });
+                }
+                return;
+            }
+            #[cfg(test)]
+            test_gate(&group, TestPoint::Acquired);
+            if let Some(owner) = group.upgrade() {
+                lock(&owner.registry).endpoint = RetainedEndpointState::Published;
+            }
+            #[cfg(test)]
+            test_gate(&group, TestPoint::Published);
+            while !sealed(&group) {
+                if let Some(owner) = group.upgrade() {
+                    harvest_retired(&owner, &window);
+                }
+                let Some(id) = window.reserve_slot() else {
+                    thread::sleep(Duration::from_millis(1));
+                    continue;
+                };
+                let next = {
+                    let mut acquisition = lock(&acquisition);
+                    acquisition.window_reservation = Some(id);
+                    match window.accept(acquisition.listener.as_ref().unwrap()) {
+                        Some(Ok(stream)) => {
+                            let token = if matches!(stream, Stream::Tcp(_)) {
+                                Some(acquisition.token.clone())
+                            } else {
+                                None
+                            };
+                            acquisition.accepted = Some(Arc::new(ClientInput {
+                                window: Some(Arc::new(WindowClient {
+                                    id,
+                                    io: Mutex::new(WindowIo {
+                                        buffer: Some(Box::new([0; BUFFER])),
+                                        used: 0,
+                                        first_byte: None,
+                                        authenticated: token.is_none(),
+                                        auth_started: window.now(),
+                                        auth_output: None,
+                                        auth_reserved: 0,
+                                        written: 0,
+                                        eof: false,
+                                        pending: None,
+                                        response_started: None,
+                                    }),
+                                    failed: AtomicBool::new(false),
+                                })),
+                                token,
+                                io: Mutex::new(ClientIo {
+                                    socket: Some(NativeSocket(stream)),
+                                    ..ClientIo::default()
+                                }),
+                                stage: AtomicUsize::new(0),
+                                bytes_written: AtomicUsize::new(0),
+                                auth_read: AtomicUsize::new(0),
+                                command_read: AtomicUsize::new(0),
+                                fd_retired: AtomicBool::new(false),
+                            }));
+                            Ok(acquisition.accepted.as_ref().unwrap().clone())
+                        }
+                        Some(Err(error)) => Err(Some(error)),
+                        None => Err(None),
+                    }
+                };
+                let input = match next {
+                    Ok(input) => input,
+                    Err(error) => {
+                        lock(&acquisition).window_reservation = None;
+                        window.release_slot(id);
+                        if let Some(error) = error
+                            && error.kind() != io::ErrorKind::WouldBlock
+                        {
+                            record_failure(&group, RetainedWorkerStage::Listener, &error);
+                            return;
+                        }
+                        thread::sleep(Duration::from_millis(1));
+                        continue;
+                    }
+                };
+                #[cfg(test)]
+                test_gate(&group, TestPoint::Accepted);
+                let Some(owner) = group.upgrade() else { return };
+                let (index, refused) = {
+                    let mut registry = lock(&owner.registry);
+                    let index = registry.clients.len();
+                    let refused = owner.sealed.load(Ordering::Acquire);
+                    registry.clients.push(ClientRecord {
+                        input: input.clone(),
+                        stop: None,
+                        handle: None,
+                        state: if refused {
+                            WorkerState::Refused
+                        } else {
+                            WorkerState::SpawnPending
+                        },
+                        refused,
+                    });
+                    if refused {
+                        registry.refused += 1;
+                    }
+                    (index, refused)
+                };
+                {
+                    let mut state = lock(&window.state);
+                    state.slots[id.index].as_mut().unwrap().client = Some(index);
+                }
+                {
+                    let mut acquisition = lock(&acquisition);
+                    acquisition.accepted = None;
+                    acquisition.window_reservation = None;
+                }
+                let cap = {
+                    let state = lock(&input.io);
+                    let stream = &state.socket.as_ref().unwrap().0;
+                    let nonblocking = match stream {
+                        #[cfg(unix)]
+                        Stream::Unix(stream) => stream.set_nonblocking(true),
+                        Stream::Tcp(stream) => stream.set_nonblocking(true),
+                    };
+                    nonblocking.and_then(|()| stream.try_clone())
+                };
+                match cap {
+                    Ok(cap) if !refused => {
+                        let stop = Arc::new(NativeSocket(cap));
+                        let fenced = {
+                            let mut registry = lock(&owner.registry);
+                            registry.clients[index].stop = Some(stop.clone());
+                            owner.sealed.load(Ordering::Acquire)
+                        };
+                        if fenced {
+                            stop.shutdown();
+                        }
+                        if spawn_fixed(&owner, Actor::Client(index)).is_err() {
+                            retire_client_socket(&group, index, &input);
+                        }
+                    }
+                    Ok(cap) => {
+                        drop(cap);
+                        retire_client_socket(&group, index, &input);
+                    }
+                    Err(error) => {
+                        input
+                            .window
+                            .as_ref()
+                            .unwrap()
+                            .failed
+                            .store(true, Ordering::Release);
+                        record_failure(&group, RetainedWorkerStage::Listener, &error);
+                        let mut registry = lock(&owner.registry);
+                        registry.clients[index].state = WorkerState::Refused;
+                        registry.clients[index].refused = true;
+                        registry.refused += usize::from(!refused);
+                        drop(registry);
+                        retire_client_socket(&group, index, &input);
+                    }
+                }
+                #[cfg(test)]
+                if owner
+                    .test
+                    .panic_listener_after_client
+                    .load(Ordering::Acquire)
+                {
+                    panic!("fixed retained listener panic after client registration");
+                }
+            }
+        }
+
+        fn consume(io: &mut WindowIo, count: usize) {
+            let used = io.used;
+            io.buffer.as_mut().unwrap().copy_within(count..used, 0);
+            io.used -= count;
+            if io.used == 0 {
+                io.first_byte = None;
+            }
+        }
+
+        fn expired(window: &WindowGroup, started: Option<Instant>) -> bool {
+            started
+                .is_some_and(|started| window.now().saturating_duration_since(started) >= OPERATION)
+        }
+
+        fn read_more(
+            window: &WindowGroup,
+            state: &mut WindowIo,
+            socket: &NativeSocket,
+            id: SlotId,
+        ) -> Option<io::Result<usize>> {
+            let used = state.used;
+            let result = window.read(id, socket, &mut state.buffer.as_mut().unwrap()[used..])?;
+            if let Ok(count) = result {
+                if count > 0 && state.used == 0 {
+                    state.first_byte = Some(window.now());
+                }
+                state.used += count;
+                state.eof = count == 0;
+            }
+            Some(result)
+        }
+
+        pub(super) fn client_worker(group: &Weak<Group>, input: &ClientInput) {
+            let Some(owner) = group.upgrade() else { return };
+            let window = owner.window.as_ref().unwrap().clone();
+            drop(owner);
+            let client = input.window.as_ref().unwrap();
+            #[cfg(test)]
+            test_gate(group, TestPoint::Client);
+            loop {
+                if sealed(group) {
+                    return;
+                }
+                let mut io = lock(&client.io);
+                let socket_guard = lock(&input.io);
+                let socket = socket_guard.socket.as_ref().unwrap();
+                // A bulk read may already own the next incomplete line while
+                // authentication or an earlier response is still in flight.
+                // Its original clock runs independently of those operations;
+                // observing it neither parses the tail nor renews its deadline.
+                if !io.eof
+                    && io.used > 0
+                    && io.buffer.as_ref().unwrap()[io.used - 1] != b'\n'
+                    && expired(&window, io.first_byte)
+                {
+                    window.expired.fetch_add(1, Ordering::Release);
+                    return;
+                }
+                if !io.authenticated {
+                    input.stage.store(1, Ordering::Release);
+                    if expired(&window, Some(io.auth_started)) {
+                        window.expired.fetch_add(1, Ordering::Release);
+                        return;
+                    }
+                    if io.auth_output.is_none() {
+                        if let Some(newline) = io.buffer.as_ref().unwrap()[..io.used]
+                            .iter()
+                            .position(|byte| *byte == b'\n')
+                        {
+                            if newline >= 256 {
+                                return;
+                            }
+                            let line =
+                                String::from_utf8_lossy(&io.buffer.as_ref().unwrap()[..newline]);
+                            let ok = line.trim().strip_prefix("auth ").is_some_and(|token| {
+                                same_token(token.trim(), input.token.as_deref().unwrap())
+                            });
+                            let response = if ok {
+                                "{\"ok\":true}\n"
+                            } else {
+                                "{\"error\":\"bad or missing token: the first line must be auth TOKEN\"}\n"
+                            };
+                            if !window.reserve_bytes(response.len()) {
+                                return;
+                            }
+                            io.auth_reserved = response.len();
+                            io.auth_output = Some(response.to_owned());
+                            consume(&mut io, newline + 1);
+                            // Failed authentication is retired after its fixed error write.
+                            io.eof |= !ok;
+                        } else if io.used >= 256 || io.eof {
+                            return;
+                        } else {
+                            let read = read_more(&window, &mut io, socket, client.id);
+                            if let Some(Err(error)) = &read
+                                && error.kind() != io::ErrorKind::WouldBlock
+                            {
+                                native_failure(
+                                    group,
+                                    client,
+                                    RetainedWorkerStage::Authentication,
+                                    error,
+                                );
+                                return;
+                            }
+                            #[cfg(test)]
+                            let received = matches!(read, Some(Ok(count)) if count > 0);
+                            drop(socket_guard);
+                            drop(io);
+                            #[cfg(test)]
+                            if received {
+                                window.auth_bulk_read.entered.store(true, Ordering::Release);
+                                while window.auth_bulk_read.hold.load(Ordering::Acquire) {
+                                    thread::sleep(Duration::from_millis(1));
+                                }
+                            }
+                            thread::sleep(Duration::from_millis(1));
+                            continue;
+                        }
+                    }
+                    let text = io.auth_output.as_ref().unwrap();
+                    match window.write(client.id, socket, &text.as_bytes()[io.written..]) {
+                        Some(Ok(0)) => return,
+                        Some(Ok(count)) => io.written += count,
+                        Some(Err(error)) if error.kind() == io::ErrorKind::WouldBlock => {
+                            window.write_blocks.fetch_add(1, Ordering::Release);
+                        }
+                        Some(Err(error)) if error.kind() != io::ErrorKind::WouldBlock => {
+                            native_failure(
+                                group,
+                                client,
+                                RetainedWorkerStage::Authentication,
+                                &error,
+                            );
+                            return;
+                        }
+                        _ => {}
+                    }
+                    if io.written == io.auth_output.as_ref().unwrap().len() {
+                        window.bytes.fetch_sub(io.auth_reserved, Ordering::AcqRel);
+                        io.auth_reserved = 0;
+                        io.auth_output = None;
+                        io.written = 0;
+                        io.authenticated = true;
+                        if io.eof {
+                            return;
+                        }
+                    }
+                } else if let Some(pending) = io.pending.clone() {
+                    input.stage.store(3, Ordering::Release);
+                    if expired(&window, io.response_started) {
+                        window.expired.fetch_add(1, Ordering::Release);
+                        return;
+                    }
+                    let mut response = lock(&pending.state);
+                    if response.text.is_none() && !pending.observed.load(Ordering::Acquire) {
+                        match response.receiver.try_recv() {
+                            Ok(text) => {
+                                response.text = Some(text);
+                                pending.observed.store(true, Ordering::Release);
+                                if let Some(owner) = group.upgrade() {
+                                    lock(&owner.registry).observed += 1;
+                                }
+                            }
+                            Err(mpsc::TryRecvError::Disconnected) => {
+                                response.disconnected = true;
+                                let policy = pending.window.as_ref().unwrap();
+                                match encode(
+                                    &window,
+                                    policy,
+                                    WindowReply::Error {
+                                        message: "request abandoned or reply refused",
+                                    },
+                                ) {
+                                    Ok(text) => response.text = Some(text),
+                                    Err(_) => return,
+                                }
+                                pending.observed.store(true, Ordering::Release);
+                                if let Some(owner) = group.upgrade() {
+                                    lock(&owner.registry).observed += 1;
+                                }
+                            }
+                            Err(mpsc::TryRecvError::Empty) => {}
+                        }
+                    }
+                    if let Some(text) = &response.text {
+                        input.stage.store(4, Ordering::Release);
+                        if io.written < text.len() {
+                            match window.write(client.id, socket, &text.as_bytes()[io.written..]) {
+                                Some(Ok(0)) => return,
+                                Some(Ok(count)) => {
+                                    io.written += count;
+                                    input.bytes_written.fetch_add(count, Ordering::Release);
+                                }
+                                Some(Err(error)) if error.kind() == io::ErrorKind::WouldBlock => {
+                                    window.write_blocks.fetch_add(1, Ordering::Release);
+                                }
+                                Some(Err(error)) if error.kind() != io::ErrorKind::WouldBlock => {
+                                    native_failure(
+                                        group,
+                                        client,
+                                        RetainedWorkerStage::ResponseWrite,
+                                        &error,
+                                    );
+                                    return;
+                                }
+                                _ => {}
+                            }
+                        }
+                        if io.written == text.len()
+                            && !pending
+                                .window
+                                .as_ref()
+                                .unwrap()
+                                .ticket_live
+                                .load(Ordering::Acquire)
+                        {
+                            pending.delivered.store(true, Ordering::Release);
+                            response.text = None;
+                            release_reply(&window, pending.window.as_ref().unwrap());
+                            window.pending.fetch_sub(1, Ordering::AcqRel);
+                            io.pending = None;
+                            io.response_started = None;
+                            io.written = 0;
+                            if let Some(owner) = group.upgrade() {
+                                let mut registry = lock(&owner.registry);
+                                registry.delivered += 1;
+                                registry
+                                    .replies
+                                    .retain(|reply| !Arc::ptr_eq(reply, &pending));
+                            }
+                        }
+                    }
+                } else {
+                    input.stage.store(2, Ordering::Release);
+                    if expired(&window, io.first_byte) {
+                        window.expired.fetch_add(1, Ordering::Release);
+                        return;
+                    }
+                    let newline = io.buffer.as_ref().unwrap()[..io.used]
+                        .iter()
+                        .position(|byte| *byte == b'\n');
+                    if newline.is_none() && !io.eof {
+                        if io.used > LINE {
+                            return;
+                        }
+                        if let Some(Err(error)) = read_more(&window, &mut io, socket, client.id)
+                            && error.kind() != io::ErrorKind::WouldBlock
+                        {
+                            native_failure(group, client, RetainedWorkerStage::CommandRead, &error);
+                            return;
+                        }
+                    } else {
+                        if io.used == 0 {
+                            return;
+                        }
+                        let length = newline.unwrap_or(io.used);
+                        if length > LINE {
+                            return;
+                        }
+                        let end = if newline.is_some()
+                            && length > 0
+                            && io.buffer.as_ref().unwrap()[length - 1] == b'\r'
+                        {
+                            length - 1
+                        } else {
+                            length
+                        };
+                        let Ok(line) = std::str::from_utf8(&io.buffer.as_ref().unwrap()[..end])
+                        else {
+                            return;
+                        };
+                        if line.trim().is_empty() {
+                            consume(&mut io, newline.map_or(length, |n| n + 1));
+                        } else {
+                            let mut owned_line = String::new();
+                            if owned_line.try_reserve_exact(line.len()).is_err() {
+                                client.failed.store(true, Ordering::Release);
+                                return;
+                            }
+                            owned_line.push_str(line);
+                            let line = owned_line;
+                            let selector = command(&line);
+                            let (reply, receiver) = mpsc::channel();
+                            let policy = Arc::new(WindowPending {
+                                id: client.id,
+                                bytes: AtomicUsize::new(0),
+                                ticket_live: AtomicBool::new(true),
+                            });
+                            let pending = Arc::new(PendingReply {
+                                window: Some(policy.clone()),
+                                state: Mutex::new(ReplyState {
+                                    receiver,
+                                    text: None,
+                                    disconnected: false,
+                                }),
+                                observed: AtomicBool::new(false),
+                                delivered: AtomicBool::new(false),
+                            });
+                            io.pending = Some(pending.clone());
+                            window.pending.fetch_add(1, Ordering::Release);
+                            io.response_started = Some(window.now());
+                            consume(&mut io, newline.map_or(length, |n| n + 1));
+                            let Some(owner) = group.upgrade() else { return };
+                            lock(&owner.registry).replies.push(pending);
+                            let mut state = lock(&window.state);
+                            state.requests.push_back(WindowRequest {
+                                line,
+                                command: selector,
+                                reply: Some(reply),
+                                pending: policy,
+                                owner: Arc::downgrade(&window),
+                            });
+                            #[cfg(test)]
+                            if owner.test.panic_client.load(Ordering::Acquire) {
+                                panic!("fixed retained client panic after request registration");
+                            }
+                        }
+                    }
+                }
+                drop(socket_guard);
+                drop(io);
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+
+        /// Checked join precedes late-receiver resolution and index reuse. The
+        /// consumed payload is replaced by compact canceled-byte/outcome history;
+        /// this says nothing about external Game cancellation or peer delivery.
+        pub(super) fn harvest_retired(group: &Group, window: &WindowGroup) {
+            let indices: Vec<_> = lock(&window.state)
+                .slots
+                .iter()
+                .flatten()
+                .filter_map(|slot| slot.client)
+                .collect();
+            let clients: Vec<_> = {
+                let registry = lock(&group.registry);
+                indices
+                    .into_iter()
+                    .filter_map(|index| {
+                        let client = &registry.clients[index];
+                        (client.state.terminal()
+                            && client.input.fd_retired.load(Ordering::Acquire)
+                            && client.input.window.is_some())
+                        .then(|| (index, client.input.clone()))
+                    })
+                    .collect()
+            };
+            for (index, input) in clients {
+                #[cfg(test)]
+                {
+                    window.retirement.entered.store(true, Ordering::Release);
+                    while window.retirement.hold.load(Ordering::Acquire) {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                }
+                let client = input.window.as_ref().unwrap();
+                if client.failed.load(Ordering::Acquire) {
+                    continue;
+                }
+                let mut io = lock(&client.io);
+                if let Some(pending) = io.pending.clone() {
+                    let policy = pending.window.as_ref().unwrap();
+                    if policy.ticket_live.load(Ordering::Acquire) {
+                        continue;
+                    }
+                    let mut response = lock(&pending.state);
+                    if !pending.observed.load(Ordering::Acquire) {
+                        match response.receiver.try_recv() {
+                            Ok(text) => {
+                                response.text = Some(text);
+                                pending.observed.store(true, Ordering::Release);
+                                lock(&group.registry).observed += 1;
+                            }
+                            Err(mpsc::TryRecvError::Disconnected) => {
+                                response.disconnected = true;
+                                pending.observed.store(true, Ordering::Release);
+                                lock(&group.registry).observed += 1;
+                            }
+                            Err(mpsc::TryRecvError::Empty) => continue,
+                        }
+                    }
+                    if !pending.delivered.load(Ordering::Acquire) {
+                        window.canceled.fetch_add(
+                            response.text.as_ref().map_or(0, String::len),
+                            Ordering::Release,
+                        );
+                    }
+                    response.text = None;
+                    release_reply(window, policy);
+                    window.pending.fetch_sub(1, Ordering::AcqRel);
+                    io.pending = None;
+                    lock(&group.registry)
+                        .replies
+                        .retain(|reply| !Arc::ptr_eq(reply, &pending));
+                }
+                window.bytes.fetch_sub(io.auth_reserved, Ordering::AcqRel);
+                io.auth_reserved = 0;
+                io.auth_output = None;
+                io.buffer = None;
+                drop(io);
+                // Remove only this exact original generation, never a foreign slot.
+                let matches = lock(&window.state).slots[client.id.index]
+                    .as_ref()
+                    .is_some_and(|slot| slot.id == client.id && slot.client == Some(index));
+                if matches {
+                    window.release_slot(client.id);
+                }
+            }
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            const BACKSTOP: Duration = Duration::from_secs(10);
+
+            struct Fixture {
+                path: PathBuf,
+                owner: Option<RetainedControl>,
+                frame: u64,
+            }
+            struct Peer {
+                stream: Stream,
+                received: Vec<u8>,
+            }
+
+            impl Peer {
+                fn write(&mut self, bytes: &[u8]) {
+                    self.stream.write_all(bytes).unwrap();
+                }
+                fn line(&mut self) -> Option<String> {
+                    let mut bytes = [0; 8192];
+                    loop {
+                        if let Some(end) = self.received.iter().position(|byte| *byte == b'\n') {
+                            let line: Vec<_> = self.received.drain(..=end).collect();
+                            return Some(String::from_utf8(line).unwrap());
+                        }
+                        match self.stream.read(&mut bytes) {
+                            Ok(0) => return None,
+                            Ok(count) => self.received.extend_from_slice(&bytes[..count]),
+                            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return None,
+                            Err(error) => panic!("native peer read: {error}"),
+                        }
+                    }
+                }
+            }
+
+            impl Fixture {
+                fn new(tcp: bool) -> Self {
+                    let path = std::env::temp_dir().join(format!(
+                        "horizon-window-control-{}-{}.{}",
+                        std::process::id(),
+                        NEXT.fetch_add(1, Ordering::Relaxed),
+                        if tcp { "json" } else { "sock" }
+                    ));
+                    assert!(!path.exists());
+                    Self {
+                        owner: Some(RetainedControl::prepare_window(&path)),
+                        path,
+                        frame: 0,
+                    }
+                }
+                fn owner(&mut self) -> &mut RetainedControl {
+                    self.owner.as_mut().unwrap()
+                }
+                fn policy(&self) -> Arc<WindowGroup> {
+                    self.owner
+                        .as_ref()
+                        .unwrap()
+                        .group
+                        .window
+                        .as_ref()
+                        .unwrap()
+                        .clone()
+                }
+                fn pump(&mut self) -> WindowFrameObservation {
+                    self.frame = self.frame.checked_add(1).unwrap();
+                    let frame = self.frame;
+                    let view = self.owner().grant_window_frame(frame);
+                    assert!(view.total_starts <= 32 && view.listener_starts <= 8);
+                    assert!(view.client_starts.iter().all(|count| *count <= 3));
+                    assert!(view.live_slots + view.reserved_slots <= SLOTS);
+                    assert!(
+                        view.pending_requests <= SLOTS
+                            && view.reserved_response_bytes <= TOTAL_OUTPUT
+                    );
+                    view
+                }
+                fn until(&mut self, mut condition: impl FnMut(&mut Self) -> bool) {
+                    let deadline = Instant::now() + BACKSTOP;
+                    while !condition(self) {
+                        assert!(Instant::now() < deadline, "window native fixture backstop");
+                        self.pump();
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                }
+                fn start(&mut self) {
+                    self.owner().start().unwrap();
+                    self.until(|fixture| {
+                        fixture.owner().observation().endpoint == RetainedEndpointState::Published
+                    });
+                }
+                fn raw(&self) -> Peer {
+                    let stream = if uses_tcp(&self.path) {
+                        let (port, _) = read_endpoint(&self.path).unwrap();
+                        let stream = TcpStream::connect_timeout(
+                            &std::net::SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+                            BACKSTOP,
+                        )
+                        .unwrap();
+                        stream.set_nonblocking(true).unwrap();
+                        Stream::Tcp(stream)
+                    } else {
+                        #[cfg(unix)]
+                        {
+                            let stream = UnixStream::connect(&self.path).unwrap();
+                            stream.set_nonblocking(true).unwrap();
+                            Stream::Unix(stream)
+                        }
+                        #[cfg(not(unix))]
+                        unreachable!()
+                    };
+                    Peer {
+                        stream,
+                        received: Vec::new(),
+                    }
+                }
+                fn client(&mut self) -> Peer {
+                    let mut peer = self.raw();
+                    if uses_tcp(&self.path) {
+                        let (_, token) = read_endpoint(&self.path).unwrap();
+                        peer.write(format!("auth {token}\n").as_bytes());
+                        let mut line = None;
+                        self.until(|_| {
+                            line = peer.line();
+                            line.is_some()
+                        });
+                        assert_eq!(line.as_deref(), Some("{\"ok\":true}\n"));
+                    }
+                    peer
+                }
+                fn request(&mut self) -> WindowRequest {
+                    let mut request = None;
+                    self.until(|fixture| {
+                        request = fixture.owner().try_recv_window();
+                        request.is_some()
+                    });
+                    request.unwrap()
+                }
+                fn closed(mut self) -> ClosedControl {
+                    self.policy()
+                        .retirement
+                        .hold
+                        .store(false, Ordering::Release);
+                    self.policy()
+                        .auth_bulk_read
+                        .hold
+                        .store(false, Ordering::Release);
+                    let mut owner = self.owner.take().unwrap();
+                    release_all_gates(&owner.group);
+                    owner.begin_close(Instant::now() + BACKSTOP);
+                    let deadline = Instant::now() + BACKSTOP;
+                    while owner.poll_close().observation.phase != RetainedControlPhase::Quiescent {
+                        assert!(Instant::now() < deadline);
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    match owner.try_closed() {
+                        Ok(closed) => closed,
+                        Err(_) => panic!("native window close did not transfer"),
+                    }
+                }
+            }
+
+            fn release_all_gates(group: &Group) {
+                for gate in [
+                    &group.test.acquisition,
+                    &group.test.acquired,
+                    &group.test.published,
+                    &group.test.accepted,
+                    &group.test.client,
+                    &group.test.cleanup,
+                ] {
+                    gate.hold.store(false, Ordering::Release);
+                }
+            }
+
+            impl Drop for Fixture {
+                fn drop(&mut self) {
+                    if let Some(mut owner) = self.owner.take() {
+                        owner
+                            .group
+                            .window
+                            .as_ref()
+                            .unwrap()
+                            .retirement
+                            .hold
+                            .store(false, Ordering::Release);
+                        owner
+                            .group
+                            .window
+                            .as_ref()
+                            .unwrap()
+                            .auth_bulk_read
+                            .hold
+                            .store(false, Ordering::Release);
+                        release_all_gates(&owner.group);
+                        owner.begin_close(Instant::now() + BACKSTOP);
+                        let deadline = Instant::now() + BACKSTOP;
+                        while owner.poll_close().observation.phase
+                            != RetainedControlPhase::Quiescent
+                        {
+                            assert!(Instant::now() < deadline);
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                        assert!(owner.try_closed().is_ok());
+                    }
+                }
+            }
+
+            #[test]
+            fn window_raw_paths_refuse_before_start_and_after_fence() {
+                let mut fixture = Fixture::new(true);
+                let sender = fixture.owner().sender();
+                let (reply, response) = mpsc::channel();
+                let refused = match sender.try_send(Request {
+                    line: "original-local".into(),
+                    reply,
+                }) {
+                    Err(value) => value,
+                    Ok(()) => panic!("bounded local injection"),
+                };
+                assert_eq!(refused.line, "original-local");
+                refused.reply.send("same-channel".into()).unwrap();
+                assert_eq!(response.recv_timeout(BACKSTOP).unwrap(), "same-channel");
+                assert!(fixture.owner().try_recv().is_none());
+                assert!(!fixture.path.exists());
+                fixture.start();
+                let mut peer = fixture.client();
+                peer.write(b"close-retry 7\n");
+                fixture.until(|fixture| fixture.owner().window_observation().queued_requests == 1);
+                assert!(fixture.owner().try_recv().is_none());
+                let request = fixture.request();
+                assert_eq!(
+                    request.command(),
+                    WindowCommand::Retry {
+                        expected_attempt: 7
+                    }
+                );
+                assert_eq!(request.line(), "close-retry 7");
+                request
+                    .reply(WindowReply::Admission {
+                        accepted: false,
+                        attempt: 1,
+                    })
+                    .unwrap();
+                let mut line = None;
+                fixture.until(|_| {
+                    line = peer.line();
+                    line.is_some()
+                });
+                assert_eq!(
+                    line.unwrap(),
+                    "{\"ok\":true,\"accepted\":false,\"attempt\":1}\n"
+                );
+                fixture.owner().begin_close(Instant::now() + BACKSTOP);
+                assert!(fixture.owner().try_recv_window().is_none());
+                assert!(!fixture.pump().grant_accepted);
+            }
+
+            #[test]
+            fn window_actual_credit_generation_and_expiry() {
+                let mut fixture = Fixture::new(true);
+                fixture.owner().start().unwrap();
+                let deadline = Instant::now() + BACKSTOP;
+                while fixture.owner().observation().endpoint != RetainedEndpointState::Published {
+                    assert!(Instant::now() < deadline);
+                    thread::yield_now();
+                }
+                let _peer = fixture.raw();
+                assert_eq!(fixture.owner().window_observation().lifetime_starts, 0);
+                let mut generation = 0;
+                let deadline = Instant::now() + BACKSTOP;
+                loop {
+                    generation += 1;
+                    fixture.owner().grant_window_frame(generation);
+                    let end = Instant::now() + Duration::from_millis(5);
+                    while Instant::now() < end {
+                        thread::yield_now();
+                    }
+                    if fixture.owner().window_observation().lifetime_starts > 0 {
+                        break;
+                    }
+                    assert!(Instant::now() < deadline);
+                }
+                let first = fixture.owner().window_observation();
+                assert!(first.deadline_expired && first.lifetime_starts > 0);
+                assert!(
+                    first.total_starts <= 32
+                        && first.listener_starts <= 8
+                        && first.client_starts.iter().all(|count| *count <= 3)
+                );
+                assert!(
+                    !fixture
+                        .owner()
+                        .grant_window_frame(generation)
+                        .grant_accepted
+                );
+                let before = first.lifetime_starts;
+                let end = Instant::now() + Duration::from_millis(5);
+                while Instant::now() < end {
+                    thread::yield_now();
+                }
+                assert_eq!(fixture.owner().window_observation().lifetime_starts, before);
+                assert!(
+                    fixture
+                        .owner()
+                        .grant_window_frame(generation + 1)
+                        .grant_accepted
+                );
+                fixture.frame = generation + 1;
+            }
+
+            #[test]
+            fn window_auth_bulk_tails_and_serial_requests() {
+                for tcp in [true, false] {
+                    let mut fixture = Fixture::new(tcp);
+                    fixture.start();
+                    let mut peer = fixture.raw();
+                    let mut bytes = Vec::new();
+                    if uses_tcp(&fixture.path) {
+                        let (_, token) = read_endpoint(&fixture.path).unwrap();
+                        bytes.extend_from_slice(format!("auth {token}\n").as_bytes());
+                    }
+                    bytes.extend_from_slice(b"status\r\nclose-status\n");
+                    peer.write(&bytes);
+                    if uses_tcp(&fixture.path) {
+                        let mut auth = None;
+                        fixture.until(|_| {
+                            auth = peer.line();
+                            auth.is_some()
+                        });
+                        assert_eq!(auth.as_deref(), Some("{\"ok\":true}\n"));
+                    }
+                    let first = fixture.request();
+                    assert_eq!(first.command(), WindowCommand::Status);
+                    assert_eq!(first.line(), "status");
+                    for _ in 0..8 {
+                        fixture.pump();
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    assert!(fixture.owner().try_recv_window().is_none());
+                    assert_eq!(fixture.owner().window_observation().pending_requests, 1);
+                    first
+                        .reply(WindowReply::Status {
+                            phase: "Blocked",
+                            stage: "Native\nIO",
+                            attempt: 3,
+                            detail: "quotes\" and \\ and \u{1}",
+                            world_closed: false,
+                            control_sealed: false,
+                        })
+                        .unwrap();
+                    let mut line = None;
+                    fixture.until(|_| {
+                        line = peer.line();
+                        line.is_some()
+                    });
+                    let reply: serde_json::Value =
+                        serde_json::from_str(line.as_deref().unwrap()).unwrap();
+                    assert_eq!(reply["stage"], "Native\nIO");
+                    let second = fixture.request();
+                    assert_eq!(second.command(), WindowCommand::CloseStatus);
+                    second
+                        .reply(WindowReply::Error { message: "fixed" })
+                        .unwrap();
+                    fixture.until(|_| peer.line().is_some());
+                    assert!(fixture.closed().observation().endpoint_released);
+                }
+            }
+
+            #[test]
+            fn window_slots_reserve_before_accept_and_reuse_after_join() {
+                let mut fixture = Fixture::new(true);
+                fixture
+                    .owner()
+                    .group
+                    .test
+                    .accepted
+                    .hold
+                    .store(true, Ordering::Release);
+                fixture.start();
+                let peer = fixture.raw();
+                fixture.until(|fixture| {
+                    fixture
+                        .owner()
+                        .group
+                        .test
+                        .accepted
+                        .entered
+                        .load(Ordering::Acquire)
+                });
+                let view = fixture.owner().window_observation();
+                assert_eq!(view.reserved_slots, 1);
+                assert_eq!(view.live_slots, 0);
+                assert_eq!(fixture.owner().observation().registered_clients, 0);
+                fixture
+                    .owner()
+                    .group
+                    .test
+                    .accepted
+                    .hold
+                    .store(false, Ordering::Release);
+                drop(peer);
+                fixture.until(|fixture| {
+                    fixture.owner().window_observation().live_slots == 0
+                        && fixture.owner().observation().retired_client_sockets == 1
+                });
+                let mut peers = Vec::new();
+                for _ in 0..SLOTS {
+                    peers.push(fixture.client());
+                }
+                let ninth = fixture.raw();
+                for _ in 0..10 {
+                    fixture.pump();
+                    thread::sleep(Duration::from_millis(1));
+                }
+                assert_eq!(fixture.owner().window_observation().live_slots, SLOTS);
+                assert_eq!(fixture.owner().observation().registered_clients, SLOTS + 1);
+                drop(ninth);
+                drop(peers);
+                fixture.until(|fixture| fixture.owner().window_observation().live_slots == 0);
+                let _reused = fixture.client();
+                assert!(fixture.owner().observation().registered_clients > SLOTS);
+            }
+
+            #[test]
+            fn window_deadlines_expire_without_credit_and_do_not_renew() {
+                let mut auth = Fixture::new(true);
+                auth.start();
+                let mut peer = auth.raw();
+                peer.write(b"auth partial");
+                auth.until(|fixture| fixture.owner().observation().registered_clients == 1);
+                let policy = auth.policy();
+                policy.time_offset.store(6000, Ordering::Release);
+                peer.write(b"more");
+                for _ in 0..4 {
+                    auth.pump();
+                    thread::sleep(Duration::from_millis(1));
+                }
+                policy.time_offset.store(10001, Ordering::Release);
+                let deadline = Instant::now() + BACKSTOP;
+                while auth.owner().observation().retired_client_sockets == 0 {
+                    assert!(Instant::now() < deadline);
+                    thread::yield_now();
+                }
+                assert_eq!(policy.observe(false).expired_operations, 1);
+
+                let mut command = Fixture::new(true);
+                command.start();
+                let mut peer = command.client();
+                peer.write(b"partial");
+                command.until(|fixture| {
+                    let input = lock(&fixture.owner().group.registry).clients[0]
+                        .input
+                        .clone();
+                    input
+                        .window
+                        .as_ref()
+                        .is_some_and(|client| lock(&client.io).used > 0)
+                });
+                let policy = command.policy();
+                policy.time_offset.store(10001, Ordering::Release);
+                let deadline = Instant::now() + BACKSTOP;
+                while command.owner().observation().retired_client_sockets == 0 {
+                    assert!(Instant::now() < deadline);
+                    thread::yield_now();
+                }
+                assert_eq!(policy.observe(false).expired_operations, 1);
+
+                let mut response = Fixture::new(true);
+                response.start();
+                let mut peer = response.client();
+                peer.write(b"status\n");
+                let request = response.request();
+                let policy = response.policy();
+                policy.time_offset.store(10001, Ordering::Release);
+                let deadline = Instant::now() + BACKSTOP;
+                while response.owner().observation().retired_client_sockets == 0 {
+                    assert!(Instant::now() < deadline);
+                    thread::yield_now();
+                }
+                assert_eq!(policy.observe(false).pending_requests, 1);
+                drop(request);
+                response
+                    .until(|fixture| fixture.owner().window_observation().pending_requests == 0);
+
+                // One real native read owns auth, a complete command and the
+                // next partial line at t0. Delaying the prior operations must
+                // not give that partial tail a fresh t9 response deadline.
+                let mut bulk = Fixture::new(true);
+                bulk.start();
+                let policy = bulk.policy();
+                policy.auth_bulk_read.hold.store(true, Ordering::Release);
+                let mut peer = bulk.raw();
+                let (_, token) = read_endpoint(&bulk.path).unwrap();
+                let bytes = format!("auth {token}\nstatus\npartial-next");
+                peer.write(bytes.as_bytes());
+                bulk.until(|_| policy.auth_bulk_read.entered.load(Ordering::Acquire));
+                let input = lock(&bulk.owner().group.registry).clients[0].input.clone();
+                let client = input.window.as_ref().unwrap();
+                let original_first_byte = {
+                    let io = lock(&client.io);
+                    assert_eq!(&io.buffer.as_ref().unwrap()[..io.used], bytes.as_bytes());
+                    io.first_byte.unwrap()
+                };
+                policy.time_offset.store(9000, Ordering::Release);
+                policy.auth_bulk_read.hold.store(false, Ordering::Release);
+                let request = bulk.request();
+                assert_eq!(request.command(), WindowCommand::Status);
+                {
+                    let io = lock(&client.io);
+                    assert_eq!(&io.buffer.as_ref().unwrap()[..io.used], b"partial-next");
+                    assert_eq!(io.first_byte, Some(original_first_byte));
+                    assert!(
+                        io.response_started.unwrap() > original_first_byte + Duration::from_secs(8)
+                    );
+                }
+                assert_eq!(policy.observe(false).expired_operations, 0);
+                policy.time_offset.store(10001, Ordering::Release);
+                let deadline = Instant::now() + BACKSTOP;
+                while !input.fd_retired.load(Ordering::Acquire) {
+                    assert!(Instant::now() < deadline);
+                    thread::yield_now();
+                }
+                assert_eq!(policy.observe(false).expired_operations, 1);
+                assert_eq!(policy.observe(false).pending_requests, 1);
+                assert!(bulk.owner().try_recv_window().is_none());
+                assert_eq!(lock(&client.io).first_byte, Some(original_first_byte));
+                request
+                    .reply(WindowReply::Error {
+                        message: "late original response after tail timeout",
+                    })
+                    .unwrap();
+                bulk.until(|fixture| fixture.owner().window_observation().pending_requests == 0);
+            }
+
+            #[test]
+            fn window_input_and_typed_output_limits() {
+                let mut fixture = Fixture::new(true);
+                fixture.start();
+                let mut oversized = fixture.client();
+                oversized.write(&vec![b'x'; LINE + 1]);
+                fixture.until(|fixture| fixture.owner().observation().retired_client_sockets == 1);
+                assert!(fixture.owner().try_recv_window().is_none());
+                let mut peer = fixture.client();
+                peer.write(b"status\n");
+                let request = fixture.request();
+                assert_eq!(
+                    request.reply(WindowReply::Error {
+                        message: &"x".repeat(OUTPUT)
+                    }),
+                    Err(WindowReplyRefusal::TooLarge)
+                );
+                let mut line = None;
+                fixture.until(|_| {
+                    line = peer.line();
+                    line.is_some()
+                });
+                assert!(line.unwrap().contains("request abandoned or reply refused"));
+                fixture.until(|fixture| {
+                    fixture.owner().window_observation().reserved_response_bytes == 0
+                });
+                peer.write(b"close-retry 1 9\n");
+                let request = fixture.request();
+                assert_eq!(request.command(), WindowCommand::Unsupported);
+                request
+                    .reply(WindowReply::Error {
+                        message: "unsupported fixed selector",
+                    })
+                    .unwrap();
+                fixture.until(|_| peer.line().is_some());
+            }
+
+            #[test]
+            fn window_late_reply_retains_slot_and_aggregate_reservation() {
+                let mut fixture = Fixture::new(true);
+                fixture.start();
+                let mut peers = Vec::new();
+                let mut requests = Vec::new();
+                for _ in 0..SLOTS {
+                    let mut peer = fixture.client();
+                    peer.write(b"status\n");
+                    requests.push(fixture.request());
+                    peers.push(peer);
+                }
+                let policy = fixture.policy();
+                policy.retirement.hold.store(true, Ordering::Release);
+                policy.time_offset.store(10001, Ordering::Release);
+                fixture
+                    .until(|fixture| fixture.owner().observation().retired_client_sockets == SLOTS);
+                fixture.until(|fixture| {
+                    fixture.owner().poll_close();
+                    lock(&fixture.owner().group.registry)
+                        .clients
+                        .iter()
+                        .all(|client| client.state == WorkerState::Joined)
+                });
+                assert_eq!(policy.observe(false).live_slots, SLOTS);
+                assert_eq!(policy.observe(false).pending_requests, SLOTS);
+                let body = "x".repeat(OUTPUT - 13);
+                for request in requests {
+                    request
+                        .reply(WindowReply::Error { message: &body })
+                        .unwrap();
+                }
+                assert_eq!(policy.observe(false).reserved_response_bytes, TOTAL_OUTPUT);
+                assert_eq!(policy.observe(false).live_slots, SLOTS);
+                policy.retirement.hold.store(false, Ordering::Release);
+                fixture.until(|fixture| {
+                    fixture.owner().window_observation().pending_requests == 0
+                        && fixture.owner().window_observation().live_slots == 0
+                });
+                assert_eq!(policy.observe(false).canceled_reply_bytes, TOTAL_OUTPUT);
+                assert_eq!(policy.observe(false).reserved_response_bytes, 0);
+                let _reused = fixture.client();
+                drop(peers);
+            }
+
+            #[test]
+            fn window_stop_without_grant_and_panic_custody() {
+                let mut fixture = Fixture::new(true);
+                fixture.start();
+                let _peer = fixture.client();
+                let deadline = Instant::now() + BACKSTOP;
+                while !fixture.owner().window_observation().deadline_expired {
+                    assert!(Instant::now() < deadline);
+                    thread::yield_now();
+                }
+                let before = fixture.owner().window_observation().lifetime_starts;
+                let closed = fixture.closed();
+                assert!(closed.observation().native_quiescent);
+                assert!(closed.observation().endpoint_released);
+                assert_eq!(
+                    closed
+                        .group
+                        .window
+                        .as_ref()
+                        .unwrap()
+                        .observe(false)
+                        .lifetime_starts,
+                    before
+                );
+
+                #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+                {
+                    let mut held = Fixture::new(true);
+                    let receipt = held.owner().arm_window_cleanup_hold().unwrap();
+                    held.start();
+                    let _peer = held.client();
+                    let original = lock(&held.owner().group.registry)
+                        .cleanup
+                        .as_ref()
+                        .unwrap()
+                        .thread()
+                        .id();
+                    held.owner().begin_close(Instant::now());
+                    held.until(|_| receipt.entered());
+                    assert_eq!(
+                        held.owner().poll_close().observation.phase,
+                        RetainedControlPhase::Blocked
+                    );
+                    assert_eq!(
+                        lock(&held.owner().group.registry)
+                            .cleanup
+                            .as_ref()
+                            .unwrap()
+                            .thread()
+                            .id(),
+                        original
+                    );
+                    held.owner().retry_close(Instant::now() + BACKSTOP).unwrap();
+                    assert_eq!(held.owner().observation().close_attempts, 2);
+                    receipt.release();
+                    assert!(held.closed().observation().endpoint_released);
+                }
+
+                let mut failed = Fixture::new(true);
+                failed.start();
+                let mut peer = failed.client();
+                failed
+                    .owner()
+                    .group
+                    .test
+                    .panic_client
+                    .store(true, Ordering::Release);
+                peer.write(b"status\n");
+                let request = failed.request();
+                failed.until(|fixture| {
+                    fixture.owner().poll_close();
+                    lock(&fixture.owner().group.registry).clients[0].state == WorkerState::Joined
+                });
+                assert_eq!(failed.owner().window_observation().live_slots, 1);
+                request
+                    .reply(WindowReply::Error {
+                        message: "late after original actor panic",
+                    })
+                    .unwrap();
+                let closed = failed.closed();
+                assert!(
+                    closed
+                        .observation()
+                        .failures
+                        .iter()
+                        .any(|failure| failure.kind == RetainedFailureKind::Panicked)
+                );
+                let registry = lock(&closed.group.registry);
+                assert_eq!(registry.replies.len(), 1);
+                assert!(
+                    lock(&registry.replies[0].state)
+                        .text
+                        .as_deref()
+                        .unwrap()
+                        .contains("late after original actor panic")
+                );
+            }
+
+            #[test]
+            #[cfg(unix)]
+            fn window_actual_nonreading_peer_preserves_output_bound() {
+                let mut fixture = Fixture::new(false);
+                fixture.start();
+                let mut peer = fixture.client();
+                peer.write(b"status\n");
+                let request = fixture.request();
+                request
+                    .reply(WindowReply::Error {
+                        message: &"x".repeat(OUTPUT - 13),
+                    })
+                    .unwrap();
+                fixture.until(|fixture| {
+                    let input = lock(&fixture.owner().group.registry).clients[0]
+                        .input
+                        .clone();
+                    input.bytes_written.load(Ordering::Acquire) > 0
+                        && fixture.owner().window_observation().write_would_block > 0
+                });
+                let mut progress = [0; 4096];
+                let count = peer.stream.read(&mut progress).unwrap();
+                assert!(count > 0);
+                for _ in 0..5 {
+                    fixture.pump();
+                    thread::sleep(Duration::from_millis(1));
+                }
+                {
+                    let input = lock(&fixture.owner().group.registry).clients[0]
+                        .input
+                        .clone();
+                    assert!(
+                        !lock(&fixture.owner().group.registry).clients[0]
+                            .handle
+                            .as_ref()
+                            .unwrap()
+                            .is_finished()
+                    );
+                    assert!(input.bytes_written.load(Ordering::Acquire) < OUTPUT);
+                }
+                assert_eq!(
+                    fixture.owner().window_observation().reserved_response_bytes,
+                    OUTPUT
+                );
+                let closed = fixture.closed();
+                assert!(closed.observation().native_quiescent);
+                assert_eq!(
+                    closed
+                        .group
+                        .window
+                        .as_ref()
+                        .unwrap()
+                        .observe(false)
+                        .reserved_response_bytes,
+                    0
+                );
+            }
+        }
     }
 
     #[cfg(test)]
