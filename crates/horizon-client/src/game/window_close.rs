@@ -1116,7 +1116,7 @@ impl ApplicationHandler for Application<'_> {
                         }
                         self.retry(self.attempt);
                     }
-                    PhysicalKey::Code(KeyCode::Enter) if self.terminal_failure => {
+                    PhysicalKey::Code(KeyCode::Enter) if self.terminal_failure && !is_synthetic => {
                         self.exit_acknowledged = true
                     }
                     PhysicalKey::Code(KeyCode::Escape) => self.begin_close(false),
