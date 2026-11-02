@@ -186,6 +186,12 @@ pub fn settings_from_json(
 impl ChunkGenerator for FlatTerrain {
     type Worker = ();
     fn worker(&self) {}
+    #[cfg(feature = "paired-packages")]
+    fn retained_lod_capability(
+        self: std::sync::Arc<Self>,
+    ) -> Option<crate::lod::retained::LodCapability> {
+        Some(crate::lod::retained::LodCapability::for_provider(self))
+    }
     fn lod_surface(&self, _: &mut (), _: i32, _: i32) -> Option<crate::lod::Surface> {
         self.surface
     }
@@ -221,11 +227,70 @@ impl ChunkGenerator for FlatTerrain {
     }
 }
 
+#[cfg(feature = "paired-packages")]
+impl crate::lod::retained::RetainedLodProvider for FlatTerrain {
+    fn retained_sampler(
+        self: std::sync::Arc<Self>,
+        group: std::sync::Arc<crate::lod::retained::LodGroup>,
+    ) -> std::result::Result<
+        Box<dyn crate::lod::retained::CheckedLodSampler>,
+        crate::lod::retained::LodFailure,
+    > {
+        use crate::lod::retained::{LodFailure, LodStage, PureLodSampler};
+        if group.is_stopping() {
+            return Err(LodFailure::new(
+                LodStage::Acquire,
+                "flat LOD admission sealed",
+            ));
+        }
+        Ok(Box::new(PureLodSampler::new(self)))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::save::{number, text};
     use crate::server::json::{self, Json};
+
+    #[cfg(feature = "paired-packages")]
+    #[test]
+    fn retained_flat_known_provider_has_checked_surface_and_sealed_refusal() {
+        use crate::lod::retained::LodGroup;
+        use std::sync::Arc;
+        let expected = crate::lod::Surface {
+            height: -60,
+            state: horizon_world::registry::BlockStateId(1),
+            water: None,
+            biome: 0,
+        };
+        let source = Arc::new(FlatTerrain {
+            layers: vec![1; 4],
+            biome: 0,
+            surface: Some(expected),
+        });
+        let capability = source
+            .clone()
+            .retained_lod_capability()
+            .expect("known flat capability");
+        let group = LodGroup::for_test();
+        let mut sampler = capability.sampler(group.clone()).unwrap();
+        let columns = sampler.grid(-16, 32, 4, 3).unwrap();
+        assert_eq!(columns.len(), 9);
+        assert!(
+            columns
+                .iter()
+                .all(|column| column.surface == Some(expected))
+        );
+        assert!(
+            sampler.fork().unwrap().is_none(),
+            "flat keeps the actual no-fork path"
+        );
+        group.request_stop();
+        assert!(capability.sampler(group.clone()).is_err());
+        group.poll_finished();
+        assert!(group.observe_workers().ready);
+    }
 
     fn read(text: &str) -> (Option<Tag>, Vec<String>) {
         let json: Json = json::parse(text, false).unwrap();

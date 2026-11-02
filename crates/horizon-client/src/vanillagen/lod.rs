@@ -470,6 +470,739 @@ impl VanillaLodSampler {
     }
 }
 
+/// The retained route never constructs the legacy Builder, including temporarily.
+/// Its native decorator and every generated neighborhood remain group-owned.
+#[cfg(feature = "paired-packages")]
+mod retained {
+    use super::*;
+    use crate::lod::retained::{
+        CheckedLodSampler, LodFailure, LodGroup, LodRole, LodStage, RetainedLodProvider,
+    };
+
+    struct Backend {
+        requests: Mutex<Requests>,
+        stop: Arc<AtomicBool>,
+        wake: Arc<Condvar>,
+        results: Mutex<VecDeque<LodDetail>>,
+        error: Mutex<Option<String>>,
+        /// Requests retired by the existing bounded nearest-first policy.
+        retired: Mutex<Vec<(i32, i32)>>,
+        #[cfg(test)]
+        fail_after_proto: Mutex<Option<usize>>,
+        #[cfg(test)]
+        panic_after_proto: Mutex<Option<usize>>,
+    }
+    struct Batch {
+        origin: (i32, i32),
+        requested: Vec<(i32, i32)>,
+        chunks: FxHashMap<(i32, i32), ProtoChunk>,
+        /// Keep the actual mutable neighborhood outside the unwind frame.
+        region: Vec<ProtoChunk>,
+        remaining: FxHashMap<(i32, i32), u8>,
+        emitted: Vec<LodDetail>,
+    }
+    impl Batch {
+        fn new(origin: (i32, i32), requested: Vec<(i32, i32)>) -> Self {
+            Self {
+                origin,
+                requested,
+                chunks: FxHashMap::default(),
+                region: Vec::with_capacity(9),
+                remaining: (0..BATCH)
+                    .flat_map(|x| (0..BATCH).map(move |z| ((origin.0 + x, origin.1 + z), 9)))
+                    .collect(),
+                emitted: Vec::new(),
+            }
+        }
+    }
+    struct Work {
+        terrain: Arc<VanillaTerrain>,
+        backend: Arc<Backend>,
+        generator: Option<OverworldGenerator>,
+        worker: Option<GeneratorWorker>,
+        active: Option<Batch>,
+        completed: Vec<((i32, i32), Vec<(i32, i32)>, usize)>,
+    }
+    struct Sampler {
+        /// Always builder=None. The checked route never calls tolerant grid().
+        inner: VanillaLodSampler,
+        backend: Option<Arc<Backend>>,
+        stop: Arc<AtomicBool>,
+        #[cfg(test)]
+        work: Option<Arc<Mutex<Work>>>,
+        grid_input: Option<(i32, i32, i32, usize)>,
+        raw_grid: Option<Vec<horizon_world::worldgen::generator::LodColumn>>,
+        partial_grid: Vec<Column>,
+    }
+    impl RetainedLodProvider for VanillaTerrain {
+        fn retained_sampler(
+            self: Arc<Self>,
+            group: Arc<LodGroup>,
+        ) -> Result<Box<dyn CheckedLodSampler>, LodFailure> {
+            Ok(Box::new(Sampler::new(self, group)?))
+        }
+    }
+    impl Sampler {
+        fn new(terrain: Arc<VanillaTerrain>, group: Arc<LodGroup>) -> Result<Self, LodFailure> {
+            // One permanent admission fence is shared with every actor and
+            // fork. Registry contention may delay a wakeup, never the fence.
+            let stop = group.admission_fence();
+            let wake = Arc::new(Condvar::new());
+            group.register_stop(stop.clone(), wake.clone());
+            let backend = Arc::new(Backend {
+                requests: Mutex::new(Requests::default()),
+                stop: stop.clone(),
+                wake,
+                results: Mutex::new(VecDeque::new()),
+                error: Mutex::new(None),
+                retired: Mutex::new(Vec::new()),
+                #[cfg(test)]
+                fail_after_proto: Mutex::new(None),
+                #[cfg(test)]
+                panic_after_proto: Mutex::new(None),
+            });
+            let work = Arc::new(Mutex::new(Work {
+                terrain: terrain.clone(),
+                backend: backend.clone(),
+                generator: None,
+                worker: None,
+                active: None,
+                completed: Vec::new(),
+            }));
+            // The group retains this original state even if native spawn fails.
+            group.spawn(LodRole::Decoration, work.clone(), run)?;
+            let inner = bare_sampler(terrain, None);
+            Ok(Self {
+                inner,
+                backend: Some(backend),
+                stop,
+                #[cfg(test)]
+                work: Some(work),
+                grid_input: None,
+                raw_grid: None,
+                partial_grid: Vec::new(),
+            })
+        }
+    }
+    fn bare_sampler(
+        generator: Arc<VanillaTerrain>,
+        vegetation: Option<Arc<Vegetation>>,
+    ) -> VanillaLodSampler {
+        let worker = generator.generator.worker();
+        let vegetation = vegetation.unwrap_or_else(|| {
+            Arc::new(Vegetation::new(
+                generator.generator.data(),
+                &generator.biome_map,
+                generator.seed,
+            ))
+        });
+        VanillaLodSampler {
+            generator,
+            worker,
+            builder: None,
+            vegetation,
+            cache: FxHashMap::default(),
+            order: VecDeque::new(),
+            details: Vec::new(),
+        }
+    }
+    fn failure(message: impl Into<String>) -> LodFailure {
+        LodFailure::new(LodStage::Decorate, message)
+    }
+    fn run(state: Arc<Mutex<Work>>) -> Result<(), LodFailure> {
+        let backend = state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .backend
+            .clone();
+        let outcome = run_inner(&state, &backend);
+        if let Err(error) = &outcome {
+            *backend.error.lock().unwrap_or_else(|e| e.into_inner()) = Some(error.message.clone());
+            backend.stop.store(true, Ordering::Release);
+            backend.wake.notify_all();
+        }
+        outcome
+    }
+    fn run_inner(state: &Arc<Mutex<Work>>, backend: &Backend) -> Result<(), LodFailure> {
+        {
+            let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+            if backend.stop.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            // This independent pipeline preserves structure one-shot flags in
+            // gameplay's original generator. It is never reconstructed on Retry.
+            state.generator = Some(
+                OverworldGenerator::for_dimension(
+                    state.terrain.generator.data().clone(),
+                    state.terrain.seed,
+                    "minecraft:normal",
+                    &state.terrain.dimension,
+                )
+                .map_err(|e| failure(format!("decoration initialization: {e}")))?,
+            );
+            state.worker = Some(state.generator.as_ref().unwrap().worker());
+        }
+        loop {
+            let (origin, requested) = {
+                let mut requests = backend.requests.lock().unwrap_or_else(|e| e.into_inner());
+                while requests.chunks.is_empty() && !backend.stop.load(Ordering::Acquire) {
+                    // The timeout only rechecks a stop racing notification. It
+                    // never supplies a successful generation/close result.
+                    requests = backend
+                        .wake
+                        .wait_timeout(requests, std::time::Duration::from_millis(100))
+                        .unwrap_or_else(|e| e.into_inner())
+                        .0;
+                }
+                if backend.stop.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                let key = *requests
+                    .chunks
+                    .iter()
+                    .min_by_key(|&&key| (distance(key, requests.center), key))
+                    .unwrap();
+                let origin = batch_origin(key);
+                let selected: Vec<_> = requests
+                    .chunks
+                    .iter()
+                    .copied()
+                    .filter(|&key| batch_origin(key) == origin)
+                    .collect();
+                // Copy the request identity into the durable active state
+                // before removing any original queued request.
+                state.lock().unwrap_or_else(|e| e.into_inner()).active =
+                    Some(Batch::new(origin, selected.clone()));
+                for key in &selected {
+                    requests.chunks.remove(key);
+                }
+                requests.current = Some(origin);
+                (origin, selected)
+            };
+            let _ = (origin, requested); // identities live in the original Batch.
+            let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+            let Work {
+                terrain,
+                worker,
+                active,
+                completed,
+                ..
+            } = &mut *state;
+            let batch = active.as_mut().unwrap();
+            retained_batch(worker.as_mut().unwrap(), batch, terrain, backend)?;
+            if backend.stop.load(Ordering::Acquire) {
+                // Active maps and partial neighborhood remain owned as-is.
+                return Ok(());
+            }
+            // Normal consumption retires voxel neighborhoods after all their
+            // derived columns are published. Stopped/failed batches never take
+            // this path and retain their actual proto/neighbor state.
+            let batch = active.take().unwrap();
+            completed.push((batch.origin, batch.requested, batch.emitted.len()));
+            backend
+                .requests
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .current = None;
+        }
+    }
+    fn retained_batch(
+        worker: &mut GeneratorWorker,
+        batch: &mut Batch,
+        terrain: &VanillaTerrain,
+        backend: &Backend,
+    ) -> Result<(), LodFailure> {
+        worker.forget_structure_starts();
+        let origin = batch.origin;
+        for dx in -2..BATCH + 2 {
+            for dz in -2..BATCH + 2 {
+                if backend.stop.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                let key = (origin.0 + dx, origin.1 + dz);
+                let chunk = worker
+                    .generate_proto(ChunkPos::new(key.0, key.1))
+                    .map_err(|e| failure(format!("proto {} {}: {e}", key.0, key.1)))?;
+                batch.chunks.insert(key, chunk);
+                #[cfg(test)]
+                if *backend
+                    .panic_after_proto
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    == Some(batch.chunks.len())
+                {
+                    panic!("injected retained decoration panic after native proto");
+                }
+                #[cfg(test)]
+                if *backend
+                    .fail_after_proto
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    == Some(batch.chunks.len())
+                {
+                    return Err(failure(
+                        "injected retained decoration failure after native proto",
+                    ));
+                }
+            }
+        }
+        let center = (origin.0 + BATCH / 2, origin.1 + BATCH / 2);
+        for (x, z) in vanilla_order(center, BATCH / 2)
+            .into_iter()
+            .filter(|&(x, z)| {
+                x >= origin.0 - 1
+                    && x <= origin.0 + BATCH
+                    && z >= origin.1 - 1
+                    && z <= origin.1 + BATCH
+            })
+        {
+            if backend.stop.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            for i in 0..9 {
+                batch.region.push(
+                    batch
+                        .chunks
+                        .remove(&(x + i % 3 - 1, z + i / 3 - 1))
+                        .expect("generated retained neighborhood"),
+                );
+            }
+            let region: &mut [ProtoChunk; 9] = batch
+                .region
+                .as_mut_slice()
+                .try_into()
+                .unwrap_or_else(|_| panic!("nine retained neighbors"));
+            worker
+                .decorate(region)
+                .map_err(|e| failure(format!("features {x} {z}: {e}")))?;
+            for chunk in batch.region.drain(..) {
+                let pos = chunk.position();
+                batch.chunks.insert((pos.x, pos.z), chunk);
+            }
+            for dx in -1..=1 {
+                for dz in -1..=1 {
+                    let key = (x + dx, z + dz);
+                    if let Some(left) = batch.remaining.get_mut(&key) {
+                        *left -= 1;
+                        if *left == 0 {
+                            let detail = (
+                                key,
+                                columns(
+                                    &batch.chunks[&key],
+                                    &terrain.biome_map,
+                                    &terrain.dimension,
+                                ),
+                            );
+                            batch.emitted.push(detail.clone());
+                            backend
+                                .results
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .push_back(detail);
+                            backend
+                                .requests
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .finished
+                                .insert(key);
+                        }
+                    }
+                }
+            }
+        }
+        if batch.remaining.values().any(|&left| left != 0) {
+            return Err(failure("incomplete retained decoration halo"));
+        }
+        Ok(())
+    }
+    impl Sampler {
+        fn check(&self) -> Result<(), LodFailure> {
+            if let Some(backend) = &self.backend
+                && let Some(error) = &*backend.error.lock().unwrap_or_else(|e| e.into_inner())
+            {
+                return Err(failure(error.clone()));
+            }
+            if self.stop.load(Ordering::Acquire) {
+                return Err(failure("retained decoration admission closed"));
+            }
+            Ok(())
+        }
+        fn receive(&mut self) -> Result<(), LodFailure> {
+            self.check()?;
+            if let Some(backend) = &self.backend {
+                let mut results = backend.results.lock().unwrap_or_else(|e| e.into_inner());
+                while let Some((key, columns)) = results.pop_front() {
+                    if !self.inner.cache.contains_key(&key) {
+                        self.inner.order.push_back(key);
+                    }
+                    self.inner.cache.insert(key, columns.clone());
+                    while self.inner.cache.len() > CACHE {
+                        if let Some(old) = self.inner.order.pop_front() {
+                            self.inner.cache.remove(&old);
+                            backend
+                                .requests
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .finished
+                                .remove(&old);
+                        }
+                    }
+                    self.inner.details.push((key, columns));
+                }
+            }
+            self.check()
+        }
+    }
+    impl CheckedLodSampler for Sampler {
+        fn fork(&self) -> Result<Option<Box<dyn CheckedLodSampler>>, LodFailure> {
+            self.check()?;
+            Ok(Some(Box::new(Self {
+                inner: bare_sampler(
+                    self.inner.generator.clone(),
+                    Some(self.inner.vegetation.clone()),
+                ),
+                backend: None,
+                stop: self.stop.clone(),
+                #[cfg(test)]
+                work: None,
+                grid_input: None,
+                raw_grid: None,
+                partial_grid: Vec::new(),
+            })))
+        }
+        fn request_detail(
+            &mut self,
+            chunks: &[(i32, i32)],
+            center: [i32; 2],
+        ) -> Result<(), LodFailure> {
+            self.receive()?;
+            let Some(backend) = &self.backend else {
+                return Ok(());
+            };
+            let mut requests = backend.requests.lock().unwrap_or_else(|e| e.into_inner());
+            self.check()?;
+            requests.center = center;
+            for &key in chunks {
+                if let Some(columns) = self.inner.cache.get(&key) {
+                    self.inner.details.push((key, columns.clone()));
+                } else if requests.current != Some(batch_origin(key))
+                    && !requests.finished.contains(&key)
+                {
+                    requests.chunks.insert(key);
+                }
+            }
+            if requests.chunks.len() > REQUESTS {
+                let mut sorted: Vec<_> = requests.chunks.iter().copied().collect();
+                sorted.sort_unstable_by_key(|&key| (distance(key, center), key));
+                backend
+                    .retired
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .extend(sorted.iter().skip(REQUESTS).copied());
+                requests.chunks = sorted.into_iter().take(REQUESTS).collect();
+            }
+            backend.wake.notify_all();
+            Ok(())
+        }
+        fn drain_details(&mut self) -> Result<Vec<LodDetail>, LodFailure> {
+            self.receive()?;
+            Ok(std::mem::take(&mut self.inner.details))
+        }
+        fn grid(
+            &mut self,
+            x: i32,
+            z: i32,
+            width: i32,
+            side: usize,
+        ) -> Result<Vec<Column>, LodFailure> {
+            self.check()?;
+            self.grid_input = Some((x, z, width, side));
+            self.partial_grid.clear();
+            self.raw_grid = Some(
+                self.inner
+                    .worker
+                    .lod_grid(x + width / 2, z + width / 2, width, side)
+                    .map_err(|e| {
+                        LodFailure::new(LodStage::Sample, format!("direct far {x} {z}: {e}"))
+                    })?,
+            );
+            for (index, (surface, spans)) in self.raw_grid.as_ref().unwrap().iter().enumerate() {
+                let (wx, wz) = (
+                    x + (index % side) as i32 * width,
+                    z + (index / side) as i32 * width,
+                );
+                let column = if width <= 16
+                    && let Some(columns) = self.inner.cache.get(&(wx >> 4, wz >> 4))
+                {
+                    Column::reduced(
+                        columns,
+                        (wx & 15) as usize,
+                        (wz & 15) as usize,
+                        width as usize,
+                    )
+                } else {
+                    self.inner.preview_column(
+                        wx + width / 2,
+                        wz + width / 2,
+                        width,
+                        *surface,
+                        spans.clone(),
+                    )
+                };
+                self.partial_grid.push(column);
+            }
+            self.check()?;
+            self.raw_grid = None;
+            self.grid_input = None;
+            Ok(std::mem::take(&mut self.partial_grid))
+        }
+    }
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::time::{Duration, Instant};
+
+        fn terrain() -> Arc<VanillaTerrain> {
+            let root = std::path::PathBuf::from(
+                std::env::var_os("HORIZON_TEST_RESOURCES").expect("pinned resource directory"),
+            );
+            let assets = crate::assets::Assets::load(&root).expect("real prepared assets");
+            let biomes = crate::biome::Biomes::load(&root).expect("real prepared biomes");
+            Arc::new(
+                VanillaTerrain::new(&root.join("worldgen"), assets.registry, &biomes, 1234)
+                    .expect("real prepared worldgen"),
+            )
+        }
+        fn finish(group: &LodGroup) -> crate::lod::retained::LodObservation {
+            group.request_stop();
+            let deadline = Instant::now() + Duration::from_secs(90);
+            loop {
+                group.poll_finished();
+                let observation = group.observe_workers();
+                if observation.ready {
+                    return observation;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "native decorator did not actually finish/join"
+                );
+                thread::sleep(Duration::from_millis(2));
+            }
+        }
+        #[test]
+        #[ignore = "requires pinned prepared worldgen in HORIZON_TEST_RESOURCES"]
+        fn retained_real_vanilla_checked_grid_and_fork() {
+            let terrain = terrain();
+            let group = LodGroup::for_test();
+            let mut sampler =
+                Sampler::new(terrain.clone(), group.clone()).expect("retained sampler");
+            let mut fork = sampler
+                .fork()
+                .expect("checked fork")
+                .expect("actual independent worker");
+            let sampled = sampler.grid(-1024, 0, 32, 2).expect("checked native grid");
+            let forked = fork.grid(-1024, 0, 32, 2).expect("forked native grid");
+            let (entered, entered_rx) = mpsc::channel();
+            let (release, release_rx) = mpsc::channel();
+            let registry_group = group.clone();
+            let registry_holder = thread::spawn(move || {
+                registry_group.hold_registry_for_test(entered, release_rx);
+            });
+            entered_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("actual registry held");
+            group.request_stop();
+            // No poll can forward backend signals while this actual lock is
+            // held. All these calls must see the authoritative fence directly.
+            let same_fence = Arc::ptr_eq(&sampler.stop, &group.admission_fence())
+                && Arc::ptr_eq(&sampler.stop, &sampler.backend.as_ref().unwrap().stop);
+            let sealed = sampler.stop.load(Ordering::Acquire);
+            let grid_refused = sampler.grid(0, 0, 32, 2).is_err();
+            let fork_grid_refused = fork.grid(0, 0, 32, 2).is_err();
+            let request_refused = sampler.request_detail(&[(99, 99)], [0, 0]).is_err();
+            let fork_refused = sampler.fork().is_err();
+            release.send(()).expect("release actual registry holder");
+            registry_holder
+                .join()
+                .expect("checked registry holder join");
+            let observation = finish(&group);
+            assert!(
+                same_fence && sealed,
+                "backend uses the exact permanent group fence"
+            );
+            assert!(
+                grid_refused && fork_grid_refused && request_refused && fork_refused,
+                "registry contention cannot admit new native sampling or detail work after close"
+            );
+            assert_eq!(sampled, forked);
+            assert!(
+                observation
+                    .workers
+                    .iter()
+                    .all(|worker| worker.joined && worker.failure.is_none())
+            );
+            assert!(Arc::ptr_eq(&sampler.inner.generator, &terrain));
+            assert!(sampler.inner.builder.is_none());
+            assert!(
+                sampler.grid(0, 0, 32, 2).is_err(),
+                "closed route cannot publish a sentinel"
+            );
+        }
+        #[test]
+        #[ignore = "requires pinned prepared worldgen in HORIZON_TEST_RESOURCES"]
+        fn retained_real_decoration_request_keeps_completed_detail() {
+            let group = LodGroup::for_test();
+            let mut sampler = Sampler::new(terrain(), group.clone()).expect("retained sampler");
+            let key = (-64, 0);
+            sampler
+                .request_detail(&[key], [-1024, 0])
+                .expect("real detail request");
+            let deadline = Instant::now() + Duration::from_secs(90);
+            let backend = sampler.backend.as_ref().unwrap().clone();
+            let produced = loop {
+                let present = backend
+                    .results
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .any(|(at, _)| *at == key);
+                if present {
+                    break true;
+                }
+                if backend.stop.load(Ordering::Acquire) || Instant::now() >= deadline {
+                    break false;
+                }
+                thread::sleep(Duration::from_millis(2));
+            };
+            let observation = finish(&group);
+            assert!(
+                produced,
+                "real decorated columns missing or native worker failed"
+            );
+            assert!(
+                observation
+                    .workers
+                    .iter()
+                    .all(|worker| worker.joined && worker.failure.is_none())
+            );
+            let results = backend.results.lock().unwrap_or_else(|e| e.into_inner());
+            let columns = &results.iter().find(|(at, _)| *at == key).unwrap().1;
+            assert!(columns.iter().any(|column| !column.spans.is_empty()));
+            assert!(
+                sampler.drain_details().is_err(),
+                "late results stay owned after close"
+            );
+            assert!(results.iter().any(|(at, _)| *at == key));
+        }
+        #[test]
+        #[ignore = "requires pinned prepared worldgen in HORIZON_TEST_RESOURCES"]
+        fn retained_real_decoration_failure_preserves_original_active_batch() {
+            for panic in [false, true] {
+                let group = LodGroup::for_test();
+                let mut sampler = Sampler::new(terrain(), group.clone()).expect("retained sampler");
+                let backend = sampler.backend.as_ref().unwrap().clone();
+                if panic {
+                    *backend.panic_after_proto.lock().unwrap() = Some(1);
+                } else {
+                    *backend.fail_after_proto.lock().unwrap() = Some(1);
+                }
+                sampler
+                    .request_detail(&[(0, 0)], [0, 0])
+                    .expect("native request before failure");
+                let deadline = Instant::now() + Duration::from_secs(90);
+                while !group.is_stopping() && Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                let had_failed = group.is_stopping();
+                let observation = finish(&group);
+                assert!(
+                    had_failed,
+                    "failure injection did not reach original native worker"
+                );
+                assert!(
+                    observation
+                        .workers
+                        .iter()
+                        .any(|worker| worker.failure.is_some())
+                );
+                {
+                    let work = sampler
+                        .work
+                        .as_ref()
+                        .unwrap()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    let batch = work.active.as_ref().expect("failed active batch retained");
+                    assert_eq!(
+                        batch.chunks.len(),
+                        1,
+                        "actual first native proto remains owned"
+                    );
+                    assert_eq!(batch.requested, vec![(0, 0)]);
+                    assert_eq!(batch.remaining.len(), (BATCH * BATCH) as usize);
+                }
+                assert!(
+                    sampler.drain_details().is_err(),
+                    "failed backend cannot become successful empty terrain"
+                );
+            }
+        }
+        #[test]
+        #[ignore = "requires pinned prepared worldgen in HORIZON_TEST_RESOURCES"]
+        fn retained_real_decorator_spawn_refusal_keeps_original_factory_input() {
+            let terrain = terrain();
+            let group = LodGroup::for_test();
+            group.refuse_spawn(LodRole::Decoration);
+            let outcome = Sampler::new(terrain.clone(), group.clone());
+            let observation = finish(&group);
+            let error = match outcome {
+                Err(error) => error,
+                Ok(_) => panic!("controlled actual decoration spawn must refuse"),
+            };
+            assert_eq!(error.stage, LodStage::Spawn);
+            assert!(observation.ready);
+            assert_eq!(observation.workers.len(), 1);
+            assert_eq!(observation.workers[0].role, LodRole::Decoration);
+            assert!(observation.workers[0].joined);
+            assert_eq!(observation.workers[0].failure.as_ref(), Some(&error));
+            let payloads = group.retained_payloads_for_test::<Work>();
+            assert_eq!(payloads.len(), 1, "original actual decorator slot payload");
+            let work = payloads[0].lock().unwrap_or_else(|e| e.into_inner());
+            assert!(Arc::ptr_eq(&work.terrain, &terrain));
+            assert!(work.generator.is_none() && work.worker.is_none());
+            assert!(work.active.is_none() && work.completed.is_empty());
+            assert!(work.backend.results.lock().unwrap().is_empty());
+            assert!(work.backend.requests.lock().unwrap().chunks.is_empty());
+        }
+        #[test]
+        #[ignore = "requires pinned prepared worldgen in HORIZON_TEST_RESOURCES"]
+        fn retained_real_decorator_initialization_failure_is_checked() {
+            let mut terrain = terrain();
+            Arc::get_mut(&mut terrain).unwrap().dimension = "minecraft:missing_dimension".into();
+            let group = LodGroup::for_test();
+            let mut sampler =
+                Sampler::new(terrain, group.clone()).expect("registered native decorator");
+            let deadline = Instant::now() + Duration::from_secs(90);
+            while !group.is_stopping() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(2));
+            }
+            let failed = group.is_stopping();
+            let observation = finish(&group);
+            assert!(failed, "actual invalid dimension must fail initialization");
+            let message = observation
+                .workers
+                .iter()
+                .find_map(|worker| worker.failure.as_ref())
+                .expect("checked native initialization failure")
+                .message
+                .clone();
+            assert!(message.contains("minecraft:missing_dimension"));
+            assert!(sampler.drain_details().is_err());
+            assert!(sampler.grid(0, 0, 32, 2).is_err());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

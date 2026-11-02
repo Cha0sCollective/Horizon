@@ -32,6 +32,15 @@ pub type Proto = Box<dyn std::any::Any + Send>;
 pub trait ChunkGenerator: Send + Sync + 'static {
     type Worker: Send + 'static;
     fn worker(&self) -> Self::Worker;
+    /// Retention is an explicit property of the actual provider allocation.
+    /// Unknown generators must be refused before any sampler or worker factory.
+    #[cfg(feature = "paired-packages")]
+    fn retained_lod_capability(self: Arc<Self>) -> Option<crate::lod::retained::LodCapability>
+    where
+        Self: Sized,
+    {
+        None
+    }
     fn lod_sampler(self: Arc<Self>) -> Box<dyn LodSampler>
     where
         Self: Sized,
@@ -140,6 +149,10 @@ pub trait LodSampler: Send {
 }
 pub trait LodSource: Send + Sync {
     fn sampler(self: Arc<Self>) -> Box<dyn LodSampler>;
+    #[cfg(feature = "paired-packages")]
+    fn retained_lod_capability(self: Arc<Self>) -> Option<crate::lod::retained::LodCapability> {
+        None
+    }
 }
 struct GeneratorSampler<G: ChunkGenerator> {
     generator: Arc<G>,
@@ -153,6 +166,10 @@ impl<G: ChunkGenerator> LodSampler for GeneratorSampler<G> {
 impl<G: ChunkGenerator> LodSource for G {
     fn sampler(self: Arc<Self>) -> Box<dyn LodSampler> {
         ChunkGenerator::lod_sampler(self)
+    }
+    #[cfg(feature = "paired-packages")]
+    fn retained_lod_capability(self: Arc<Self>) -> Option<crate::lod::retained::LodCapability> {
+        ChunkGenerator::retained_lod_capability(self)
     }
 }
 /// The generator's saving, for the streamer (which doesn't know its type).

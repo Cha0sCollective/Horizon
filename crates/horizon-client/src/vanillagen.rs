@@ -431,6 +431,10 @@ impl ChunkGenerator for VanillaTerrain {
     fn lod_sampler(self: Arc<Self>) -> Box<dyn LodSampler> {
         Box::new(VanillaLodSampler::new(self))
     }
+    #[cfg(feature = "paired-packages")]
+    fn retained_lod_capability(self: Arc<Self>) -> Option<crate::lod::retained::LodCapability> {
+        Some(crate::lod::retained::LodCapability::for_provider(self))
+    }
     fn lod_surface(
         &self,
         worker: &mut GeneratorWorker,

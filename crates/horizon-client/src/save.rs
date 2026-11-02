@@ -9522,6 +9522,1114 @@ impl<G: ChunkGenerator> crate::streaming::LodSampler for SavedLodSampler<G> {
     }
 }
 
+/// Checked LOD is separate from the ordinary tolerant saved-column sampler.
+/// These actors own the original wrapper and each active read before fallible
+/// native work. The group retains the actor even when its worker unwinds.
+#[cfg(feature = "paired-packages")]
+mod retained_lod_saved {
+    use super::*;
+    use crate::lod::{
+        Column,
+        retained::{
+            CheckedLodSampler, LodCapability, LodFailure, LodGroup, LodStage, RetainedLodProvider,
+        },
+    };
+    use std::io::{Read, Seek, SeekFrom};
+
+    const SECTOR: u64 = 4096;
+    const HEADER: usize = 8192;
+    const MAX_COMPRESSED: usize = 64 << 20;
+
+    struct NativeRead {
+        save: Arc<SaveDir>,
+        at: (i32, i32),
+        path: PathBuf,
+        stage: &'static str,
+        pending: Option<(u64, Record)>,
+        file: Option<fs::File>,
+        region_open_error: Option<std::io::ErrorKind>,
+        external: Option<fs::File>,
+        external_path: Option<PathBuf>,
+        header: Vec<u8>,
+        record_header: [u8; 5],
+        compressed: Vec<u8>,
+        record: Option<ChunkRecord>,
+        root: Option<Arc<NamedTag>>,
+        columns: Option<LodSurfaces>,
+        error: Option<String>,
+        absent: bool,
+        ineligible: bool,
+    }
+    impl NativeRead {
+        fn new(save: Arc<SaveDir>, at: (i32, i32)) -> Self {
+            Self {
+                path: save.region_path("region", at.0 >> 5, at.1 >> 5),
+                save,
+                at,
+                stage: "pending",
+                pending: None,
+                file: None,
+                region_open_error: None,
+                external: None,
+                external_path: None,
+                header: Vec::new(),
+                record_header: [0; 5],
+                compressed: Vec::new(),
+                record: None,
+                root: None,
+                columns: None,
+                error: None,
+                absent: false,
+                ineligible: false,
+            }
+        }
+        fn fail(&mut self, error: impl std::fmt::Display) -> LodFailure {
+            let error = format!(
+                "saved LOD root={} column={},{} file={} external={:?} stage={}: {error}",
+                self.save.root.display(),
+                self.at.0,
+                self.at.1,
+                self.path.display(),
+                self.external_path,
+                self.stage,
+            );
+            self.error = Some(error.clone());
+            LodFailure::new(LodStage::NativeRead, error)
+        }
+        fn read(
+            &mut self,
+            assets: &crate::assets::Assets,
+            biomes: &Biomes,
+        ) -> std::result::Result<Option<LodSurfaces>, LodFailure> {
+            let result = self.read_inner(assets, biomes);
+            result.map_err(|error| self.fail(error))
+        }
+        fn read_inner(
+            &mut self,
+            assets: &crate::assets::Assets,
+            biomes: &Biomes,
+        ) -> std::result::Result<Option<LodSurfaces>, String> {
+            let save = self.save.clone();
+            self.stage = "pending";
+            self.pending = save
+                .pending
+                .lock()
+                .map_err(|_| "pending map poisoned")?
+                .get(&(Folder::Region, self.at.0, self.at.1))
+                .cloned();
+            if let Some((_, record)) = &self.pending {
+                self.stage = "pending projection";
+                match record {
+                    Record::Delete => {
+                        self.absent = true;
+                        return Ok(None);
+                    }
+                    Record::Tag(_) | Record::Chunk(_, _) => {
+                        self.root = Some(record.tag().ok_or("pending column projection absent")?);
+                    }
+                    Record::Poi(_, _) | Record::FinishedEntities(_) => {
+                        return Err("non-column pending record in region folder".into());
+                    }
+                }
+            } else {
+                // The same cached-file mutex serializes normal native writers.
+                // Negative cache entries never prove that a region is absent.
+                self.stage = "region serialization";
+                let regions = save.regions.lock().map_err(|_| "region cache poisoned")?;
+                let cached = regions
+                    .get(&(self.at.0 >> 5, self.at.1 >> 5))
+                    .and_then(Clone::clone);
+                let _file_guard = cached
+                    .as_ref()
+                    .map(|file| file.lock())
+                    .transpose()
+                    .map_err(|_| "cached region file poisoned")?;
+                self.read_disk()?;
+                if self.absent {
+                    return Ok(None);
+                }
+                self.stage = "decompression/NBT";
+                self.root = Some(Arc::new(
+                    self.record
+                        .as_ref()
+                        .ok_or("record custody absent")?
+                        .nbt(Limits::default())
+                        .map_err(|error| error.to_string())?,
+                ));
+            }
+            self.stage = "saved-column validation";
+            let root = self.root.as_ref().ok_or("root custody absent")?;
+            if root.tag.get("DataVersion") != Some(&Tag::Int(DATA_VERSION))
+                || root.tag.get("xPos") != Some(&Tag::Int(self.at.0))
+                || root.tag.get("zPos") != Some(&Tag::Int(self.at.1))
+            {
+                return Err("saved column version/coordinate mismatch".into());
+            }
+            let status =
+                ChunkStatus::from_nbt(root.tag.get("Status").ok_or("missing saved status")?)
+                    .map_err(|error| error.to_string())?;
+            if status != ChunkStatus::Full {
+                // A well-identified proto is genuinely ineligible for saved
+                // final surfaces. Unknown/malformed status is an error above.
+                self.ineligible = true;
+                return Ok(None);
+            }
+            validate_surfaces(root, assets, biomes)?;
+            self.stage = "saved-column decode";
+            self.columns = Some(
+                decode_lod_surfaces_with_resolution(
+                    root,
+                    assets,
+                    biomes,
+                    self.save.shape.sky_light,
+                    true,
+                )
+                .ok_or("validated saved-column decoder refused")?,
+            );
+            self.stage = "complete";
+            Ok(self.columns.clone())
+        }
+        fn read_disk(&mut self) -> std::result::Result<(), String> {
+            self.stage = "region metadata";
+            match fs::symlink_metadata(&self.path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    self.absent = true;
+                    return Ok(());
+                }
+                Err(error) => return Err(error.to_string()),
+                Ok(meta) if !meta.is_file() || meta.file_type().is_symlink() => {
+                    return Err("region is not a regular file".into());
+                }
+                Ok(_) => {}
+            }
+            self.stage = "region open";
+            self.file = match fs::File::open(&self.path) {
+                Ok(file) => Some(file),
+                Err(error) => {
+                    self.region_open_error = Some(error.kind());
+                    return Err(error.to_string());
+                }
+            };
+            self.stage = "original header";
+            let file = self.file.as_mut().unwrap();
+            let size = file.metadata().map_err(|error| error.to_string())?.len();
+            if size < HEADER as u64 || !size.is_multiple_of(SECTOR) {
+                return Err("truncated/unaligned original region".into());
+            }
+            self.header.resize(HEADER, 0);
+            file.read_exact(&mut self.header)
+                .map_err(|error| error.to_string())?;
+            // Validate original locations before any tolerant constructor can
+            // erase an invalid nonzero location. No second file is opened.
+            let mut ranges = Vec::new();
+            for index in 0..1024 {
+                let location =
+                    u32::from_be_bytes(self.header[index * 4..index * 4 + 4].try_into().unwrap());
+                if location == 0 {
+                    continue;
+                }
+                let first = u64::from(location >> 8);
+                let end = first + u64::from(location & 255);
+                if first < 2 || location & 255 == 0 || end > size / SECTOR {
+                    return Err("invalid original region location".into());
+                }
+                ranges.push((first, end));
+            }
+            ranges.sort_unstable();
+            if ranges.windows(2).any(|pair| pair[0].1 > pair[1].0) {
+                return Err("overlapping original region locations".into());
+            }
+            let index = self.at.0.rem_euclid(32) as usize + self.at.1.rem_euclid(32) as usize * 32;
+            let location =
+                u32::from_be_bytes(self.header[index * 4..index * 4 + 4].try_into().unwrap());
+            if location == 0 {
+                self.absent = true;
+                return Ok(());
+            }
+            self.stage = "native record header";
+            file.seek(SeekFrom::Start(u64::from(location >> 8) * SECTOR))
+                .map_err(|error| error.to_string())?;
+            file.read_exact(&mut self.record_header)
+                .map_err(|error| error.to_string())?;
+            let length = u32::from_be_bytes(self.record_header[..4].try_into().unwrap()) as usize;
+            if length < 1 || length as u64 + 4 > u64::from(location & 255) * SECTOR {
+                return Err("invalid native record length".into());
+            }
+            let compression = Compression::try_from(self.record_header[4] & 127)
+                .map_err(|error| error.to_string())?;
+            self.stage = "native record payload";
+            if self.record_header[4] & 128 != 0 {
+                if length != 1 {
+                    return Err("external record has inline payload".into());
+                }
+                self.external_path = Some(
+                    self.path
+                        .parent()
+                        .unwrap()
+                        .join(format!("c.{}.{}.mcc", self.at.0, self.at.1)),
+                );
+                let path = self.external_path.as_ref().unwrap();
+                self.stage = "external native metadata";
+                let meta = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+                if !meta.is_file()
+                    || meta.file_type().is_symlink()
+                    || meta.len() > MAX_COMPRESSED as u64
+                {
+                    return Err("invalid external native record file/size".into());
+                }
+                self.stage = "external native open";
+                self.external = Some(fs::File::open(path).map_err(|error| error.to_string())?);
+                self.stage = "external native read";
+                self.external
+                    .as_mut()
+                    .unwrap()
+                    .take((MAX_COMPRESSED + 1) as u64)
+                    .read_to_end(&mut self.compressed)
+                    .map_err(|error| error.to_string())?;
+                if self.compressed.len() > MAX_COMPRESSED {
+                    return Err("external native compressed limit".into());
+                }
+            } else {
+                self.compressed.resize(length - 1, 0);
+                file.read_exact(&mut self.compressed)
+                    .map_err(|error| error.to_string())?;
+            }
+            self.record = Some(ChunkRecord {
+                compression,
+                compressed: std::mem::take(&mut self.compressed),
+                timestamp: u32::from_be_bytes(
+                    self.header[4096 + index * 4..4100 + index * 4]
+                        .try_into()
+                        .unwrap(),
+                ),
+            });
+            if file.metadata().map_err(|error| error.to_string())?.len() != size {
+                return Err("native region size changed during read".into());
+            }
+            Ok(())
+        }
+    }
+
+    fn validate_palette_data(
+        container: &Tag,
+        palette_len: usize,
+    ) -> std::result::Result<(), String> {
+        if palette_len == 1 {
+            match container.get("data") {
+                None => {}
+                Some(Tag::LongArray(words)) if words.is_empty() => {}
+                _ => return Err("uniform saved palette has malformed/extraneous data".into()),
+            }
+        }
+        Ok(())
+    }
+    fn validate_surfaces(
+        root: &NamedTag,
+        assets: &crate::assets::Assets,
+        biomes: &Biomes,
+    ) -> std::result::Result<(), String> {
+        let Some(Tag::List(sections)) = root.tag.get("sections") else {
+            return Err("saved sections not a list".into());
+        };
+        let mut seen = HashSet::new();
+        for section in sections {
+            let Some(Tag::Byte(y)) = section.get("Y") else {
+                return Err("saved section Y not a byte".into());
+            };
+            let y = i32::from(*y);
+            if !seen.insert(y) {
+                return Err("duplicate saved section Y".into());
+            }
+            if !((MIN_Y >> 4) - 1..=(MIN_Y >> 4) + SECTIONS as i32).contains(&y) {
+                return Err("saved section outside terrain/light border height".into());
+            }
+            let in_range = (MIN_Y >> 4..(MIN_Y >> 4) + SECTIONS as i32).contains(&y);
+            if !in_range
+                && (section.get("block_states").is_some() || section.get("biomes").is_some())
+            {
+                return Err("saved block/biome section outside LOD height".into());
+            }
+            for name in ["SkyLight", "BlockLight"] {
+                if let Some(value) = section.get(name)
+                    && !matches!(value, Tag::ByteArray(bytes) if bytes.len() == 2048)
+                {
+                    return Err(format!("malformed saved {name} layer"));
+                }
+            }
+            if let Some(states) = section.get("block_states") {
+                if section.get("biomes").is_none() {
+                    return Err("saved block-bearing section lacks biome container".into());
+                }
+                let Some(Tag::List(palette)) = states.get("palette") else {
+                    return Err("saved block palette absent".into());
+                };
+                if palette.len() > 4096 {
+                    return Err("saved block palette too large".into());
+                }
+                validate_palette_data(states, palette.len())?;
+                horizon_world::chunk::PalettedContainer::from_nbt(states, 4096, 4)
+                    .map_err(|error| error.to_string())?;
+                for value in palette {
+                    let descriptor =
+                        BlockState::from_nbt(value).map_err(|error| error.to_string())?;
+                    assets
+                        .registry
+                        .resolve(&descriptor)
+                        .map_err(|error| error.to_string())?;
+                }
+            }
+            if let Some(container) = section.get("biomes") {
+                let Some(Tag::List(palette)) = container.get("palette") else {
+                    return Err("saved biome palette absent".into());
+                };
+                if palette.len() > 64 {
+                    return Err("saved biome palette too large".into());
+                }
+                validate_palette_data(container, palette.len())?;
+                horizon_world::chunk::PalettedContainer::from_nbt(container, 64, 1)
+                    .map_err(|error| error.to_string())?;
+                for value in palette {
+                    let Tag::String(name) = value else {
+                        return Err("saved biome entry not a string".into());
+                    };
+                    let name = name.to_string().map_err(|error| error.to_string())?;
+                    if !biomes.index.contains_key(&name) {
+                        return Err("unknown saved biome".into());
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    struct SamplerState<G: ChunkGenerator> {
+        generator: Arc<Persistent<G>>,
+        inner_capability: LodCapability,
+        inner: Option<Box<dyn CheckedLodSampler>>,
+        cache: std::collections::VecDeque<((i32, i32), Option<LodSurfaces>, NativeRead)>,
+        current_read: Option<NativeRead>,
+        requested: Vec<(i32, i32)>,
+        missing: Vec<(i32, i32)>,
+        details: Vec<crate::streaming::LodDetail>,
+        active_details: Option<Vec<crate::streaming::LodDetail>>,
+        active_grid: Option<Vec<Column>>,
+    }
+    impl<G: ChunkGenerator> SamplerState<G> {
+        fn saved_columns(
+            &mut self,
+            key: (i32, i32),
+        ) -> std::result::Result<Option<LodSurfaces>, LodFailure> {
+            if let Some(index) = self.cache.iter().position(|(at, _, _)| *at == key) {
+                let cached = self.cache.remove(index).unwrap();
+                let columns = cached.1.clone();
+                self.cache.push_front(cached);
+                return Ok(columns);
+            }
+            self.current_read = Some(NativeRead::new(self.generator.save.clone(), key));
+            let columns = self
+                .current_read
+                .as_mut()
+                .unwrap()
+                .read(&self.generator.registry, &self.generator.biomes)?;
+            self.cache
+                .push_front((key, columns.clone(), self.current_read.take().unwrap()));
+            self.cache.truncate(128);
+            Ok(columns)
+        }
+    }
+    struct CheckedSaved<G: ChunkGenerator> {
+        state: Arc<Mutex<SamplerState<G>>>,
+        group: std::sync::Weak<LodGroup>,
+    }
+    impl<G: ChunkGenerator> CheckedSaved<G> {
+        fn state(
+            &self,
+        ) -> std::result::Result<std::sync::MutexGuard<'_, SamplerState<G>>, LodFailure> {
+            self.state.lock().map_err(|_| {
+                LodFailure::new(
+                    LodStage::NativeRead,
+                    "saved LOD sampler state poisoned; original inputs retained",
+                )
+            })
+        }
+    }
+    impl<G: ChunkGenerator> CheckedLodSampler for CheckedSaved<G> {
+        fn fork(&self) -> std::result::Result<Option<Box<dyn CheckedLodSampler>>, LodFailure> {
+            let state = self.state()?;
+            let group = self
+                .group
+                .upgrade()
+                .ok_or_else(|| LodFailure::new(LodStage::Fork, "saved LOD group absent"))?;
+            if group.is_stopping() {
+                return Err(LodFailure::new(
+                    LodStage::Fork,
+                    "saved LOD fork admission sealed",
+                ));
+            }
+            let fork = Arc::new(Mutex::new(SamplerState {
+                generator: state.generator.clone(),
+                inner_capability: state.inner_capability.clone(),
+                inner: None,
+                cache: Default::default(),
+                current_read: None,
+                requested: Vec::new(),
+                missing: Vec::new(),
+                details: Vec::new(),
+                active_details: None,
+                active_grid: None,
+            }));
+            group.retain(fork.clone());
+            // The pending original wrapper/capability owner is already retained
+            // before an inner fork can acquire native state or panic.
+            let Some(inner) = state.inner.as_ref().unwrap().fork()? else {
+                return Ok(None);
+            };
+            fork.lock().unwrap().inner = Some(inner);
+            Ok(Some(Box::new(Self {
+                state: fork,
+                group: Arc::downgrade(&group),
+            })))
+        }
+        fn request_detail(
+            &mut self,
+            chunks: &[(i32, i32)],
+            center: [i32; 2],
+        ) -> std::result::Result<(), LodFailure> {
+            let mut state = self.state()?;
+            state.requested = chunks.to_vec();
+            state.missing.clear();
+            for index in 0..state.requested.len() {
+                let key = state.requested[index];
+                if let Some(columns) = state.saved_columns(key)? {
+                    state.details.push((key, columns));
+                } else {
+                    state.missing.push(key);
+                }
+            }
+            let missing = state.missing.clone();
+            state
+                .inner
+                .as_mut()
+                .unwrap()
+                .request_detail(&missing, center)
+        }
+        fn drain_details(
+            &mut self,
+        ) -> std::result::Result<Vec<crate::streaming::LodDetail>, LodFailure> {
+            let mut state = self.state()?;
+            state.active_details = Some(state.inner.as_mut().unwrap().drain_details()?);
+            for index in 0..state.active_details.as_ref().unwrap().len() {
+                let (key, generated) = state.active_details.as_ref().unwrap()[index].clone();
+                let columns = state.saved_columns(key)?.unwrap_or(generated);
+                state.active_details.as_mut().unwrap()[index].1 = columns;
+            }
+            let completed = state.active_details.take().unwrap();
+            state.details.extend(completed);
+            Ok(std::mem::take(&mut state.details))
+        }
+        fn grid(
+            &mut self,
+            x: i32,
+            z: i32,
+            stride: i32,
+            side: usize,
+        ) -> std::result::Result<Vec<Column>, LodFailure> {
+            let mut state = self.state()?;
+            state.active_grid = Some(state.inner.as_mut().unwrap().grid(x, z, stride, side)?);
+            if stride <= 16 {
+                for index in 0..state.active_grid.as_ref().unwrap().len() {
+                    let (wx, wz) = (
+                        x + (index % side) as i32 * stride,
+                        z + (index / side) as i32 * stride,
+                    );
+                    if let Some(saved) = state.saved_columns((wx >> 4, wz >> 4))? {
+                        state.active_grid.as_mut().unwrap()[index] = Column::reduced(
+                            &saved,
+                            (wx & 15) as usize,
+                            (wz & 15) as usize,
+                            stride as usize,
+                        );
+                    }
+                }
+            }
+            Ok(state.active_grid.take().unwrap())
+        }
+    }
+    impl<G: ChunkGenerator> RetainedLodProvider for Persistent<G> {
+        fn retained_sampler(
+            self: Arc<Self>,
+            group: Arc<LodGroup>,
+        ) -> std::result::Result<Box<dyn CheckedLodSampler>, LodFailure> {
+            if group.is_stopping() {
+                return Err(LodFailure::new(
+                    LodStage::Acquire,
+                    "saved LOD admission sealed",
+                ));
+            }
+            let inner_capability =
+                self.inner
+                    .clone()
+                    .retained_lod_capability()
+                    .ok_or_else(|| {
+                        LodFailure::new(LodStage::Acquire, "saved LOD actual inner unsupported")
+                    })?;
+            let inner_source: Arc<dyn crate::streaming::LodSource> = self.inner.clone();
+            if !inner_capability.matches_source(&inner_source) {
+                return Err(LodFailure::new(
+                    LodStage::Acquire,
+                    "saved LOD inner capability allocation mismatch",
+                ));
+            }
+            let state = Arc::new(Mutex::new(SamplerState {
+                generator: self,
+                inner_capability: inner_capability.clone(),
+                inner: None,
+                cache: Default::default(),
+                current_read: None,
+                requested: Vec::new(),
+                missing: Vec::new(),
+                details: Vec::new(),
+                active_details: None,
+                active_grid: None,
+            }));
+            group.retain(state.clone());
+            let inner = inner_capability.sampler(group.clone())?;
+            state.lock().unwrap().inner = Some(inner);
+            Ok(Box::new(CheckedSaved {
+                state,
+                group: Arc::downgrade(&group),
+            }))
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        struct Resources {
+            assets: Arc<crate::assets::Assets>,
+            biomes: Arc<Biomes>,
+        }
+        fn resources() -> &'static Resources {
+            static RESOURCES: OnceLock<Resources> = OnceLock::new();
+            RESOURCES.get_or_init(|| {
+                let root = PathBuf::from(
+                    std::env::var_os("HORIZON_TEST_RESOURCES")
+                        .expect("pinned real resource root required"),
+                );
+                Resources {
+                    assets: Arc::new(
+                        crate::assets::Assets::load(&root).expect("actual pinned assets"),
+                    ),
+                    biomes: Arc::new(Biomes::load(&root).expect("actual pinned biomes")),
+                }
+            })
+        }
+        struct Scratch(PathBuf);
+        impl Scratch {
+            fn new(label: &str) -> Self {
+                static NEXT: AtomicU64 = AtomicU64::new(0);
+                let root = std::env::temp_dir().join(format!(
+                    "retained-lod-read-{}-{}-{label}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed)
+                ));
+                fs::create_dir(&root).unwrap();
+                Self(root)
+            }
+            fn save(&self) -> Arc<SaveDir> {
+                Arc::new(SaveDir::new(self.0.clone()))
+            }
+        }
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                if !std::thread::panicking() {
+                    fs::remove_dir_all(&self.0).unwrap();
+                }
+            }
+        }
+        fn column(at: (i32, i32)) -> NamedTag {
+            let resources = resources();
+            let mut column = Chunk::empty(at.0, at.1);
+            column.set(
+                1,
+                65,
+                1,
+                resources
+                    .assets
+                    .registry
+                    .default_state("minecraft:stone")
+                    .unwrap()
+                    .0,
+            );
+            encode_with(
+                &column,
+                resources.assets.registry,
+                &resources.biomes,
+                None,
+                LevelShape::OVERWORLD,
+            )
+        }
+        fn seed(save: &SaveDir, at: (i32, i32), record: &ChunkRecord) {
+            let path = save.region_path("region", at.0 >> 5, at.1 >> 5);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let mut file = RegionFile::open_writable(path, true).unwrap();
+            file.write(ChunkPos::new(at.0, at.1), record).unwrap();
+            file.sync().unwrap();
+        }
+        fn record(root: &NamedTag) -> ChunkRecord {
+            ChunkRecord::from_nbt(root, Compression::Zlib, 7, Limits::default()).unwrap()
+        }
+        fn read(
+            save: Arc<SaveDir>,
+            at: (i32, i32),
+        ) -> (
+            NativeRead,
+            std::result::Result<Option<LodSurfaces>, LodFailure>,
+        ) {
+            let mut state = NativeRead::new(save, at);
+            let result = state.read(&resources().assets, &resources().biomes);
+            (state, result)
+        }
+        fn flat() -> Arc<crate::flatgen::FlatTerrain> {
+            let settings = Tag::compound([(
+                "dimensions",
+                Tag::compound([(
+                    "minecraft:overworld",
+                    Tag::compound([(
+                        "generator",
+                        Tag::compound([
+                            ("type", string("minecraft:flat")),
+                            (
+                                "settings",
+                                Tag::compound([
+                                    ("biome", string("minecraft:plains")),
+                                    (
+                                        "layers",
+                                        Tag::List(vec![Tag::compound([
+                                            ("height", Tag::Int(1)),
+                                            ("block", string("minecraft:stone")),
+                                        ])]),
+                                    ),
+                                ]),
+                            ),
+                        ]),
+                    )]),
+                )]),
+            )]);
+            Arc::new(
+                crate::flatgen::FlatTerrain::from_settings(
+                    &settings,
+                    resources().assets.registry,
+                    &resources().biomes,
+                )
+                .unwrap(),
+            )
+        }
+        #[test]
+        #[ignore = "requires pinned real resources; actual readonly native record and absence"]
+        fn retained_lod_native_success_and_genuine_absence_keep_original_inputs() {
+            let root = Scratch::new("native");
+            let save = root.save();
+            let (missing, result) = read(save.clone(), (0, 0));
+            assert!(result.unwrap().is_none() && missing.absent);
+            assert!(
+                !save.region_path("region", 0, 0).exists(),
+                "read must not create a region"
+            );
+            seed(&save, (0, 0), &record(&column((0, 0))));
+            let path = save.region_path("region", 0, 0);
+            let original = fs::read(&path).unwrap();
+            let (state, result) = read(save.clone(), (0, 0));
+            let columns = result.unwrap().unwrap();
+            assert!(Arc::ptr_eq(&state.save, &save));
+            assert!(Arc::ptr_eq(state.columns.as_ref().unwrap(), &columns));
+            assert!(state.file.is_some() && state.record.is_some() && state.root.is_some());
+            assert_eq!(columns[17].surface.unwrap().height, 66);
+            let (empty_slot, result) = read(save.clone(), (1, 0));
+            assert!(result.unwrap().is_none() && empty_slot.absent);
+            assert_eq!(empty_slot.header.len(), HEADER);
+            assert_eq!(
+                fs::read(&path).unwrap(),
+                original,
+                "native read is byte-preserving"
+            );
+            assert!(save.pending.lock().unwrap().is_empty());
+            assert!(
+                save.regions.lock().unwrap().is_empty(),
+                "far reads must not populate region cache"
+            );
+        }
+        #[test]
+        #[ignore = "requires pinned real resources; exact pending record and checked proto eligibility"]
+        fn retained_lod_pending_identity_proto_eligibility_and_unknown_provider() {
+            let root = Scratch::new("pending");
+            let save = root.save();
+            let original = Arc::new(column((2, 3)));
+            save.pending
+                .lock()
+                .unwrap()
+                .insert((Folder::Region, 2, 3), (42, Record::Tag(original.clone())));
+            let (state, result) = read(save.clone(), (2, 3));
+            assert!(result.unwrap().is_some());
+            let Some((42, Record::Tag(held))) = &state.pending else {
+                panic!("original pending record lost")
+            };
+            assert!(Arc::ptr_eq(held, &original));
+            assert!(Arc::ptr_eq(state.root.as_ref().unwrap(), &original));
+            assert!(state.file.is_none());
+            let mut proto = column((2, 3));
+            put(&mut proto.tag, "Status", ChunkStatus::Features.to_nbt());
+            save.pending
+                .lock()
+                .unwrap()
+                .insert((Folder::Region, 2, 3), (43, Record::Tag(Arc::new(proto))));
+            let (state, result) = read(save.clone(), (2, 3));
+            assert!(result.unwrap().is_none() && state.ineligible && !state.absent);
+            let mut malformed = column((2, 3));
+            put(
+                &mut malformed.tag,
+                "Status",
+                string("minecraft:not_a_status"),
+            );
+            save.pending.lock().unwrap().insert(
+                (Folder::Region, 2, 3),
+                (44, Record::Tag(Arc::new(malformed))),
+            );
+            let (state, result) = read(save.clone(), (2, 3));
+            assert_eq!(result.err().unwrap().stage, LodStage::NativeRead);
+            assert!(state.root.is_some() && state.error.is_some() && !state.ineligible);
+            struct Unknown;
+            impl ChunkGenerator for Unknown {
+                type Worker = ();
+                fn worker(&self) {
+                    panic!("unsupported LOD worker acquired");
+                }
+                fn proto(&self, _: &mut (), _: i32, _: i32) -> crate::streaming::Proto {
+                    panic!("unsupported proto")
+                }
+                fn finish(&self, _: crate::streaming::Proto) -> Chunk {
+                    panic!("unsupported finish")
+                }
+            }
+            let unknown = Arc::new(Unknown);
+            let persistent = Arc::new(Persistent {
+                inner: unknown.clone(),
+                save: save.clone(),
+                registry: resources().assets.clone(),
+                biomes: resources().biomes.clone(),
+            });
+            assert!(persistent.clone().retained_lod_capability().is_none());
+            assert!(Arc::ptr_eq(&persistent.inner, &unknown));
+            // Safe public trait implementations can return another allocation's
+            // genuine token. Some(token) alone must not bless this inner owner.
+            struct Foreign {
+                capability: LodCapability,
+            }
+            impl ChunkGenerator for Foreign {
+                type Worker = ();
+                fn worker(&self) {
+                    panic!("foreign inner worker acquired");
+                }
+                fn retained_lod_capability(self: Arc<Self>) -> Option<LodCapability> {
+                    Some(self.capability.clone())
+                }
+                fn proto(&self, _: &mut (), _: i32, _: i32) -> crate::streaming::Proto {
+                    panic!("foreign proto")
+                }
+                fn finish(&self, _: crate::streaming::Proto) -> Chunk {
+                    panic!("foreign finish")
+                }
+            }
+            let foreign = Arc::new(Foreign {
+                capability: flat().retained_lod_capability().unwrap(),
+            });
+            let wrapped = Arc::new(Persistent {
+                inner: foreign.clone(),
+                save: save.clone(),
+                registry: resources().assets.clone(),
+                biomes: resources().biomes.clone(),
+            });
+            assert!(
+                wrapped.clone().retained_lod_capability().is_none(),
+                "foreign capability refused before wrapper mint"
+            );
+            let group = LodGroup::for_test();
+            assert_eq!(
+                wrapped.retained_sampler(group.clone()).err().unwrap().stage,
+                LodStage::Acquire,
+                "factory rechecks exact original inner"
+            );
+            assert!(group.observe_workers().workers.is_empty());
+            group.request_stop();
+            group.poll_finished();
+            save.pending.lock().unwrap().clear();
+        }
+        #[test]
+        #[ignore = "requires pinned real resources; malformed original header and actual filesystem refusal"]
+        fn retained_lod_original_header_and_native_io_failures_never_become_absence() {
+            let root = Scratch::new("header");
+            let save = root.save();
+            let path = save.region_path("region", 0, 0);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let mut invalid = vec![vec![0; HEADER - 1], vec![0; HEADER + 1]];
+            let mut bad_offset = vec![0; HEADER];
+            bad_offset[..4].copy_from_slice(&257u32.to_be_bytes());
+            invalid.push(bad_offset);
+            let mut overlap = vec![0; HEADER + 4096];
+            overlap[..4].copy_from_slice(&513u32.to_be_bytes());
+            overlap[4..8].copy_from_slice(&513u32.to_be_bytes());
+            invalid.push(overlap);
+            for bytes in invalid {
+                fs::write(&path, &bytes).unwrap();
+                let (state, result) = read(save.clone(), (0, 0));
+                let error = result.err().unwrap();
+                assert_eq!(error.stage, LodStage::NativeRead);
+                assert!(
+                    error.message.contains("column=0,0")
+                        && error.message.contains("stage=original header")
+                );
+                assert!(state.file.is_some() && state.error.is_some() && !state.absent);
+                assert_eq!(fs::read(&path).unwrap(), bytes);
+            }
+            fs::remove_file(&path).unwrap();
+            fs::create_dir(&path).unwrap();
+            let (state, result) = read(save.clone(), (0, 0));
+            assert!(
+                result
+                    .err()
+                    .unwrap()
+                    .message
+                    .contains("stage=region metadata")
+            );
+            assert!(!state.absent && state.error.is_some());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                struct RestorePermissions {
+                    path: PathBuf,
+                    original: fs::Permissions,
+                }
+                impl Drop for RestorePermissions {
+                    fn drop(&mut self) {
+                        let _ = fs::set_permissions(&self.path, self.original.clone());
+                    }
+                }
+                fs::remove_dir(&path).unwrap();
+                seed(&save, (0, 0), &record(&column((0, 0))));
+                let original = fs::read(&path).unwrap();
+                let permissions = fs::metadata(&path).unwrap().permissions();
+                let original_mode = permissions.mode();
+                let restore = RestorePermissions {
+                    path: path.clone(),
+                    original: permissions,
+                };
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+                let (state, result) = read(save.clone(), (0, 0));
+                let error = result.expect_err("UID1000 must reach the actual denied File::open");
+                assert_eq!(error.stage, LodStage::NativeRead);
+                assert!(error.message.contains("stage=region open"));
+                assert_eq!(
+                    state.region_open_error,
+                    Some(std::io::ErrorKind::PermissionDenied)
+                );
+                assert_eq!(state.path, path);
+                assert!(Arc::ptr_eq(&state.save, &save));
+                assert!(!state.absent && state.error.is_some() && state.file.is_none());
+                drop(restore);
+                assert_eq!(
+                    fs::metadata(&path).unwrap().permissions().mode(),
+                    original_mode
+                );
+                assert_eq!(
+                    fs::read(&path).unwrap(),
+                    original,
+                    "denied readonly open leaves original bytes unchanged"
+                );
+            }
+        }
+        #[test]
+        #[ignore = "requires pinned real resources; native decompression/NBT and saved projection errors"]
+        fn retained_lod_decode_failure_keeps_record_and_refuses_procedural_success() {
+            let root = Scratch::new("decode");
+            let save = root.save();
+            let malformed = ChunkRecord {
+                compression: Compression::Zlib,
+                compressed: vec![1, 2, 3],
+                timestamp: 9,
+            };
+            seed(&save, (0, 0), &malformed);
+            let (state, result) = read(save.clone(), (0, 0));
+            assert!(result.err().unwrap().message.contains("decompression/NBT"));
+            assert_eq!(
+                state.record.as_ref().unwrap().compressed,
+                malformed.compressed
+            );
+            assert!(!state.absent && state.root.is_none());
+            let persistent = Arc::new(Persistent {
+                inner: flat(),
+                save: save.clone(),
+                registry: resources().assets.clone(),
+                biomes: resources().biomes.clone(),
+            });
+            let group = LodGroup::for_test();
+            let capability = persistent.clone().retained_lod_capability().unwrap();
+            let mut sampler = capability.sampler(group.clone()).unwrap();
+            assert_eq!(
+                sampler.grid(0, 0, 1, 1).err().unwrap().stage,
+                LodStage::NativeRead,
+                "saved failure must not become a procedural successful grid"
+            );
+            group.request_stop();
+            group.poll_finished();
+            assert!(group.observe_workers().ready);
+            let mut malformed_root = column((0, 0));
+            put(&mut malformed_root.tag, "sections", Tag::Int(0));
+            save.pending.lock().unwrap().insert(
+                (Folder::Region, 0, 0),
+                (11, Record::Tag(Arc::new(malformed_root))),
+            );
+            let (state, result) = read(save.clone(), (0, 0));
+            assert!(
+                result
+                    .err()
+                    .unwrap()
+                    .message
+                    .contains("saved sections not a list")
+            );
+            assert!(state.root.is_some() && state.pending.is_some() && state.columns.is_none());
+            save.pending.lock().unwrap().clear();
+        }
+        #[test]
+        #[ignore = "requires pinned real resources; strict palette, coordinates, sections, biome and light validation"]
+        fn retained_lod_saved_validation_rejects_tolerant_decoder_normalization() {
+            let root = Scratch::new("validation");
+            let save = root.save();
+            let original = column((0, 0));
+            // Native block-state descriptors may omit default properties. The
+            // retained projection resolves valid omissions, and does not replace
+            // a valid partial descriptor with the block's unrelated default.
+            for value in [
+                string("minecraft:oak_log"),
+                Tag::compound([
+                    ("id", string("minecraft:oak_leaves")),
+                    (
+                        "properties",
+                        Tag::compound([("persistent", string("true"))]),
+                    ),
+                ]),
+            ] {
+                let descriptor = BlockState::from_nbt(&value).unwrap();
+                let expected = resources().assets.registry.resolve(&descriptor).unwrap();
+                let mut valid = original.clone();
+                if let Tag::Compound(map) = &mut valid.tag
+                    && let Some(Tag::List(sections)) = map.get_mut(&"sections".into())
+                {
+                    put(
+                        &mut sections[0],
+                        "block_states",
+                        Tag::compound([("palette", Tag::List(vec![value]))]),
+                    );
+                }
+                save.pending
+                    .lock()
+                    .unwrap()
+                    .insert((Folder::Region, 0, 0), (10, Record::Tag(Arc::new(valid))));
+                let (_, result) = read(save.clone(), (0, 0));
+                assert!(
+                    result.unwrap().unwrap()[17]
+                        .spans
+                        .iter()
+                        .any(|span| span.state == expected)
+                );
+            }
+            let mut invalid = Vec::new();
+            // Omission matrix includes empty-air, actual non-air and highest
+            // sections. Present terrain without biome input must fail instead
+            // of silently publishing the tolerant decoder's biome zero.
+            let Some(Tag::List(original_sections)) = original.tag.get("sections") else {
+                panic!("real encoded sections missing")
+            };
+            for index in [0, 8, original_sections.len() - 1] {
+                let mut omitted = original.clone();
+                if let Tag::Compound(map) = &mut omitted.tag
+                    && let Some(Tag::List(sections)) = map.get_mut(&"sections".into())
+                    && let Tag::Compound(section) = &mut sections[index]
+                {
+                    section.remove(&"biomes".into());
+                }
+                invalid.push(omitted);
+            }
+            // Empty and light-only sparse sections remain valid: neither
+            // supplies block terrain that could acquire a fabricated biome.
+            for light_only in [false, true] {
+                let mut sparse = original.clone();
+                if let Tag::Compound(map) = &mut sparse.tag
+                    && let Some(Tag::List(sections)) = map.get_mut(&"sections".into())
+                    && let Tag::Compound(section) = &mut sections[0]
+                {
+                    section.remove(&"block_states".into());
+                    section.remove(&"biomes".into());
+                    if light_only {
+                        section.insert("SkyLight".into(), Tag::ByteArray(vec![0xff; 2048]));
+                    }
+                }
+                save.pending
+                    .lock()
+                    .unwrap()
+                    .insert((Folder::Region, 0, 0), (10, Record::Tag(Arc::new(sparse))));
+                assert!(read(save.clone(), (0, 0)).1.unwrap().is_some());
+            }
+            let mut coords = original.clone();
+            put(&mut coords.tag, "xPos", Tag::Int(1));
+            invalid.push(coords);
+            let mut duplicate = original.clone();
+            if let Tag::Compound(map) = &mut duplicate.tag
+                && let Some(Tag::List(sections)) = map.get_mut(&"sections".into())
+            {
+                sections.push(sections[0].clone());
+            }
+            invalid.push(duplicate);
+            for (field, value) in [
+                (
+                    "block_states",
+                    Tag::compound([(
+                        "palette",
+                        Tag::List(vec![string("minecraft:missing_block")]),
+                    )]),
+                ),
+                (
+                    "biomes",
+                    Tag::compound([(
+                        "palette",
+                        Tag::List(vec![string("minecraft:missing_biome")]),
+                    )]),
+                ),
+                ("SkyLight", Tag::ByteArray(vec![0; 4])),
+            ] {
+                let mut malformed = original.clone();
+                if let Tag::Compound(map) = &mut malformed.tag
+                    && let Some(Tag::List(sections)) = map.get_mut(&"sections".into())
+                {
+                    put(&mut sections[0], field, value);
+                }
+                invalid.push(malformed);
+            }
+            for malformed in invalid {
+                let original = Arc::new(malformed);
+                save.pending
+                    .lock()
+                    .unwrap()
+                    .insert((Folder::Region, 0, 0), (12, Record::Tag(original.clone())));
+                let (state, result) = read(save.clone(), (0, 0));
+                assert_eq!(result.err().unwrap().stage, LodStage::NativeRead);
+                assert!(Arc::ptr_eq(state.root.as_ref().unwrap(), &original));
+                assert!(!state.absent && state.columns.is_none());
+            }
+            save.pending.lock().unwrap().clear();
+        }
+    }
+}
+
 /// Read one palette index without expanding the other entries in the section.
 fn lod_palette_index(
     container: &Tag,
@@ -9604,6 +10712,15 @@ fn decode_lod_surfaces(
     biomes: &Biomes,
     sky_light: bool,
 ) -> Option<LodSurfaces> {
+    decode_lod_surfaces_with_resolution(root, assets, biomes, sky_light, false)
+}
+fn decode_lod_surfaces_with_resolution(
+    root: &NamedTag,
+    assets: &crate::assets::Assets,
+    biomes: &Biomes,
+    sky_light: bool,
+    checked: bool,
+) -> Option<LodSurfaces> {
     let Tag::List(sections) = root.tag.get("sections")? else {
         return None;
     };
@@ -9636,10 +10753,14 @@ fn decode_lod_surfaces(
                 .map(|entry| {
                     let descriptor = BlockState::from_nbt(entry).ok()?;
                     let state = *states.entry(descriptor.clone()).or_insert_with(|| {
-                        assets
-                            .registry
-                            .id(&descriptor)
-                            .or_else(|| assets.registry.default_state(&descriptor.name))
+                        if checked {
+                            assets.registry.resolve(&descriptor).ok()
+                        } else {
+                            assets
+                                .registry
+                                .id(&descriptor)
+                                .or_else(|| assets.registry.default_state(&descriptor.name))
+                        }
                     });
                     Some(state.map(|state| {
                         let properties = assets.properties.heightmap_state(state);
@@ -9771,6 +10892,17 @@ impl<G: ChunkGenerator> ChunkGenerator for Persistent<G> {
     type Worker = G::Worker;
     fn worker(&self) -> G::Worker {
         self.inner.worker()
+    }
+    #[cfg(feature = "paired-packages")]
+    fn retained_lod_capability(self: Arc<Self>) -> Option<crate::lod::retained::LodCapability> {
+        // Capability lookup executes no factory. The immutable, original inner
+        // allocation must support the checked path before the wrapper opts in.
+        let inner_capability = self.inner.clone().retained_lod_capability()?;
+        let inner_source: Arc<dyn crate::streaming::LodSource> = self.inner.clone();
+        if !inner_capability.matches_source(&inner_source) {
+            return None;
+        }
+        Some(crate::lod::retained::LodCapability::for_provider(self))
     }
     fn lod_sampler(self: Arc<Self>) -> Box<dyn crate::streaming::LodSampler> {
         let inner = ChunkGenerator::lod_sampler(self.inner.clone());

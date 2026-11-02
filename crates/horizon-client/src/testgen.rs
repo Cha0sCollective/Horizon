@@ -64,6 +64,12 @@ fn hash(x: i32, z: i32) -> u32 {
 impl ChunkGenerator for TestTerrain {
     type Worker = ();
     fn worker(&self) {}
+    #[cfg(feature = "paired-packages")]
+    fn retained_lod_capability(
+        self: std::sync::Arc<Self>,
+    ) -> Option<crate::lod::retained::LodCapability> {
+        Some(crate::lod::retained::LodCapability::for_provider(self))
+    }
     fn lod_surface(&self, _: &mut (), x: i32, z: i32) -> Option<crate::lod::Surface> {
         let h = Self::height(x, z);
         Some(crate::lod::Surface {
@@ -87,6 +93,25 @@ impl ChunkGenerator for TestTerrain {
         let mut chunk = *proto.downcast::<Chunk>().expect("test terrain proto");
         chunk.fresh = true;
         chunk
+    }
+}
+#[cfg(feature = "paired-packages")]
+impl crate::lod::retained::RetainedLodProvider for TestTerrain {
+    fn retained_sampler(
+        self: std::sync::Arc<Self>,
+        group: std::sync::Arc<crate::lod::retained::LodGroup>,
+    ) -> std::result::Result<
+        Box<dyn crate::lod::retained::CheckedLodSampler>,
+        crate::lod::retained::LodFailure,
+    > {
+        use crate::lod::retained::{LodFailure, LodStage, PureLodSampler};
+        if group.is_stopping() {
+            return Err(LodFailure::new(
+                LodStage::Acquire,
+                "test-terrain LOD admission sealed",
+            ));
+        }
+        Ok(Box::new(PureLodSampler::new(self)))
     }
 }
 impl TestTerrain {
@@ -211,5 +236,35 @@ mod tests {
             }
         }
         assert!(wet, "fixture includes underwater land");
+    }
+
+    #[cfg(feature = "paired-packages")]
+    #[test]
+    fn retained_test_known_provider_uses_original_surface_and_sealed_refusal() {
+        use crate::lod::retained::LodGroup;
+        use std::sync::Arc;
+        let source = Arc::new(terrain());
+        let capability = source
+            .clone()
+            .retained_lod_capability()
+            .expect("known test capability");
+        let group = LodGroup::for_test();
+        let mut sampler = capability.sampler(group.clone()).unwrap();
+        let columns = sampler.grid(-32, 48, 2, 4).unwrap();
+        for (index, column) in columns.iter().enumerate() {
+            assert_eq!(
+                column.surface,
+                source.lod_surface(
+                    &mut (),
+                    -32 + (index % 4) as i32 * 2,
+                    48 + (index / 4) as i32 * 2
+                )
+            );
+        }
+        assert!(sampler.fork().unwrap().is_none());
+        group.request_stop();
+        assert!(capability.sampler(group.clone()).is_err());
+        group.poll_finished();
+        assert!(group.observe_workers().ready);
     }
 }

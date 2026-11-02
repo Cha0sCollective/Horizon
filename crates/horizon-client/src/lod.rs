@@ -1465,6 +1465,1749 @@ impl Drop for Lod {
         }
     }
 }
+
+/// Checked ownership of the actual far-terrain worker family. Ordinary LOD
+/// construction deliberately remains on its existing path.
+#[cfg(feature = "paired-packages")]
+pub mod retained {
+    use super::*;
+    use crate::streaming::{ChunkGenerator, LodDetail};
+    use std::{
+        any::Any,
+        panic::AssertUnwindSafe,
+        time::{Duration, Instant},
+    };
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum LodStage {
+        Acquire,
+        Fork,
+        Sample,
+        DetailRequest,
+        DetailDrain,
+        Decorate,
+        NativeRead,
+        Spawn,
+        Panic,
+    }
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct LodFailure {
+        pub stage: LodStage,
+        pub message: String,
+    }
+    impl LodFailure {
+        pub fn new(stage: LodStage, message: impl Into<String>) -> Self {
+            Self {
+                stage,
+                message: message.into(),
+            }
+        }
+    }
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum LodRole {
+        Outer,
+        Sampling,
+        Decoration,
+    }
+
+    pub(crate) trait CheckedLodSampler: Send {
+        fn fork(&self) -> Result<Option<Box<dyn CheckedLodSampler>>, LodFailure> {
+            Ok(None)
+        }
+        fn request_detail(
+            &mut self,
+            _chunks: &[(i32, i32)],
+            _center: [i32; 2],
+        ) -> Result<(), LodFailure> {
+            Ok(())
+        }
+        fn drain_details(&mut self) -> Result<Vec<LodDetail>, LodFailure> {
+            Ok(Vec::new())
+        }
+        fn grid(
+            &mut self,
+            x: i32,
+            z: i32,
+            stride: i32,
+            side: usize,
+        ) -> Result<Vec<Column>, LodFailure>;
+    }
+    pub(crate) trait RetainedLodProvider: Send + Sync + 'static {
+        fn retained_sampler(
+            self: Arc<Self>,
+            group: Arc<LodGroup>,
+        ) -> Result<Box<dyn CheckedLodSampler>, LodFailure>;
+    }
+
+    /// Only the concrete, reviewed providers in this crate can mint this token.
+    /// Both trait views retain the very same original allocation.
+    #[derive(Clone)]
+    pub struct LodCapability {
+        source: Arc<dyn LodSource>,
+        provider: Arc<dyn RetainedLodProvider>,
+    }
+    impl LodCapability {
+        pub(crate) fn matches_source(&self, source: &Arc<dyn LodSource>) -> bool {
+            Arc::ptr_eq(source, &self.source)
+        }
+        pub(crate) fn for_provider<G: ChunkGenerator + RetainedLodProvider>(
+            source: Arc<G>,
+        ) -> Self {
+            Self {
+                source: source.clone(),
+                provider: source,
+            }
+        }
+        pub(crate) fn sampler(
+            &self,
+            group: Arc<LodGroup>,
+        ) -> Result<Box<dyn CheckedLodSampler>, LodFailure> {
+            self.provider.clone().retained_sampler(group)
+        }
+    }
+    /// Adapter restricted to the explicitly opted-in, helper-free generators.
+    pub(crate) struct PureLodSampler<G: ChunkGenerator> {
+        generator: Arc<G>,
+        worker: G::Worker,
+    }
+    impl<G: ChunkGenerator> PureLodSampler<G> {
+        pub(crate) fn new(generator: Arc<G>) -> Self {
+            let worker = generator.worker();
+            Self { generator, worker }
+        }
+    }
+    impl<G: ChunkGenerator> CheckedLodSampler for PureLodSampler<G> {
+        fn grid(
+            &mut self,
+            x: i32,
+            z: i32,
+            stride: i32,
+            side: usize,
+        ) -> Result<Vec<Column>, LodFailure> {
+            let mut columns = Vec::with_capacity(side * side);
+            for dz in 0..side {
+                for dx in 0..side {
+                    columns.push(Column::from_surface(self.generator.lod_surface(
+                        &mut self.worker,
+                        x + dx as i32 * stride,
+                        z + dz as i32 * stride,
+                    )));
+                }
+            }
+            Ok(columns)
+        }
+    }
+
+    struct Slot {
+        role: LodRole,
+        // The registry, not an unwinding worker stack, owns original inputs.
+        _payload: Arc<dyn Any + Send + Sync>,
+        handle: Option<thread::JoinHandle<()>>,
+        joined: bool,
+        outcome: Option<Result<(), LodFailure>>,
+    }
+    #[derive(Default)]
+    struct Registry {
+        slots: Vec<Slot>,
+        signals: Vec<(Arc<AtomicBool>, Arc<Condvar>)>,
+        payloads: Vec<Arc<dyn Any + Send + Sync>>,
+        #[cfg(test)]
+        refuse: Option<(LodRole, usize)>,
+        #[cfg(test)]
+        work_gate: Option<Arc<WorkGate>>,
+    }
+    pub(crate) struct LodGroup {
+        shared: Arc<Shared>,
+        // Every retained backend uses this exact permanent fence. Wakeup
+        // delivery may be deferred while registration owns its short lock;
+        // admission never depends on that lock or a later poll.
+        sealed: Arc<AtomicBool>,
+        registry: Mutex<Registry>,
+    }
+    impl LodGroup {
+        fn new(shared: Arc<Shared>) -> Arc<Self> {
+            Arc::new(Self {
+                shared,
+                sealed: Arc::new(AtomicBool::new(false)),
+                registry: Mutex::new(Registry::default()),
+            })
+        }
+        pub(crate) fn admission_fence(&self) -> Arc<AtomicBool> {
+            self.sealed.clone()
+        }
+        pub(crate) fn retain<T: Send + 'static>(&self, state: Arc<Mutex<T>>) {
+            self.registry
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .payloads
+                .push(state);
+        }
+        #[cfg(test)]
+        pub(crate) fn for_test() -> Arc<Self> {
+            Self::new(Arc::new(Shared {
+                jobs: Mutex::new(VecDeque::new()),
+                observed: Mutex::new(FxHashMap::default()),
+                kinds: std::sync::OnceLock::new(),
+                wake: Condvar::new(),
+                stop: AtomicBool::new(false),
+            }))
+        }
+        #[cfg(test)]
+        pub(crate) fn request_stop(&self) {
+            self.stop();
+        }
+        #[cfg(test)]
+        pub(crate) fn hold_registry_for_test(
+            &self,
+            entered: mpsc::Sender<()>,
+            release: mpsc::Receiver<()>,
+        ) {
+            let _registry = self.registry.lock().unwrap_or_else(|e| e.into_inner());
+            entered.send(()).unwrap();
+            release.recv().unwrap();
+        }
+        #[cfg(test)]
+        pub(crate) fn poll_finished(&self) {
+            self.poll();
+        }
+        #[cfg(test)]
+        pub(crate) fn observe_workers(&self) -> LodObservation {
+            self.observation()
+        }
+        #[cfg(test)]
+        pub(crate) fn retained_payloads_for_test<T: Send + 'static>(&self) -> Vec<Arc<Mutex<T>>> {
+            let registry = self.registry.lock().unwrap_or_else(|e| e.into_inner());
+            let mut result = Vec::new();
+            for erased in registry
+                .slots
+                .iter()
+                .map(|slot| &slot._payload)
+                .chain(&registry.payloads)
+            {
+                if let Ok(state) = Arc::downcast::<Mutex<T>>(erased.clone())
+                    && !result.iter().any(|old| Arc::ptr_eq(old, &state))
+                {
+                    result.push(state);
+                }
+            }
+            result
+        }
+        #[cfg(test)]
+        fn hold_work(&self, kind: WorkKind) {
+            let gate = self
+                .registry
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .work_gate
+                .clone();
+            if let Some(gate) = gate.filter(|gate| gate.kind == kind) {
+                gate.entered.store(true, Ordering::Release);
+                let mut released = gate.released.lock().unwrap();
+                while !*released {
+                    released = gate.wake.wait(released).unwrap();
+                }
+                assert!(!gate.panic, "controlled retained active work panic");
+            }
+        }
+        #[cfg(test)]
+        pub(crate) fn refuse_spawn(&self, role: LodRole) {
+            self.refuse_spawn_after(role, 0);
+        }
+        #[cfg(test)]
+        fn refuse_spawn_after(&self, role: LodRole, accepted: usize) {
+            self.registry
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .refuse = Some((role, accepted));
+        }
+        pub(crate) fn is_stopping(&self) -> bool {
+            self.sealed.load(Ordering::Acquire)
+        }
+        pub(crate) fn register_stop(&self, stop: Arc<AtomicBool>, wake: Arc<Condvar>) {
+            let mut registry = self.registry.lock().unwrap_or_else(|e| e.into_inner());
+            if self.is_stopping() {
+                stop.store(true, Ordering::Release);
+                wake.notify_all();
+            }
+            registry.signals.push((stop, wake));
+        }
+        fn stop(&self) {
+            self.sealed.store(true, Ordering::Release);
+            self.shared.stop.store(true, Ordering::Release);
+            self.shared.wake.notify_all();
+            // A UI close never waits for an actor or native callback. A later
+            // poll repeats these wakeups if registration briefly owns the lock.
+            if let Ok(registry) = self.registry.try_lock() {
+                for (stop, wake) in &registry.signals {
+                    stop.store(true, Ordering::Release);
+                    wake.notify_all();
+                }
+            }
+        }
+        pub(crate) fn spawn<T, F>(
+            self: &Arc<Self>,
+            role: LodRole,
+            state: Arc<Mutex<T>>,
+            run: F,
+        ) -> Result<usize, LodFailure>
+        where
+            T: Send + 'static,
+            F: FnOnce(Arc<Mutex<T>>) -> Result<(), LodFailure> + Send + 'static,
+        {
+            let mut registry = self.registry.lock().unwrap_or_else(|e| e.into_inner());
+            let id = registry.slots.len();
+            registry.slots.push(Slot {
+                role,
+                _payload: state.clone(),
+                handle: None,
+                joined: false,
+                outcome: None,
+            });
+            #[cfg(test)]
+            if registry.refuse.is_some_and(|(refused, accepted)| {
+                refused == role
+                    && registry.slots[..id]
+                        .iter()
+                        .filter(|slot| slot.role == role)
+                        .count()
+                        == accepted
+            }) {
+                registry.refuse = None;
+                let error = LodFailure::new(
+                    LodStage::Spawn,
+                    format!("controlled {role:?} spawn refusal"),
+                );
+                registry.slots[id].joined = true;
+                registry.slots[id].outcome = Some(Err(error.clone()));
+                drop(registry);
+                self.stop();
+                return Err(error);
+            }
+            if self.is_stopping() {
+                let error = LodFailure::new(LodStage::Spawn, "LOD admission permanently sealed");
+                registry.slots[id].joined = true;
+                registry.slots[id].outcome = Some(Err(error.clone()));
+                return Err(error);
+            }
+            // Pending custody is visible to close before the native spawn. No
+            // native operation or callback runs under the lifecycle lock.
+            drop(registry);
+            let (release, start) = mpsc::channel();
+            let group = self.clone();
+            let name = match role {
+                LodRole::Outer => "Far terrain",
+                LodRole::Sampling => "Far sampling",
+                LodRole::Decoration => "Far decoration",
+            };
+            let result = thread::Builder::new().name(name.into()).spawn(move || {
+                if start.recv().is_err() {
+                    return;
+                }
+                let outcome = if group.is_stopping() {
+                    Ok(())
+                } else {
+                    match std::panic::catch_unwind(AssertUnwindSafe(|| run(state))) {
+                        Ok(outcome) => outcome,
+                        Err(payload) => {
+                            let message = payload
+                                .downcast_ref::<String>()
+                                .cloned()
+                                .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+                                .unwrap_or_else(|| "non-string native worker panic".into());
+                            Err(LodFailure::new(LodStage::Panic, message))
+                        }
+                    }
+                };
+                let failed = outcome.is_err();
+                if failed {
+                    group.stop();
+                }
+                group
+                    .registry
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .slots[id]
+                    .outcome = Some(outcome);
+                if failed {
+                    group.stop();
+                }
+            });
+            match result {
+                Ok(handle) => {
+                    self.registry
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .slots[id]
+                        .handle = Some(handle);
+                    // The actual handle and original state are owned before
+                    // this latch permits any factory or native worker work.
+                    let _ = release.send(());
+                    Ok(id)
+                }
+                Err(error) => {
+                    let error = LodFailure::new(LodStage::Spawn, format!("{name}: {error}"));
+                    let mut registry = self.registry.lock().unwrap_or_else(|e| e.into_inner());
+                    registry.slots[id].joined = true;
+                    registry.slots[id].outcome = Some(Err(error.clone()));
+                    drop(registry);
+                    self.stop();
+                    Err(error)
+                }
+            }
+        }
+        fn poll(&self) {
+            if self.is_stopping() {
+                self.stop();
+            }
+            loop {
+                let finished = {
+                    let Ok(mut registry) = self.registry.try_lock() else {
+                        return;
+                    };
+                    registry
+                        .slots
+                        .iter_mut()
+                        .enumerate()
+                        .find_map(|(id, slot)| {
+                            if slot
+                                .handle
+                                .as_ref()
+                                .is_some_and(thread::JoinHandle::is_finished)
+                            {
+                                Some((id, slot.handle.take().unwrap()))
+                            } else {
+                                None
+                            }
+                        })
+                };
+                let Some((id, handle)) = finished else {
+                    break;
+                };
+                let joined = handle.join();
+                let mut registry = self.registry.lock().unwrap_or_else(|e| e.into_inner());
+                let slot = &mut registry.slots[id];
+                slot.joined = true;
+                if joined.is_err() || slot.outcome.is_none() {
+                    slot.outcome = Some(Err(LodFailure::new(
+                        LodStage::Panic,
+                        "worker exited without its checked terminal outcome",
+                    )));
+                }
+            }
+        }
+        fn observation(&self) -> LodObservation {
+            let Ok(registry) = self.registry.try_lock() else {
+                return LodObservation {
+                    sealed: self.is_stopping(),
+                    registry_busy: true,
+                    workers: Vec::new(),
+                    ready: false,
+                };
+            };
+            LodObservation {
+                sealed: self.is_stopping(),
+                registry_busy: false,
+                workers: registry
+                    .slots
+                    .iter()
+                    .map(|slot| LodWorkerObservation {
+                        role: slot.role,
+                        finished: slot.joined
+                            || slot
+                                .handle
+                                .as_ref()
+                                .is_some_and(thread::JoinHandle::is_finished),
+                        joined: slot.joined,
+                        failure: slot
+                            .outcome
+                            .as_ref()
+                            .and_then(|r| r.as_ref().err())
+                            .cloned(),
+                    })
+                    .collect(),
+                ready: self.is_stopping() && registry.slots.iter().all(|slot| slot.joined),
+            }
+        }
+    }
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct LodWorkerObservation {
+        pub role: LodRole,
+        pub finished: bool,
+        pub joined: bool,
+        pub failure: Option<LodFailure>,
+    }
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct LodObservation {
+        pub sealed: bool,
+        pub registry_busy: bool,
+        pub workers: Vec<LodWorkerObservation>,
+        pub ready: bool,
+    }
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum LodClosePhase {
+        Dormant,
+        Running,
+        Closing,
+        Blocked,
+        Ready,
+    }
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct LodCloseObservation {
+        pub phase: LodClosePhase,
+        pub workers: LodObservation,
+        pub attempts: u64,
+    }
+
+    struct Actor {
+        capability: Option<LodCapability>,
+        sampler: Option<Box<dyn CheckedLodSampler>>,
+        shared: Arc<Shared>,
+        context: Arc<WorkerContext>,
+        tx: mpsc::Sender<Done>,
+        active: Option<Arc<Job>>,
+        observed: Option<Arc<Chunk>>,
+        late: Vec<Done>,
+        details: VecDeque<LodDetail>,
+        meshes: Vec<(TileKey, SectionMesh)>,
+    }
+    impl Actor {
+        fn publish(&mut self, done: Done, group: &LodGroup) {
+            if group.is_stopping() {
+                self.late.push(done);
+            } else if let Err(error) = self.tx.send(done) {
+                self.late.push(error.0);
+            }
+        }
+    }
+    fn sample_job(actor: &mut Actor, key: TileKey, group: &LodGroup) -> Result<(), LodFailure> {
+        let [x, _, z] = key.origin();
+        let samples =
+            actor
+                .sampler
+                .as_mut()
+                .unwrap()
+                .grid(x, z, key.size() / CELLS as i32, CELLS)?;
+        actor.publish(Done::Sample { key, samples }, group);
+        Ok(())
+    }
+    fn run_sampling(state: Arc<Mutex<Actor>>, group: Arc<LodGroup>) -> Result<(), LodFailure> {
+        let mut actor = state.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            let job = {
+                let mut jobs = actor.shared.jobs.lock().unwrap_or_else(|e| e.into_inner());
+                loop {
+                    if group.is_stopping() {
+                        return Ok(());
+                    }
+                    if let Some(index) = jobs.iter().position(|job| matches!(job, Job::Sample(_))) {
+                        break jobs.remove(index).unwrap();
+                    }
+                    jobs = actor
+                        .shared
+                        .wake
+                        .wait(jobs)
+                        .unwrap_or_else(|e| e.into_inner());
+                }
+            };
+            let job = Arc::new(job);
+            actor.active = Some(job.clone());
+            let Job::Sample(key) = &*job else {
+                unreachable!()
+            };
+            sample_job(&mut actor, *key, &group)?;
+            if group.is_stopping() {
+                return Ok(());
+            }
+            actor.active = None;
+        }
+    }
+    fn run_outer(
+        state: Arc<Mutex<Actor>>,
+        group: Arc<LodGroup>,
+        count: usize,
+    ) -> Result<(), LodFailure> {
+        let mut actor = state.lock().unwrap_or_else(|e| e.into_inner());
+        let capability = actor.capability.as_ref().unwrap().clone();
+        actor.sampler = Some(capability.sampler(group.clone())?);
+        if group.is_stopping() {
+            return Ok(());
+        }
+        let mut sampling = 0;
+        for _ in 0..count {
+            if group.is_stopping() {
+                return Ok(());
+            }
+            let Some(sampler) = actor.sampler.as_ref().unwrap().fork()? else {
+                break;
+            };
+            let child = Arc::new(Mutex::new(Actor {
+                capability: None,
+                sampler: Some(sampler),
+                shared: actor.shared.clone(),
+                context: actor.context.clone(),
+                tx: actor.tx.clone(),
+                active: None,
+                observed: None,
+                late: Vec::new(),
+                details: VecDeque::new(),
+                meshes: Vec::new(),
+            }));
+            let child_group = group.clone();
+            group.spawn(LodRole::Sampling, child, move |state| {
+                run_sampling(state, child_group)
+            })?;
+            sampling += 1;
+        }
+        let mut mesher = mesh::Mesher::default();
+        loop {
+            if group.is_stopping() {
+                return Ok(());
+            }
+            actor.details = actor.sampler.as_mut().unwrap().drain_details()?.into();
+            while let Some((key, columns)) = actor.details.front().cloned() {
+                actor.publish(Done::Detail(key, ReducedColumns::new(columns)), &group);
+                actor.details.pop_front();
+            }
+            let job = {
+                let mut jobs = actor.shared.jobs.lock().unwrap_or_else(|e| e.into_inner());
+                if (jobs.is_empty()
+                    || (sampling > 0 && jobs.iter().all(|job| matches!(job, Job::Sample(_)))))
+                    && !group.is_stopping()
+                {
+                    jobs = actor
+                        .shared
+                        .wake
+                        .wait_timeout(jobs, Duration::from_millis(100))
+                        .unwrap_or_else(|e| e.into_inner())
+                        .0;
+                }
+                if group.is_stopping() {
+                    return Ok(());
+                }
+                if sampling == 0 {
+                    jobs.pop_front()
+                } else {
+                    jobs.iter()
+                        .position(|job| !matches!(job, Job::Sample(_)))
+                        .and_then(|index| jobs.remove(index))
+                }
+            };
+            let Some(job) = job else {
+                continue;
+            };
+            let job = Arc::new(job);
+            actor.active = Some(job.clone());
+            match &*job {
+                Job::Sample(key) => sample_job(&mut actor, *key, &group)?,
+                Job::Observe(key) => {
+                    let chunk = actor
+                        .shared
+                        .observed
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(key);
+                    actor.observed = chunk.clone();
+                    #[cfg(test)]
+                    group.hold_work(WorkKind::Observe);
+                    if let (Some(chunk), Some(kinds)) = (chunk, actor.shared.kinds.get()) {
+                        let done =
+                            Done::Observed(*key, ReducedColumns::new(summarize(&chunk, kinds)));
+                        actor.publish(done, &group);
+                    }
+                }
+                Job::RequestDetail { chunks, center } => {
+                    actor
+                        .sampler
+                        .as_mut()
+                        .unwrap()
+                        .request_detail(chunks, *center)?;
+                    actor.publish(Done::DetailRequested, &group);
+                }
+                Job::Mesh {
+                    snapshot,
+                    keys,
+                    finer,
+                    covered,
+                    bounds,
+                } => {
+                    for key in keys {
+                        if group.is_stopping() {
+                            return Ok(());
+                        }
+                        // Finish the indivisible mesh callback already admitted;
+                        // its original snapshot stays in active through stop.
+                        let input =
+                            snapshot.mesh_input(*key, finer.get(key).cloned().unwrap_or_default());
+                        let mut mesh = mesher.mesh(
+                            input.key,
+                            &input.columns(),
+                            covered,
+                            *bounds,
+                            &actor.context,
+                            &input.neighbors,
+                            &input.finer,
+                        );
+                        mesh.sort_solid();
+                        actor.meshes.push((input.key, mesh));
+                        #[cfg(test)]
+                        group.hold_work(WorkKind::Mesh);
+                    }
+                    let meshes = std::mem::take(&mut actor.meshes);
+                    actor.publish(
+                        Done::Mesh {
+                            active: snapshot.active.clone(),
+                            meshes,
+                            covered: covered.clone(),
+                        },
+                        &group,
+                    );
+                }
+            }
+            if group.is_stopping() {
+                return Ok(());
+            }
+            actor.active = None;
+            actor.observed = None;
+        }
+    }
+
+    pub struct LodRefusal {
+        pub source: Arc<dyn LodSource>,
+        pub capability: Option<LodCapability>,
+        pub context: Arc<WorkerContext>,
+        pub failure: LodFailure,
+    }
+    /// No sampler, handle, or mutable legacy LOD escapes this owner.
+    pub struct RetainedLod {
+        lod: Option<Lod>,
+        group: Arc<LodGroup>,
+        source: Option<Arc<dyn LodSource>>,
+        capability: Option<LodCapability>,
+        context: Option<Arc<WorkerContext>>,
+        tx: Option<mpsc::Sender<Done>>,
+        started: bool,
+        deadline: Option<Instant>,
+        attempts: u64,
+        resolved: bool,
+    }
+    pub struct ClosedLod {
+        _lod: Lod,
+        _group: Arc<LodGroup>,
+        _source: Arc<dyn LodSource>,
+        _capability: LodCapability,
+        _context: Arc<WorkerContext>,
+        observation: LodCloseObservation,
+    }
+    impl ClosedLod {
+        pub fn observe(&self) -> &LodCloseObservation {
+            &self.observation
+        }
+    }
+    impl RetainedLod {
+        pub fn prepare(
+            source: Arc<dyn LodSource>,
+            capability: Option<LodCapability>,
+            context: Arc<WorkerContext>,
+        ) -> Result<Self, LodRefusal> {
+            let valid = capability
+                .as_ref()
+                .is_some_and(|cap| cap.matches_source(&source));
+            if !valid {
+                return Err(LodRefusal {
+                    source,
+                    capability,
+                    context,
+                    failure: LodFailure::new(
+                        LodStage::Acquire,
+                        "unsupported or foreign retained LOD capability",
+                    ),
+                });
+            }
+            let shared = Arc::new(Shared {
+                jobs: Mutex::new(VecDeque::new()),
+                observed: Mutex::new(FxHashMap::default()),
+                kinds: std::sync::OnceLock::new(),
+                wake: Condvar::new(),
+                stop: AtomicBool::new(false),
+            });
+            let (tx, results) = mpsc::channel();
+            let lod = Lod {
+                shared: shared.clone(),
+                thread: None,
+                results,
+                #[cfg(test)]
+                context: context.clone(),
+                meshing: false,
+                reselect: true,
+                replanned: true,
+                invalidated: FxHashSet::default(),
+                area: None,
+                plan: Plan::default(),
+                reduced_detail: false,
+                pending: FxHashSet::default(),
+                sample_nearby: true,
+                detail_masks: FxHashMap::default(),
+                detail_request_pending: false,
+                detail_request_at: Instant::now(),
+                small: thread::available_parallelism().map_or(1, |n| n.get()) <= 4,
+                near_loading: false,
+                held_sample_at: Instant::now(),
+                ready: FxHashMap::default(),
+                active: FxHashSet::default(),
+                dirty: FxHashSet::default(),
+                removed: Vec::new(),
+                covered: FxHashSet::default(),
+                covered_bounds: None,
+                cutout: None,
+                saved: FxHashMap::default(),
+                reduced: FxHashMap::default(),
+                saved_order: VecDeque::new(),
+            };
+            Ok(Self {
+                lod: Some(lod),
+                group: LodGroup::new(shared),
+                source: Some(source),
+                capability,
+                context: Some(context),
+                tx: Some(tx),
+                started: false,
+                deadline: None,
+                attempts: 0,
+                resolved: false,
+            })
+        }
+        pub fn start(&mut self) -> Result<(), LodFailure> {
+            let count = thread::available_parallelism()
+                .map_or(1, |n| n.get() / 4)
+                .clamp(1, 3);
+            self.start_count(count)
+        }
+        fn start_count(&mut self, count: usize) -> Result<(), LodFailure> {
+            if self.started || self.group.is_stopping() {
+                return Err(LodFailure::new(
+                    LodStage::Acquire,
+                    "LOD already started or sealed",
+                ));
+            }
+            self.started = true;
+            let state = Arc::new(Mutex::new(Actor {
+                capability: self.capability.clone(),
+                sampler: None,
+                shared: self.group.shared.clone(),
+                context: self.context.as_ref().unwrap().clone(),
+                tx: self.tx.as_ref().unwrap().clone(),
+                active: None,
+                observed: None,
+                late: Vec::new(),
+                details: VecDeque::new(),
+                meshes: Vec::new(),
+            }));
+            let group = self.group.clone();
+            self.group.spawn(LodRole::Outer, state, move |state| {
+                run_outer(state, group, count)
+            })?;
+            Ok(())
+        }
+        pub fn observe_chunk(
+            &mut self,
+            chunk: Arc<Chunk>,
+            facts: &BlockFacts,
+        ) -> Result<(), Arc<Chunk>> {
+            if self.group.is_stopping() {
+                return Err(chunk);
+            }
+            self.lod.as_mut().unwrap().observe(chunk, facts);
+            Ok(())
+        }
+        pub fn update_frame(
+            &mut self,
+            camera: [f64; 3],
+            yaw: f32,
+            detail: i32,
+            distance: u32,
+            covered: Option<FxHashSet<(i32, i32)>>,
+        ) -> Result<Vec<(TileKey, SectionMesh)>, Option<FxHashSet<(i32, i32)>>> {
+            // This load admits the fixed frame operation. A concurrent native
+            // worker fault may seal while it finishes; those already-admitted
+            // inputs remain in the original queues, without starting more work.
+            if self.group.is_stopping() {
+                return Err(covered);
+            }
+            Ok(self
+                .lod
+                .as_mut()
+                .unwrap()
+                .update(camera, yaw, detail, distance, covered))
+        }
+        pub fn set_near_loading(&mut self, value: bool) -> Result<(), LodFailure> {
+            self.running()?.set_near_loading(value);
+            Ok(())
+        }
+        pub fn set_reduced_detail(&mut self, value: bool) -> Result<(), LodFailure> {
+            self.running()?.set_reduced_detail(value);
+            Ok(())
+        }
+        pub fn invalidate_chunk(&mut self, x: i32, z: i32) -> Result<(), LodFailure> {
+            self.running()?.invalidate_chunk(x, z);
+            Ok(())
+        }
+        fn running(&mut self) -> Result<&mut Lod, LodFailure> {
+            if self.group.is_stopping() {
+                Err(LodFailure::new(
+                    LodStage::Acquire,
+                    "LOD producer admission sealed",
+                ))
+            } else {
+                Ok(self.lod.as_mut().unwrap())
+            }
+        }
+        pub fn ground(&self, x: i32, z: i32) -> Option<(i32, BlockStateId)> {
+            self.lod.as_ref().unwrap().ground(x, z)
+        }
+        pub fn stats(&self) -> (usize, usize) {
+            self.lod.as_ref().unwrap().stats()
+        }
+        pub fn progress(&self) -> (usize, usize) {
+            self.lod.as_ref().unwrap().progress()
+        }
+        pub fn refined_samples(&self) -> usize {
+            self.lod.as_ref().unwrap().refined_samples()
+        }
+        pub fn observing(&self) -> usize {
+            self.lod.as_ref().unwrap().observing()
+        }
+        pub fn removed(&mut self) -> Result<Vec<TileKey>, LodFailure> {
+            Ok(self.running()?.removed())
+        }
+        pub fn take_cutout(&mut self) -> Result<Option<FxHashSet<(i32, i32)>>, LodFailure> {
+            Ok(self.running()?.take_cutout())
+        }
+        pub fn begin_close(&mut self, now: Instant, timeout: Duration) -> LodCloseObservation {
+            if self.deadline.is_none() {
+                self.deadline = Some(now + timeout);
+                self.attempts = 1;
+            }
+            self.group.stop();
+            self.observe_close(now)
+        }
+        pub fn retry_close(
+            &mut self,
+            now: Instant,
+            timeout: Duration,
+        ) -> Result<LodCloseObservation, LodFailure> {
+            if self.deadline.is_none() {
+                return Err(LodFailure::new(LodStage::Acquire, "close has not begun"));
+            }
+            self.deadline = Some(now + timeout);
+            self.attempts = self.attempts.saturating_add(1);
+            self.group.stop();
+            Ok(self.observe_close(now))
+        }
+        pub fn poll_close(&mut self, now: Instant) -> LodCloseObservation {
+            self.group.poll();
+            self.observe_close(now)
+        }
+        pub fn status(&self) -> LodObservation {
+            self.group.observation()
+        }
+        pub fn observe_close(&self, now: Instant) -> LodCloseObservation {
+            let workers = self.group.observation();
+            let phase = if workers.ready {
+                LodClosePhase::Ready
+            } else if let Some(deadline) = self.deadline {
+                if now >= deadline {
+                    LodClosePhase::Blocked
+                } else {
+                    LodClosePhase::Closing
+                }
+            } else if self.started {
+                LodClosePhase::Running
+            } else {
+                LodClosePhase::Dormant
+            };
+            LodCloseObservation {
+                phase,
+                workers,
+                attempts: self.attempts,
+            }
+        }
+        #[allow(clippy::result_large_err)]
+        pub fn try_closed(mut self, now: Instant) -> Result<ClosedLod, Self> {
+            let observation = self.observe_close(now);
+            if !observation.workers.ready {
+                return Err(self);
+            }
+            self.resolved = true;
+            Ok(ClosedLod {
+                _lod: self.lod.take().unwrap(),
+                _group: self.group.clone(),
+                _source: self.source.take().unwrap(),
+                _capability: self.capability.take().unwrap(),
+                _context: self.context.take().unwrap(),
+                observation,
+            })
+        }
+    }
+    impl Drop for RetainedLod {
+        fn drop(&mut self) {
+            if !self.resolved {
+                eprintln!("fatal: unresolved retained LOD owner");
+                std::process::abort();
+            }
+        }
+    }
+    #[cfg(test)]
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum WorkKind {
+        Observe,
+        Mesh,
+    }
+    #[cfg(test)]
+    struct WorkGate {
+        kind: WorkKind,
+        entered: AtomicBool,
+        released: Mutex<bool>,
+        wake: Condvar,
+        panic: bool,
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::{
+            assets::Assets, biome::Biomes, light::LightTables, mesher::MeshTables, streaming::Proto,
+        };
+        use std::sync::{OnceLock, atomic::AtomicUsize};
+
+        fn context() -> Arc<WorkerContext> {
+            static CONTEXT: OnceLock<Arc<WorkerContext>> = OnceLock::new();
+            CONTEXT
+                .get_or_init(|| {
+                    let root = std::path::PathBuf::from(
+                        std::env::var_os("HORIZON_TEST_RESOURCES").expect("HORIZON_TEST_RESOURCES"),
+                    );
+                    let assets = Arc::new(Assets::load(&root).expect("real prepared assets"));
+                    let render =
+                        Arc::new(assets.reload(&root).expect("real prepared render assets"));
+                    let facts = BlockFacts::load(&root, assets.registry).expect("real block facts");
+                    let biomes = Arc::new(Biomes::load(&root).expect("real biomes"));
+                    let tables = Arc::new(
+                        MeshTables::new(
+                            &assets,
+                            &render,
+                            &facts,
+                            crate::models::load_visibility(&root, assets.registry)
+                                .expect("real visibility"),
+                        )
+                        .expect("real mesh tables"),
+                    );
+                    Arc::new(WorkerContext {
+                        light: Arc::new(
+                            LightTables::load(&root, assets.registry, &facts)
+                                .expect("real light tables"),
+                        ),
+                        tables,
+                        assets,
+                        render,
+                        biomes,
+                    })
+                })
+                .clone()
+        }
+        struct Gate {
+            open: Mutex<bool>,
+            wake: Condvar,
+            entered: AtomicUsize,
+        }
+        impl Gate {
+            fn new(open: bool) -> Arc<Self> {
+                Arc::new(Self {
+                    open: Mutex::new(open),
+                    wake: Condvar::new(),
+                    entered: AtomicUsize::new(0),
+                })
+            }
+            fn wait(&self) {
+                self.entered.fetch_add(1, Ordering::Release);
+                let mut open = self.open.lock().unwrap();
+                while !*open {
+                    open = self.wake.wait(open).unwrap();
+                }
+            }
+            fn release(&self) {
+                *self.open.lock().unwrap() = true;
+                self.wake.notify_all();
+            }
+        }
+        fn until(mut predicate: impl FnMut() -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while !predicate() {
+                assert!(
+                    Instant::now() < deadline,
+                    "native progress backstop expired"
+                );
+                thread::yield_now();
+            }
+        }
+        struct FixtureSource {
+            forks: bool,
+            gate: Arc<Gate>,
+            factories: AtomicUsize,
+            panic_factory: bool,
+            panic_grid: bool,
+            factory_gate: Option<Arc<Gate>>,
+            fork_gate: Option<Arc<Gate>>,
+        }
+        impl FixtureSource {
+            fn new(forks: bool, gate: Arc<Gate>) -> Arc<Self> {
+                Arc::new(Self {
+                    forks,
+                    gate,
+                    factories: AtomicUsize::new(0),
+                    panic_factory: false,
+                    panic_grid: false,
+                    factory_gate: None,
+                    fork_gate: None,
+                })
+            }
+        }
+        impl ChunkGenerator for FixtureSource {
+            type Worker = ();
+            fn worker(&self) {
+                panic!("retained path called legacy worker factory")
+            }
+            fn proto(&self, _worker: &mut (), _x: i32, _z: i32) -> Proto {
+                Box::new(())
+            }
+            fn finish(&self, _proto: Proto) -> Chunk {
+                Chunk::empty(0, 0)
+            }
+        }
+        struct FixtureSampler {
+            source: Arc<FixtureSource>,
+        }
+        impl CheckedLodSampler for FixtureSampler {
+            fn fork(&self) -> Result<Option<Box<dyn CheckedLodSampler>>, LodFailure> {
+                if let Some(gate) = &self.source.fork_gate {
+                    gate.wait();
+                }
+                Ok(self.source.forks.then(|| {
+                    Box::new(Self {
+                        source: self.source.clone(),
+                    }) as Box<dyn CheckedLodSampler>
+                }))
+            }
+            fn grid(
+                &mut self,
+                _x: i32,
+                _z: i32,
+                _stride: i32,
+                side: usize,
+            ) -> Result<Vec<Column>, LodFailure> {
+                self.source.gate.wait();
+                assert!(!self.source.panic_grid, "controlled native sample panic");
+                Ok(vec![Column::default(); side * side])
+            }
+        }
+        impl RetainedLodProvider for FixtureSource {
+            fn retained_sampler(
+                self: Arc<Self>,
+                _group: Arc<LodGroup>,
+            ) -> Result<Box<dyn CheckedLodSampler>, LodFailure> {
+                self.factories.fetch_add(1, Ordering::Release);
+                if let Some(gate) = &self.factory_gate {
+                    gate.wait();
+                }
+                assert!(!self.panic_factory, "controlled native factory panic");
+                Ok(Box::new(FixtureSampler { source: self }))
+            }
+        }
+        fn prepare(source: Arc<FixtureSource>) -> RetainedLod {
+            RetainedLod::prepare(
+                source.clone(),
+                Some(LodCapability::for_provider(source)),
+                context(),
+            )
+            .unwrap_or_else(|_| panic!("fixture capability refused"))
+        }
+        fn enqueue(owner: &RetainedLod, key: TileKey) {
+            owner
+                .group
+                .shared
+                .jobs
+                .lock()
+                .unwrap()
+                .push_back(Job::Sample(key));
+            owner.group.shared.wake.notify_all();
+        }
+        fn key(x: i32) -> TileKey {
+            TileKey { x, z: 0, level: 0 }
+        }
+        fn finish(mut owner: RetainedLod) -> ClosedLod {
+            owner.begin_close(Instant::now(), Duration::from_secs(5));
+            until(|| owner.poll_close(Instant::now()).workers.ready);
+            owner
+                .try_closed(Instant::now())
+                .unwrap_or_else(|_| panic!("actual joined family refused handoff"))
+        }
+        fn actors(group: &LodGroup) -> Vec<Arc<Mutex<Actor>>> {
+            group
+                .registry
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .slots
+                .iter()
+                .filter_map(|slot| Arc::downcast::<Mutex<Actor>>(slot._payload.clone()).ok())
+                .collect()
+        }
+
+        #[test]
+        #[ignore = "requires HORIZON_TEST_RESOURCES"]
+        fn retained_lod_capability_refuses_foreign_and_unknown_before_factory() {
+            let a = FixtureSource::new(false, Gate::new(true));
+            let b = FixtureSource::new(false, Gate::new(true));
+            let source: Arc<dyn LodSource> = a.clone();
+            let refusal = RetainedLod::prepare(
+                source.clone(),
+                Some(LodCapability::for_provider(b.clone())),
+                context(),
+            )
+            .err()
+            .expect("foreign capability must refuse");
+            assert!(Arc::ptr_eq(&source, &refusal.source));
+            assert!(Arc::ptr_eq(&refusal.context, &context()));
+            assert!(source.clone().retained_lod_capability().is_none());
+            assert!(RetainedLod::prepare(source, None, context()).is_err());
+            assert_eq!(a.factories.load(Ordering::Acquire), 0);
+            assert_eq!(b.factories.load(Ordering::Acquire), 0);
+        }
+        #[test]
+        #[ignore = "requires HORIZON_TEST_RESOURCES"]
+        fn retained_lod_dormant_close_has_no_acquisition_and_keeps_original_source() {
+            let source = FixtureSource::new(false, Gate::new(true));
+            let weak = Arc::downgrade(&source);
+            let mut owner = prepare(source.clone());
+            assert_eq!(
+                owner.observe_close(Instant::now()).phase,
+                LodClosePhase::Dormant
+            );
+            let fence = owner.group.admission_fence();
+            assert!(Arc::ptr_eq(&fence, &owner.group.admission_fence()));
+            let group = owner.group.clone();
+            let (entered, held) = mpsc::channel();
+            let (release, resume) = mpsc::channel();
+            let helper = thread::spawn(move || group.hold_registry_for_test(entered, resume));
+            held.recv_timeout(Duration::from_secs(5))
+                .expect("actual registry must be held");
+            let closing = owner.begin_close(Instant::now(), Duration::ZERO);
+            assert!(closing.workers.registry_busy && closing.workers.sealed);
+            assert!(
+                fence.load(Ordering::Acquire),
+                "permanent fence must seal before any registry wakeup or poll"
+            );
+            assert!(
+                !helper.is_finished(),
+                "close returned while the registry remained held"
+            );
+            release.send(()).unwrap();
+            helper.join().unwrap();
+            let closed = finish(owner);
+            assert!(closed.observe().workers.workers.is_empty());
+            assert_eq!(source.factories.load(Ordering::Acquire), 0);
+            drop(source);
+            assert!(weak.upgrade().is_some());
+            drop(closed);
+            assert!(weak.upgrade().is_none());
+        }
+        #[test]
+        #[ignore = "requires HORIZON_TEST_RESOURCES"]
+        fn retained_lod_no_fork_blocked_retry_keeps_original_active_and_late_sample() {
+            let gate = Gate::new(false);
+            let mut owner = prepare(FixtureSource::new(false, gate.clone()));
+            owner.start_count(3).unwrap();
+            enqueue(&owner, key(7));
+            enqueue(&owner, key(8));
+            until(|| gate.entered.load(Ordering::Acquire) == 1);
+            let original = owner.group.clone();
+            let now = Instant::now();
+            let close = owner.begin_close(now, Duration::ZERO);
+            assert_eq!(close.phase, LodClosePhase::Blocked);
+            assert_eq!(owner.poll_close(now + Duration::from_secs(1)).attempts, 1);
+            owner = owner
+                .try_closed(now)
+                .err()
+                .expect("unfinished original actor must refuse");
+            assert!(Arc::ptr_eq(&original, &owner.group));
+            assert_eq!(
+                owner
+                    .retry_close(now + Duration::from_secs(1), Duration::from_secs(5))
+                    .unwrap()
+                    .attempts,
+                2
+            );
+            assert_eq!(owner.group.shared.jobs.lock().unwrap().len(), 1);
+            gate.release();
+            until(|| owner.poll_close(Instant::now()).workers.ready);
+            let actors = actors(&owner.group);
+            let actor = actors[0].lock().unwrap_or_else(|e| e.into_inner());
+            assert!(matches!(&**actor.active.as_ref().unwrap(),Job::Sample(k) if *k==key(7)));
+            assert!(
+                matches!(&actor.late[0],Done::Sample{key:k,samples} if *k==key(7)&&samples.len()==256)
+            );
+            assert_eq!(owner.status().workers.len(), 1);
+            drop(actor);
+            let closed = owner
+                .try_closed(Instant::now())
+                .unwrap_or_else(|_| panic!("joined outer must hand off"));
+            assert!(closed.observe().workers.ready);
+        }
+        #[test]
+        #[ignore = "requires HORIZON_TEST_RESOURCES"]
+        fn retained_lod_one_two_three_actual_sampling_children_are_independently_joined() {
+            for count in 1..=3 {
+                let gate = Gate::new(false);
+                let mut owner = prepare(FixtureSource::new(true, gate.clone()));
+                owner.start_count(count).unwrap();
+                for x in 0..count {
+                    enqueue(&owner, key(x as i32));
+                }
+                until(|| gate.entered.load(Ordering::Acquire) == count);
+                owner.begin_close(Instant::now(), Duration::ZERO);
+                assert_eq!(
+                    owner
+                        .status()
+                        .workers
+                        .iter()
+                        .filter(|w| w.role == LodRole::Sampling)
+                        .count(),
+                    count
+                );
+                owner.poll_close(Instant::now());
+                assert!(!owner.status().ready);
+                gate.release();
+                let closed = finish(owner);
+                assert_eq!(closed.observe().workers.workers.len(), count + 1);
+                assert!(
+                    closed
+                        .observe()
+                        .workers
+                        .workers
+                        .iter()
+                        .all(|w| w.joined && w.failure.is_none())
+                );
+            }
+        }
+        #[test]
+        #[ignore = "requires HORIZON_TEST_RESOURCES"]
+        fn retained_lod_factory_and_sampling_panics_preserve_checked_owners() {
+            for factory in [true, false] {
+                let source = Arc::new(FixtureSource {
+                    forks: !factory,
+                    gate: Gate::new(true),
+                    factories: AtomicUsize::new(0),
+                    panic_factory: factory,
+                    panic_grid: !factory,
+                    factory_gate: None,
+                    fork_gate: None,
+                });
+                let mut owner = prepare(source.clone());
+                owner.start_count(2).unwrap();
+                if !factory {
+                    enqueue(&owner, key(9));
+                }
+                until(|| owner.status().sealed);
+                let closed = finish(owner);
+                assert!(closed.observe().workers.workers.iter().any(|w| {
+                    w.failure
+                        .as_ref()
+                        .is_some_and(|e| e.stage == LodStage::Panic)
+                }));
+                let payloads = actors(&closed._group);
+                assert!(payloads.iter().any(|a| {
+                    a.lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .capability
+                        .is_some()
+                }));
+                if !factory {
+                    assert!(
+                        payloads.iter().any(|a| a
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .active
+                            .is_some())
+                    );
+                }
+                assert_eq!(source.factories.load(Ordering::Acquire), 1);
+            }
+        }
+        #[test]
+        #[ignore = "requires HORIZON_TEST_RESOURCES"]
+        fn retained_lod_outer_and_partial_sampling_spawn_refusal_retain_pending_inputs() {
+            for role in [LodRole::Outer, LodRole::Sampling] {
+                let source = FixtureSource::new(true, Gate::new(true));
+                let mut owner = prepare(source.clone());
+                if role == LodRole::Sampling {
+                    owner.group.refuse_spawn_after(role, 1);
+                } else {
+                    owner.group.refuse_spawn(role);
+                }
+                let started = owner.start_count(3);
+                if role == LodRole::Outer {
+                    assert!(started.is_err());
+                } else {
+                    started.unwrap();
+                }
+                until(|| owner.status().sealed);
+                let closed = finish(owner);
+                assert!(closed.observe().workers.workers.iter().any(|w| {
+                    w.role == role
+                        && w.failure
+                            .as_ref()
+                            .is_some_and(|f| f.stage == LodStage::Spawn)
+                }));
+                assert!(actors(&closed._group).iter().any(|a| {
+                    let a = a.lock().unwrap_or_else(|e| e.into_inner());
+                    a.capability.is_some() || a.sampler.is_some()
+                }));
+            }
+        }
+        #[test]
+        #[ignore = "requires HORIZON_TEST_RESOURCES"]
+        fn retained_lod_factory_and_fork_racing_close_keep_original_late_acquisition() {
+            for factory in [true, false] {
+                let gate = Gate::new(false);
+                let source = Arc::new(FixtureSource {
+                    forks: true,
+                    gate: Gate::new(true),
+                    factories: AtomicUsize::new(0),
+                    panic_factory: false,
+                    panic_grid: false,
+                    factory_gate: factory.then(|| gate.clone()),
+                    fork_gate: (!factory).then(|| gate.clone()),
+                });
+                let mut owner = prepare(source.clone());
+                owner.start_count(3).unwrap();
+                until(|| gate.entered.load(Ordering::Acquire) == 1);
+                owner.begin_close(Instant::now(), Duration::ZERO);
+                assert!(!owner.poll_close(Instant::now()).workers.ready);
+                gate.release();
+                let closed = finish(owner);
+                let payloads = actors(&closed._group);
+                assert!(payloads.iter().any(|a| {
+                    a.lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .sampler
+                        .is_some()
+                }));
+                assert_eq!(source.factories.load(Ordering::Acquire), 1);
+                assert!(closed.observe().workers.workers.iter().all(|w| w.joined));
+                // No child performs a native callback after the permanent fence.
+                assert_eq!(source.gate.entered.load(Ordering::Acquire), 0);
+            }
+        }
+        #[test]
+        #[ignore = "requires HORIZON_TEST_RESOURCES"]
+        fn retained_lod_queued_observed_and_mesh_snapshot_survive_unstarted_close() {
+            let mut owner = prepare(FixtureSource::new(false, Gate::new(true)));
+            let context = context();
+            let root =
+                std::path::PathBuf::from(std::env::var_os("HORIZON_TEST_RESOURCES").unwrap());
+            let facts = BlockFacts::load(&root, context.assets.registry).unwrap();
+            let chunk = Arc::new(Chunk::empty(20, 30));
+            owner
+                .observe_chunk(chunk.clone(), &facts)
+                .unwrap_or_else(|_| panic!("running observer refused original chunk"));
+            let samples = Arc::new(vec![Column::default(); 256]);
+            let snapshot = Snapshot {
+                active: [key(0)].into_iter().collect(),
+                samples: [(key(0), samples.clone())].into_iter().collect(),
+                saved: FxHashMap::default(),
+                reduced: FxHashMap::default(),
+            };
+            owner
+                .group
+                .shared
+                .jobs
+                .lock()
+                .unwrap()
+                .push_back(Job::Mesh {
+                    snapshot,
+                    keys: vec![key(0)],
+                    finer: FxHashMap::default(),
+                    covered: FxHashSet::default(),
+                    bounds: None,
+                });
+            let closed = finish(owner);
+            assert!(Arc::ptr_eq(
+                closed
+                    ._group
+                    .shared
+                    .observed
+                    .lock()
+                    .unwrap()
+                    .get(&(20, 30))
+                    .unwrap(),
+                &chunk
+            ));
+            let jobs = closed._group.shared.jobs.lock().unwrap();
+            assert!(matches!(jobs.front(), Some(Job::Observe((20, 30)))));
+            assert!(
+                matches!(&jobs[1],Job::Mesh{snapshot,..} if Arc::ptr_eq(&snapshot.samples[&key(0)],&samples))
+            );
+        }
+        #[test]
+        #[ignore = "requires HORIZON_TEST_RESOURCES"]
+        fn retained_lod_active_observe_and_partial_mesh_keep_original_inputs_on_stop_or_panic() {
+            let context = context();
+            let root =
+                std::path::PathBuf::from(std::env::var_os("HORIZON_TEST_RESOURCES").unwrap());
+            let facts = BlockFacts::load(&root, context.assets.registry).unwrap();
+            for kind in [WorkKind::Observe, WorkKind::Mesh] {
+                for panic in [false, true] {
+                    let mut owner = prepare(FixtureSource::new(false, Gate::new(true)));
+                    let gate = Arc::new(WorkGate {
+                        kind,
+                        entered: AtomicBool::new(false),
+                        released: Mutex::new(false),
+                        wake: Condvar::new(),
+                        panic,
+                    });
+                    owner.group.registry.lock().unwrap().work_gate = Some(gate.clone());
+                    let chunk = Arc::new(Chunk::empty(11, 12));
+                    let newer = Arc::new(Chunk::empty(11, 12));
+                    let samples = Arc::new(vec![Column::default(); 256]);
+                    if kind == WorkKind::Observe {
+                        owner
+                            .observe_chunk(chunk.clone(), &facts)
+                            .unwrap_or_else(|_| panic!("observer refused"));
+                    } else {
+                        let snapshot = Snapshot {
+                            active: [key(0), key(1)].into_iter().collect(),
+                            samples: [(key(0), samples.clone()), (key(1), samples.clone())]
+                                .into_iter()
+                                .collect(),
+                            saved: FxHashMap::default(),
+                            reduced: FxHashMap::default(),
+                        };
+                        owner
+                            .group
+                            .shared
+                            .jobs
+                            .lock()
+                            .unwrap()
+                            .push_back(Job::Mesh {
+                                snapshot,
+                                keys: vec![key(0), key(1)],
+                                finer: FxHashMap::default(),
+                                covered: FxHashSet::default(),
+                                bounds: None,
+                            });
+                    }
+                    owner.start_count(0).unwrap();
+                    until(|| gate.entered.load(Ordering::Acquire));
+                    if kind == WorkKind::Observe {
+                        // The active original has moved into the actor, so an
+                        // edit during summary must enqueue its own original Arc.
+                        owner
+                            .observe_chunk(newer.clone(), &facts)
+                            .unwrap_or_else(|_| panic!("newer observation refused"));
+                    }
+                    owner.begin_close(Instant::now(), Duration::ZERO);
+                    assert!(!owner.poll_close(Instant::now()).workers.ready);
+                    *gate.released.lock().unwrap() = true;
+                    gate.wake.notify_all();
+                    let closed = finish(owner);
+                    let payloads = actors(&closed._group);
+                    let actor = payloads[0].lock().unwrap_or_else(|e| e.into_inner());
+                    assert!(actor.active.is_some());
+                    if kind == WorkKind::Observe {
+                        assert!(Arc::ptr_eq(actor.observed.as_ref().unwrap(), &chunk));
+                        assert!(Arc::ptr_eq(
+                            closed
+                                ._group
+                                .shared
+                                .observed
+                                .lock()
+                                .unwrap()
+                                .get(&(11, 12))
+                                .unwrap(),
+                            &newer
+                        ));
+                        assert!(matches!(
+                            closed._group.shared.jobs.lock().unwrap().front(),
+                            Some(Job::Observe((11, 12)))
+                        ));
+                        if !panic {
+                            assert!(matches!(&actor.late[0], Done::Observed((11, 12), _)));
+                        }
+                    } else {
+                        assert_eq!(
+                            actor.meshes.len(),
+                            1,
+                            "first actual mesh result must remain owned"
+                        );
+                        assert!(
+                            matches!(&**actor.active.as_ref().unwrap(),Job::Mesh{snapshot,..} if Arc::ptr_eq(&snapshot.samples[&key(0)],&samples))
+                        );
+                    }
+                    assert_eq!(
+                        closed.observe().workers.workers.iter().any(|w| w
+                            .failure
+                            .as_ref()
+                            .is_some_and(|f| f.stage == LodStage::Panic)),
+                        panic
+                    );
+                }
+            }
+        }
+        #[test]
+        #[ignore = "requires pinned actual worldgen and HORIZON_TEST_RESOURCES"]
+        fn retained_lod_real_persistent_vanilla_whole_family_keeps_exact_source_and_save() {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let root =
+                std::path::PathBuf::from(std::env::var_os("HORIZON_TEST_RESOURCES").unwrap());
+            let context = context();
+            let path = std::env::temp_dir().join(format!(
+                "retained-lod-whole-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&path).unwrap();
+            let terrain = Arc::new(
+                crate::vanillagen::VanillaTerrain::new(
+                    &root.join("worldgen"),
+                    context.assets.registry,
+                    &context.biomes,
+                    1234,
+                )
+                .unwrap(),
+            );
+            let save = Arc::new(crate::save::SaveDir::new(path.clone()));
+            let persistent = Arc::new(crate::save::Persistent {
+                inner: terrain.clone(),
+                save: save.clone(),
+                registry: context.assets.clone(),
+                biomes: context.biomes.clone(),
+            });
+            let weak_terrain = Arc::downgrade(&terrain);
+            let weak_save = Arc::downgrade(&save);
+            let weak_wrapper = Arc::downgrade(&persistent);
+            let capability = ChunkGenerator::retained_lod_capability(persistent.clone())
+                .expect("actual Persistent<VanillaTerrain> must opt in");
+            let source: Arc<dyn LodSource> = persistent.clone();
+            assert!(capability.matches_source(&source));
+            let mut owner = RetainedLod::prepare(source.clone(), Some(capability), context)
+                .unwrap_or_else(|_| panic!("actual provider refused"));
+            owner.start_count(2).unwrap();
+            until(|| owner.status().workers.len() == 4);
+            assert_eq!(
+                owner
+                    .status()
+                    .workers
+                    .iter()
+                    .filter(|w| w.role == LodRole::Decoration)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                owner
+                    .status()
+                    .workers
+                    .iter()
+                    .filter(|w| w.role == LodRole::Sampling)
+                    .count(),
+                2
+            );
+            enqueue(&owner, key(0));
+            let mut sampled = false;
+            until(|| {
+                if let Ok(done) = owner.lod.as_ref().unwrap().results.try_recv() {
+                    if let Done::Sample { samples, .. } = done {
+                        assert_eq!(samples.len(), 256);
+                        assert!(samples.iter().any(|c| c.surface.is_some()));
+                        sampled = true;
+                    } else {
+                        panic!("unexpected whole-family sample result");
+                    }
+                }
+                assert!(
+                    !owner.status().workers.iter().any(|w| w.failure.is_some()),
+                    "production factory or sampling failed"
+                );
+                sampled
+            });
+            let closed = finish(owner);
+            assert!(Arc::ptr_eq(&closed._source, &source));
+            assert!(
+                Arc::ptr_eq(&persistent.inner, &terrain) && Arc::ptr_eq(&persistent.save, &save)
+            );
+            assert!(
+                closed
+                    .observe()
+                    .workers
+                    .workers
+                    .iter()
+                    .all(|w| w.joined && w.failure.is_none())
+            );
+            assert!(
+                !path.join("region").exists(),
+                "saved-column absence must remain read-only"
+            );
+            drop(source);
+            drop(persistent);
+            drop(terrain);
+            drop(save);
+            assert!(
+                weak_wrapper.upgrade().is_some()
+                    && weak_terrain.upgrade().is_some()
+                    && weak_save.upgrade().is_some()
+            );
+            drop(closed);
+            assert!(
+                weak_wrapper.upgrade().is_none()
+                    && weak_terrain.upgrade().is_none()
+                    && weak_save.upgrade().is_none(),
+                "closed registry must have no strong ownership cycle"
+            );
+            std::fs::remove_dir(&path).unwrap();
+        }
+        #[test]
+        #[ignore = "requires HORIZON_TEST_RESOURCES"]
+        fn retained_lod_finished_without_join_is_not_closed_and_inputs_are_returned() {
+            let mut owner = prepare(FixtureSource::new(false, Gate::new(true)));
+            owner.start_count(0).unwrap();
+            owner.begin_close(Instant::now(), Duration::from_secs(1));
+            until(|| owner.status().workers.iter().all(|w| w.finished));
+            assert!(!owner.status().ready);
+            owner = owner
+                .try_closed(Instant::now())
+                .err()
+                .expect("finished is not joined");
+            let context = context();
+            let root =
+                std::path::PathBuf::from(std::env::var_os("HORIZON_TEST_RESOURCES").unwrap());
+            let facts = BlockFacts::load(&root, context.assets.registry).unwrap();
+            let chunk = Arc::new(Chunk::empty(4, 5));
+            let returned = owner.observe_chunk(chunk.clone(), &facts).err().unwrap();
+            assert!(Arc::ptr_eq(&chunk, &returned));
+            let covered: FxHashSet<_> = [(1, 2), (3, 4)].into_iter().collect();
+            let returned = owner
+                .update_frame([0., 70., 0.], 0., 4, 64, Some(covered.clone()))
+                .err()
+                .unwrap();
+            assert_eq!(returned, Some(covered));
+            let closed = finish(owner);
+            assert!(closed.observe().workers.ready);
+        }
+        #[test]
+        #[ignore = "separate fatal child requires HORIZON_TEST_RESOURCES"]
+        fn retained_lod_unresolved_owner_drop_aborts() {
+            let _owner = prepare(FixtureSource::new(false, Gate::new(true)));
+            eprintln!("S1LD1_UNRESOLVED_LOD_DROP_ARMED");
+        }
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
