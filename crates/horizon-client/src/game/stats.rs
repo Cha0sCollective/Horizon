@@ -150,12 +150,7 @@ impl Stats {
     /// `ServerStatsCounter.save`.
     pub(super) fn write(&self, path: &Path) -> horizon_client::Result<()> {
         let json = self.to_json();
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).map_err(|error| format!("{}: {error}", path.display()))?;
-        }
-        let text = serde_json::to_string_pretty(&json)
-            .map_err(|error| format!("{}: {error}", path.display()))?;
-        std::fs::write(path, text).map_err(|error| format!("{}: {error}", path.display()).into())
+        write_stats_json(path, &json)
     }
     fn save_local_to(
         &self,
@@ -169,6 +164,161 @@ impl Stats {
         }
         let Some(uuid) = uuid else { return Ok(()) };
         self.write(&player_json(world, "stats", uuid))
+    }
+}
+
+fn write_stats_json(path: &Path, json: &serde_json::Value) -> horizon_client::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|error| format!("{}: {error}", path.display()))?;
+    }
+    let text = serde_json::to_string_pretty(json)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    std::fs::write(path, text).map_err(|error| format!("{}: {error}", path.display()).into())
+}
+
+#[cfg(feature = "paired-packages")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::game) enum StatsSkip {
+    Unloaded,
+    Remote,
+    NoPlayer,
+    MissingUuid,
+}
+
+#[cfg(feature = "paired-packages")]
+#[derive(PartialEq)]
+struct MetadataStatsState {
+    root: PathBuf,
+    uuid: Option<[i32; 4]>,
+    remote: bool,
+    no_player: bool,
+    loaded: bool,
+    values: BTreeMap<String, BTreeMap<String, i32>>,
+    phantom_tick: i32,
+    events: Vec<(String, String, Option<i32>)>,
+    dirty: BTreeMap<String, BTreeSet<String>>,
+}
+#[cfg(feature = "paired-packages")]
+impl MetadataStatsState {
+    fn guard(&self) -> Option<StatsSkip> {
+        if !self.loaded {
+            Some(StatsSkip::Unloaded)
+        } else if self.remote {
+            Some(StatsSkip::Remote)
+        } else if self.no_player {
+            Some(StatsSkip::NoPlayer)
+        } else if self.uuid.is_none() {
+            Some(StatsSkip::MissingUuid)
+        } else {
+            None
+        }
+    }
+}
+#[cfg(feature = "paired-packages")]
+pub(in crate::game) struct StatsExpected {
+    identity: std::sync::Arc<()>,
+    state: MetadataStatsState,
+}
+#[cfg(feature = "paired-packages")]
+#[derive(Clone)]
+pub(in crate::game) struct StatsInput {
+    identity: std::sync::Arc<()>,
+    native: Option<(PathBuf, serde_json::Value)>,
+    guard: Option<StatsSkip>,
+}
+#[cfg(feature = "paired-packages")]
+pub(in crate::game) struct StatsWritten {
+    identity: std::sync::Arc<()>,
+    guard: Option<StatsSkip>,
+}
+#[cfg(feature = "paired-packages")]
+impl StatsWritten {
+    pub(in crate::game) fn effect(&self) -> super::paired_close::MetadataEffect {
+        if self.guard.is_some() {
+            super::paired_close::MetadataEffect::Skipped
+        } else {
+            super::paired_close::MetadataEffect::Completed
+        }
+    }
+}
+#[cfg(feature = "paired-packages")]
+impl StatsInput {
+    #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+    pub(in crate::game) fn guard(&self) -> Option<StatsSkip> {
+        self.guard
+    }
+    #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+    pub(in crate::game) fn path(&self) -> Option<&Path> {
+        self.native.as_ref().map(|(path, _)| path.as_path())
+    }
+    pub(in crate::game) fn write_native(&self) -> horizon_client::Result<StatsWritten> {
+        if let Some((path, json)) = &self.native {
+            write_stats_json(path, json)?;
+        }
+        Ok(StatsWritten {
+            identity: self.identity.clone(),
+            guard: self.guard,
+        })
+    }
+}
+#[cfg(feature = "paired-packages")]
+impl Game<'_> {
+    fn metadata_stats_state(&self) -> MetadataStatsState {
+        MetadataStatsState {
+            root: self.world_root.clone(),
+            uuid: self.level.player_uuid,
+            remote: self.remote.is_some(),
+            no_player: self.no_player_here(),
+            loaded: self.stats.loaded,
+            values: self.stats.values.clone(),
+            phantom_tick: self.stats.phantom_tick,
+            events: self.stats.events.clone(),
+            dirty: self.stats.dirty.clone(),
+        }
+    }
+    pub(in crate::game) fn prepare_metadata_stats(&self) -> (StatsExpected, StatsInput) {
+        let state = self.metadata_stats_state();
+        let guard = state.guard();
+        let native = if guard.is_some() {
+            None
+        } else {
+            Some((
+                player_json(
+                    &state.root,
+                    "stats",
+                    state.uuid.expect("selected stats UUID"),
+                ),
+                self.stats.to_json(),
+            ))
+        };
+        let identity = std::sync::Arc::new(());
+        (
+            StatsExpected {
+                identity: identity.clone(),
+                state,
+            },
+            StatsInput {
+                identity,
+                native,
+                guard,
+            },
+        )
+    }
+    pub(in crate::game) fn preflight_metadata_stats(
+        &self,
+        expected: &StatsExpected,
+        written: &StatsWritten,
+    ) -> horizon_client::Result<()> {
+        if !std::sync::Arc::ptr_eq(&expected.identity, &written.identity)
+            || written.guard != expected.state.guard()
+            || self.metadata_stats_state() != expected.state
+        {
+            return Err("retained stats metadata owner/input/guard mismatch".into());
+        }
+        Ok(())
+    }
+    pub(in crate::game) fn commit_metadata_stats(&mut self, _expected: &StatsExpected) {
+        // Disk writes do not acknowledge network statistics or scoreboard events.
     }
 }
 /// `players/<dir>/<uuid>.json` of a world (advancements, stats).

@@ -83,6 +83,306 @@ fn in_range(v: i32, (lo, hi): IntRange) -> bool {
     lo.is_none_or(|l| v >= l) && hi.is_none_or(|h| v <= h)
 }
 
+#[cfg(feature = "paired-packages")]
+#[derive(PartialEq)]
+struct RetainedRecorded {
+    health_bits: Option<u32>,
+    integers: [Option<i32>; 5],
+}
+#[cfg(feature = "paired-packages")]
+impl Recorded {
+    fn retained_snapshot(&self) -> RetainedRecorded {
+        RetainedRecorded {
+            health_bits: self.health_and_absorption.map(f32::to_bits),
+            integers: [self.food, self.air, self.armor, self.xp, self.level],
+        }
+    }
+}
+#[cfg(feature = "paired-packages")]
+#[derive(PartialEq)]
+struct RetainedBorder {
+    packed: Tag,
+    absolute: i32,
+    speed_bits: u64,
+    previous_bounds: [u64; 4],
+    current_bounds: [u64; 4],
+}
+#[cfg(feature = "paired-packages")]
+fn retained_border(border: &horizon_client::worldborder::WorldBorder) -> RetainedBorder {
+    RetainedBorder {
+        packed: border.pack(),
+        absolute: border.absolute_max_size(),
+        speed_bits: border.lerp_speed().to_bits(),
+        previous_bounds: border.geometry().bounds(0.0).map(f64::to_bits),
+        current_bounds: border.geometry().bounds(1.0).map(f64::to_bits),
+    }
+}
+#[cfg(feature = "paired-packages")]
+pub(in crate::game) struct ScoreMetadataExpected {
+    root: std::path::PathBuf,
+    loaded: bool,
+    remote: bool,
+    board: Scoreboard,
+    storage: horizon_client::command_storage::CommandStorage,
+    stopwatches: horizon_client::stopwatches::RetainedStopwatchExpected,
+    recorded: RetainedRecorded,
+    border: RetainedBorder,
+}
+#[cfg(feature = "paired-packages")]
+#[derive(Clone)]
+pub(in crate::game) struct ScoreMetadataInput {
+    #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+    control: Option<super::paired_close::MetadataTestControl>,
+    root: std::path::PathBuf,
+    active: bool,
+    storage: horizon_client::command_storage::CommandStorage,
+    stopwatches: Option<horizon_client::stopwatches::RetainedStopwatchInput>,
+    border: Tag,
+    border_default: bool,
+    board: Tag,
+    board_default: bool,
+}
+#[cfg(feature = "paired-packages")]
+pub(in crate::game) struct ScoreMetadataPost {
+    root: std::path::PathBuf,
+    active: bool,
+    storage: Option<horizon_client::command_storage::CommandStorage>,
+    stopwatches: Option<horizon_client::stopwatches::RetainedStopwatchPost>,
+}
+#[cfg(feature = "paired-packages")]
+pub(in crate::game) struct ScoreMetadataIo {
+    /// Storage is one opaque native operation: Completed does not enumerate
+    /// namespace files. An error leaves every namespace's subfile effect unknown.
+    pub effects: [super::paired_close::MetadataEffect; 4],
+    pub result: Result<ScoreMetadataPost, String>,
+}
+#[cfg(feature = "paired-packages")]
+impl ScoreMetadataInput {
+    #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+    pub(in crate::game) fn with_test_control(
+        mut self,
+        control: Option<super::paired_close::MetadataTestControl>,
+    ) -> Self {
+        self.control = control;
+        self
+    }
+    #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+    fn before_family(&self, family: super::paired_close::MetadataFamily) {
+        if let Some(control) = &self.control {
+            control.before_family(family);
+        }
+    }
+    pub(in crate::game) fn write_native(&self) -> ScoreMetadataIo {
+        use super::paired_close::MetadataEffect as E;
+        let mut effects = [E::Unattempted; 4];
+        if !self.active {
+            return ScoreMetadataIo {
+                effects: [E::Skipped; 4],
+                result: Ok(ScoreMetadataPost {
+                    root: self.root.clone(),
+                    active: false,
+                    storage: None,
+                    stopwatches: None,
+                }),
+            };
+        }
+        let mut storage = self.storage.clone();
+        #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+        self.before_family(super::paired_close::MetadataFamily::Storage);
+        if let Err(error) = storage.save(&self.root) {
+            effects[0] = E::Unknown;
+            return ScoreMetadataIo {
+                effects,
+                result: Err(format!(
+                    "command storage namespace effects unknown: {error}"
+                )),
+            };
+        }
+        effects[0] = E::Completed;
+        #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+        self.before_family(super::paired_close::MetadataFamily::Stopwatches);
+        let stopwatches = match self.stopwatches.as_ref().unwrap().write(&self.root) {
+            Ok(post) => {
+                effects[1] = if post.did_write() {
+                    E::Completed
+                } else {
+                    E::Skipped
+                };
+                post
+            }
+            Err(error) => {
+                effects[1] = E::Unknown;
+                return ScoreMetadataIo {
+                    effects,
+                    result: Err(error),
+                };
+            }
+        };
+        let border_path = self.root.join("data/minecraft/world_border.dat");
+        #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+        self.before_family(super::paired_close::MetadataFamily::Border);
+        let border_exists = if self.border_default {
+            match border_path.try_exists() {
+                Ok(exists) => exists,
+                Err(error) => {
+                    effects[2] = E::Unknown;
+                    return ScoreMetadataIo {
+                        effects,
+                        result: Err(format!("{}: {error}", border_path.display())),
+                    };
+                }
+            }
+        } else {
+            true
+        };
+        if border_exists {
+            if let Err(error) = save::write_dat(
+                &border_path,
+                Tag::compound([
+                    ("data", self.border.clone()),
+                    ("DataVersion", Tag::Int(horizon_world::DATA_VERSION)),
+                ]),
+            ) {
+                effects[2] = E::Unknown;
+                return ScoreMetadataIo {
+                    effects,
+                    result: Err(error.to_string()),
+                };
+            }
+            effects[2] = E::Completed;
+        } else {
+            effects[2] = E::Skipped;
+        }
+        let board_path = self.root.join("data/minecraft/scoreboard.dat");
+        #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+        self.before_family(super::paired_close::MetadataFamily::Scoreboard);
+        let board_exists = if self.board_default {
+            match board_path.try_exists() {
+                Ok(exists) => exists,
+                Err(error) => {
+                    effects[3] = E::Unknown;
+                    return ScoreMetadataIo {
+                        effects,
+                        result: Err(format!("{}: {error}", board_path.display())),
+                    };
+                }
+            }
+        } else {
+            true
+        };
+        if board_exists {
+            if let Err(error) = save::write_dat(
+                &board_path,
+                Tag::compound([
+                    ("data", self.board.clone()),
+                    ("DataVersion", Tag::Int(horizon_world::DATA_VERSION)),
+                ]),
+            ) {
+                effects[3] = E::Unknown;
+                return ScoreMetadataIo {
+                    effects,
+                    result: Err(error.to_string()),
+                };
+            }
+            effects[3] = E::Completed;
+        } else {
+            effects[3] = E::Skipped;
+        }
+        ScoreMetadataIo {
+            effects,
+            result: Ok(ScoreMetadataPost {
+                root: self.root.clone(),
+                active: true,
+                storage: Some(storage),
+                stopwatches: Some(stopwatches),
+            }),
+        }
+    }
+}
+#[cfg(feature = "paired-packages")]
+impl Game<'_> {
+    pub(in crate::game) fn prepare_retained_score_metadata(
+        &self,
+        now_ms: i64,
+    ) -> Result<(ScoreMetadataExpected, ScoreMetadataInput), String> {
+        let active = self.score.loaded && self.remote.is_none();
+        let (stopwatches, input) = if active {
+            let (expected, input) = self.score.stopwatches.prepare_retained_save(now_ms)?;
+            (expected, Some(input))
+        } else {
+            (self.score.stopwatches.retained_state_snapshot(), None)
+        };
+        let expected = ScoreMetadataExpected {
+            root: self.world_root.clone(),
+            loaded: self.score.loaded,
+            remote: self.remote.is_some(),
+            board: self.score.board.clone(),
+            storage: self.score.storage.clone(),
+            stopwatches,
+            recorded: self.score.recorded.retained_snapshot(),
+            border: retained_border(&self.border),
+        };
+        let input = ScoreMetadataInput {
+            #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+            control: None,
+            root: self.world_root.clone(),
+            active,
+            storage: self.score.storage.clone(),
+            stopwatches: input,
+            border: self.border.pack(),
+            border_default: self.border == horizon_client::worldborder::WorldBorder::default(),
+            board: self.score.board.pack(),
+            board_default: self.score.board == Scoreboard::default(),
+        };
+        Ok((expected, input))
+    }
+    pub(in crate::game) fn preflight_retained_score_metadata(
+        &self,
+        expected: &ScoreMetadataExpected,
+        post: &ScoreMetadataPost,
+    ) -> Result<(), String> {
+        let active = expected.loaded && !expected.remote;
+        if self.world_root != expected.root
+            || self.remote.is_some() != expected.remote
+            || self.score.loaded != expected.loaded
+            || self.score.board != expected.board
+            || self.score.storage != expected.storage
+            || self.score.recorded.retained_snapshot() != expected.recorded
+            || retained_border(&self.border) != expected.border
+            || post.root != expected.root
+            || post.active != active
+            || !self
+                .score
+                .stopwatches
+                .matches_retained_state(&expected.stopwatches)
+        {
+            return Err("retained score metadata original state or route changed".into());
+        }
+        if active {
+            let Some(stopwatches) = post.stopwatches.as_ref() else {
+                return Err("retained stopwatch post missing".into());
+            };
+            if post.storage.is_none() {
+                return Err("retained command storage post missing".into());
+            }
+            self.score
+                .stopwatches
+                .preflight_retained_save(&expected.stopwatches, stopwatches)?;
+        } else if post.storage.is_some() || post.stopwatches.is_some() {
+            return Err("skipped score metadata cannot acknowledge markers".into());
+        }
+        Ok(())
+    }
+    pub(in crate::game) fn commit_retained_score_metadata(&mut self, post: ScoreMetadataPost) {
+        if let Some(storage) = post.storage {
+            self.score.storage = storage;
+        }
+        if let Some(stopwatches) = post.stopwatches {
+            self.score.stopwatches.commit_retained_save(stopwatches);
+        }
+    }
+}
+
 impl Game<'_> {
     fn scoreboard_path(&self) -> std::path::PathBuf {
         self.world_root.join("data/minecraft/scoreboard.dat")

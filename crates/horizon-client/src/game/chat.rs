@@ -89,6 +89,111 @@ impl WorldClock {
         )
     }
 }
+#[cfg(feature = "paired-packages")]
+pub(in crate::game) struct ClockMetadataExpected {
+    root: std::path::PathBuf,
+    remote: bool,
+    ticks: i64,
+    bits: [u32; 2],
+    paused: bool,
+}
+#[cfg(feature = "paired-packages")]
+#[derive(Clone)]
+pub(in crate::game) struct ClockMetadataInput {
+    root: std::path::PathBuf,
+    ticks: i64,
+    clock: WorldClock,
+}
+#[cfg(feature = "paired-packages")]
+pub(in crate::game) struct ClockMetadataPost {
+    root: std::path::PathBuf,
+    ticks: i64,
+    bits: [u32; 2],
+    paused: bool,
+}
+#[cfg(feature = "paired-packages")]
+pub(in crate::game) struct ClockMetadataIo {
+    pub effect: super::paired_close::MetadataEffect,
+    pub result: Result<ClockMetadataPost, String>,
+}
+#[cfg(feature = "paired-packages")]
+impl ClockMetadataInput {
+    pub(in crate::game) fn write_native(&self) -> ClockMetadataIo {
+        use super::paired_close::MetadataEffect as E;
+        let post = ClockMetadataPost {
+            root: self.root.clone(),
+            ticks: self.ticks,
+            bits: [self.clock.partial.to_bits(), self.clock.rate.to_bits()],
+            paused: self.clock.paused,
+        };
+        if self.root.as_os_str().is_empty() {
+            return ClockMetadataIo {
+                effect: E::Skipped,
+                result: Ok(post),
+            };
+        }
+        // The retained Game guard excludes Level::write while this concrete
+        // native strict read/merge/write runs. Unknown clocks stay native-owned.
+        match self.clock.save_to(&self.root, self.ticks) {
+            Ok(()) => ClockMetadataIo {
+                effect: E::Completed,
+                result: Ok(post),
+            },
+            Err(error) => ClockMetadataIo {
+                effect: E::Unknown,
+                result: Err(error.to_string()),
+            },
+        }
+    }
+}
+#[cfg(feature = "paired-packages")]
+impl Game<'_> {
+    pub(in crate::game) fn prepare_retained_clock_metadata(
+        &self,
+    ) -> (ClockMetadataExpected, ClockMetadataInput) {
+        (
+            ClockMetadataExpected {
+                root: self.world_root.clone(),
+                remote: self.remote.is_some(),
+                ticks: self.world.day_time,
+                bits: [
+                    self.ui.clock.partial.to_bits(),
+                    self.ui.clock.rate.to_bits(),
+                ],
+                paused: self.ui.clock.paused,
+            },
+            ClockMetadataInput {
+                root: self.world_root.clone(),
+                ticks: self.world.day_time,
+                clock: self.ui.clock,
+            },
+        )
+    }
+    pub(in crate::game) fn preflight_retained_clock_metadata(
+        &self,
+        expected: &ClockMetadataExpected,
+        post: &ClockMetadataPost,
+    ) -> Result<(), String> {
+        if self.world_root != expected.root
+            || self.remote.is_some() != expected.remote
+            || self.world.day_time != expected.ticks
+            || [
+                self.ui.clock.partial.to_bits(),
+                self.ui.clock.rate.to_bits(),
+            ] != expected.bits
+            || self.ui.clock.paused != expected.paused
+            || post.root != expected.root
+            || post.ticks != expected.ticks
+            || post.bits != expected.bits
+            || post.paused != expected.paused
+        {
+            return Err("retained clock original ticks, control bits or route changed".into());
+        }
+        Ok(())
+    }
+    pub(in crate::game) fn commit_retained_clock_metadata(&mut self, _post: ClockMetadataPost) {}
+}
+
 /// A clock time marker from the timelines (ClockTimeMarker).
 #[derive(Clone, Copy, Debug)]
 pub struct TimeMarker {

@@ -170,6 +170,175 @@ fn save_random_sequences_to<'a>(
     horizon_client::save::write_dat(path, tag)
 }
 
+#[cfg(feature = "paired-packages")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::game) enum RandomSequencesSkip {
+    Remote,
+}
+
+#[cfg(feature = "paired-packages")]
+type MetadataSequenceWords = std::collections::BTreeMap<String, (u64, u64)>;
+#[cfg(feature = "paired-packages")]
+#[derive(PartialEq)]
+struct MetadataSequenceState {
+    root: std::path::PathBuf,
+    remote: bool,
+    world: horizon_world::nbt::Tag,
+    local: Option<MetadataSequenceWords>,
+    guests: Option<std::collections::BTreeMap<u32, Option<MetadataSequenceWords>>>,
+}
+
+#[cfg(feature = "paired-packages")]
+pub(in crate::game) struct RandomSequencesExpected {
+    identity: std::sync::Arc<()>,
+    state: MetadataSequenceState,
+}
+#[cfg(feature = "paired-packages")]
+#[derive(Clone)]
+pub(in crate::game) struct RandomSequencesInput {
+    identity: std::sync::Arc<()>,
+    native: Option<(std::path::PathBuf, horizon_world::nbt::Tag)>,
+    guard: Option<RandomSequencesSkip>,
+}
+#[cfg(feature = "paired-packages")]
+pub(in crate::game) struct RandomSequencesWritten {
+    identity: std::sync::Arc<()>,
+    guard: Option<RandomSequencesSkip>,
+}
+#[cfg(feature = "paired-packages")]
+impl RandomSequencesWritten {
+    pub(in crate::game) fn effect(&self) -> super::paired_close::MetadataEffect {
+        if self.guard.is_some() {
+            super::paired_close::MetadataEffect::Skipped
+        } else {
+            super::paired_close::MetadataEffect::Completed
+        }
+    }
+}
+#[cfg(feature = "paired-packages")]
+impl RandomSequencesInput {
+    #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+    pub(in crate::game) fn guard(&self) -> Option<RandomSequencesSkip> {
+        self.guard
+    }
+    #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+    pub(in crate::game) fn path(&self) -> Option<&std::path::Path> {
+        self.native.as_ref().map(|(path, _)| path.as_path())
+    }
+    pub(in crate::game) fn write_native(&self) -> horizon_client::Result<RandomSequencesWritten> {
+        if let Some((path, tag)) = &self.native {
+            horizon_client::save::write_dat(path, tag.clone())?;
+        }
+        Ok(RandomSequencesWritten {
+            identity: self.identity.clone(),
+            guard: self.guard,
+        })
+    }
+}
+
+#[cfg(feature = "paired-packages")]
+impl Game<'_> {
+    fn metadata_sequence_state(&self) -> MetadataSequenceState {
+        let sequences = |session: &merchant::Session| -> MetadataSequenceWords {
+            session
+                .sequences
+                .iter()
+                .map(|(id, random)| (id.clone(), random.state_words()))
+                .collect()
+        };
+        MetadataSequenceState {
+            root: self.world_root.clone(),
+            remote: self.remote.is_some(),
+            world: self.rand_sequences.to_nbt(),
+            local: self
+                .station
+                .as_ref()
+                .and_then(|station| station.merchant.as_ref())
+                .map(|merchant| sequences(&merchant.session)),
+            guests: self.lan.as_ref().map(|host| {
+                host.play
+                    .iter()
+                    .map(|(connection, player)| {
+                        (
+                            *connection,
+                            player
+                                .merchant
+                                .as_ref()
+                                .map(|merchant| sequences(&merchant.merchant.session)),
+                        )
+                    })
+                    .collect()
+            }),
+        }
+    }
+    pub(in crate::game) fn prepare_metadata_random_sequences(
+        &self,
+    ) -> horizon_client::Result<(RandomSequencesExpected, RandomSequencesInput)> {
+        let state = self.metadata_sequence_state();
+        let guard = state.remote.then_some(RandomSequencesSkip::Remote);
+        let native = if guard.is_some() {
+            None
+        } else {
+            let local = self
+                .station
+                .as_ref()
+                .and_then(|station| station.merchant.as_ref())
+                .map(|merchant| merchant.session.as_ref());
+            let guests = self
+                .lan
+                .iter()
+                .flat_map(|host| host.play.values())
+                .filter_map(|player| player.merchant.as_ref())
+                .map(|merchant| merchant.merchant.session.as_ref());
+            let snapshot =
+                random_sequence_snapshot(&self.rand_sequences, local.into_iter().chain(guests))?;
+            Some((
+                self.random_sequences_path(),
+                horizon_world::nbt::Tag::compound([
+                    ("data", snapshot.to_nbt()),
+                    (
+                        "DataVersion",
+                        horizon_world::nbt::Tag::Int(horizon_world::DATA_VERSION),
+                    ),
+                ]),
+            ))
+        };
+        let identity = std::sync::Arc::new(());
+        Ok((
+            RandomSequencesExpected {
+                identity: identity.clone(),
+                state,
+            },
+            RandomSequencesInput {
+                identity,
+                native,
+                guard,
+            },
+        ))
+    }
+    pub(in crate::game) fn preflight_metadata_random_sequences(
+        &self,
+        expected: &RandomSequencesExpected,
+        written: &RandomSequencesWritten,
+    ) -> horizon_client::Result<()> {
+        let guard = expected.state.remote.then_some(RandomSequencesSkip::Remote);
+        if !std::sync::Arc::ptr_eq(&expected.identity, &written.identity)
+            || written.guard != guard
+            || self.metadata_sequence_state() != expected.state
+        {
+            return Err("retained random-sequence metadata owner/input/guard mismatch".into());
+        }
+        Ok(())
+    }
+    pub(in crate::game) fn commit_metadata_random_sequences(
+        &mut self,
+        _expected: &RandomSequencesExpected,
+    ) {
+        // Native random-sequence saving has no live saved marker. In particular,
+        // merchant loans stay with their original sessions throughout this batch.
+    }
+}
+
 impl Game<'_> {
     pub(super) fn random_sequences_path(&self) -> std::path::PathBuf {
         self.world_root.join("data/minecraft/random_sequences.dat")

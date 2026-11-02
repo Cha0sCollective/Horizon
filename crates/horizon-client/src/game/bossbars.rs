@@ -47,6 +47,171 @@ fn num(n: impl std::fmt::Display) -> Text {
     Text::literal(n.to_string())
 }
 
+#[cfg(feature = "paired-packages")]
+#[derive(PartialEq)]
+struct RetainedOffer {
+    id: u128,
+    name: Tag,
+    progress_bits: u32,
+    color: i32,
+    overlay: i32,
+    darken: bool,
+    music: bool,
+    fog: bool,
+    scope: Scope,
+}
+#[cfg(feature = "paired-packages")]
+fn retained_sent(state: &BossState) -> HashMap<u128, HashMap<u128, RetainedOffer>> {
+    state
+        .sent
+        .iter()
+        .map(|(&viewer, offers)| {
+            (
+                viewer,
+                offers
+                    .iter()
+                    .map(|(&id, offer)| {
+                        (
+                            id,
+                            RetainedOffer {
+                                id: offer.id,
+                                name: offer.name.clone(),
+                                progress_bits: offer.progress.to_bits(),
+                                color: offer.color,
+                                overlay: offer.overlay,
+                                darken: offer.darken,
+                                music: offer.music,
+                                fog: offer.fog,
+                                scope: offer.scope,
+                            },
+                        )
+                    })
+                    .collect(),
+            )
+        })
+        .collect()
+}
+#[cfg(feature = "paired-packages")]
+pub(in crate::game) struct BossMetadataExpected {
+    root: std::path::PathBuf,
+    remote: bool,
+    loaded: bool,
+    bars: BossBars,
+    sent: HashMap<u128, HashMap<u128, RetainedOffer>>,
+}
+#[cfg(feature = "paired-packages")]
+#[derive(Clone)]
+pub(in crate::game) struct BossMetadataInput {
+    path: std::path::PathBuf,
+    active: bool,
+    empty: bool,
+    data: Tag,
+}
+#[cfg(feature = "paired-packages")]
+pub(in crate::game) struct BossMetadataPost {
+    path: std::path::PathBuf,
+    active: bool,
+}
+#[cfg(feature = "paired-packages")]
+pub(in crate::game) struct BossMetadataIo {
+    pub effect: super::paired_close::MetadataEffect,
+    pub result: Result<BossMetadataPost, String>,
+}
+#[cfg(feature = "paired-packages")]
+impl BossMetadataInput {
+    pub(in crate::game) fn write_native(&self) -> BossMetadataIo {
+        use super::paired_close::MetadataEffect as E;
+        if !self.active {
+            return BossMetadataIo {
+                effect: E::Skipped,
+                result: Ok(BossMetadataPost {
+                    path: self.path.clone(),
+                    active: false,
+                }),
+            };
+        }
+        if self.empty {
+            match self.path.try_exists() {
+                Ok(false) => {
+                    return BossMetadataIo {
+                        effect: E::Skipped,
+                        result: Ok(BossMetadataPost {
+                            path: self.path.clone(),
+                            active: true,
+                        }),
+                    };
+                }
+                Ok(true) => {}
+                Err(error) => {
+                    return BossMetadataIo {
+                        effect: E::Unknown,
+                        result: Err(format!("{}: {error}", self.path.display())),
+                    };
+                }
+            }
+        }
+        match save::write_dat(
+            &self.path,
+            Tag::compound([
+                ("data", self.data.clone()),
+                ("DataVersion", Tag::Int(horizon_world::DATA_VERSION)),
+            ]),
+        ) {
+            Ok(()) => BossMetadataIo {
+                effect: E::Completed,
+                result: Ok(BossMetadataPost {
+                    path: self.path.clone(),
+                    active: true,
+                }),
+            },
+            Err(error) => BossMetadataIo {
+                effect: E::Unknown,
+                result: Err(error.to_string()),
+            },
+        }
+    }
+}
+#[cfg(feature = "paired-packages")]
+impl Game<'_> {
+    pub(in crate::game) fn prepare_retained_boss_metadata(
+        &self,
+    ) -> (BossMetadataExpected, BossMetadataInput) {
+        (
+            BossMetadataExpected {
+                root: self.world_root.clone(),
+                remote: self.remote.is_some(),
+                loaded: self.bosses.loaded,
+                bars: self.bosses.bars.clone(),
+                sent: retained_sent(&self.bosses),
+            },
+            BossMetadataInput {
+                path: self.bossbar_path(),
+                active: self.bosses.loaded && self.remote.is_none(),
+                empty: self.bosses.bars.bars.is_empty(),
+                data: self.bosses.bars.pack(),
+            },
+        )
+    }
+    pub(in crate::game) fn preflight_retained_boss_metadata(
+        &self,
+        expected: &BossMetadataExpected,
+        post: &BossMetadataPost,
+    ) -> Result<(), String> {
+        if self.world_root != expected.root
+            || self.remote.is_some() != expected.remote
+            || self.bosses.loaded != expected.loaded
+            || self.bosses.bars != expected.bars
+            || retained_sent(&self.bosses) != expected.sent
+            || post.path != self.bossbar_path()
+            || post.active != (expected.loaded && !expected.remote)
+        {
+            return Err("retained bossbar original owner state or route changed".into());
+        }
+        Ok(())
+    }
+    pub(in crate::game) fn commit_retained_boss_metadata(&mut self, _post: BossMetadataPost) {}
+}
+
 impl Game<'_> {
     fn bossbar_path(&self) -> std::path::PathBuf {
         self.world_root

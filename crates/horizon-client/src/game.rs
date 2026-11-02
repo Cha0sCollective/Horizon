@@ -138,6 +138,8 @@ mod packs;
 mod pad;
 mod pad_menu;
 mod paintings;
+#[cfg(feature = "paired-packages")]
+mod paired_close;
 mod pandas;
 mod passengers;
 mod persist;

@@ -121,6 +121,125 @@ impl Stopwatches {
     }
 }
 
+/// Opaque native timer state for the dormant retained metadata guard. Elapsed
+/// milliseconds are sampled once; worker attempts never consult the clock.
+#[cfg(feature = "paired-packages")]
+pub struct RetainedStopwatchExpected {
+    state: RetainedStopwatchState,
+    sampled_at: Option<i64>,
+}
+#[cfg(feature = "paired-packages")]
+#[derive(Clone, PartialEq)]
+struct RetainedStopwatchState {
+    watches: BTreeMap<String, Stopwatch>,
+    dirty: bool,
+}
+#[cfg(feature = "paired-packages")]
+#[derive(Clone)]
+pub struct RetainedStopwatchInput {
+    state: RetainedStopwatchState,
+    sampled_at: i64,
+    data: Tag,
+    skipped: bool,
+}
+#[cfg(feature = "paired-packages")]
+pub struct RetainedStopwatchPost {
+    state: RetainedStopwatchState,
+    sampled_at: i64,
+    wrote: bool,
+}
+#[cfg(feature = "paired-packages")]
+impl RetainedStopwatchPost {
+    pub fn did_write(&self) -> bool {
+        self.wrote
+    }
+}
+#[cfg(feature = "paired-packages")]
+impl RetainedStopwatchInput {
+    pub fn skipped(&self) -> bool {
+        self.skipped
+    }
+    pub fn write(&self, root: &Path) -> Result<RetainedStopwatchPost, String> {
+        if !self.skipped {
+            save::write_dat(&file(root), self.data.clone()).map_err(|error| error.to_string())?;
+        }
+        Ok(RetainedStopwatchPost {
+            state: self.state.clone(),
+            sampled_at: self.sampled_at,
+            wrote: !self.skipped,
+        })
+    }
+}
+#[cfg(feature = "paired-packages")]
+impl Stopwatches {
+    pub fn retained_state_snapshot(&self) -> RetainedStopwatchExpected {
+        RetainedStopwatchExpected {
+            state: RetainedStopwatchState {
+                watches: self.watches.clone(),
+                dirty: self.dirty,
+            },
+            sampled_at: None,
+        }
+    }
+    pub fn matches_retained_state(&self, expected: &RetainedStopwatchExpected) -> bool {
+        self.watches == expected.state.watches && self.dirty == expected.state.dirty
+    }
+    pub fn prepare_retained_save(
+        &self,
+        now: i64,
+    ) -> Result<(RetainedStopwatchExpected, RetainedStopwatchInput), String> {
+        let state = RetainedStopwatchState {
+            watches: self.watches.clone(),
+            dirty: self.dirty,
+        };
+        let mut map = Compound::new();
+        for (id, watch) in &self.watches {
+            let elapsed = i64::try_from(
+                i128::from(watch.accumulated) + i128::from(now) - i128::from(watch.creation_time),
+            )
+            .map_err(|_| format!("stopwatch elapsed milliseconds overflow: {id}"))?;
+            map.insert(id.as_str().into(), Tag::Long(elapsed));
+        }
+        let data = Tag::compound([
+            ("data", Tag::compound([("stopwatches", Tag::Compound(map))])),
+            ("DataVersion", Tag::Int(horizon_world::DATA_VERSION)),
+        ]);
+        let input = RetainedStopwatchInput {
+            state: state.clone(),
+            sampled_at: now,
+            data,
+            skipped: !self.dirty && self.watches.is_empty(),
+        };
+        Ok((
+            RetainedStopwatchExpected {
+                state,
+                sampled_at: Some(now),
+            },
+            input,
+        ))
+    }
+    pub fn preflight_retained_save(
+        &self,
+        expected: &RetainedStopwatchExpected,
+        post: &RetainedStopwatchPost,
+    ) -> Result<(), String> {
+        if !self.matches_retained_state(expected)
+            || post.state != expected.state
+            || Some(post.sampled_at) != expected.sampled_at
+        {
+            return Err("retained stopwatch original state or attempt changed".into());
+        }
+        Ok(())
+    }
+    /// The batch owner preflights every family before any commit. This only
+    /// acknowledges the original dirty marker; timers keep running unchanged.
+    pub fn commit_retained_save(&mut self, post: RetainedStopwatchPost) {
+        if post.wrote {
+            self.dirty = false;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -145,6 +264,54 @@ mod tests {
             Some(&Tag::Int(horizon_world::DATA_VERSION))
         );
         tag.get("data").unwrap().get("stopwatches").unwrap().clone()
+    }
+
+    #[cfg(feature = "paired-packages")]
+    #[test]
+    fn retained_stopwatch_fixed_i64_native_retry_and_state_preflight() {
+        let root = scratch("retained-exact");
+        let mut watches = Stopwatches::default();
+        watches.watches.insert(
+            "test:exact".into(),
+            Stopwatch {
+                creation_time: 100,
+                accumulated: 9_007_199_254_740_993,
+            },
+        );
+        watches.dirty = true;
+        let before = watches.watches.clone();
+        let (expected, input) = watches.prepare_retained_save(160).unwrap();
+        let blocked = file(&root).with_file_name("stopwatches.dat_new");
+        std::fs::create_dir_all(&blocked).unwrap();
+        assert!(input.write(&root).is_err());
+        assert!(watches.dirty);
+        assert_eq!(watches.watches, before);
+        std::fs::remove_dir(blocked).unwrap();
+        let post = input.clone().write(&root).unwrap();
+        let mut changed = watches.clone();
+        changed.watches.get_mut("test:exact").unwrap().accumulated += 1;
+        assert!(changed.preflight_retained_save(&expected, &post).is_err());
+        assert!(changed.dirty && watches.dirty);
+        watches.preflight_retained_save(&expected, &post).unwrap();
+        watches.commit_retained_save(post);
+        assert!(!watches.dirty);
+        assert_eq!(watches.watches, before);
+        assert_eq!(
+            saved_watches(&root).get("test:exact"),
+            Some(&Tag::Long(9_007_199_254_741_053))
+        );
+        let mut overflow = Stopwatches::default();
+        overflow.watches.insert(
+            "test:overflow".into(),
+            Stopwatch {
+                creation_time: -1,
+                accumulated: i64::MAX,
+            },
+        );
+        overflow.dirty = true;
+        assert!(overflow.prepare_retained_save(1).is_err());
+        assert!(overflow.dirty);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

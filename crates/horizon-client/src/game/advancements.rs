@@ -108,10 +108,13 @@ pub(super) fn write_progress(
     tree: &Tree,
 ) -> horizon_client::Result<()> {
     let json = progress.to_json(tree, horizon_world::DATA_VERSION);
+    write_progress_json(path, &json)
+}
+fn write_progress_json(path: &std::path::Path, json: &Value) -> horizon_client::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|error| format!("{}: {error}", path.display()))?;
     }
-    let text = serde_json::to_string_pretty(&json)
+    let text = serde_json::to_string_pretty(json)
         .map_err(|error| format!("{}: {error}", path.display()))?;
     std::fs::write(path, text).map_err(|error| format!("{}: {error}", path.display()).into())
 }
@@ -132,6 +135,554 @@ impl AdvState {
             &self.progress,
             &self.tree,
         )
+    }
+}
+
+#[cfg(feature = "paired-packages")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::game) enum AdvancementsSkip {
+    Unloaded,
+    Remote,
+    NoPlayer,
+    MissingUuid,
+}
+
+#[cfg(feature = "paired-packages")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::game) enum RetainedTreeStatus {
+    Unstarted,
+    Pending,
+    Ready,
+    Skipped(AdvancementsSkip),
+    Failed(String),
+}
+#[cfg(feature = "paired-packages")]
+struct RetainedTreeOriginal {
+    world: std::path::PathBuf,
+    data: std::path::PathBuf,
+    tree: Arc<Tree>,
+    install_result: bool,
+}
+/// The actual handle remains in the original AdvState. This non-Clone state
+/// guards its identity and keeps every harvested native result/failure.
+#[cfg(feature = "paired-packages")]
+pub(in crate::game) struct RetainedTreeState {
+    original: Option<RetainedTreeOriginal>,
+    thread: Option<std::thread::ThreadId>,
+    ready: Option<Arc<Tree>>,
+    harvested: Option<Arc<Tree>>,
+    status: RetainedTreeStatus,
+    failures: Vec<String>,
+    #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+    control: Option<RetainedTreeTestControl>,
+}
+#[cfg(feature = "paired-packages")]
+impl Default for RetainedTreeState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+#[cfg(feature = "paired-packages")]
+impl RetainedTreeState {
+    pub(in crate::game) fn new() -> Self {
+        Self {
+            original: None,
+            thread: None,
+            ready: None,
+            harvested: None,
+            status: RetainedTreeStatus::Unstarted,
+            failures: Vec::new(),
+            #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+            control: None,
+        }
+    }
+    pub(in crate::game) fn status(&self) -> &RetainedTreeStatus {
+        &self.status
+    }
+    pub(in crate::game) fn unresolved(&self) -> bool {
+        self.thread.is_some()
+    }
+    fn failed(&mut self, error: impl Into<String>) -> RetainedTreeStatus {
+        let error = error.into();
+        if self.failures.last() != Some(&error) {
+            self.failures.push(error.clone());
+        }
+        self.status = RetainedTreeStatus::Failed(error);
+        self.status.clone()
+    }
+    fn ready_for(&self, game: &Game<'_>) -> bool {
+        self.status == RetainedTreeStatus::Ready
+            && self.thread.is_none()
+            && game.adv.pending_tree.is_none()
+            && self
+                .ready
+                .as_ref()
+                .is_some_and(|tree| Arc::ptr_eq(tree, &game.adv.tree))
+            && self.original.as_ref().is_some_and(|original| {
+                original.world == game.world_root
+                    && original.data == game.options.resources.join("data")
+            })
+    }
+}
+#[cfg(feature = "paired-packages")]
+impl Drop for RetainedTreeState {
+    fn drop(&mut self) {
+        if self.thread.is_some() {
+            use std::io::Write;
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "fatal: unresolved retained advancement tree helper"
+            );
+            std::process::abort();
+        }
+    }
+}
+
+#[cfg(feature = "paired-packages")]
+#[derive(PartialEq)]
+struct MetadataAdvancementsRoute {
+    root: std::path::PathBuf,
+    uuid: Option<[i32; 4]>,
+    remote: bool,
+    no_player: bool,
+    loaded: bool,
+}
+#[cfg(feature = "paired-packages")]
+impl MetadataAdvancementsRoute {
+    fn guard(&self) -> Option<AdvancementsSkip> {
+        if !self.loaded {
+            Some(AdvancementsSkip::Unloaded)
+        } else if self.remote {
+            Some(AdvancementsSkip::Remote)
+        } else if self.no_player {
+            Some(AdvancementsSkip::NoPlayer)
+        } else if self.uuid.is_none() {
+            Some(AdvancementsSkip::MissingUuid)
+        } else {
+            None
+        }
+    }
+}
+#[cfg(feature = "paired-packages")]
+pub(in crate::game) struct AdvancementsExpected {
+    identity: Arc<()>,
+    route: MetadataAdvancementsRoute,
+    tree: Arc<Tree>,
+    progress: BTreeMap<String, BTreeMap<String, String>>,
+}
+#[cfg(feature = "paired-packages")]
+#[derive(Clone)]
+pub(in crate::game) struct AdvancementsInput {
+    identity: Arc<()>,
+    native: Option<(std::path::PathBuf, Value)>,
+    guard: Option<AdvancementsSkip>,
+}
+#[cfg(feature = "paired-packages")]
+pub(in crate::game) struct AdvancementsWritten {
+    identity: Arc<()>,
+    guard: Option<AdvancementsSkip>,
+}
+#[cfg(feature = "paired-packages")]
+impl AdvancementsWritten {
+    pub(in crate::game) fn effect(&self) -> super::paired_close::MetadataEffect {
+        if self.guard.is_some() {
+            super::paired_close::MetadataEffect::Skipped
+        } else {
+            super::paired_close::MetadataEffect::Completed
+        }
+    }
+}
+#[cfg(feature = "paired-packages")]
+impl AdvancementsInput {
+    #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+    pub(in crate::game) fn guard(&self) -> Option<AdvancementsSkip> {
+        self.guard
+    }
+    #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+    pub(in crate::game) fn path(&self) -> Option<&std::path::Path> {
+        self.native.as_ref().map(|(path, _)| path.as_path())
+    }
+    pub(in crate::game) fn write_native(&self) -> horizon_client::Result<AdvancementsWritten> {
+        if let Some((path, json)) = &self.native {
+            write_progress_json(path, json)?;
+        }
+        Ok(AdvancementsWritten {
+            identity: self.identity.clone(),
+            guard: self.guard,
+        })
+    }
+}
+
+#[cfg(feature = "paired-packages")]
+impl Game<'_> {
+    fn metadata_advancements_route(&self) -> MetadataAdvancementsRoute {
+        MetadataAdvancementsRoute {
+            root: self.world_root.clone(),
+            uuid: self.level.player_uuid,
+            remote: self.remote.is_some(),
+            no_player: self.no_player_here(),
+            loaded: self.adv.loaded,
+        }
+    }
+    pub(in crate::game) fn start_metadata_advancement_tree(
+        &mut self,
+        state: &mut RetainedTreeState,
+    ) -> horizon_client::Result<()> {
+        if state.status != RetainedTreeStatus::Unstarted {
+            return Err(
+                "retained advancement tree start already requested; explicit Retry required".into(),
+            );
+        }
+        state.original = Some(RetainedTreeOriginal {
+            world: self.world_root.clone(),
+            data: self.options.resources.join("data"),
+            tree: self.adv.tree.clone(),
+            install_result: self.adv.tree.list.is_empty(),
+        });
+        // An actual pre-existing helper wins over skipped progress or a nonempty
+        // tree. Never infer that a missing handle was a successful prior spawn.
+        if let Some(handle) = &self.adv.pending_tree {
+            state.thread = Some(handle.thread().id());
+            state.status = RetainedTreeStatus::Pending;
+            return Ok(());
+        }
+        if let Some(skip) = self.metadata_advancements_route().guard() {
+            state.status = RetainedTreeStatus::Skipped(skip);
+            return Ok(());
+        }
+        if !self.adv.tree.list.is_empty() {
+            state.ready = Some(self.adv.tree.clone());
+            state.status = RetainedTreeStatus::Ready;
+            return Ok(());
+        }
+        self.spawn_metadata_advancement_tree(state)
+    }
+    fn spawn_metadata_advancement_tree(
+        &mut self,
+        state: &mut RetainedTreeState,
+    ) -> horizon_client::Result<()> {
+        let data = state
+            .original
+            .as_ref()
+            .expect("retained tree original before spawn")
+            .data
+            .clone();
+        #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+        let control = state.control.take();
+        #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+        if control
+            .as_ref()
+            .is_some_and(|control| control.action == RetainedTreeTestAction::RefuseSpawn)
+        {
+            state.failed("controlled retained advancement tree spawn refusal");
+            return Err("controlled retained advancement tree spawn refusal".into());
+        }
+        let spawned = std::thread::Builder::new()
+            .name("horizon-retained-advancements".into())
+            .spawn(move || {
+                #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+                if let Some(control) = &control {
+                    control.gate.wait();
+                }
+                let tree = Tree::load(&data);
+                #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+                if control
+                    .as_ref()
+                    .is_some_and(|control| control.action == RetainedTreeTestAction::BlockThenPanic)
+                {
+                    panic!(
+                        "controlled retained advancement helper panic after actual native Tree load"
+                    );
+                }
+                tree
+            });
+        match spawned {
+            Ok(handle) => {
+                state.thread = Some(handle.thread().id());
+                self.adv.pending_tree = Some(handle);
+                state.status = RetainedTreeStatus::Pending;
+                Ok(())
+            }
+            Err(error) => {
+                state.failed(error.to_string());
+                Err(error.into())
+            }
+        }
+    }
+    pub(in crate::game) fn poll_metadata_advancement_tree(
+        &mut self,
+        state: &mut RetainedTreeState,
+    ) -> RetainedTreeStatus {
+        let Some(thread) = state.thread else {
+            return state.status.clone();
+        };
+        let Some(handle) = self.adv.pending_tree.as_ref() else {
+            return state
+                .failed("retained advancement tree original handle missing; owner unresolved");
+        };
+        if handle.thread().id() != thread {
+            return state.failed(
+                "retained advancement tree helper identity mismatch; original owner unresolved",
+            );
+        }
+        if !handle.is_finished() {
+            return state.status.clone();
+        }
+        let previously_failed = matches!(state.status, RetainedTreeStatus::Failed(_));
+        let joined = self.adv.pending_tree.take().unwrap().join();
+        state.thread = None;
+        let tree = match joined {
+            Ok(tree) => Arc::new(tree),
+            Err(_) => return state.failed("retained advancement tree helper panicked"),
+        };
+        state.harvested = Some(tree.clone());
+        // A late genuine result is retained/reaped, but cannot waive an earlier
+        // owner failure or become implicit Retry/readiness.
+        if previously_failed {
+            return state.status.clone();
+        }
+        let original = state
+            .original
+            .as_ref()
+            .expect("retained tree route before harvest");
+        if original.world != self.world_root
+            || original.data != self.options.resources.join("data")
+            || !Arc::ptr_eq(&original.tree, &self.adv.tree)
+        {
+            return state.failed("retained advancement tree original route/tree changed");
+        }
+        if original.install_result {
+            self.adv.tree = tree;
+        }
+        state.ready = Some(self.adv.tree.clone());
+        state.status = RetainedTreeStatus::Ready;
+        state.status.clone()
+    }
+    pub(in crate::game) fn retry_metadata_advancement_tree(
+        &mut self,
+        state: &mut RetainedTreeState,
+    ) -> horizon_client::Result<()> {
+        if !matches!(state.status, RetainedTreeStatus::Failed(_))
+            || state.thread.is_some()
+            || self.adv.pending_tree.is_some()
+        {
+            return Err("retained advancement tree Retry requires a harvested failure".into());
+        }
+        let original = state
+            .original
+            .as_ref()
+            .ok_or("retained advancement tree original route missing")?;
+        if original.world != self.world_root
+            || original.data != self.options.resources.join("data")
+            || !Arc::ptr_eq(&original.tree, &self.adv.tree)
+        {
+            return Err("retained advancement tree Retry route/tree mismatch".into());
+        }
+        self.spawn_metadata_advancement_tree(state)
+    }
+    pub(in crate::game) fn prepare_metadata_advancements(
+        &self,
+        tree_state: &RetainedTreeState,
+    ) -> horizon_client::Result<(AdvancementsExpected, AdvancementsInput)> {
+        let route = self.metadata_advancements_route();
+        let guard = route.guard();
+        if self.adv.pending_tree.is_some() || tree_state.unresolved() {
+            return Err(
+                "retained advancement tree must be harvested before metadata preparation".into(),
+            );
+        }
+        if matches!(tree_state.status, RetainedTreeStatus::Failed(_)) {
+            return Err("retained advancement tree failed; explicit helper Retry required".into());
+        }
+        if guard.is_none() && !tree_state.ready_for(self) {
+            return Err("retained advancement tree has no matching Ready provenance".into());
+        }
+        let native = if guard.is_some() {
+            None
+        } else {
+            Some((
+                super::stats::player_json(
+                    &route.root,
+                    "advancements",
+                    route.uuid.expect("selected advancement UUID"),
+                ),
+                self.adv
+                    .progress
+                    .to_json(&self.adv.tree, horizon_world::DATA_VERSION),
+            ))
+        };
+        let identity = Arc::new(());
+        Ok((
+            AdvancementsExpected {
+                identity: identity.clone(),
+                route,
+                tree: self.adv.tree.clone(),
+                progress: self.adv.progress.criteria.clone(),
+            },
+            AdvancementsInput {
+                identity,
+                native,
+                guard,
+            },
+        ))
+    }
+    pub(in crate::game) fn preflight_metadata_advancements(
+        &self,
+        expected: &AdvancementsExpected,
+        written: &AdvancementsWritten,
+    ) -> horizon_client::Result<()> {
+        if !Arc::ptr_eq(&expected.identity, &written.identity)
+            || expected.route != self.metadata_advancements_route()
+            || written.guard != expected.route.guard()
+            || !Arc::ptr_eq(&expected.tree, &self.adv.tree)
+            || self.adv.pending_tree.is_some()
+            || expected.progress != self.adv.progress.criteria
+        {
+            return Err("retained advancement metadata owner/input/guard mismatch".into());
+        }
+        Ok(())
+    }
+    pub(in crate::game) fn commit_metadata_advancements(
+        &mut self,
+        _expected: &AdvancementsExpected,
+    ) {
+        // Ordinary advancement persistence has no disk saved marker. Recipes,
+        // toasts, announcements, changed/unlocked sets and index stay untouched.
+    }
+}
+
+#[cfg(all(
+    test,
+    feature = "paired-packages",
+    feature = "native-writer-test-control",
+    debug_assertions
+))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::game) enum RetainedTreeTestAction {
+    BlockBeforeLoad,
+    BlockThenPanic,
+    RefuseSpawn,
+}
+#[cfg(all(
+    test,
+    feature = "paired-packages",
+    feature = "native-writer-test-control",
+    debug_assertions
+))]
+struct RetainedTreeTestGate {
+    entered: std::sync::atomic::AtomicBool,
+    released: std::sync::Mutex<bool>,
+    ready: std::sync::Condvar,
+}
+#[cfg(all(
+    test,
+    feature = "paired-packages",
+    feature = "native-writer-test-control",
+    debug_assertions
+))]
+impl RetainedTreeTestGate {
+    fn wait(&self) {
+        use std::sync::atomic::Ordering;
+        let mut released = self
+            .released
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        self.entered.store(true, Ordering::Release);
+        while !*released {
+            released = self
+                .ready
+                .wait(released)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+    }
+}
+#[cfg(all(
+    test,
+    feature = "paired-packages",
+    feature = "native-writer-test-control",
+    debug_assertions
+))]
+pub(in crate::game) struct RetainedTreeTestControl {
+    action: RetainedTreeTestAction,
+    gate: Arc<RetainedTreeTestGate>,
+}
+#[cfg(all(
+    test,
+    feature = "paired-packages",
+    feature = "native-writer-test-control",
+    debug_assertions
+))]
+pub(in crate::game) struct RetainedTreeTestReceipt {
+    gate: Arc<RetainedTreeTestGate>,
+}
+#[cfg(all(
+    test,
+    feature = "paired-packages",
+    feature = "native-writer-test-control",
+    debug_assertions
+))]
+impl RetainedTreeTestControl {
+    pub(in crate::game) fn new(action: RetainedTreeTestAction) -> (Self, RetainedTreeTestReceipt) {
+        let gate = Arc::new(RetainedTreeTestGate {
+            entered: std::sync::atomic::AtomicBool::new(false),
+            released: std::sync::Mutex::new(false),
+            ready: std::sync::Condvar::new(),
+        });
+        (
+            Self {
+                action,
+                gate: gate.clone(),
+            },
+            RetainedTreeTestReceipt { gate },
+        )
+    }
+}
+#[cfg(all(
+    test,
+    feature = "paired-packages",
+    feature = "native-writer-test-control",
+    debug_assertions
+))]
+impl RetainedTreeTestReceipt {
+    pub(in crate::game) fn entered(&self) -> bool {
+        self.gate.entered.load(std::sync::atomic::Ordering::Acquire)
+    }
+    pub(in crate::game) fn release(&self) {
+        *self
+            .gate
+            .released
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = true;
+        self.gate.ready.notify_all();
+    }
+}
+#[cfg(all(
+    test,
+    feature = "paired-packages",
+    feature = "native-writer-test-control",
+    debug_assertions
+))]
+impl Drop for RetainedTreeTestReceipt {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+#[cfg(all(
+    test,
+    feature = "paired-packages",
+    feature = "native-writer-test-control",
+    debug_assertions
+))]
+impl RetainedTreeState {
+    pub(in crate::game) fn set_test_control(
+        &mut self,
+        control: RetainedTreeTestControl,
+    ) -> horizon_client::Result<()> {
+        if self.thread.is_some() || self.control.is_some() {
+            return Err("retained tree control already owned or worker running".into());
+        }
+        self.control = Some(control);
+        Ok(())
     }
 }
 /// The game's world for predicates.

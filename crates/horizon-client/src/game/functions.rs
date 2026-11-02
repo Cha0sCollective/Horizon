@@ -67,37 +67,194 @@ impl FnState {
         if self.schedule.is_empty() && !path.try_exists()? {
             return Ok(());
         }
-        let mut events = self.schedule.clone();
-        events.sort_by_key(|e| (e.time, e.seq));
-        let list = events
-            .iter()
-            .map(|e| {
-                let (kind, name) = match e.id.strip_prefix('#') {
-                    Some(tag) => ("minecraft:function_tag", tag),
-                    None => ("minecraft:function", e.id.as_str()),
-                };
-                Tag::compound([
-                    ("trigger_time", Tag::Long(e.time)),
-                    ("id", Tag::String(e.id.as_str().into())),
-                    (
-                        "callback",
-                        Tag::compound([
-                            ("type", Tag::String(kind.into())),
-                            ("id", Tag::String(name.into())),
-                        ]),
-                    ),
-                ])
-            })
-            .collect();
         save::write_dat(
             path,
             Tag::compound([
-                ("data", Tag::compound([("events", Tag::List(list))])),
+                ("data", schedule_data(&self.schedule)),
                 ("DataVersion", Tag::Int(horizon_world::DATA_VERSION)),
             ]),
         )
     }
 }
+#[cfg(feature = "paired-packages")]
+pub(in crate::game) struct ScheduleMetadataExpected {
+    root: std::path::PathBuf,
+    remote: bool,
+    loaded: bool,
+    load_pending: bool,
+    enabled: Vec<String>,
+    pack_ids: Vec<String>,
+    schedule: Vec<Scheduled>,
+    next_seq: u64,
+    store: DataStore,
+}
+#[cfg(feature = "paired-packages")]
+#[derive(Clone)]
+pub(in crate::game) struct ScheduleMetadataInput {
+    path: std::path::PathBuf,
+    active: bool,
+    empty: bool,
+    data: Tag,
+}
+#[cfg(feature = "paired-packages")]
+pub(in crate::game) struct ScheduleMetadataPost {
+    path: std::path::PathBuf,
+    active: bool,
+}
+#[cfg(feature = "paired-packages")]
+pub(in crate::game) struct ScheduleMetadataIo {
+    pub effect: super::paired_close::MetadataEffect,
+    pub result: Result<ScheduleMetadataPost, String>,
+}
+#[cfg(feature = "paired-packages")]
+impl ScheduleMetadataInput {
+    pub(in crate::game) fn write_native(&self) -> ScheduleMetadataIo {
+        use super::paired_close::MetadataEffect as E;
+        if !self.active {
+            return ScheduleMetadataIo {
+                effect: E::Skipped,
+                result: Ok(ScheduleMetadataPost {
+                    path: self.path.clone(),
+                    active: false,
+                }),
+            };
+        }
+        if self.empty {
+            match self.path.try_exists() {
+                Ok(false) => {
+                    return ScheduleMetadataIo {
+                        effect: E::Skipped,
+                        result: Ok(ScheduleMetadataPost {
+                            path: self.path.clone(),
+                            active: true,
+                        }),
+                    };
+                }
+                Ok(true) => {}
+                Err(error) => {
+                    return ScheduleMetadataIo {
+                        effect: E::Unknown,
+                        result: Err(format!("{}: {error}", self.path.display())),
+                    };
+                }
+            }
+        }
+        match save::write_dat(
+            &self.path,
+            Tag::compound([
+                ("data", self.data.clone()),
+                ("DataVersion", Tag::Int(horizon_world::DATA_VERSION)),
+            ]),
+        ) {
+            Ok(()) => ScheduleMetadataIo {
+                effect: E::Completed,
+                result: Ok(ScheduleMetadataPost {
+                    path: self.path.clone(),
+                    active: true,
+                }),
+            },
+            Err(error) => ScheduleMetadataIo {
+                effect: E::Unknown,
+                result: Err(error.to_string()),
+            },
+        }
+    }
+}
+fn schedule_data(schedule: &[Scheduled]) -> Tag {
+    let mut events = schedule.to_vec();
+    events.sort_by_key(|event| (event.time, event.seq));
+    let events = events
+        .iter()
+        .map(|event| {
+            let (kind, name) = match event.id.strip_prefix('#') {
+                Some(tag) => ("minecraft:function_tag", tag),
+                None => ("minecraft:function", event.id.as_str()),
+            };
+            Tag::compound([
+                ("trigger_time", Tag::Long(event.time)),
+                ("id", Tag::String(event.id.as_str().into())),
+                (
+                    "callback",
+                    Tag::compound([
+                        ("type", Tag::String(kind.into())),
+                        ("id", Tag::String(name.into())),
+                    ]),
+                ),
+            ])
+        })
+        .collect();
+    Tag::compound([("events", Tag::List(events))])
+}
+#[cfg(feature = "paired-packages")]
+impl Game<'_> {
+    pub(in crate::game) fn prepare_retained_schedule_metadata(
+        &self,
+    ) -> (ScheduleMetadataExpected, ScheduleMetadataInput) {
+        let store = &self.fns.store;
+        let expected = ScheduleMetadataExpected {
+            root: self.world_root.clone(),
+            remote: self.remote.is_some(),
+            loaded: self.fns.loaded,
+            load_pending: self.fns.load_pending,
+            enabled: self.fns.enabled.clone(),
+            pack_ids: self.fns.packs.iter().map(|pack| pack.id.clone()).collect(),
+            schedule: self.fns.schedule.clone(),
+            next_seq: self.fns.next_seq,
+            store: DataStore {
+                functions: store.functions.clone(),
+                function_tags: store.function_tags.clone(),
+                predicates: store.predicates.clone(),
+                item_modifiers: store.item_modifiers.clone(),
+                errors: store.errors.clone(),
+            },
+        };
+        let input = ScheduleMetadataInput {
+            path: self.schedule_path(),
+            active: self.fns.loaded && self.remote.is_none(),
+            empty: self.fns.schedule.is_empty(),
+            data: schedule_data(&self.fns.schedule),
+        };
+        (expected, input)
+    }
+    pub(in crate::game) fn preflight_retained_schedule_metadata(
+        &self,
+        expected: &ScheduleMetadataExpected,
+        post: &ScheduleMetadataPost,
+    ) -> Result<(), String> {
+        let store = &self.fns.store;
+        if self.world_root != expected.root
+            || self.remote.is_some() != expected.remote
+            || self.fns.loaded != expected.loaded
+            || self.fns.load_pending != expected.load_pending
+            || self.fns.enabled != expected.enabled
+            || self
+                .fns
+                .packs
+                .iter()
+                .map(|pack| pack.id.clone())
+                .collect::<Vec<_>>()
+                != expected.pack_ids
+            || self.fns.schedule != expected.schedule
+            || self.fns.next_seq != expected.next_seq
+            || store.functions != expected.store.functions
+            || store.function_tags != expected.store.function_tags
+            || store.predicates != expected.store.predicates
+            || store.item_modifiers != expected.store.item_modifiers
+            || store.errors != expected.store.errors
+            || post.path != self.schedule_path()
+            || post.active != (expected.loaded && !expected.remote)
+        {
+            return Err("retained schedule/function original state or route changed".into());
+        }
+        Ok(())
+    }
+    pub(in crate::game) fn commit_retained_schedule_metadata(
+        &mut self,
+        _post: ScheduleMetadataPost,
+    ) {
+    }
+}
+
 /// What a function reported through `return`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Outcome {
