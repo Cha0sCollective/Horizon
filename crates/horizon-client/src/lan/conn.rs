@@ -32,6 +32,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(feature = "paired-packages")]
+use super::{RetainedContext, RetainedOutcome};
+#[cfg(not(feature = "paired-packages"))]
+struct RetainedContext;
+
 /// ServerCommonPacketListenerImpl.KEEPALIVE_TIME and the disconnect timeout.
 const KEEP_ALIVE_EVERY: Duration = Duration::from_secs(15);
 const KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -236,6 +241,8 @@ pub struct PlayerSender {
     posted: Arc<AtomicUsize>,
     #[cfg(feature = "paired-packages")]
     staged: Option<StagedSender>,
+    #[cfg(feature = "paired-packages")]
+    retained: Option<Arc<RetainedOutbound>>,
 }
 impl PlayerSender {
     pub fn new(tx: Sender<Out>, pending: Arc<AtomicUsize>) -> Self {
@@ -246,12 +253,19 @@ impl PlayerSender {
             posted: Arc::default(),
             #[cfg(feature = "paired-packages")]
             staged: None,
+            #[cfg(feature = "paired-packages")]
+            retained: None,
         }
     }
     fn held(&self) -> std::sync::MutexGuard<'_, Vec<Vec<u8>>> {
         self.held.lock().unwrap_or_else(PoisonError::into_inner)
     }
     pub fn send(&self, body: Vec<u8>) {
+        #[cfg(feature = "paired-packages")]
+        if let Some(retained) = &self.retained {
+            retained.enqueue(vec![body], HOLDING.get());
+            return;
+        }
         #[cfg(feature = "paired-packages")]
         if let Some(staged) = &self.staged {
             staged.send(body);
@@ -269,6 +283,11 @@ impl PlayerSender {
     /// while the tick holds them.
     pub fn send_many(&self, bodies: impl IntoIterator<Item = Vec<u8>>) {
         #[cfg(feature = "paired-packages")]
+        if let Some(retained) = &self.retained {
+            retained.enqueue(bodies.into_iter().collect(), HOLDING.get());
+            return;
+        }
+        #[cfg(feature = "paired-packages")]
         if self.staged.is_some() {
             bodies.into_iter().for_each(|body| self.send(body));
             return;
@@ -285,6 +304,11 @@ impl PlayerSender {
     }
     /// Hand the held packets to the writer thread.
     pub fn flush(&self) {
+        #[cfg(feature = "paired-packages")]
+        if let Some(retained) = &self.retained {
+            retained.flush();
+            return;
+        }
         let held = std::mem::take(&mut *self.held());
         if !held.is_empty() {
             self.deliver(Out::Packets(held));
@@ -304,6 +328,20 @@ impl PlayerSender {
     }
     /// To the writer thread, after anything still with the post thread.
     fn deliver(&self, out: Out) {
+        #[cfg(feature = "paired-packages")]
+        if let Some(retained) = &self.retained {
+            match out {
+                Out::Packet(body) => retained.enqueue(vec![body], false),
+                Out::Packets(bodies) => retained.enqueue(bodies, false),
+                Out::Disconnect(reason) => retained.enqueue_internal(
+                    vec![play::Clientbound::Disconnect(cfg::Disconnect { reason }).encode()],
+                    false,
+                    true,
+                ),
+                Out::Close => retained.seal(),
+            }
+            return;
+        }
         if self.posted.load(Ordering::Acquire) == 0 {
             let _ = self.tx.send(out);
         } else {
@@ -404,6 +442,167 @@ impl Drop for StagedBody {
     }
 }
 
+/// The registry keeps this queue even when either native actor panics. An active
+/// body stays here until a successful native write; failure never drains it.
+#[cfg(feature = "paired-packages")]
+pub(super) struct RetainedOutbound {
+    inner: Mutex<RetainedQueue>,
+    ready: std::sync::Condvar,
+    pending: Arc<AtomicUsize>,
+    close_latch: Arc<std::sync::atomic::AtomicBool>,
+}
+#[cfg(feature = "paired-packages")]
+#[derive(Default)]
+struct RetainedQueue {
+    queued: std::collections::VecDeque<Arc<[u8]>>,
+    held: Vec<Arc<[u8]>>,
+    active: Option<Arc<[u8]>>,
+    written: usize,
+    failed: usize,
+    sealed: bool,
+    disconnecting: bool,
+    close_after: Option<Arc<[u8]>>,
+    failure: Option<RetainedOutcome>,
+}
+/// Counts describe retained bodies and successful native writes, not delivery.
+#[cfg(feature = "paired-packages")]
+#[derive(Clone, Debug)]
+pub struct RetainedOutboundStatus {
+    pub queued_bodies: usize,
+    pub queued_bytes: usize,
+    pub active_bodies: usize,
+    pub active_bytes: usize,
+    pub written_bodies: usize,
+    pub failed_bodies: usize,
+    pub sealed: bool,
+}
+#[cfg(feature = "paired-packages")]
+impl RetainedOutbound {
+    fn new(close_latch: Arc<std::sync::atomic::AtomicBool>) -> Arc<Self> {
+        Arc::new(Self {
+            inner: Mutex::default(),
+            ready: std::sync::Condvar::new(),
+            pending: Arc::default(),
+            close_latch,
+        })
+    }
+    fn inner(&self) -> std::sync::MutexGuard<'_, RetainedQueue> {
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+    pub(super) fn seal(&self) {
+        self.inner().sealed = true;
+        self.ready.notify_all();
+    }
+    pub(super) fn snapshot(&self) -> RetainedOutboundStatus {
+        let q = self.inner();
+        RetainedOutboundStatus {
+            queued_bodies: q.queued.len() + q.held.len(),
+            queued_bytes: q.queued.iter().chain(&q.held).map(|b| b.len()).sum(),
+            active_bodies: usize::from(q.active.is_some()),
+            active_bytes: q.active.as_ref().map_or(0, |b| b.len()),
+            written_bodies: q.written,
+            failed_bodies: q.failed,
+            sealed: q.sealed || q.disconnecting || self.close_latch.load(Ordering::Acquire),
+        }
+    }
+    fn enqueue(&self, bodies: Vec<Vec<u8>>, held: bool) {
+        self.enqueue_internal(bodies, held, false);
+    }
+    fn enqueue_internal(&self, bodies: Vec<Vec<u8>>, held: bool, close_after: bool) {
+        let bytes = bodies
+            .iter()
+            .try_fold(0usize, |sum, b| sum.checked_add(b.len()));
+        let mut q = self.inner();
+        // This load is the enqueue admission point shared with the registry's
+        // permanent close latch, including the gap before individual seals.
+        if self.close_latch.load(Ordering::Acquire) || q.sealed || q.disconnecting {
+            return;
+        }
+        let Some(next) = bytes
+            .and_then(|n| self.pending.load(Ordering::Acquire).checked_add(n))
+            .filter(|n| *n <= MAX_PENDING)
+        else {
+            q.failure = Some(RetainedOutcome::Protocol(
+                "outbound queue limit exceeded".into(),
+            ));
+            q.sealed = true;
+            self.ready.notify_all();
+            return;
+        };
+        self.pending.store(next, Ordering::Release);
+        let bodies: Vec<Arc<[u8]>> = bodies.into_iter().map(Arc::from).collect();
+        if close_after {
+            q.disconnecting = true;
+            q.close_after = bodies.last().cloned();
+        }
+        if held {
+            q.held.extend(bodies);
+        } else {
+            let previous = std::mem::take(&mut q.held);
+            q.queued.extend(previous);
+            q.queued.extend(bodies);
+        }
+        self.ready.notify_one();
+    }
+    fn flush(&self) {
+        let mut q = self.inner();
+        // Preserve held custody after closure, without starting new IO.
+        if !self.close_latch.load(Ordering::Acquire) && !q.sealed {
+            let held = std::mem::take(&mut q.held);
+            q.queued.extend(held);
+            self.ready.notify_one();
+        }
+    }
+    fn next(&self) -> Option<Arc<[u8]>> {
+        let mut q = self.inner();
+        if q.queued.is_empty() && !q.sealed && !self.close_latch.load(Ordering::Acquire) {
+            q = self
+                .ready
+                .wait_timeout(q, Duration::from_millis(200))
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        if self.close_latch.load(Ordering::Acquire) || q.sealed {
+            return None;
+        }
+        let body = q.queued.pop_front()?;
+        q.active = Some(body.clone());
+        Some(body)
+    }
+    fn written(&self) {
+        let mut q = self.inner();
+        if let Some(body) = q.active.take() {
+            self.pending.fetch_sub(body.len(), Ordering::AcqRel);
+            q.written += 1;
+            if q.close_after
+                .as_ref()
+                .is_some_and(|last| Arc::ptr_eq(last, &body))
+            {
+                q.sealed = true;
+            }
+        }
+    }
+    fn failed(&self, failure: RetainedOutcome) {
+        let mut q = self.inner();
+        q.failed += usize::from(q.active.is_some());
+        q.failure = Some(failure);
+        q.sealed = true;
+        self.ready.notify_all();
+    }
+    fn sender(self: &Arc<Self>) -> PlayerSender {
+        let (tx, rx) = channel();
+        drop(rx);
+        PlayerSender {
+            tx,
+            pending: self.pending.clone(),
+            held: Arc::default(),
+            posted: Arc::default(),
+            staged: None,
+            retained: Some(self.clone()),
+        }
+    }
+}
+
 /// Hand every player's held packets to their writer threads. Waking a writer
 /// costs a system call, and on a busy machine often the rest of the core's
 /// time slice; one thread of its own wakes them, so the game thread wakes one
@@ -413,6 +612,11 @@ pub fn flush_all<'a>(senders: impl IntoIterator<Item = &'a PlayerSender>) {
     let batch: Vec<Posted> = senders
         .into_iter()
         .filter_map(|s| {
+            #[cfg(feature = "paired-packages")]
+            if let Some(retained) = &s.retained {
+                retained.flush();
+                return None;
+            }
             let held = std::mem::take(&mut *s.held());
             (!held.is_empty()).then(|| s.posting(Out::Packets(held)))
         })
@@ -438,6 +642,13 @@ impl Posted {
 /// Give a batch to the post thread, started the first time; without one
 /// (the thread could not start) the batch is handed over here.
 fn post(batch: Vec<Posted>) {
+    #[cfg(all(
+        test,
+        feature = "paired-packages",
+        feature = "native-writer-test-control",
+        debug_assertions
+    ))]
+    retained_controls::POST_CALLS.fetch_add(1, Ordering::Relaxed);
     static POST: std::sync::OnceLock<Option<Sender<Vec<Posted>>>> = std::sync::OnceLock::new();
     let post = POST.get_or_init(|| {
         let (tx, rx) = channel::<Vec<Posted>>();
@@ -556,6 +767,52 @@ pub fn serve_local(
     serve_connection(Connection::local(pipe), address, shared)
 }
 
+/// The caller registered this connection's original shutdown capability before
+/// releasing its native actor. This entry deliberately bypasses legacy peek.
+#[cfg(feature = "paired-packages")]
+pub(super) fn serve_retained(
+    c: Connection,
+    address: std::net::SocketAddr,
+    shared: Arc<Shared>,
+    owner: RetainedContext,
+) -> RetainedOutcome {
+    let _terminal = RetainedInterrupt(owner.clone());
+    match serve_modern(c, address, shared, Some(&owner)) {
+        Ok(()) => RetainedOutcome::Returned,
+        Err(error) => retained_outcome(error),
+    }
+}
+
+#[cfg(feature = "paired-packages")]
+struct RetainedInterrupt(RetainedContext);
+#[cfg(feature = "paired-packages")]
+impl Drop for RetainedInterrupt {
+    fn drop(&mut self) {
+        self.0.interrupt();
+    }
+}
+
+#[cfg(feature = "paired-packages")]
+fn retained_outcome(error: String) -> RetainedOutcome {
+    if let Some(native) = error.strip_prefix("retained native IO: ") {
+        RetainedOutcome::Io(native.to_owned())
+    } else if let Some(receive) = error.strip_prefix("retained receive: ") {
+        RetainedOutcome::Receive(receive.to_owned())
+    } else if let Some(encode) = error.strip_prefix("retained encode: ") {
+        RetainedOutcome::Encode(encode.to_owned())
+    } else if error == "retained EOF: Connection closed by the server" {
+        RetainedOutcome::Eof
+    } else if let Some(spawn) = error.strip_prefix("retained writer spawn: ") {
+        RetainedOutcome::Spawn(spawn.to_owned())
+    } else if error == "retained connection closed" {
+        RetainedOutcome::Closed
+    } else if error == "retained queue closed" {
+        RetainedOutcome::QueueClosed
+    } else {
+        RetainedOutcome::Protocol(error)
+    }
+}
+
 #[cfg(feature = "paired-packages")]
 thread_local! {
     static STAGED_CONN: Cell<Option<u32>> = const { Cell::new(None) };
@@ -639,15 +896,26 @@ fn recv_staged(
 }
 
 fn serve_connection(
+    c: Connection,
+    address: std::net::SocketAddr,
+    shared: Arc<Shared>,
+) -> Result<(), String> {
+    serve_modern(c, address, shared, None)
+}
+
+// The optional owner follows the existing packet pipeline explicitly. Ordinary
+// callers retain their codecs, admission and legacy handling unchanged.
+fn serve_modern(
     mut c: Connection,
     address: std::net::SocketAddr,
     shared: Arc<Shared>,
+    retained: Option<&RetainedContext>,
 ) -> Result<(), String> {
     let e = |e: horizon_protocol::Error| e.to_string();
     c.reader
         .set_read_timeout(Some(Duration::from_secs(30)))
-        .map_err(e)?;
-    let (id, payload) = recv_connection(&mut c, &shared).map_err(e)?;
+        .map_err(|e| native_error(retained, e))?;
+    let (id, payload) = recv_modern(&mut c, &shared, retained)?;
     let intention = match handshake::Serverbound::decode(id, &payload).map_err(e)? {
         handshake::Serverbound::Intention(i) => i,
         _ => return Err("expected a handshake".into()),
@@ -660,8 +928,11 @@ fn serve_connection(
         // ServerHandshakePacketListenerImpl: a server that does not reply
         // to status requests closes the connection.
         handshake::STATUS if !shared.config.enable_status => Ok(()),
-        handshake::STATUS => serve_status(&mut c, &shared),
+        handshake::STATUS => serve_status(&mut c, &shared, retained),
         handshake::TRANSFER if !shared.config.accepts_transfers => {
+            if retained.is_some() {
+                return Err("retained connection requires modern offline login".into());
+            }
             login_disconnect(
                 &mut c,
                 &translatable("multiplayer.disconnect.transfers_disabled", &[]),
@@ -679,37 +950,110 @@ fn serve_connection(
                     "{{\"translate\":\"{key}\",\"with\":[\"{}\"]}}",
                     horizon_protocol::GAME_VERSION
                 );
-                let _ = c.send(
-                    &login::Clientbound::Disconnect(login::Disconnect { reason_json: json })
-                        .encode(),
-                );
+                let body = &login::Clientbound::Disconnect(login::Disconnect { reason_json: json })
+                    .encode();
+                if retained.is_some() {
+                    send_modern(&mut c, body, retained)?;
+                    return Err("retained connection requires protocol 777".into());
+                }
+                let _ = c.send(body);
                 return Ok(());
             }
-            serve_login(c, address, &shared)
+            serve_login(c, address, &shared, retained)
         }
         other => Err(format!("unknown intent {other}")),
     }
 }
 
-fn serve_status(c: &mut Connection, shared: &Shared) -> Result<(), String> {
+fn native_error(retained: Option<&RetainedContext>, error: impl std::fmt::Display) -> String {
+    if retained.is_some() {
+        format!("retained native IO: {error}")
+    } else {
+        error.to_string()
+    }
+}
+
+fn recv_modern(
+    c: &mut Connection,
+    shared: &Shared,
+    retained: Option<&RetainedContext>,
+) -> Result<(i32, Vec<u8>), String> {
+    #[cfg(feature = "paired-packages")]
+    if let Some(owner) = retained {
+        if owner.is_closing() {
+            return Err("retained connection closed".into());
+        }
+        #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+        retained_controls::read_started(owner.conn());
+        let packet = c.recv();
+        #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+        retained_controls::read_finished(owner.conn());
+        let packet = packet.map_err(|e| receive_error(retained, e))?;
+        if owner.is_closing() {
+            return Err("retained connection closed".into());
+        }
+        return Ok(packet);
+    }
+    recv_connection(c, shared).map_err(|e| native_error(retained, e))
+}
+
+#[cfg(feature = "paired-packages")]
+fn receive_error(retained: Option<&RetainedContext>, error: horizon_protocol::Error) -> String {
+    if retained.is_some() {
+        // ConnReader::recv emits this exact fixed message only at read()==0.
+        // Every other baseline Error may be native IO or a codec failure; its
+        // text alone cannot recover a missing typed source.
+        if error.0 == "Connection closed by the server" {
+            return format!("retained EOF: {error}");
+        }
+        return format!("retained receive: {error}");
+    }
+    error.to_string()
+}
+
+fn send_modern(
+    c: &mut Connection,
+    body: &[u8],
+    retained: Option<&RetainedContext>,
+) -> Result<(), String> {
+    #[cfg(feature = "paired-packages")]
+    if retained.is_some_and(RetainedContext::is_closing) {
+        return Err("retained connection closed".into());
+    }
+    if retained.is_some() {
+        let contents =
+            prepare_retained_body(&c.writer, body).map_err(|e| format!("retained encode: {e}"))?;
+        return c
+            .writer
+            .send_contents(&contents)
+            .map_err(|e| native_error(retained, e));
+    }
+    c.send(body).map_err(|e| e.to_string())
+}
+
+fn serve_status(
+    c: &mut Connection,
+    shared: &Shared,
+    retained: Option<&RetainedContext>,
+) -> Result<(), String> {
     let e = |e: horizon_protocol::Error| e.to_string();
     let mut requested = false;
     loop {
-        let (id, payload) = recv_connection(c, shared).map_err(e)?;
+        let (id, payload) = recv_modern(c, shared, retained)?;
         match status::Serverbound::decode(id, &payload).map_err(e)? {
             // ServerStatusPacketListenerImpl: a second request disconnects.
             status::Serverbound::StatusRequest(_) if requested => return Ok(()),
             status::Serverbound::StatusRequest(_) => {
                 requested = true;
                 let json = shared.status_json();
-                c.send(
+                send_modern(
+                    c,
                     &status::Clientbound::StatusResponse(status::StatusResponse { json }).encode(),
-                )
-                .map_err(e)?;
+                    retained,
+                )?;
             }
             status::Serverbound::PingRequest(p) => {
-                c.send(&status::Clientbound::PongResponse(p).encode())
-                    .map_err(e)?;
+                send_modern(c, &status::Clientbound::PongResponse(p).encode(), retained)?;
                 return Ok(());
             }
             status::Serverbound::Unknown(..) => return Ok(()),
@@ -860,14 +1204,29 @@ fn serve_login(
     mut c: Connection,
     address: std::net::SocketAddr,
     shared: &Arc<Shared>,
+    retained: Option<&RetainedContext>,
 ) -> Result<(), String> {
     let e = |e: horizon_protocol::Error| e.to_string();
-    let (id, payload) = recv_connection(&mut c, shared).map_err(e)?;
+    let (id, payload) = recv_modern(&mut c, shared, retained)?;
     let hello = match login::Serverbound::decode(id, &payload).map_err(e)? {
         login::Serverbound::Hello(h) => h,
         _ => return Err("expected a login hello".into()),
     };
     if !valid_name(&hello.name) {
+        if retained.is_some() {
+            send_modern(
+                &mut c,
+                &login::Clientbound::Disconnect(login::Disconnect {
+                    reason_json: component_json(&translatable(
+                        "multiplayer.disconnect.invalid_name",
+                        &[],
+                    )),
+                })
+                .encode(),
+                retained,
+            )?;
+            return Err("invalid retained player name".into());
+        }
         login_disconnect(
             &mut c,
             &translatable("multiplayer.disconnect.invalid_name", &[]),
@@ -914,12 +1273,31 @@ fn serve_login(
             Err(error) => return Err(error.to_string()),
         }
     }
+    #[cfg(feature = "paired-packages")]
+    if let Some(owner) = retained {
+        if let Some(reason) = owner.admit(shared, uuid, &hello.name) {
+            send_modern(
+                &mut c,
+                &login::Clientbound::Disconnect(login::Disconnect {
+                    reason_json: component_json(&reason),
+                })
+                .encode(),
+                retained,
+            )?;
+            return Ok(());
+        }
+        let result = login_and_configure(&mut c, shared, uuid, &hello.name, properties, retained)?;
+        if let Some(parts) = result {
+            return play_retained(c, parts, address, owner.clone());
+        }
+        return Ok(());
+    }
     if let Some(reason) = shared.try_admit(address, uuid, &hello.name) {
         let text = refuse(&mut c, shared, "Server thread", &user, &reason);
         lost(shared, &user, &text);
         return Ok(());
     }
-    let result = login_and_configure(&mut c, shared, uuid, &hello.name, properties);
+    let result = login_and_configure(&mut c, shared, uuid, &hello.name, properties, retained);
     match result {
         Ok(Some(parts)) => {
             play(c, shared, parts, address);
@@ -939,6 +1317,299 @@ fn serve_login(
     }
 }
 
+#[cfg(feature = "paired-packages")]
+fn play_retained(
+    c: Connection,
+    parts: Parts,
+    address: std::net::SocketAddr,
+    owner: RetainedContext,
+) -> Result<(), String> {
+    let outbound = RetainedOutbound::new(owner.close_latch());
+    if !owner.attach_outbound(outbound.clone()) {
+        return Err("retained connection closed".into());
+    }
+    let conn = owner.conn();
+    let (mut reader, writer) = c.split();
+    reader
+        .set_read_timeout(Some(KEEP_ALIVE_TIMEOUT))
+        .map_err(|e| native_error(Some(&owner), e))?;
+    let alive = Arc::new(AtomicI64::new(-1));
+    let latency = Arc::new(AtomicI32::new(0));
+    let (start, started) = channel();
+    let worker = {
+        let owner = owner.clone();
+        let outbound = outbound.clone();
+        let alive = alive.clone();
+        let latency = latency.clone();
+        let builder = std::thread::Builder::new().name(format!("horizon-retained-out-{conn}"));
+        #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+        let builder = if retained_controls::writer_spawn_fails(conn) {
+            builder.stack_size(usize::MAX / 2)
+        } else {
+            builder
+        };
+        builder
+            .spawn(move || {
+                let _interrupt = RetainedInterrupt(owner.clone());
+                let _active = RetainedActiveGuard(outbound.clone());
+                if started.recv().is_err() {
+                    return RetainedOutcome::QueueClosed;
+                }
+                horizon_threads::behind_server();
+                write_retained(writer, &outbound, &owner, &alive, &latency)
+            })
+            .map_err(|e| format!("retained writer spawn: {e}"))?
+    };
+    // The original handle is now registry-owned, even when close won this race.
+    let accepted = owner.install_writer(worker);
+    if !accepted {
+        outbound.seal();
+    }
+    if start.send(()).is_err() {
+        owner.record_failure(RetainedOutcome::QueueClosed);
+        return Err("retained queue closed".into());
+    }
+    if !accepted {
+        return Err("retained connection closed".into());
+    }
+    let joined = Joined {
+        conn,
+        uuid: parts.uuid,
+        name: parts.name,
+        properties: parts.properties,
+        info: parts.info,
+        brand: parts.brand,
+        sender: outbound.sender(),
+        latency,
+        address,
+    };
+    if !owner.emit(NetEvent::Joined(Box::new(joined))) {
+        return Err("retained queue closed".into());
+    }
+    #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+    retained_controls::outer_started(conn);
+    let result = loop {
+        if owner.is_closing() {
+            break Err("retained connection closed".into());
+        }
+        #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+        retained_controls::read_started(conn);
+        let packet = reader.recv();
+        #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+        retained_controls::read_finished(conn);
+        let (id, payload) = match packet {
+            Ok(packet) => packet,
+            Err(error) => break Err(receive_error(Some(&owner), error)),
+        };
+        if owner.is_closing() {
+            break Err("retained connection closed".into());
+        }
+        match play::Serverbound::decode(id, &payload) {
+            Ok(play::Serverbound::KeepAlive(k)) => alive.store(k.id, Ordering::Relaxed),
+            Ok(packet) => {
+                if !owner.emit(NetEvent::Packet(conn, Box::new(packet))) {
+                    break Err("retained queue closed".into());
+                }
+            }
+            Err(error) => break Err(format!("Invalid packet {id}: {error}")),
+        }
+    };
+    let reason = result.as_ref().err().cloned().unwrap_or_default();
+    let _ = owner.emit(NetEvent::Left(conn, reason));
+    // Exact UUID release belongs to registry harvest after BOTH original joins.
+    result
+}
+
+#[cfg(feature = "paired-packages")]
+struct RetainedActiveGuard(Arc<RetainedOutbound>);
+#[cfg(feature = "paired-packages")]
+impl Drop for RetainedActiveGuard {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.failed(RetainedOutcome::Panic);
+        }
+        self.0.seal();
+    }
+}
+
+#[cfg(feature = "paired-packages")]
+fn write_retained(
+    mut writer: ConnWriter,
+    outbound: &RetainedOutbound,
+    owner: &RetainedContext,
+    alive: &AtomicI64,
+    latency: &AtomicI32,
+) -> RetainedOutcome {
+    let start = Instant::now();
+    let mut sent_at: Option<(i64, Instant)> = None;
+    let mut next = Instant::now() + KEEP_ALIVE_EVERY;
+    loop {
+        if let Some(failure) = outbound.inner().failure.clone() {
+            return failure;
+        }
+        if owner.is_closing() || outbound.inner().sealed {
+            return RetainedOutcome::Closed;
+        }
+        if let Some(body) = outbound.next() {
+            let contents = match prepare_retained_body(&writer, &body) {
+                Ok(contents) => contents,
+                Err(error) => {
+                    let outcome = RetainedOutcome::Encode(error.to_string());
+                    outbound.failed(outcome.clone());
+                    return outcome;
+                }
+            };
+            #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+            retained_controls::before_write(owner.conn());
+            if let Err(error) = writer.send_contents(&contents) {
+                let outcome = RetainedOutcome::Io(error.to_string());
+                outbound.failed(outcome.clone());
+                return outcome;
+            }
+            outbound.written();
+            #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+            retained_controls::after_write(owner.conn());
+        }
+        let now = Instant::now();
+        if let Some((id, at)) = sent_at {
+            if alive.load(Ordering::Relaxed) == id {
+                latency.store(
+                    i32::try_from(at.elapsed().as_millis()).unwrap_or(i32::MAX),
+                    Ordering::Relaxed,
+                );
+                sent_at = None;
+            } else if at.elapsed() > KEEP_ALIVE_TIMEOUT {
+                return RetainedOutcome::Protocol("keep-alive timeout".into());
+            }
+        }
+        if sent_at.is_none() && now >= next {
+            let id = i64::try_from(start.elapsed().as_millis()).unwrap_or(0);
+            outbound.enqueue(
+                vec![play::Clientbound::KeepAlive(cfg::KeepAlive { id }).encode()],
+                false,
+            );
+            sent_at = Some((id, now));
+            next = now + KEEP_ALIVE_EVERY;
+        }
+    }
+}
+
+/// Fixed, serial-test controls touch the actual native actors at acquisition or
+/// immediately before their existing socket writer. No arbitrary task callback.
+#[cfg(all(
+    test,
+    feature = "paired-packages",
+    feature = "native-writer-test-control",
+    debug_assertions
+))]
+mod retained_controls {
+    use super::*;
+    #[derive(Default)]
+    pub(super) struct Control {
+        pub conn: u32,
+        pub panic_writer: bool,
+        pub panic_outer: bool,
+        pub spawn_failure: bool,
+        pub pause_writer: bool,
+        pub entered: usize,
+        pub completed: usize,
+    }
+    static CONTROL: Mutex<Control> = Mutex::new(Control {
+        conn: 0,
+        panic_writer: false,
+        panic_outer: false,
+        spawn_failure: false,
+        pause_writer: false,
+        entered: 0,
+        completed: 0,
+    });
+    static WAKE: std::sync::Condvar = std::sync::Condvar::new();
+    static READS: Mutex<Vec<(u32, usize, usize)>> = Mutex::new(Vec::new());
+    pub(super) static POST_CALLS: AtomicUsize = AtomicUsize::new(0);
+    pub(super) fn reads(conn: u32) -> (usize, usize) {
+        READS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .find(|r| r.0 == conn)
+            .map_or((0, 0), |r| (r.1, r.2))
+    }
+    pub(super) fn read_started(conn: u32) {
+        let mut reads = READS.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(r) = reads.iter_mut().find(|r| r.0 == conn) {
+            r.1 += 1;
+        } else {
+            reads.push((conn, 1, 0));
+        }
+    }
+    pub(super) fn read_finished(conn: u32) {
+        let mut reads = READS.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(r) = reads.iter_mut().find(|r| r.0 == conn) {
+            r.2 += 1;
+        }
+    }
+    pub(super) fn set(control: Control) {
+        *CONTROL.lock().unwrap_or_else(PoisonError::into_inner) = control;
+        WAKE.notify_all();
+    }
+    pub(super) fn release() {
+        CONTROL
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pause_writer = false;
+        WAKE.notify_all();
+    }
+    pub(super) fn counts() -> (usize, usize) {
+        let c = CONTROL.lock().unwrap_or_else(PoisonError::into_inner);
+        (c.entered, c.completed)
+    }
+    pub(super) fn writer_spawn_fails(conn: u32) -> bool {
+        let c = CONTROL.lock().unwrap_or_else(PoisonError::into_inner);
+        c.conn == conn && c.spawn_failure
+    }
+    pub(super) fn outer_started(conn: u32) {
+        let c = CONTROL.lock().unwrap_or_else(PoisonError::into_inner);
+        let panic = c.conn == conn && c.panic_outer;
+        drop(c);
+        assert!(
+            !panic,
+            "intentional retained outer actor panic after Joined"
+        );
+    }
+    pub(super) fn before_write(conn: u32) {
+        let mut c = CONTROL.lock().unwrap_or_else(PoisonError::into_inner);
+        if c.conn != conn {
+            return;
+        }
+        c.entered += 1;
+        while c.pause_writer {
+            c = WAKE.wait(c).unwrap_or_else(PoisonError::into_inner);
+        }
+        let panic = c.panic_writer;
+        drop(c);
+        assert!(
+            !panic,
+            "intentional retained native writer panic with active payload"
+        );
+    }
+    pub(super) fn after_write(conn: u32) {
+        let mut c = CONTROL.lock().unwrap_or_else(PoisonError::into_inner);
+        if c.conn == conn {
+            c.completed += 1;
+        }
+    }
+}
+
+#[cfg(all(
+    test,
+    feature = "paired-packages",
+    feature = "native-writer-test-control",
+    debug_assertions
+))]
+pub(super) fn retained_test_read_progress(conn: u32) -> (usize, usize) {
+    retained_controls::reads(conn)
+}
+
 struct Parts {
     uuid: u128,
     name: String,
@@ -953,16 +1624,21 @@ fn login_and_configure(
     uuid: u128,
     name: &str,
     properties: Vec<login::Property>,
+    retained: Option<&RetainedContext>,
 ) -> Result<Option<Parts>, String> {
     let e = |e: horizon_protocol::Error| e.to_string();
     // ServerLoginPacketListenerImpl: memory connections are not compressed.
     let threshold = shared.config.compression_threshold;
     if threshold >= 0 && !c.is_memory() {
-        c.send(&login::Clientbound::Compression(login::Compression { threshold }).encode())
-            .map_err(e)?;
+        send_modern(
+            c,
+            &login::Clientbound::Compression(login::Compression { threshold }).encode(),
+            retained,
+        )?;
         c.set_compression(threshold);
     }
-    c.send(
+    send_modern(
+        c,
         &login::Clientbound::LoginFinished(login::LoginFinished {
             profile: login::GameProfile {
                 uuid,
@@ -972,11 +1648,11 @@ fn login_and_configure(
             session: uuid,
         })
         .encode(),
-    )
-    .map_err(e)?;
+        retained,
+    )?;
     // The client may send its settings before acknowledging the login.
     loop {
-        let (id, payload) = recv_connection(c, shared).map_err(e)?;
+        let (id, payload) = recv_modern(c, shared, retained)?;
         match login::Serverbound::decode(id, &payload).map_err(e)? {
             login::Serverbound::LoginAcknowledged(_) => break,
             login::Serverbound::CustomQueryAnswer(_) | login::Serverbound::CookieResponse(_) => {}
@@ -985,7 +1661,7 @@ fn login_and_configure(
     }
     // Configuration.
     let sync: &SyncData = &shared.sync;
-    let send = |c: &mut Connection, p: cfg::Clientbound| c.send(&p.encode()).map_err(e);
+    let send = |c: &mut Connection, p: cfg::Clientbound| send_modern(c, &p.encode(), retained);
     send(
         c,
         cfg::Clientbound::CustomPayload(cfg::CustomPayload {
@@ -1028,7 +1704,7 @@ fn login_and_configure(
     let mut info = ClientInformation::new(10);
     let mut brand = String::from("vanilla");
     let known_pack = loop {
-        let (id, payload) = recv_connection(c, shared).map_err(e)?;
+        let (id, payload) = recv_modern(c, shared, retained)?;
         match cfg::Serverbound::decode(id, &payload).map_err(e)? {
             cfg::Serverbound::ClientInformation(i) => info = i,
             cfg::Serverbound::CustomPayload(p) if p.channel == "minecraft:brand" => {
@@ -1065,7 +1741,7 @@ fn login_and_configure(
     }
     send(c, cfg::Clientbound::FinishConfiguration(Empty))?;
     loop {
-        let (id, payload) = recv_connection(c, shared).map_err(e)?;
+        let (id, payload) = recv_modern(c, shared, retained)?;
         match cfg::Serverbound::decode(id, &payload).map_err(e)? {
             cfg::Serverbound::FinishConfiguration(_) => break,
             cfg::Serverbound::ClientInformation(i) => info = i,
@@ -1276,6 +1952,7 @@ fn play_staged(
             pending: pending.clone(),
             conn,
         }),
+        retained: None,
     };
     let latency = Arc::new(AtomicI32::new(0));
     let alive = Arc::new(AtomicI64::new(-1));
@@ -1550,6 +2227,15 @@ fn send_body(writer: &mut ConnWriter, body: &[u8]) -> horizon_protocol::Result<(
     }
 }
 
+/// Retained preparation is separate from the actual native write. Ordinary and
+/// staged sends retain their original send_body path and failure behavior.
+fn prepare_retained_body(writer: &ConnWriter, body: &[u8]) -> horizon_protocol::Result<Arc<[u8]>> {
+    match writer.threshold {
+        Some(t) if body.len() >= t.max(SHARED_FRAME_MIN) => SharedFrames::get().contents(body, t),
+        _ => horizon_protocol::frame::contents(body, writer.threshold).map(Arc::from),
+    }
+}
+
 fn write_loop(
     mut writer: ConnWriter,
     rx: Receiver<Out>,
@@ -1749,6 +2435,715 @@ mod tests {
     }
 }
 
+#[cfg(all(
+    test,
+    feature = "paired-packages",
+    feature = "native-writer-test-control",
+    debug_assertions
+))]
+mod retained_transport_tests {
+    use super::super::{ClosedLan, RetainedActor, RetainedLan, RetainedOfflineConfig};
+    use super::*;
+
+    struct Fixture(Option<RetainedLan>);
+    impl Fixture {
+        fn new() -> Self {
+            Self::with_compression(-1)
+        }
+        fn with_compression(compression_threshold: i32) -> Self {
+            retained_controls::set(Default::default());
+            Self(Some(
+                RetainedLan::new(
+                    super::super::retained_test_sync(),
+                    RetainedOfflineConfig {
+                        bind: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+                        port: 0,
+                        motd: "retained native test".into(),
+                        max_players: 4,
+                        compression_threshold,
+                        enable_status: true,
+                        hide_online_players: false,
+                        announce: false,
+                    },
+                )
+                .expect("valid retained fixture"),
+            ))
+        }
+        fn lan(&mut self) -> &mut RetainedLan {
+            self.0.as_mut().unwrap()
+        }
+        fn pipe(&mut self) -> Connection {
+            let c = Connection::local(self.lan().connect_local().expect("actual native Pipe"));
+            c.reader
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            c
+        }
+        fn tcp(&mut self) -> Connection {
+            let port = self.lan().listen().expect("actual native listener");
+            let c = Connection::from_stream(
+                TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
+                    .expect("actual loopback TCP"),
+            )
+            .unwrap();
+            c.reader
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            c
+        }
+        fn wait(&mut self, predicate: impl Fn(&super::super::RetainedObservation) -> bool) -> bool {
+            let until = Instant::now() + Duration::from_secs(5);
+            loop {
+                self.lan().poll_close();
+                if predicate(&self.lan().observe()) {
+                    return true;
+                }
+                if Instant::now() >= until {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        fn joined(&mut self) -> Option<Joined> {
+            if !self.wait(|o| o.queued_events > 0) {
+                return None;
+            }
+            self.lan()
+                .poll_events(16)
+                .into_iter()
+                .find_map(|event| match event {
+                    NetEvent::Joined(joined) => Some(*joined),
+                    _ => None,
+                })
+        }
+        fn close(&mut self) -> ClosedLan {
+            retained_controls::release();
+            self.lan().begin_close(Duration::from_secs(5));
+            let completed = self.wait(|o| o.quiescent);
+            assert!(completed, "actual retained native actors did not finish");
+            match self.0.take().unwrap().try_closed() {
+                Ok(closed) => closed,
+                Err(owner) => {
+                    self.0 = Some(owner);
+                    panic!("quiescence failed checked consume");
+                }
+            }
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            retained_controls::release();
+            if self.0.is_some() {
+                let _ = self.close();
+            }
+            retained_controls::set(Default::default());
+        }
+    }
+
+    // This exercises every ordinary login/configuration encoder, including the
+    // real prepared registry/tag data, rather than an abbreviated play fixture.
+    fn login_client(c: &mut Connection, name: &str) -> Result<usize, String> {
+        let e = |e: horizon_protocol::Error| e.to_string();
+        c.send(
+            &handshake::Serverbound::Intention(handshake::Intention {
+                protocol: PROTOCOL_VERSION,
+                host: "localhost".into(),
+                port: 0,
+                intent: handshake::LOGIN,
+            })
+            .encode(),
+        )
+        .map_err(e)?;
+        c.send(
+            &login::Serverbound::Hello(login::ServerHello {
+                name: name.into(),
+                uuid: 0,
+            })
+            .encode(),
+        )
+        .map_err(e)?;
+        loop {
+            let (id, body) = c.recv().map_err(e)?;
+            match login::Clientbound::decode(id, &body).map_err(e)? {
+                login::Clientbound::Compression(p) => c.set_compression(p.threshold),
+                login::Clientbound::LoginFinished(p) => {
+                    if p.profile.uuid != offline_uuid(name) {
+                        return Err("incorrect offline UUID".into());
+                    }
+                    break;
+                }
+                other => return Err(format!("unexpected login packet {other:?}")),
+            }
+        }
+        c.send(&login::Serverbound::LoginAcknowledged(Empty).encode())
+            .map_err(e)?;
+        let mut registries = 0;
+        let mut tags = false;
+        loop {
+            let (id, body) = c.recv().map_err(e)?;
+            match cfg::Clientbound::decode(id, &body).map_err(e)? {
+                cfg::Clientbound::SelectKnownPacks(_) => {
+                    c.send(
+                        &cfg::Serverbound::SelectKnownPacks(cfg::SelectKnownPacks {
+                            packs: Vec::new(),
+                        })
+                        .encode(),
+                    )
+                    .map_err(e)?;
+                }
+                cfg::Clientbound::RegistryData(_) => registries += 1,
+                cfg::Clientbound::UpdateTags(_) => tags = true,
+                cfg::Clientbound::FinishConfiguration(_) => {
+                    if registries == 0 || !tags {
+                        return Err("missing real configuration data".into());
+                    }
+                    c.send(&cfg::Serverbound::FinishConfiguration(Empty).encode())
+                        .map_err(e)?;
+                    return Ok(registries);
+                }
+                cfg::Clientbound::Disconnect(_) => return Err("configuration refused".into()),
+                _ => {}
+            }
+        }
+    }
+    fn actor(
+        closed: &ClosedLan,
+        kind: RetainedActor,
+        outcome: impl Fn(&RetainedOutcome) -> bool,
+    ) -> bool {
+        closed
+            .observation
+            .terminals
+            .iter()
+            .any(|t| t.actor == kind && outcome(&t.outcome))
+    }
+
+    #[test]
+    fn retained_native_tcp_login_keeps_joined_and_packet_events() {
+        let mut fixture = Fixture::new();
+        let mut client = fixture.tcp();
+        let login = login_client(&mut client, "RetainedTcp");
+        // Unknown play packets still use the real decoder and mailbox route.
+        let packet = client.send(&[0xff, 0x7f, 19]);
+        let queued = fixture.wait(|o| o.queued_events >= 2);
+        let closed = fixture.close();
+        assert!(login.unwrap() > 0);
+        packet.unwrap();
+        assert!(queued);
+        assert!(
+            closed
+                .events
+                .iter()
+                .any(|e| matches!(e, NetEvent::Joined(_)))
+        );
+        assert!(
+            closed
+                .events
+                .iter()
+                .any(|e| matches!(e, NetEvent::Packet(_, _)))
+        );
+        assert!(
+            closed
+                .observation
+                .attempts
+                .iter()
+                .all(|a| a.released && !a.outer_pending && !a.writer_pending)
+        );
+        assert!(actor(&closed, RetainedActor::Writer, |_| true));
+    }
+
+    #[test]
+    fn retained_native_pipe_login_and_eof_keep_unconsumed_joined() {
+        let mut fixture = Fixture::new();
+        let mut client = fixture.pipe();
+        let login = login_client(&mut client, "RetainedPipe");
+        let joined = fixture.wait(|o| o.queued_events > 0);
+        drop(client);
+        let ended = fixture.wait(|o| o.terminals.iter().any(|t| t.actor == RetainedActor::Outer));
+        let closed = fixture.close();
+        assert!(login.unwrap() > 0 && joined && ended);
+        assert!(
+            closed
+                .events
+                .iter()
+                .any(|e| matches!(e, NetEvent::Joined(_)))
+        );
+        assert!(actor(&closed, RetainedActor::Outer, |o| matches!(
+            o,
+            RetainedOutcome::Eof
+        )));
+    }
+
+    #[test]
+    fn retained_direct_sender_flush_order_and_sealed_held_custody() {
+        let mut fixture = Fixture::new();
+        let mut client = fixture.pipe();
+        let login = login_client(&mut client, "DirectOrder");
+        let joined = fixture.joined();
+        let Some(joined) = joined else {
+            fixture.close();
+            panic!("native Joined missing");
+        };
+        let sender = joined.sender;
+        let before_post = retained_controls::POST_CALLS.load(Ordering::Acquire);
+        sender.send(vec![1, 1]);
+        let holding = Holding::start();
+        sender.send_many([vec![1, 2], vec![1, 3]]);
+        drop(holding);
+        flush_all([&sender]);
+        sender.send(vec![1, 4]);
+        let packets: Vec<_> = (0..4).map(|_| client.recv()).collect();
+        retained_controls::set(retained_controls::Control {
+            conn: joined.conn,
+            pause_writer: true,
+            ..Default::default()
+        });
+        sender.send(vec![1, 5]);
+        let writer_entered = fixture.wait(|_| retained_controls::counts().0 > 0);
+        let holding = Holding::start();
+        sender.send(vec![1, 6]);
+        drop(holding);
+        let public_disconnected = sender.tx.send(Out::Packet(vec![1, 99])).is_err();
+        let latched = Arc::new(std::sync::Barrier::new(2));
+        let resume = Arc::new(std::sync::Barrier::new(2));
+        fixture
+            .lan()
+            .retained_test_close_gate(latched.clone(), resume.clone());
+        let mut owner = fixture.0.take().unwrap();
+        let closer = std::thread::spawn(move || {
+            owner.begin_close(Duration::from_secs(5));
+            owner
+        });
+        latched.wait();
+        // The actual writer is paused with its active payload. Native queue
+        // sealing has not happened, yet the irreversible registry latch rejects
+        // every producer and leaves the already held body in original custody.
+        let queue = sender.retained.as_ref().unwrap();
+        let unsealed_in_gap = !queue.inner().sealed;
+        let before_gap = queue.snapshot();
+        sender.send(vec![1, 70]);
+        sender.send_many([vec![1, 71], vec![1, 72]]);
+        sender.flush();
+        flush_all([&sender]);
+        sender.deliver(Out::Packet(vec![1, 73]));
+        sender.deliver(Out::Packets(vec![vec![1, 74]]));
+        sender.disconnect(horizon_world::nbt::Tag::String("already closing".into()));
+        let after_gap = queue.snapshot();
+        resume.wait();
+        fixture.0 = Some(
+            closer
+                .join()
+                .expect("actual close coordinator returned original owner"),
+        );
+        let closed = fixture.close();
+        sender.send(vec![1, 75]);
+        sender.flush();
+        flush_all([&sender]);
+        let status = sender.retained.as_ref().unwrap().snapshot();
+        let after_post = retained_controls::POST_CALLS.load(Ordering::Acquire);
+        login.unwrap();
+        assert!(public_disconnected);
+        assert!(writer_entered && unsealed_in_gap);
+        assert!(before_gap.sealed && after_gap.sealed);
+        assert_eq!(before_gap.queued_bodies, after_gap.queued_bodies);
+        assert_eq!(before_gap.queued_bytes, after_gap.queued_bytes);
+        assert_eq!(after_gap.queued_bodies, 1);
+        assert_eq!(after_gap.active_bodies, 1);
+        assert_eq!(
+            packets.into_iter().map(|p| p.unwrap()).collect::<Vec<_>>(),
+            [(1, vec![1]), (1, vec![2]), (1, vec![3]), (1, vec![4])]
+        );
+        assert_eq!(before_post, after_post);
+        assert_eq!(status.queued_bodies, 1);
+        assert_eq!(status.queued_bytes, 2);
+        assert_eq!(status.written_bodies, 4);
+        assert_eq!(status.failed_bodies, 1);
+        assert!(status.sealed && closed.observation.quiescent);
+
+        // The disconnect route flushes held packets into the same direct queue,
+        // then closes only after its own native write has succeeded.
+        let mut fixture = Fixture::new();
+        let mut client = fixture.pipe();
+        let login = login_client(&mut client, "DirectDisconnect");
+        let joined = fixture.joined();
+        let Some(joined) = joined else {
+            fixture.close();
+            panic!("native Joined missing");
+        };
+        let before_post = retained_controls::POST_CALLS.load(Ordering::Acquire);
+        let holding = Holding::start();
+        joined.sender.send(vec![1, 7]);
+        joined
+            .sender
+            .disconnect(horizon_world::nbt::Tag::String("closed".into()));
+        drop(holding);
+        let first = client.recv();
+        let disconnect = client
+            .recv()
+            .and_then(|(id, body)| play::Clientbound::decode(id, &body));
+        let closed = fixture.close();
+        login.unwrap();
+        assert_eq!(first.unwrap(), (1, vec![7]));
+        assert!(matches!(
+            disconnect.unwrap(),
+            play::Clientbound::Disconnect(_)
+        ));
+        assert_eq!(
+            before_post,
+            retained_controls::POST_CALLS.load(Ordering::Acquire)
+        );
+        assert!(actor(&closed, RetainedActor::Writer, |o| matches!(
+            o,
+            RetainedOutcome::Closed
+        )));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn retained_blocked_actual_tcp_writer_is_interrupted_with_payload_custody() {
+        use std::io::Read;
+        let mut fixture = Fixture::new();
+        let mut observer: Option<TcpStream> = None;
+        let precondition = (|| -> Result<(Joined, Arc<[u8]>), String> {
+            fixture.lan().retained_test_socket_send_buffer(4096);
+            let port = fixture.lan().listen().map_err(|e| e.to_string())?;
+            let socket = TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
+                .map_err(|e| e.to_string())?;
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .map_err(|e| e.to_string())?;
+            socket
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .map_err(|e| e.to_string())?;
+            rustix::net::sockopt::set_socket_recv_buffer_size(&socket, 4096)
+                .map_err(|e| e.to_string())?;
+            let recv_bytes = rustix::net::sockopt::socket_recv_buffer_size(&socket)
+                .map_err(|e| e.to_string())?;
+            observer = Some(socket.try_clone().map_err(|e| e.to_string())?);
+            let mut client = Connection::from_stream(socket).map_err(|e| e.to_string())?;
+            login_client(&mut client, "BlockedWriter")?;
+            let joined = fixture.joined().ok_or("native Joined missing")?;
+            let send_bytes = fixture
+                .lan()
+                .retained_test_socket_buffer()?
+                .ok_or("accepted native SO_SNDBUF observation missing")?;
+            retained_controls::set(retained_controls::Control {
+                conn: joined.conn,
+                ..Default::default()
+            });
+            let marker = b"s1tl1-first-native-active-frame-unique-v1";
+            let channel = "horizon:retained_writer_probe";
+            let mut data = vec![0xa5; 1_999_900];
+            data[..marker.len()].copy_from_slice(marker);
+            let body = play::Clientbound::CustomPayload(cfg::CustomPayload {
+                channel: channel.into(),
+                data,
+            })
+            .encode();
+            let expected_prefix = &body[..128];
+            let capacity = send_bytes
+                .checked_add(recv_bytes)
+                .and_then(|n| n.checked_add(131))
+                .and_then(|n| n.checked_mul(8))
+                .ok_or("native buffer capacity arithmetic overflow")?;
+            if send_bytes == 0 || recv_bytes == 0 || capacity >= body.len() {
+                return Err(format!(
+                    "native buffers too large for defining frame: send={send_bytes}, recv={recv_bytes}, frame={}",
+                    body.len()
+                ));
+            }
+            joined.sender.send(body.clone());
+            if !fixture.wait(|_| retained_controls::counts().0 > 0) {
+                return Err("original native writer did not enter first frame write".into());
+            }
+            let queue = joined.sender.retained.as_ref().unwrap();
+            let original_active = queue
+                .inner()
+                .active
+                .clone()
+                .ok_or("first active body missing")?;
+            if original_active.as_ref() != body.as_slice() {
+                return Err("first active body differs from unique defining frame".into());
+            }
+            // This clone reads only a bounded prefix of the SAME first frame.
+            // Actual length/id/channel/marker bytes establish native progress;
+            // effective buffers plus the prefix cannot accommodate its remainder.
+            let peer = observer.as_mut().unwrap();
+            let mut length = 0usize;
+            let mut prefix_done = false;
+            for shift in [0, 7, 14] {
+                let mut byte = [0u8; 1];
+                peer.read_exact(&mut byte).map_err(|e| e.to_string())?;
+                length |= usize::from(byte[0] & 0x7f) << shift;
+                if byte[0] & 0x80 == 0 {
+                    prefix_done = true;
+                    break;
+                }
+            }
+            if !prefix_done || length != body.len() {
+                return Err("incorrect first native frame length".into());
+            }
+            let mut prefix = [0u8; 128];
+            peer.read_exact(&mut prefix).map_err(|e| e.to_string())?;
+            if prefix.as_slice() != expected_prefix {
+                return Err("native first-frame prefix mismatch".into());
+            }
+            let mut r = horizon_protocol::buf::Reader::new(&prefix);
+            if r.varint().map_err(|e| e.to_string())?
+                != horizon_protocol::ids::play::clientbound::CUSTOM_PAYLOAD
+                || r.string(32767).map_err(|e| e.to_string())? != channel
+                || r.bytes(marker.len()).map_err(|e| e.to_string())? != marker
+            {
+                return Err("native first-frame identity mismatch".into());
+            }
+            let current = queue
+                .inner()
+                .active
+                .clone()
+                .ok_or("first active body disappeared")?;
+            if !Arc::ptr_eq(&original_active, &current)
+                || retained_controls::counts() != (1, 0)
+                || fixture.lan().retained_test_writer_finished(joined.conn) != Some(false)
+                || queue.snapshot().failed_bodies != 0
+            {
+                return Err(
+                    "same first native write was not observed unfinished before interruption"
+                        .into(),
+                );
+            }
+            Ok((joined, original_active))
+        })();
+        // Cleanup cannot establish the passing precondition: all observations
+        // above occurred before actual native interruption and checked reap.
+        fixture.lan().begin_close(Duration::from_secs(5));
+        if let Some(peer) = observer.take() {
+            let _ = peer.shutdown(std::net::Shutdown::Both);
+            drop(peer);
+        }
+        let closed = fixture.close();
+        let (joined, original_active) =
+            precondition.expect("actual first native write precondition");
+        let queue = joined.sender.retained.as_ref().unwrap();
+        let status = queue.snapshot();
+        assert_eq!(status.active_bodies, 1);
+        assert_eq!(status.failed_bodies, 1);
+        assert_eq!(status.queued_bodies, 0);
+        assert!(status.sealed);
+        assert!(Arc::ptr_eq(
+            &original_active,
+            queue.inner().active.as_ref().unwrap()
+        ));
+        assert!(actor(&closed, RetainedActor::Writer, |o| matches!(
+            o,
+            RetainedOutcome::Io(_)
+        )));
+    }
+
+    #[test]
+    fn retained_codec_receive_and_oversized_encode_preserve_original_failures() {
+        let mut fixture = Fixture::with_compression(1);
+        let mut client = fixture.tcp();
+        let login = login_client(&mut client, "MalformedCodec");
+        let joined = fixture.wait(|o| o.queued_events > 0);
+        // Declares eight uncompressed bytes, but contains the complete valid
+        // zlib encoding of an empty body. This reaches the actual decompressor.
+        let malformed = [8, 0x78, 0x9c, 3, 0, 0, 0, 0, 1];
+        let sent = client.writer.send_contents(&malformed);
+        let ended = fixture.wait(|o| o.terminals.iter().any(|t| t.actor == RetainedActor::Outer));
+        let closed = fixture.close();
+        drop(client);
+        login.unwrap();
+        sent.unwrap();
+        assert!(joined && ended);
+        assert!(actor(&closed, RetainedActor::Outer, |o| matches!(o,
+            RetainedOutcome::Receive(text)
+                if text == "Badly compressed packet - actual length 0 does not match declared size 8")));
+        assert!(!actor(&closed, RetainedActor::Outer, |o| matches!(
+            o,
+            RetainedOutcome::Io(_) | RetainedOutcome::Protocol(_)
+        )));
+        assert!(
+            closed
+                .events
+                .iter()
+                .any(|e| matches!(e, NetEvent::Joined(_)))
+        );
+        assert!(actor(&closed, RetainedActor::Writer, |_| true));
+        assert!(
+            closed
+                .observation
+                .attempts
+                .iter()
+                .all(|a| a.released && !a.outer_pending && !a.writer_pending)
+        );
+
+        let mut fixture = Fixture::new();
+        let mut client = fixture.pipe();
+        let login = login_client(&mut client, "OversizedEncode");
+        let joined = fixture.joined();
+        let Some(joined) = joined else {
+            fixture.close();
+            panic!("native Joined missing");
+        };
+        retained_controls::set(retained_controls::Control {
+            conn: joined.conn,
+            ..Default::default()
+        });
+        let bytes = horizon_protocol::frame::MAX_FRAME + 1;
+        joined.sender.send(vec![1; bytes]);
+        let ended = fixture.wait(|o| o.terminals.iter().any(|t| t.actor == RetainedActor::Writer));
+        let closed = fixture.close();
+        drop(client);
+        let queue = joined.sender.retained.as_ref().unwrap();
+        let status = queue.snapshot();
+        login.unwrap();
+        assert!(ended);
+        assert!(actor(&closed, RetainedActor::Writer, |o| matches!(o,
+            RetainedOutcome::Encode(text) if text == &format!("packet too large: {bytes} bytes"))));
+        assert!(!actor(&closed, RetainedActor::Writer, |o| matches!(
+            o,
+            RetainedOutcome::Io(_)
+        )));
+        assert_eq!(retained_controls::counts(), (0, 0));
+        assert_eq!(status.active_bytes, bytes);
+        assert_eq!(status.failed_bodies, 1);
+        assert_eq!(status.written_bodies, 0);
+        assert_eq!(queue.inner().active.as_ref().unwrap().len(), bytes);
+        assert!(actor(&closed, RetainedActor::Outer, |_| true));
+        assert!(
+            closed
+                .observation
+                .attempts
+                .iter()
+                .all(|a| a.released && !a.outer_pending && !a.writer_pending)
+        );
+    }
+
+    #[test]
+    fn retained_actual_writer_panic_retains_active_body_and_both_join_outcomes() {
+        let mut fixture = Fixture::new();
+        let mut client = fixture.pipe();
+        let login = login_client(&mut client, "WriterPanic");
+        let joined = fixture.joined();
+        let Some(joined) = joined else {
+            fixture.close();
+            panic!("native Joined missing");
+        };
+        retained_controls::set(retained_controls::Control {
+            conn: joined.conn,
+            panic_writer: true,
+            ..Default::default()
+        });
+        joined.sender.send(vec![1, 71]);
+        let ended = fixture.wait(|o| o.terminals.iter().any(|t| t.actor == RetainedActor::Writer));
+        let closed = fixture.close();
+        let status = joined.sender.retained.as_ref().unwrap().snapshot();
+        login.unwrap();
+        assert!(ended);
+        assert_eq!(status.active_bodies, 1);
+        assert_eq!(status.failed_bodies, 1);
+        assert_eq!(status.active_bytes, 2);
+        assert_eq!(
+            &**joined
+                .sender
+                .retained
+                .as_ref()
+                .unwrap()
+                .inner()
+                .active
+                .as_ref()
+                .unwrap(),
+            &[1, 71]
+        );
+        assert!(actor(&closed, RetainedActor::Writer, |o| matches!(
+            o,
+            RetainedOutcome::Panic
+        )));
+        assert!(actor(&closed, RetainedActor::Outer, |_| true));
+    }
+
+    #[test]
+    fn retained_outer_panic_keeps_actual_writer_and_queued_joined() {
+        let mut fixture = Fixture::new();
+        retained_controls::set(retained_controls::Control {
+            conn: 1,
+            panic_outer: true,
+            ..Default::default()
+        });
+        let mut client = fixture.pipe();
+        let login = login_client(&mut client, "OuterPanic");
+        let ended = fixture.wait(|o| o.terminals.iter().any(|t| t.actor == RetainedActor::Outer));
+        let closed = fixture.close();
+        login.unwrap();
+        assert!(ended);
+        assert!(
+            closed
+                .events
+                .iter()
+                .any(|e| matches!(e, NetEvent::Joined(_)))
+        );
+        assert!(actor(&closed, RetainedActor::Outer, |o| matches!(
+            o,
+            RetainedOutcome::Panic
+        )));
+        assert!(actor(&closed, RetainedActor::Writer, |_| true));
+        assert!(closed.observation.attempts.iter().all(|a| a.released));
+    }
+
+    #[test]
+    fn retained_writer_spawn_and_actual_pipe_write_errors_remain_distinct() {
+        let mut fixture = Fixture::new();
+        retained_controls::set(retained_controls::Control {
+            conn: 1,
+            spawn_failure: true,
+            ..Default::default()
+        });
+        let mut client = fixture.pipe();
+        let first_login = login_client(&mut client, "SpawnFailure");
+        let ended = fixture.wait(|o| o.terminals.iter().any(|t| t.actor == RetainedActor::Outer));
+        let failed_spawn = fixture.close();
+        first_login.unwrap();
+        assert!(ended);
+        assert!(actor(&failed_spawn, RetainedActor::Outer, |o| matches!(
+            o,
+            RetainedOutcome::Spawn(_)
+        )));
+
+        let mut fixture = Fixture::new();
+        let mut client = fixture.pipe();
+        let login = login_client(&mut client, "NativeIoError");
+        let joined = fixture.joined();
+        let Some(joined) = joined else {
+            fixture.close();
+            panic!("native Joined missing");
+        };
+        retained_controls::set(retained_controls::Control {
+            conn: joined.conn,
+            pause_writer: true,
+            ..Default::default()
+        });
+        joined.sender.send(vec![1, 83]);
+        let entered = fixture.wait(|_| retained_controls::counts().0 > 0);
+        client.writer.shutdown();
+        retained_controls::release();
+        let ended = fixture.wait(|o| o.terminals.iter().any(|t| t.actor == RetainedActor::Writer));
+        let closed = fixture.close();
+        let status = joined.sender.retained.as_ref().unwrap().snapshot();
+        login.unwrap();
+        assert!(entered && ended);
+        assert_eq!(status.failed_bodies, 1);
+        assert_eq!(status.active_bytes, 2);
+        assert!(actor(&closed, RetainedActor::Writer, |o| matches!(
+            o,
+            RetainedOutcome::Io(_)
+        )));
+        assert!(!actor(&closed, RetainedActor::Writer, |o| matches!(
+            o,
+            RetainedOutcome::Closed
+        )));
+    }
+}
+
 #[cfg(all(test, feature = "paired-packages"))]
 mod staged_transport_tests {
     use super::super::{StagedAttempt, StagedFailure, StagedInner, StagedProfiles, StagedState};
@@ -1784,6 +3179,7 @@ mod staged_transport_tests {
                     pending,
                     conn,
                 }),
+                retained: None,
             },
             rx,
         )

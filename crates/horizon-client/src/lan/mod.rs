@@ -1163,6 +1163,1277 @@ pub fn available_port() -> u16 {
         .map_or(25565, |a| a.port())
 }
 
+#[cfg(feature = "paired-packages")]
+use retained::RetainedContext;
+#[cfg(feature = "paired-packages")]
+pub use retained::{
+    ClosedLan, RetainedActor, RetainedAttemptObservation, RetainedCloseStatus, RetainedLan,
+    RetainedObservation, RetainedOfflineConfig, RetainedOutcome, RetainedTerminal,
+};
+
+#[cfg(all(test, feature = "paired-packages"))]
+pub(super) fn retained_test_sync() -> Arc<data::SyncData> {
+    static SYNC: std::sync::OnceLock<Arc<data::SyncData>> = std::sync::OnceLock::new();
+    SYNC.get_or_init(|| {
+        let resources = std::env::var_os("HORIZON_RETAINED_TEST_RESOURCES")
+            .expect("retained native tests require pinned HORIZON_RETAINED_TEST_RESOURCES");
+        Arc::new(
+            data::SyncData::load(std::path::Path::new(&resources))
+                .expect("retained native tests require valid pinned prepared resources"),
+        )
+    })
+    .clone()
+}
+
+/// A separate native owner. Ordinary LAN constructors never enter this module.
+#[cfg(feature = "paired-packages")]
+mod retained {
+    use super::*;
+    use horizon_protocol::connection::{Connection, ConnectionShutdown, Pipe};
+    use std::collections::VecDeque;
+    use std::time::Instant;
+
+    /// Constructor input deliberately cannot own online services or callbacks.
+    #[derive(Clone, Debug)]
+    pub struct RetainedOfflineConfig {
+        pub bind: Option<std::net::IpAddr>,
+        pub port: u16,
+        pub motd: String,
+        pub max_players: usize,
+        pub compression_threshold: i32,
+        pub enable_status: bool,
+        pub hide_online_players: bool,
+        pub announce: bool,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum RetainedOutcome {
+        Returned,
+        Io(String),
+        /// The baseline protocol error carries no native/codec discriminator.
+        Receive(String),
+        /// Outbound framing/compression failed before the native write call.
+        Encode(String),
+        Spawn(String),
+        PingerStartup(discovery::RetainedPingerStartError),
+        Protocol(String),
+        Eof,
+        Closed,
+        QueueClosed,
+        Panic,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum RetainedActor {
+        Listener,
+        Outer,
+        Writer,
+        Shutdown,
+        Acquisition,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct RetainedTerminal {
+        pub conn: Option<u32>,
+        pub actor: RetainedActor,
+        pub outcome: RetainedOutcome,
+    }
+
+    #[derive(Clone, Debug)]
+    pub struct RetainedAttemptObservation {
+        pub conn: u32,
+        pub uuid: Option<u128>,
+        pub released: bool,
+        pub outer_pending: bool,
+        pub writer_pending: bool,
+        pub outbound: Option<conn::RetainedOutboundStatus>,
+    }
+
+    #[derive(Clone, Debug)]
+    pub struct RetainedObservation {
+        pub closing: bool,
+        pub deadline_expired: bool,
+        pub quiescent: bool,
+        pub queued_events: usize,
+        pub listener_pending: bool,
+        pub attempts: Vec<RetainedAttemptObservation>,
+        pub terminals: Vec<RetainedTerminal>,
+        pub announcement: Option<discovery::RetainedPingerObservation>,
+    }
+
+    #[derive(Clone, Debug)]
+    pub enum RetainedCloseStatus {
+        Pending(RetainedObservation),
+        Blocked(RetainedObservation),
+        Quiescent(RetainedObservation),
+    }
+
+    /// Completion retains unconsumed game events and actual native outcomes.
+    pub struct ClosedLan {
+        pub events: Vec<NetEvent>,
+        pub observation: RetainedObservation,
+        pub announcement: Option<discovery::RetainedPingerTerminal>,
+        // Preserve original queued/active wire payloads through the typed
+        // closed handoff. They are disposed only when this closed owner drops.
+        _registry: Arc<RetainedRegistry>,
+    }
+
+    #[derive(Default)]
+    struct NativeSlot {
+        pending: bool,
+        handle: Option<JoinHandle<RetainedOutcome>>,
+        outcome: Option<RetainedOutcome>,
+    }
+    impl NativeSlot {
+        fn starting() -> Self {
+            Self {
+                pending: true,
+                ..Self::default()
+            }
+        }
+        fn unresolved(&self) -> bool {
+            self.pending || self.handle.is_some()
+        }
+        fn take_finished(&mut self) -> Option<JoinHandle<RetainedOutcome>> {
+            if self.handle.as_ref().is_some_and(JoinHandle::is_finished) {
+                self.pending = true;
+                self.handle.take()
+            } else {
+                None
+            }
+        }
+    }
+
+    struct Attempt {
+        conn: u32,
+        shutdown: ConnectionShutdown,
+        outer: NativeSlot,
+        writer: Option<NativeSlot>,
+        outbound: Option<Arc<conn::RetainedOutbound>>,
+        uuid: Option<u128>,
+        released: bool,
+    }
+    #[derive(Default)]
+    struct RegistryInner {
+        closing: bool,
+        listener: Option<NativeSlot>,
+        attempts: Vec<Attempt>,
+        events: VecDeque<NetEvent>,
+        terminals: Vec<RetainedTerminal>,
+        #[cfg(test)]
+        controls: AcquisitionControls,
+    }
+    #[cfg(test)]
+    #[derive(Default)]
+    struct AcquisitionControls {
+        outer_registered: Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
+        close_latched: Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
+        fail_outer_spawn: bool,
+        fail_listener_spawn: bool,
+        panic_listener: bool,
+        #[cfg(all(
+            feature = "native-writer-test-control",
+            debug_assertions,
+            target_os = "linux"
+        ))]
+        socket_send_buffer: Option<usize>,
+        #[cfg(all(
+            feature = "native-writer-test-control",
+            debug_assertions,
+            target_os = "linux"
+        ))]
+        socket_send_buffer_result: Option<Result<usize, String>>,
+    }
+    struct RetainedRegistry {
+        inner: Mutex<RegistryInner>,
+        shared: Arc<Shared>,
+        closing_latch: Arc<AtomicBool>,
+    }
+
+    /// Explicit per-attempt codec context; never installed in ordinary Shared.
+    #[derive(Clone)]
+    pub(super) struct RetainedContext {
+        registry: Arc<RetainedRegistry>,
+        conn: u32,
+    }
+    impl RetainedContext {
+        pub(super) fn conn(&self) -> u32 {
+            self.conn
+        }
+        pub(super) fn is_closing(&self) -> bool {
+            self.registry.closing_latch.load(Ordering::Acquire)
+        }
+        pub(super) fn close_latch(&self) -> Arc<AtomicBool> {
+            self.registry.closing_latch.clone()
+        }
+        pub(super) fn admit(
+            &self,
+            shared: &Shared,
+            uuid: u128,
+            name: &str,
+        ) -> Option<horizon_world::nbt::Tag> {
+            let mut inner = self.registry.inner();
+            if !std::ptr::eq(shared, Arc::as_ptr(&self.registry.shared)) || inner.closing {
+                return Some(translatable("multiplayer.disconnect.server_shutdown", &[]));
+            }
+            let Some(index) = inner.attempts.iter().position(|a| a.conn == self.conn) else {
+                return Some(translatable("multiplayer.disconnect.duplicate_login", &[]));
+            };
+            if inner.attempts[index].uuid.is_some()
+                || inner
+                    .attempts
+                    .iter()
+                    .any(|a| a.uuid == Some(uuid) && !a.released)
+            {
+                return Some(translatable("multiplayer.disconnect.duplicate_login", &[]));
+            }
+            if inner
+                .attempts
+                .iter()
+                .filter(|a| a.uuid.is_some() && !a.released)
+                .count()
+                >= shared.max_players()
+            {
+                return Some(translatable("multiplayer.disconnect.server_full", &[]));
+            }
+            inner.attempts[index].uuid = Some(uuid);
+            shared
+                .online
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((uuid, name.to_owned()));
+            None
+        }
+        pub(super) fn emit(&self, event: NetEvent) -> bool {
+            let mut inner = self.registry.inner();
+            if !inner.attempts.iter().any(|a| a.conn == self.conn) {
+                return false;
+            }
+            // Close seals new admission/outbound production. Already decoded
+            // events, including Left, remain available to the consumer.
+            inner.events.push_back(event);
+            true
+        }
+        pub(super) fn attach_outbound(&self, outbound: Arc<conn::RetainedOutbound>) -> bool {
+            let mut inner = self.registry.inner();
+            let closing = inner.closing;
+            let Some(attempt) = inner.attempts.iter_mut().find(|a| a.conn == self.conn) else {
+                drop(inner);
+                outbound.seal();
+                return false;
+            };
+            if attempt.outbound.is_some() {
+                drop(inner);
+                outbound.seal();
+                return false;
+            }
+            attempt.outbound = Some(outbound.clone());
+            drop(inner);
+            if closing {
+                outbound.seal();
+            }
+            !closing
+        }
+        /// The caller keeps its writer behind a start latch until this returns.
+        /// A false admission still retains the original handle for checked reap.
+        pub(super) fn install_writer(&self, handle: JoinHandle<RetainedOutcome>) -> bool {
+            let mut inner = self.registry.inner();
+            let closing = inner.closing;
+            let attempt = inner
+                .attempts
+                .iter_mut()
+                .find(|a| a.conn == self.conn)
+                .expect("retained writer belongs to a registered attempt");
+            assert!(
+                attempt.writer.is_none(),
+                "one original retained writer per attempt"
+            );
+            attempt.writer = Some(NativeSlot {
+                handle: Some(handle),
+                ..NativeSlot::default()
+            });
+            !closing
+        }
+        pub(super) fn record_failure(&self, outcome: RetainedOutcome) {
+            self.registry
+                .record(Some(self.conn), RetainedActor::Acquisition, outcome);
+        }
+        pub(super) fn interrupt(&self) {
+            let (shutdown, outbound) = {
+                let inner = self.registry.inner();
+                let Some(attempt) = inner.attempts.iter().find(|a| a.conn == self.conn) else {
+                    return;
+                };
+                (attempt.shutdown.clone(), attempt.outbound.clone())
+            };
+            if let Some(outbound) = outbound {
+                outbound.seal();
+            }
+            if let Err(error) = shutdown.shutdown() {
+                self.registry.record(
+                    Some(self.conn),
+                    RetainedActor::Shutdown,
+                    RetainedOutcome::Io(error.to_string()),
+                );
+            }
+        }
+    }
+
+    impl RetainedRegistry {
+        fn inner(&self) -> std::sync::MutexGuard<'_, RegistryInner> {
+            self.inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        }
+        fn record(&self, conn: Option<u32>, actor: RetainedActor, outcome: RetainedOutcome) {
+            self.inner().terminals.push(RetainedTerminal {
+                conn,
+                actor,
+                outcome,
+            });
+        }
+        #[cfg(all(
+            test,
+            feature = "native-writer-test-control",
+            debug_assertions,
+            target_os = "linux"
+        ))]
+        fn configure_test_socket(&self, stream: &TcpStream) -> Result<(), String> {
+            let requested = self.inner().controls.socket_send_buffer;
+            let Some(requested) = requested else {
+                return Ok(());
+            };
+            // These safe native operations concern only this newly accepted
+            // fixture socket. No raw transport escapes into the public API.
+            let result = rustix::net::sockopt::set_socket_send_buffer_size(stream, requested)
+                .and_then(|()| rustix::net::sockopt::socket_send_buffer_size(stream))
+                .map_err(|error| error.to_string())
+                .and_then(|effective| {
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(5)))
+                        .map(|()| effective)
+                        .map_err(|error| format!("accepted fixture write-timeout setup: {error}"))
+                });
+            self.inner().controls.socket_send_buffer_result = Some(result.clone());
+            result.map(|_| ())
+        }
+        fn register(self: &Arc<Self>, connection: &Connection) -> (RetainedContext, bool) {
+            let shutdown = connection.shutdown_handle();
+            let mut inner = self.inner();
+            let conn = self.shared.next_id();
+            let accepted = !inner.closing;
+            inner.attempts.push(Attempt {
+                conn,
+                shutdown,
+                outer: if accepted {
+                    NativeSlot::starting()
+                } else {
+                    NativeSlot {
+                        outcome: Some(RetainedOutcome::Closed),
+                        ..NativeSlot::default()
+                    }
+                },
+                writer: None,
+                outbound: None,
+                uuid: None,
+                released: false,
+            });
+            if !accepted {
+                inner.terminals.push(RetainedTerminal {
+                    conn: Some(conn),
+                    actor: RetainedActor::Acquisition,
+                    outcome: RetainedOutcome::Closed,
+                });
+            }
+            (
+                RetainedContext {
+                    registry: self.clone(),
+                    conn,
+                },
+                accepted,
+            )
+        }
+        fn start(self: &Arc<Self>, connection: Connection, address: SocketAddr) -> io::Result<()> {
+            let (context, accepted) = self.register(&connection);
+            if !accepted {
+                context.interrupt();
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "retained LAN closing",
+                ));
+            }
+            let (release, start) = channel();
+            let worker_context = context.clone();
+            let shared = self.shared.clone();
+            #[cfg(test)]
+            let (registration_gate, fail_spawn) = {
+                let mut inner = self.inner();
+                (
+                    inner.controls.outer_registered.take(),
+                    inner.controls.fail_outer_spawn,
+                )
+            };
+            #[cfg(test)]
+            if let Some((registered, resume)) = registration_gate {
+                registered.wait();
+                resume.wait();
+            }
+            let builder = std::thread::Builder::new().name("horizon-retained-conn".into());
+            // Force the actual native spawn operation to refuse an impossible
+            // stack; the same installation/failure path retains its result.
+            #[cfg(test)]
+            let builder = if fail_spawn {
+                builder.stack_size(usize::MAX / 2)
+            } else {
+                builder
+            };
+            let spawned = builder.spawn(move || {
+                if start.recv().is_err() {
+                    return RetainedOutcome::QueueClosed;
+                }
+                if worker_context.is_closing() {
+                    worker_context.interrupt();
+                    return RetainedOutcome::Closed;
+                }
+                conn::serve_retained(connection, address, shared, worker_context)
+            });
+            match spawned {
+                Ok(handle) => {
+                    let closing = {
+                        let mut inner = self.inner();
+                        let closing = inner.closing;
+                        let attempt = inner
+                            .attempts
+                            .iter_mut()
+                            .find(|a| a.conn == context.conn)
+                            .unwrap();
+                        attempt.outer.handle = Some(handle);
+                        attempt.outer.pending = false;
+                        closing
+                    };
+                    if closing {
+                        context.interrupt();
+                    }
+                    let _ = release.send(());
+                    Ok(())
+                }
+                Err(error) => {
+                    self.complete(
+                        Some(context.conn),
+                        RetainedActor::Outer,
+                        RetainedOutcome::Spawn(error.to_string()),
+                    );
+                    Err(error)
+                }
+            }
+        }
+        fn request_close(&self) {
+            let owners: Vec<_> = {
+                let mut inner = self.inner();
+                inner.closing = true;
+                // Queue admission reads this same permanent latch while holding
+                // its own queue lock. No producer starting after this store can
+                // enter the gap before the individual queues are sealed below.
+                self.closing_latch.store(true, Ordering::Release);
+                inner
+                    .attempts
+                    .iter()
+                    .map(|a| (a.conn, a.shutdown.clone(), a.outbound.clone()))
+                    .collect()
+            };
+            #[cfg(test)]
+            let gate = self.inner().controls.close_latched.take();
+            #[cfg(test)]
+            if let Some((latched, resume)) = gate {
+                latched.wait();
+                resume.wait();
+            }
+            for (conn, shutdown, outbound) in owners {
+                if let Some(outbound) = outbound {
+                    outbound.seal();
+                }
+                if let Err(error) = shutdown.shutdown() {
+                    self.record(
+                        Some(conn),
+                        RetainedActor::Shutdown,
+                        RetainedOutcome::Io(error.to_string()),
+                    );
+                }
+            }
+        }
+        fn complete(&self, conn: Option<u32>, actor: RetainedActor, outcome: RetainedOutcome) {
+            let mut inner = self.inner();
+            let slot = match conn {
+                None => inner.listener.as_mut().expect("listener installed"),
+                Some(conn) => {
+                    let attempt = inner.attempts.iter_mut().find(|a| a.conn == conn).unwrap();
+                    if actor == RetainedActor::Writer {
+                        attempt.writer.as_mut().unwrap()
+                    } else {
+                        &mut attempt.outer
+                    }
+                }
+            };
+            slot.pending = false;
+            slot.outcome = Some(outcome.clone());
+            inner.terminals.push(RetainedTerminal {
+                conn,
+                actor,
+                outcome,
+            });
+            // Only this original attempt can release its UUID, after both
+            // original native actors have actually returned from checked join.
+            let mut released = Vec::new();
+            for attempt in &mut inner.attempts {
+                if !attempt.released
+                    && attempt.outer.outcome.is_some()
+                    && !attempt.outer.unresolved()
+                    && attempt
+                        .writer
+                        .as_ref()
+                        .is_none_or(|w| w.outcome.is_some() && !w.unresolved())
+                    && let Some(uuid) = attempt.uuid
+                {
+                    attempt.released = true;
+                    released.push(uuid);
+                }
+            }
+            if !released.is_empty() {
+                self.shared
+                    .online
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .retain(|(uuid, _)| !released.contains(uuid));
+            }
+        }
+        fn harvest(&self) {
+            let finished = {
+                let mut inner = self.inner();
+                let mut finished = Vec::new();
+                if let Some(slot) = &mut inner.listener
+                    && let Some(handle) = slot.take_finished()
+                {
+                    finished.push((None, RetainedActor::Listener, handle));
+                }
+                for attempt in &mut inner.attempts {
+                    if let Some(handle) = attempt.outer.take_finished() {
+                        finished.push((Some(attempt.conn), RetainedActor::Outer, handle));
+                    }
+                    if let Some(writer) = &mut attempt.writer
+                        && let Some(handle) = writer.take_finished()
+                    {
+                        finished.push((Some(attempt.conn), RetainedActor::Writer, handle));
+                    }
+                }
+                finished
+            };
+            for (conn, actor, handle) in finished {
+                let outcome = handle.join().unwrap_or(RetainedOutcome::Panic);
+                self.complete(conn, actor, outcome);
+            }
+        }
+        fn quiescent(inner: &RegistryInner) -> bool {
+            inner.listener.as_ref().is_none_or(|s| !s.unresolved())
+                && inner.attempts.iter().all(|a| {
+                    !a.outer.unresolved() && a.writer.as_ref().is_none_or(|s| !s.unresolved())
+                })
+        }
+    }
+
+    pub struct RetainedLan {
+        registry: Arc<RetainedRegistry>,
+        deadline: Option<Instant>,
+        announcement: Option<discovery::RetainedPinger>,
+    }
+    impl RetainedLan {
+        /// This constructor acquires no listener, thread, online service or POST.
+        pub fn new(sync: Arc<data::SyncData>, config: RetainedOfflineConfig) -> io::Result<Self> {
+            if config.max_players == 0
+                || config.max_players > 1024
+                || config.motd.len() > 32_767
+                || config.compression_threshold < -1
+                || config.compression_threshold > (2 << 20)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "invalid retained offline configuration",
+                ));
+            }
+            let mut ordinary = NetConfig::lan(config.port, config.motd.clone(), config.max_players);
+            ordinary.bind = config.bind;
+            ordinary.compression_threshold = config.compression_threshold;
+            ordinary.enable_status = config.enable_status;
+            ordinary.hide_online_players = config.hide_online_players;
+            ordinary.announce = config.announce;
+            ordinary.listen = false;
+            let (events, disconnected) = channel();
+            drop(disconnected);
+            let shared = Arc::new(Shared {
+                sync,
+                events,
+                motd: Mutex::new(config.motd),
+                max_players: AtomicUsize::new(config.max_players),
+                online: Mutex::new(Vec::new()),
+                reserved: Mutex::new(HashSet::new()),
+                next: AtomicU32::new(1),
+                stop: AtomicBool::new(false),
+                random: Mutex::new(1),
+                config: ordinary,
+                required_negotiation: None,
+                stage: None,
+            });
+            Ok(Self {
+                registry: Arc::new(RetainedRegistry {
+                    inner: Mutex::new(RegistryInner::default()),
+                    shared,
+                    closing_latch: Arc::new(AtomicBool::new(false)),
+                }),
+                deadline: None,
+                announcement: None,
+            })
+        }
+        pub fn listen(&mut self) -> io::Result<u16> {
+            {
+                let mut inner = self.registry.inner();
+                if inner.closing {
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "retained LAN closing",
+                    ));
+                }
+                if inner.listener.is_some() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "retained listener already attempted",
+                    ));
+                }
+                // Reserve before bind/spawn, so a close cannot claim quiescence
+                // while a native listener is being acquired or installed.
+                inner.listener = Some(NativeSlot::starting());
+            }
+            let config = &self.registry.shared.config;
+            let listener = match Lan::bind(config.bind, config.port) {
+                Ok(listener) => listener,
+                Err(error) => {
+                    self.registry.complete(
+                        None,
+                        RetainedActor::Listener,
+                        RetainedOutcome::Io(error.to_string()),
+                    );
+                    return Err(error);
+                }
+            };
+            let port = match listener.local_addr() {
+                Ok(address) => address.port(),
+                Err(error) => {
+                    self.registry.complete(
+                        None,
+                        RetainedActor::Listener,
+                        RetainedOutcome::Io(error.to_string()),
+                    );
+                    return Err(error);
+                }
+            };
+            let registry = self.registry.clone();
+            let (release, start) = channel();
+            #[cfg(test)]
+            let (fail_spawn, panic_listener) = {
+                let inner = self.registry.inner();
+                (
+                    inner.controls.fail_listener_spawn,
+                    inner.controls.panic_listener,
+                )
+            };
+            let builder = std::thread::Builder::new().name("horizon-retained-accept".into());
+            #[cfg(test)]
+            let builder = if fail_spawn {
+                builder.stack_size(usize::MAX / 2)
+            } else {
+                builder
+            };
+            let spawned = builder.spawn(move || {
+                if start.recv().is_err() {
+                    return RetainedOutcome::QueueClosed;
+                }
+                #[cfg(test)]
+                if panic_listener {
+                    panic!("intentional retained native listener panic");
+                }
+                while !registry.inner().closing {
+                    match listener.accept() {
+                        Ok((stream, address)) => {
+                            if let Err(error) = stream.set_nonblocking(false) {
+                                registry.record(
+                                    None,
+                                    RetainedActor::Acquisition,
+                                    RetainedOutcome::Io(error.to_string()),
+                                );
+                                continue;
+                            }
+                            #[cfg(all(
+                                test,
+                                feature = "native-writer-test-control",
+                                debug_assertions,
+                                target_os = "linux"
+                            ))]
+                            if let Err(error) = registry.configure_test_socket(&stream) {
+                                registry.record(
+                                    None,
+                                    RetainedActor::Acquisition,
+                                    RetainedOutcome::Io(error),
+                                );
+                                continue;
+                            }
+                            match Connection::from_stream(stream) {
+                                Ok(connection) => {
+                                    let _ = registry.start(connection, address);
+                                }
+                                Err(error) => registry.record(
+                                    None,
+                                    RetainedActor::Acquisition,
+                                    RetainedOutcome::Io(error.to_string()),
+                                ),
+                            }
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => return RetainedOutcome::Io(error.to_string()),
+                    }
+                }
+                RetainedOutcome::Returned
+            });
+            match spawned {
+                Ok(handle) => {
+                    let mut inner = self.registry.inner();
+                    let slot = inner.listener.as_mut().unwrap();
+                    slot.handle = Some(handle);
+                    slot.pending = false;
+                }
+                Err(error) => {
+                    self.registry.complete(
+                        None,
+                        RetainedActor::Listener,
+                        RetainedOutcome::Spawn(error.to_string()),
+                    );
+                    return Err(error);
+                }
+            }
+            let _ = release.send(());
+            if config.announce {
+                match discovery::RetainedPinger::start(self.registry.shared.motd(), port) {
+                    Ok(pinger) => {
+                        if self.registry.inner().closing {
+                            pinger.request_stop();
+                        }
+                        self.announcement = Some(pinger);
+                    }
+                    Err(error) => {
+                        let returned = io::Error::new(error.error.kind, error.clone());
+                        self.registry.record(
+                            None,
+                            RetainedActor::Acquisition,
+                            RetainedOutcome::PingerStartup(error),
+                        );
+                        return Err(returned);
+                    }
+                }
+            }
+            Ok(port)
+        }
+        pub fn connect_local(&self) -> io::Result<Pipe> {
+            if self.registry.inner().closing {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "retained LAN closing",
+                ));
+            }
+            let (client, server) = Pipe::pair();
+            self.registry.start(
+                Connection::local(server),
+                SocketAddr::from(([127, 0, 0, 1], 0)),
+            )?;
+            Ok(client)
+        }
+        #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+        pub(super) fn retained_test_close_gate(
+            &self,
+            latched: Arc<std::sync::Barrier>,
+            resume: Arc<std::sync::Barrier>,
+        ) {
+            self.registry.inner().controls.close_latched = Some((latched, resume));
+        }
+        #[cfg(all(
+            test,
+            feature = "native-writer-test-control",
+            debug_assertions,
+            target_os = "linux"
+        ))]
+        pub(super) fn retained_test_socket_send_buffer(&self, bytes: usize) {
+            let mut inner = self.registry.inner();
+            inner.controls.socket_send_buffer = Some(bytes);
+            inner.controls.socket_send_buffer_result = None;
+        }
+        #[cfg(all(
+            test,
+            feature = "native-writer-test-control",
+            debug_assertions,
+            target_os = "linux"
+        ))]
+        pub(super) fn retained_test_socket_buffer(&self) -> Result<Option<usize>, String> {
+            self.registry
+                .inner()
+                .controls
+                .socket_send_buffer_result
+                .clone()
+                .transpose()
+        }
+        #[cfg(all(
+            test,
+            feature = "native-writer-test-control",
+            debug_assertions,
+            target_os = "linux"
+        ))]
+        pub(super) fn retained_test_writer_finished(&self, conn: u32) -> Option<bool> {
+            let inner = self.registry.inner();
+            inner
+                .attempts
+                .iter()
+                .find(|attempt| attempt.conn == conn)
+                .and_then(|attempt| attempt.writer.as_ref())
+                .and_then(|writer| writer.handle.as_ref())
+                .map(JoinHandle::is_finished)
+        }
+        pub fn poll_events(&self, max: usize) -> Vec<NetEvent> {
+            let mut inner = self.registry.inner();
+            let count = max.min(inner.events.len());
+            inner.events.drain(..count).collect()
+        }
+        pub fn begin_close(&mut self, timeout: Duration) {
+            if self.deadline.is_none() {
+                let now = Instant::now();
+                self.deadline = Some(now.checked_add(timeout).unwrap_or(now));
+            }
+            self.registry.request_close();
+            if let Some(pinger) = &self.announcement {
+                pinger.request_stop();
+            }
+        }
+        pub fn retry_close(&mut self, timeout: Duration) {
+            let now = Instant::now();
+            self.deadline = Some(now.checked_add(timeout).unwrap_or(now));
+            self.registry.request_close();
+            if let Some(pinger) = &self.announcement {
+                pinger.request_stop();
+            }
+        }
+        pub fn poll_close(&mut self) -> RetainedCloseStatus {
+            self.registry.harvest();
+            if let Some(pinger) = &mut self.announcement {
+                pinger.poll();
+            }
+            let observation = self.observe();
+            if observation.quiescent {
+                RetainedCloseStatus::Quiescent(observation)
+            } else if observation.deadline_expired {
+                RetainedCloseStatus::Blocked(observation)
+            } else {
+                RetainedCloseStatus::Pending(observation)
+            }
+        }
+        pub fn observe(&self) -> RetainedObservation {
+            // Snapshot queue Arcs under the registry lock; never take writer
+            // queue locks while holding admission/custody linearization.
+            let (closing, queued_events, listener_pending, quiescent, terminals, attempts) = {
+                let inner = self.registry.inner();
+                (
+                    inner.closing,
+                    inner.events.len(),
+                    inner.listener.as_ref().is_some_and(NativeSlot::unresolved),
+                    RetainedRegistry::quiescent(&inner),
+                    inner.terminals.clone(),
+                    inner
+                        .attempts
+                        .iter()
+                        .map(|a| {
+                            (
+                                RetainedAttemptObservation {
+                                    conn: a.conn,
+                                    uuid: a.uuid,
+                                    released: a.released,
+                                    outer_pending: a.outer.unresolved(),
+                                    writer_pending: a
+                                        .writer
+                                        .as_ref()
+                                        .is_some_and(NativeSlot::unresolved),
+                                    outbound: None,
+                                },
+                                a.outbound.clone(),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            };
+            let announcement = self
+                .announcement
+                .as_ref()
+                .map(discovery::RetainedPinger::observe);
+            RetainedObservation {
+                closing,
+                queued_events,
+                listener_pending,
+                deadline_expired: self
+                    .deadline
+                    .is_some_and(|deadline| Instant::now() >= deadline),
+                quiescent: closing && quiescent && announcement.as_ref().is_none_or(|a| a.joined),
+                terminals,
+                announcement,
+                attempts: attempts
+                    .into_iter()
+                    .map(|(mut attempt, queue)| {
+                        attempt.outbound = queue.map(|q| q.snapshot());
+                        attempt
+                    })
+                    .collect(),
+            }
+        }
+        pub fn try_closed(mut self) -> Result<ClosedLan, Self> {
+            if !self.observe().quiescent {
+                return Err(self);
+            }
+            let observation = self.observe();
+            let announcement = if let Some(pinger) = self.announcement.take() {
+                match pinger.try_dispose() {
+                    Ok(terminal) => Some(terminal),
+                    Err(pinger) => {
+                        self.announcement = Some(pinger);
+                        return Err(self);
+                    }
+                }
+            } else {
+                None
+            };
+            let events = self.poll_events(usize::MAX);
+            Ok(ClosedLan {
+                events,
+                observation,
+                announcement,
+                _registry: self.registry.clone(),
+            })
+        }
+    }
+    impl Drop for RetainedLan {
+        fn drop(&mut self) {
+            // Handles may never become detached as an accidental unwind effect.
+            let unresolved = !RetainedRegistry::quiescent(&self.registry.inner())
+                || self
+                    .announcement
+                    .as_ref()
+                    .is_some_and(|p| !p.observe().joined);
+            if unresolved {
+                let _ = std::io::Write::write_all(
+                    &mut std::io::stderr(),
+                    b"fatal: unresolved retained LAN native owner\n",
+                );
+                std::process::abort();
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::io::Write;
+
+        pub(super) fn config() -> RetainedOfflineConfig {
+            RetainedOfflineConfig {
+                bind: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+                port: 0,
+                motd: "Retained native test".into(),
+                max_players: 2,
+                compression_threshold: -1,
+                enable_status: true,
+                hide_online_players: false,
+                announce: false,
+            }
+        }
+        fn owner() -> RetainedLan {
+            RetainedLan::new(retained_test_sync(), config()).expect("valid retained fixture")
+        }
+        fn wait_until(mut condition: impl FnMut() -> bool) -> bool {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                if condition() {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            condition()
+        }
+        fn close(mut lan: RetainedLan) -> ClosedLan {
+            lan.begin_close(Duration::from_secs(5));
+            let finished =
+                wait_until(|| matches!(lan.poll_close(), RetainedCloseStatus::Quiescent(_)));
+            if !finished {
+                // An unresolved native owner cannot be hidden to make a failed
+                // assertion unwind safely. Keep requesting the original owners.
+                lan.retry_close(Duration::from_secs(5));
+                if !wait_until(|| matches!(lan.poll_close(), RetainedCloseStatus::Quiescent(_))) {
+                    let _ = std::io::Write::write_all(
+                        &mut std::io::stderr(),
+                        b"retained fixture cleanup could not reap its original native owners\n",
+                    );
+                    std::process::abort();
+                }
+            }
+            match lan.try_closed() {
+                Ok(closed) => closed,
+                Err(_) => unreachable!("proved quiescent owner"),
+            }
+        }
+        fn context(lan: &RetainedLan, conn: u32) -> RetainedContext {
+            RetainedContext {
+                registry: lan.registry.clone(),
+                conn,
+            }
+        }
+
+        #[test]
+        fn retained_constructor_validates_before_any_native_acquisition() {
+            let mut invalid = config();
+            invalid.max_players = 0;
+            let refused = RetainedLan::new(retained_test_sync(), invalid).is_err();
+            let lan = owner();
+            let before = lan.observe();
+            let closed = close(lan);
+            assert!(refused);
+            assert!(before.attempts.is_empty());
+            assert!(!before.listener_pending);
+            assert!(!before.closing);
+            assert!(closed.observation.terminals.is_empty());
+        }
+
+        #[test]
+        fn retained_silent_tcp_registers_before_modern_read_and_reaps_listener() {
+            let mut lan = owner();
+            let port = lan.listen().expect("bind fresh retained listener");
+            let client = TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
+                .expect("actual retained TCP peer");
+            let registered = wait_until(|| lan.observe().attempts.len() == 1);
+            #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+            let read_entered = wait_until(|| {
+                let (entered, completed) = conn::retained_test_read_progress(1);
+                entered > completed
+            });
+            let before = lan.observe();
+            let closed = close(lan);
+            drop(client);
+            assert!(registered);
+            #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+            assert!(
+                read_entered,
+                "actual modern native receive remained outstanding"
+            );
+            assert!(before.attempts[0].outer_pending);
+            assert!(closed.observation.quiescent);
+            assert!(
+                closed
+                    .observation
+                    .terminals
+                    .iter()
+                    .any(|t| t.actor == RetainedActor::Listener)
+            );
+            assert!(
+                closed
+                    .observation
+                    .terminals
+                    .iter()
+                    .any(|t| t.actor == RetainedActor::Outer)
+            );
+        }
+
+        #[test]
+        fn retained_local_partial_frame_is_interrupted_without_waiting_for_login() {
+            let lan = owner();
+            let mut peer = lan.connect_local().expect("actual retained Pipe peer");
+            let wrote_prefix = peer.write_all(&[0x80]).is_ok();
+            #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+            let read_entered = wait_until(|| {
+                let (entered, completed) = conn::retained_test_read_progress(1);
+                entered > completed
+            });
+            let closed = close(lan);
+            let refused_after_close = peer.write_all(&[0]).is_err();
+            assert!(wrote_prefix);
+            #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+            assert!(
+                read_entered,
+                "actual native partial-frame receive remained outstanding"
+            );
+            assert!(refused_after_close);
+            assert_eq!(closed.observation.attempts.len(), 1);
+            assert!(!closed.observation.attempts[0].outer_pending);
+        }
+
+        #[test]
+        fn retained_close_racing_registered_outer_preserves_pending_install_and_deadline() {
+            let mut lan = owner();
+            let registered = Arc::new(std::sync::Barrier::new(2));
+            let resume = Arc::new(std::sync::Barrier::new(2));
+            lan.registry.inner().controls.outer_registered =
+                Some((registered.clone(), resume.clone()));
+            let port = lan.listen().expect("fresh listener");
+            let peer =
+                TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).expect("native peer");
+            registered.wait();
+            lan.begin_close(Duration::ZERO);
+            let first_deadline = lan.deadline;
+            let blocked = matches!(lan.poll_close(), RetainedCloseStatus::Blocked(_));
+            lan.begin_close(Duration::from_secs(60));
+            let repeated_deadline = lan.deadline;
+            let refused_local = lan.connect_local().is_err();
+            lan.retry_close(Duration::from_secs(5));
+            let renewed = lan.deadline > first_deadline;
+            resume.wait();
+            let closed = close(lan);
+            drop(peer);
+            assert!(blocked);
+            assert_eq!(first_deadline, repeated_deadline);
+            assert!(refused_local);
+            assert!(renewed);
+            assert!(closed.observation.quiescent);
+            assert_eq!(closed.observation.attempts.len(), 1);
+        }
+
+        #[test]
+        fn retained_duplicate_reservation_releases_only_after_original_checked_terminal() {
+            let lan = owner();
+            let first = lan.connect_local().expect("first native Pipe");
+            let second = lan.connect_local().expect("second native Pipe");
+            let a = context(&lan, 1);
+            let b = context(&lan, 2);
+            let uuid = horizon_protocol::crypto::offline_uuid("ExactOwner");
+            let initial = a.admit(&lan.registry.shared, uuid, "ExactOwner");
+            let duplicate = b.admit(&lan.registry.shared, uuid, "ExactOwner");
+            first.shutdown();
+            let released = wait_until(|| {
+                lan.registry.harvest();
+                lan.observe().attempts[0].released
+            });
+            let replacement = b.admit(&lan.registry.shared, uuid, "ExactOwner");
+            // Re-observing/reaping the already released attempt cannot remove
+            // the new exact reservation held by attempt two.
+            lan.registry.harvest();
+            let replacement_online = lan.registry.shared.online();
+            let stale = a.admit(&lan.registry.shared, uuid, "ExactOwner");
+            let closed = close(lan);
+            second.shutdown();
+            assert!(initial.is_none());
+            assert!(duplicate.is_some());
+            assert!(released);
+            assert!(replacement.is_none());
+            assert_eq!(replacement_online, 1);
+            assert!(stale.is_some());
+            assert!(closed.observation.attempts.iter().all(|a| a.released));
+        }
+
+        #[test]
+        fn retained_polling_preserves_terminal_history_and_unconsumed_payloads() {
+            let lan = owner();
+            let peer = lan.connect_local().expect("native mailbox attempt");
+            let context = context(&lan, 1);
+            let first = context.emit(NetEvent::Packet(
+                1,
+                Box::new(play::Serverbound::Unknown(7, vec![11])),
+            ));
+            let second = context.emit(NetEvent::Packet(
+                1,
+                Box::new(play::Serverbound::Unknown(7, vec![22])),
+            ));
+            let empty = lan.poll_events(0).is_empty();
+            let polled = lan.poll_events(1);
+            let closed = close(lan);
+            peer.shutdown();
+            assert!(first && second && empty);
+            assert_eq!(polled.len(), 1);
+            assert_eq!(closed.events.len(), 1);
+            let NetEvent::Packet(1, packet) = &closed.events[0] else {
+                panic!("retained packet");
+            };
+            assert!(matches!(&**packet, play::Serverbound::Unknown(7, body) if body == &[22]));
+            assert!(
+                closed
+                    .observation
+                    .terminals
+                    .iter()
+                    .any(|t| t.actor == RetainedActor::Outer)
+            );
+        }
+
+        #[test]
+        #[cfg(target_os = "linux")]
+        fn retained_native_spawn_refusals_keep_listener_and_outer_attempt_history() {
+            let mut listener = owner();
+            listener.registry.inner().controls.fail_listener_spawn = true;
+            let listener_failed = listener.listen().is_err();
+            let listener_closed = close(listener);
+            let outer = owner();
+            outer.registry.inner().controls.fail_outer_spawn = true;
+            let outer_failed = outer.connect_local().is_err();
+            let outer_closed = close(outer);
+            assert!(listener_failed && outer_failed);
+            assert!(
+                listener_closed
+                    .observation
+                    .terminals
+                    .iter()
+                    .any(|t| t.actor == RetainedActor::Listener
+                        && matches!(t.outcome, RetainedOutcome::Spawn(_)))
+            );
+            assert!(
+                outer_closed
+                    .observation
+                    .terminals
+                    .iter()
+                    .any(|t| t.actor == RetainedActor::Outer
+                        && matches!(t.outcome, RetainedOutcome::Spawn(_)))
+            );
+            assert_eq!(outer_closed.observation.attempts.len(), 1);
+        }
+
+        #[test]
+        fn retained_listener_panic_is_joined_once_and_remains_visible() {
+            let mut lan = owner();
+            lan.registry.inner().controls.panic_listener = true;
+            let listening = lan.listen().is_ok();
+            let closed = close(lan);
+            assert!(listening);
+            assert_eq!(
+                closed
+                    .observation
+                    .terminals
+                    .iter()
+                    .filter(|t| t.actor == RetainedActor::Listener
+                        && t.outcome == RetainedOutcome::Panic)
+                    .count(),
+                1
+            );
+        }
+
+        #[test]
+        #[ignore = "root executes separately and checks exact fatal diagnostic and exit"]
+        fn retained_unresolved_drop_fatal_process() {
+            let lan = owner();
+            let _peer = lan
+                .connect_local()
+                .expect("fatal fixture actual native owner");
+            eprintln!("RETAINED_LAN_UNRESOLVED_DROP_READY");
+            drop(lan);
+            panic!("unresolved retained LAN Drop returned");
+        }
+    }
+}
+
 #[cfg(all(test, feature = "paired-packages"))]
 mod staged_transport_tests {
     use super::*;

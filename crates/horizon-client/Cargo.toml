@@ -69,6 +69,10 @@ unicode-bidi = "0.3.18"
 # The server thread's CPU time per tick (`HORIZON_SPIKES`, spans.rs).
 rustix = { version = "1", default-features = false, features = ["std", "time"] }
 
+[target.'cfg(unix)'.dev-dependencies]
+# Native transport tests verify the actual socket buffer backpressure.
+rustix = { version = "1", default-features = false, features = ["std", "net"] }
+
 [target.'cfg(windows)'.dependencies]
 # DirectX 12, where Vulkan has no adapter or device, or by choice (`graphicsApi`, graphics.rs).
 # Shaders compile with FXC (d3dcompiler_47.dll, part of Windows), or DXC when dxcompiler.dll is
