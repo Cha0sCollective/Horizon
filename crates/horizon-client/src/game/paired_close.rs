@@ -28,9 +28,14 @@ pub(super) enum MetadataFamily {
     Bossbars,
     Schedule,
     Clock,
+    Maps,
+    Fight,
+    Trader,
+    Raids,
+    Arrivals,
 }
 impl MetadataFamily {
-    const ALL: [Self; 10] = [
+    const ALL: [Self; 15] = [
         Self::RandomSequences,
         Self::Stats,
         Self::Advancements,
@@ -41,11 +46,16 @@ impl MetadataFamily {
         Self::Bossbars,
         Self::Schedule,
         Self::Clock,
+        Self::Maps,
+        Self::Fight,
+        Self::Trader,
+        Self::Raids,
+        Self::Arrivals,
     ];
 }
 
-type Effects = [MetadataEffect; 10];
-const UNATTEMPTED: Effects = [MetadataEffect::Unattempted; 10];
+type Effects = [MetadataEffect; MetadataFamily::ALL.len()];
+const UNATTEMPTED: Effects = [MetadataEffect::Unattempted; MetadataFamily::ALL.len()];
 
 use super::{
     advancements::{
@@ -54,13 +64,23 @@ use super::{
     },
     bossbars::{BossMetadataExpected, BossMetadataInput, BossMetadataPost},
     chat::{ClockMetadataExpected, ClockMetadataInput, ClockMetadataPost},
+    dragon::{FightMetadataExpected, FightMetadataInput, FightMetadataPost},
     functions::{ScheduleMetadataExpected, ScheduleMetadataInput, ScheduleMetadataPost},
+    maps::{MapsMetadataEvidence, MapsMetadataExpected, MapsMetadataInput, MapsMetadataPost},
+    nether_portal::{ArrivalsMetadataExpected, ArrivalsMetadataInput, ArrivalsMetadataPost},
+    raids::{RaidsMetadataExpected, RaidsMetadataInput, RaidsMetadataPost},
     scoreboard::{ScoreMetadataExpected, ScoreMetadataInput, ScoreMetadataPost},
     stats::{StatsExpected, StatsInput, StatsWritten},
     trading::{RandomSequencesExpected, RandomSequencesInput, RandomSequencesWritten},
+    wandering_trader::{TraderMetadataExpected, TraderMetadataInput, TraderMetadataPost},
 };
 
 struct Expected {
+    maps: MapsMetadataExpected,
+    fight: FightMetadataExpected,
+    trader: TraderMetadataExpected,
+    raids: RaidsMetadataExpected,
+    arrivals: ArrivalsMetadataExpected,
     random: RandomSequencesExpected,
     stats: StatsExpected,
     advancements: AdvancementsExpected,
@@ -72,6 +92,11 @@ struct Expected {
 /// Read-only native projection; the original remains outside the IO thread.
 #[derive(Clone)]
 struct Input {
+    maps: MapsMetadataInput,
+    fight: FightMetadataInput,
+    trader: TraderMetadataInput,
+    raids: RaidsMetadataInput,
+    arrivals: ArrivalsMetadataInput,
     random: RandomSequencesInput,
     stats: StatsInput,
     advancements: AdvancementsInput,
@@ -82,6 +107,11 @@ struct Input {
 }
 #[derive(Default)]
 struct Written {
+    maps: Option<MapsMetadataPost>,
+    fight: Option<FightMetadataPost>,
+    trader: Option<TraderMetadataPost>,
+    raids: Option<RaidsMetadataPost>,
+    arrivals: Option<ArrivalsMetadataPost>,
     random: Option<RandomSequencesWritten>,
     stats: Option<StatsWritten>,
     advancements: Option<AdvancementsWritten>,
@@ -99,6 +129,11 @@ impl Written {
             && self.boss.is_some()
             && self.schedule.is_some()
             && self.clock.is_some()
+            && self.maps.is_some()
+            && self.fight.is_some()
+            && self.trader.is_some()
+            && self.raids.is_some()
+            && self.arrivals.is_some()
     }
 }
 struct BatchIdentity;
@@ -113,6 +148,7 @@ struct Request {
     control: Option<MetadataTestControl>,
 }
 struct Outcome {
+    maps: Option<MapsMetadataEvidence>,
     batch: Arc<BatchIdentity>,
     attempt: Arc<AttemptIdentity>,
     effects: Effects,
@@ -127,6 +163,7 @@ impl Outcome {
 
 fn write_metadata(request: Request) -> Outcome {
     let mut out = Outcome {
+        maps: None,
         batch: request.batch,
         attempt: request.attempt,
         effects: UNATTEMPTED,
@@ -190,11 +227,32 @@ fn write_metadata(request: Request) -> Outcome {
     reported!(boss, Bossbars);
     reported!(schedule, Schedule);
     reported!(clock, Clock);
+    #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+    if let Some(control) = &request.control {
+        control.before_family(MetadataFamily::Maps);
+    }
+    let maps = request.input.maps.write_native();
+    out.effects[MetadataFamily::Maps as usize] = maps.effect;
+    out.maps = Some(maps.files);
+    match maps.result {
+        Ok(post) => out.written.maps = Some(post),
+        Err(error) => {
+            out.error = Some(error);
+            return out;
+        }
+    }
+    reported!(fight, Fight);
+    reported!(trader, Trader);
+    reported!(raids, Raids);
+    reported!(arrivals, Arrivals);
     out
 }
 
 #[derive(Clone, Debug)]
 pub(super) struct MetadataFailure {
+    /// Actual returned per-map/index evidence. None is no subfile proof; if the
+    /// Maps family is Unknown, unreturned subfile effects remain unknown too.
+    pub maps: Option<MapsMetadataEvidence>,
     pub attempt: u64,
     pub effects: Effects,
     pub detail: String,
@@ -240,6 +298,7 @@ pub(super) struct NativeMetadata<'a, 'window> {
 /// This certifies this metadata batch's checked CPU acknowledgment only. It is
 /// not an image, a Game-close witness or authority to release a world lock.
 pub(super) struct MetadataAcknowledged {
+    pub maps: Option<MapsMetadataEvidence>,
     _batch: Arc<BatchIdentity>,
     pub effects: Effects,
     pub sampled_ms: i64,
@@ -278,7 +337,7 @@ impl<'a, 'window> NativeMetadata<'a, 'window> {
         self.outcome.as_ref().map_or_else(
             || {
                 if self.handle.is_some() {
-                    [MetadataEffect::Unknown; 10]
+                    [MetadataEffect::Unknown; MetadataFamily::ALL.len()]
                 } else {
                     UNATTEMPTED
                 }
@@ -295,6 +354,10 @@ impl<'a, 'window> NativeMetadata<'a, 'window> {
             .any(|failure| failure.attempt == attempt && failure.detail == detail)
         {
             self.history.push(MetadataFailure {
+                maps: self
+                    .outcome
+                    .as_ref()
+                    .and_then(|outcome| outcome.maps.clone()),
                 attempt,
                 effects: self.effects(),
                 detail: detail.clone(),
@@ -320,7 +383,17 @@ impl<'a, 'window> NativeMetadata<'a, 'window> {
         let (boss, boss_input) = self.game.prepare_retained_boss_metadata();
         let (schedule, schedule_input) = self.game.prepare_retained_schedule_metadata();
         let (clock, clock_input) = self.game.prepare_retained_clock_metadata();
+        let (maps, maps_input) = self.game.prepare_retained_maps_metadata()?;
+        let (fight, fight_input) = self.game.prepare_retained_fight_metadata()?;
+        let (trader, trader_input) = self.game.prepare_retained_trader_metadata();
+        let (raids, raids_input) = self.game.prepare_retained_raids_metadata()?;
+        let (arrivals, arrivals_input) = self.game.prepare_retained_arrivals_metadata();
         self.expected = Some(Expected {
+            maps,
+            fight,
+            trader,
+            raids,
+            arrivals,
             random,
             stats,
             advancements,
@@ -330,6 +403,11 @@ impl<'a, 'window> NativeMetadata<'a, 'window> {
             clock,
         });
         self.input = Some(Arc::new(Input {
+            maps: maps_input,
+            fight: fight_input,
+            trader: trader_input,
+            raids: raids_input,
+            arrivals: arrivals_input,
             random: random_input,
             stats: stats_input,
             advancements: advancement_input,
@@ -428,6 +506,7 @@ impl<'a, 'window> NativeMetadata<'a, 'window> {
                 let mut effects = UNATTEMPTED;
                 effects.fill(MetadataEffect::Unknown);
                 self.history.push(MetadataFailure {
+                    maps: None,
                     attempt: self.attempt.as_ref().map_or(0, |a| a.number),
                     effects,
                     detail: "metadata IO worker panicked; file effects unproven".into(),
@@ -515,6 +594,7 @@ impl<'a, 'window> NativeMetadata<'a, 'window> {
         }
         if let Some(outcome) = self.outcome.take() {
             self.history.push(MetadataFailure {
+                maps: outcome.maps,
                 attempt: outcome.attempt.number,
                 effects: outcome.effects,
                 detail: outcome.error.unwrap_or_else(|| {
@@ -575,6 +655,20 @@ impl<'a, 'window> NativeMetadata<'a, 'window> {
         )?;
         self.game
             .preflight_retained_clock_metadata(&expected.clock, written.clock.as_ref().unwrap())?;
+        self.game
+            .preflight_retained_maps_metadata(&expected.maps, written.maps.as_ref().unwrap())?;
+        self.game
+            .preflight_retained_fight_metadata(&expected.fight, written.fight.as_ref().unwrap())?;
+        self.game.preflight_retained_trader_metadata(
+            &expected.trader,
+            written.trader.as_ref().unwrap(),
+        )?;
+        self.game
+            .preflight_retained_raids_metadata(&expected.raids, written.raids.as_ref().unwrap())?;
+        self.game.preflight_retained_arrivals_metadata(
+            &expected.arrivals,
+            written.arrivals.as_ref().unwrap(),
+        )?;
         Ok(())
     }
     pub(super) fn acknowledge(mut self: Box<Self>) -> Result<MetadataAcknowledged, Box<Self>> {
@@ -597,8 +691,22 @@ impl<'a, 'window> NativeMetadata<'a, 'window> {
             .commit_retained_schedule_metadata(written.schedule.take().unwrap());
         self.game
             .commit_retained_clock_metadata(written.clock.take().unwrap());
+        self.game
+            .commit_retained_maps_metadata(written.maps.take().unwrap());
+        self.game
+            .commit_retained_fight_metadata(written.fight.take().unwrap());
+        self.game
+            .commit_retained_trader_metadata(written.trader.take().unwrap());
+        self.game
+            .commit_retained_raids_metadata(written.raids.take().unwrap());
+        self.game
+            .commit_retained_arrivals_metadata(written.arrivals.take().unwrap());
         self.armed = false;
         Ok(MetadataAcknowledged {
+            maps: self
+                .outcome
+                .as_ref()
+                .and_then(|outcome| outcome.maps.clone()),
             _batch: self.batch.clone(),
             effects: self.effects(),
             sampled_ms: self.sampled_ms,

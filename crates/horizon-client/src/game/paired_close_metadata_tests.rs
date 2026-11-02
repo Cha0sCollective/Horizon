@@ -649,7 +649,7 @@ fn native_metadata_actual_worker_panic_replays_fixed_input() {
     let unknown = owner
         .failures()
         .iter()
-        .any(|f| f.effects == [MetadataEffect::Unknown; 10]);
+        .any(|f| f.effects == [MetadataEffect::Unknown; MetadataFamily::ALL.len()]);
     let retry = owner.retry(Instant::now() + WAIT).is_ok();
     complete(&mut owner);
     let same = Arc::ptr_eq(input.as_ref().unwrap(), owner.input.as_ref().unwrap());
@@ -941,4 +941,673 @@ fn native_schedule_family_stall_late_failure_and_retry() {
 #[test]
 fn native_clock_family_stall_late_failure_and_retry() {
     primary_write_failure(MetadataFamily::Clock);
+}
+
+fn remaining_rich(game: &mut Game<'_>) {
+    use crate::game::{Dim, dragon::Fight, maps::Maps};
+    rich(game);
+    game.maps = Maps::retained_metadata_fixture(Some(12), &[9, 3], &[12]);
+    game.fight = Fight::retained_metadata_fixture(true, true, true);
+    game.set_retained_trader_fixture(true, true);
+    // Deliberately unloaded yet dirty: loading is NOT the arrivals save guard.
+    game.set_retained_arrivals_fixture(false, false, true);
+    game.dim = Dim::Overworld;
+    game.level.player_extra = Some(Tag::compound([
+        ("opaque", Tag::Long(91)),
+        ("raid_omen_position", Tag::IntArray(vec![-1, -2, -3])),
+    ]));
+    game.seed_retained_raids_fixture(Some(Dim::Nether), true, true, Some([7, 8, 9]));
+}
+fn raid_file(game: &Game<'_>) -> std::path::PathBuf {
+    horizon_client::save::dimension_dir(&game.world_root, "minecraft:the_nether")
+        .join("data/minecraft/raids.dat")
+}
+fn fight_file(game: &Game<'_>) -> std::path::PathBuf {
+    horizon_client::save::dimension_dir(&game.world_root, "minecraft:the_end")
+        .join("data/minecraft/ender_dragon_fight.dat")
+}
+
+fn native_decoded(tag: Tag) -> Tag {
+    // Native NBT reads canonicalize negative zero. Compare native disk reads
+    // against that same decoded representation; live-state snapshots above
+    // continue to require the original raw floating-point bits.
+    use horizon_world::nbt::{self, Limits, NamedTag};
+    let bytes = nbt::write_named(
+        &NamedTag {
+            name: "".into(),
+            tag,
+        },
+        Limits::default(),
+    )
+    .unwrap();
+    let (decoded, used) = nbt::read_named(&bytes, Limits::default()).unwrap();
+    assert_eq!(used, bytes.len());
+    decoded.tag
+}
+
+#[test]
+fn remaining_nondefault_native_fifteen_family_ack_and_runtime_preservation() {
+    let fixture = Fixture::new("remaining-rich");
+    let mut game = fixture.game();
+    remaining_rich(&mut game);
+    let maps = game.maps.retained_metadata_test_snapshot(true);
+    let fight = game.fight.retained_metadata_test_snapshot(true);
+    let trader = game.retained_trader_fixture_state();
+    let arrivals = game.retained_arrivals_fixture_state();
+    let raids = game.retained_raids_fixture_snapshot();
+    let raid_tag = game.retained_raids_fixture_tag().unwrap();
+    let mut owner = NativeMetadata::begin(&mut game, Instant::now() + WAIT);
+    complete(&mut owner);
+    let done = ack(owner);
+    assert_eq!(
+        done.effects,
+        [MetadataEffect::Completed; MetadataFamily::ALL.len()]
+    );
+    assert_eq!(game.maps.retained_metadata_test_snapshot(true), maps);
+    assert!(game.maps.retained_metadata_test_dirty().is_empty());
+    assert_eq!(game.fight.retained_metadata_test_snapshot(true), fight);
+    assert!(!game.fight.retained_metadata_test_dirty());
+    let after = game.retained_trader_fixture_state();
+    assert_eq!(&after[..4], &trader[..4]);
+    assert_eq!(after[4], 0);
+    assert!(arrivals.runtime_eq(&game.retained_arrivals_fixture_state()));
+    assert!(!game.retained_arrivals_fixture_state().dirty());
+    assert!(game.retained_raids_fixture_runtime_matches(&raids));
+    assert!(!game.retained_raids_fixture_dirty());
+    let evidence = done.maps.unwrap();
+    assert_eq!(
+        evidence.maps,
+        vec![
+            (3, MetadataEffect::Completed),
+            (9, MetadataEffect::Completed)
+        ]
+    );
+    assert_eq!(evidence.last_id, MetadataEffect::Completed);
+    for id in [3, 9] {
+        let root = save::read_dat(
+            &game
+                .world_root
+                .join(format!("data/minecraft/maps/{id}.dat")),
+        )
+        .unwrap();
+        let map = &game.maps.data[&id];
+        let data = root.get("data").unwrap();
+        assert_eq!(
+            data.get("colors"),
+            Some(&Tag::ByteArray(map.colors.clone()))
+        );
+        assert_eq!(data.get("xCenter"), Some(&Tag::Int(map.center[0])));
+        assert_eq!(
+            data.get("dimension"),
+            Some(&Tag::String(map.dimension.as_str().into()))
+        );
+    }
+    assert!(!game.world_root.join("data/minecraft/maps/12.dat").exists());
+    let index = save::read_dat(&game.world_root.join("data/minecraft/maps/last_id.dat")).unwrap();
+    assert_eq!(index.get("data").unwrap().get("map"), Some(&Tag::Int(12)));
+    let fight = save::read_dat(&fight_file(&game)).unwrap();
+    let data = fight.get("data").unwrap();
+    assert_eq!(
+        data.get("exit_portal_location"),
+        Some(&Tag::IntArray(vec![-2, 64, 4]))
+    );
+    assert_eq!(
+        data.get("horizon_respawn_crystals"),
+        Some(&Tag::IntArray(vec![1, 64, -2, -3, -66, 3]))
+    );
+    let trader =
+        save::read_dat(&game.world_root.join("data/minecraft/wandering_trader.dat")).unwrap();
+    assert_eq!(
+        trader.get("data").unwrap().get("spawn_delay"),
+        Some(&Tag::Int(12345))
+    );
+    assert_eq!(
+        trader.get("data").unwrap().get("spawn_chance"),
+        Some(&Tag::Int(63))
+    );
+    assert_eq!(
+        save::read_dat(&game.world_root.join("data/horizon_portal_arrivals.dat")),
+        Some(native_decoded(arrivals.native_data()))
+    );
+    assert_eq!(
+        save::read_dat(&raid_file(&game)),
+        Some(native_decoded(raid_tag))
+    );
+    assert!(!game.world_root.join("data/minecraft/raids.dat").exists());
+    assert_eq!(
+        game.level
+            .player_extra
+            .as_ref()
+            .unwrap()
+            .get("raid_omen_position"),
+        Some(&Tag::IntArray(vec![7, 8, 9]))
+    );
+    assert_eq!(
+        game.level.player_extra.as_ref().unwrap().get("opaque"),
+        Some(&Tag::Long(91))
+    );
+}
+
+fn remaining_map_failure(index: bool) {
+    let fixture = Fixture::new("remaining-map-failure");
+    let mut game = fixture.game();
+    remaining_rich(&mut game);
+    let before = game.maps.retained_metadata_test_snapshot(false);
+    let extra = game.level.player_extra.clone();
+    let obstruction = game.world_root.join(if index {
+        "data/minecraft/maps/last_id.dat_new"
+    } else {
+        "data/minecraft/maps/9.dat_new"
+    });
+    fs::create_dir_all(&obstruction).unwrap();
+    let (control, receipt) =
+        MetadataTestControl::new(MetadataTestAction::HoldBeforeFamily(MetadataFamily::Maps));
+    let mut owner = NativeMetadata::begin(&mut game, Instant::now() + WAIT);
+    owner.control = Some(control);
+    owner.poll();
+    let until = Instant::now() + WAIT;
+    while !receipt.entered() && Instant::now() < until {
+        owner.poll();
+        std::thread::yield_now();
+    }
+    let entered = receipt.entered();
+    owner.deadline = Instant::now();
+    owner.poll();
+    let busy = owner.retry(Instant::now() + WAIT) == Err(MetadataRetryRefusal::Busy);
+    receipt.release();
+    reap(&mut owner);
+    let blocked = matches!(owner.poll(), MetadataStatus::Blocked(_));
+    let unchanged = owner.game.maps.retained_metadata_test_snapshot(false) == before
+        && owner.game.level.player_extra == extra
+        && storage_dirty(owner.game);
+    let evidence = owner.outcome.as_ref().and_then(|v| v.maps.clone());
+    let input = owner.input.clone();
+    fs::remove_dir(&obstruction).unwrap();
+    let retry = owner.retry(Instant::now() + WAIT).is_ok();
+    complete(&mut owner);
+    let same = Arc::ptr_eq(input.as_ref().unwrap(), owner.input.as_ref().unwrap());
+    let done = ack(owner);
+    assert!(entered && busy && blocked && unchanged && retry && same);
+    let evidence = evidence.unwrap();
+    assert_eq!(
+        evidence.maps,
+        vec![
+            (3, MetadataEffect::Completed),
+            (
+                9,
+                if index {
+                    MetadataEffect::Completed
+                } else {
+                    MetadataEffect::Unknown
+                }
+            )
+        ]
+    );
+    assert_eq!(
+        evidence.last_id,
+        if index {
+            MetadataEffect::Unknown
+        } else {
+            MetadataEffect::Unattempted
+        }
+    );
+    assert!(done.failures.iter().any(|failure| {
+        failure
+            .maps
+            .as_ref()
+            .is_some_and(|files| files.last_id == evidence.last_id && files.maps == evidence.maps)
+    }));
+    assert!(game.maps.retained_metadata_test_dirty().is_empty());
+}
+#[test]
+fn remaining_sorted_later_map_failure_keeps_every_original_dirty() {
+    remaining_map_failure(false);
+}
+#[test]
+fn remaining_index_failure_retains_completed_map_evidence_and_all_dirty() {
+    remaining_map_failure(true);
+}
+
+#[test]
+fn remaining_map_index_only_clean_maps_and_empty_sparsity() {
+    use crate::game::maps::Maps;
+    let fixture = Fixture::new("remaining-index-only");
+    let mut game = fixture.game();
+    game.maps = Maps::retained_metadata_fixture(Some(12), &[], &[3]);
+    let before = game.maps.retained_metadata_test_snapshot(false);
+    let mut owner = NativeMetadata::begin(&mut game, Instant::now() + WAIT);
+    complete(&mut owner);
+    let done = ack(owner);
+    assert_eq!(done.maps.unwrap().last_id, MetadataEffect::Completed);
+    assert_eq!(game.maps.retained_metadata_test_snapshot(false), before);
+    assert!(!game.world_root.join("data/minecraft/maps/3.dat").exists());
+    assert!(save::read_dat(&game.world_root.join("data/minecraft/maps/last_id.dat")).is_some());
+    game.maps = Maps::default();
+    let (_, input) = game.prepare_retained_maps_metadata().unwrap();
+    let io = input.write_native();
+    assert_eq!(io.effect, MetadataEffect::Skipped);
+    assert!(io.result.is_ok());
+}
+
+fn remaining_native_failure(family: MetadataFamily) {
+    let fixture = Fixture::new("remaining-family-failure");
+    let mut game = fixture.game();
+    remaining_rich(&mut game);
+    let path = match family {
+        MetadataFamily::Fight => fight_file(&game).with_file_name("ender_dragon_fight.dat_new"),
+        MetadataFamily::Trader => game
+            .world_root
+            .join("data/minecraft/wandering_trader.dat_new"),
+        MetadataFamily::Raids => raid_file(&game).with_file_name("raids.dat_new"),
+        MetadataFamily::Arrivals => game.world_root.join("data/horizon_portal_arrivals.dat_new"),
+        _ => unreachable!(),
+    };
+    fs::create_dir_all(&path).unwrap();
+    let maps = game.maps.retained_metadata_test_snapshot(false);
+    let fight = game.fight.retained_metadata_test_snapshot(false);
+    let trader = game.retained_trader_fixture_state();
+    let raids = game.retained_raids_fixture_snapshot();
+    let arrivals = game.retained_arrivals_fixture_state();
+    let (control, receipt) = MetadataTestControl::new(MetadataTestAction::HoldBeforeFamily(family));
+    let mut owner = NativeMetadata::begin(&mut game, Instant::now() + WAIT);
+    owner.control = Some(control);
+    owner.poll();
+    let until = Instant::now() + WAIT;
+    while !receipt.entered() && Instant::now() < until {
+        owner.poll();
+        std::thread::yield_now();
+    }
+    let entered = receipt.entered();
+    owner.deadline = Instant::now();
+    owner.poll();
+    let busy = owner.retry(Instant::now() + WAIT) == Err(MetadataRetryRefusal::Busy);
+    receipt.release();
+    reap(&mut owner);
+    let blocked = matches!(owner.poll(), MetadataStatus::Blocked(_));
+    let effects = owner.effects();
+    let unchanged = owner.game.maps.retained_metadata_test_snapshot(false) == maps
+        && owner.game.fight.retained_metadata_test_snapshot(false) == fight
+        && owner.game.retained_trader_fixture_state() == trader
+        && owner.game.retained_raids_fixture_matches(&raids)
+        && owner.game.retained_arrivals_fixture_state() == arrivals
+        && storage_dirty(owner.game);
+    let input = owner.input.clone();
+    fs::remove_dir(&path).unwrap();
+    let retry = owner.retry(Instant::now() + WAIT).is_ok();
+    complete(&mut owner);
+    let same = Arc::ptr_eq(input.as_ref().unwrap(), owner.input.as_ref().unwrap());
+    let _ = ack(owner);
+    assert!(entered && busy && blocked && unchanged && retry && same);
+    assert_eq!(effects[family as usize], MetadataEffect::Unknown);
+    assert!(
+        effects[..family as usize]
+            .iter()
+            .all(|e| *e == MetadataEffect::Completed)
+    );
+    assert!(
+        effects[family as usize + 1..]
+            .iter()
+            .all(|e| *e == MetadataEffect::Unattempted)
+    );
+}
+#[test]
+fn remaining_fight_native_stall_late_failure_and_fixed_retry() {
+    remaining_native_failure(MetadataFamily::Fight);
+}
+#[test]
+fn remaining_trader_native_stall_late_failure_and_fixed_retry() {
+    remaining_native_failure(MetadataFamily::Trader);
+}
+#[test]
+fn remaining_raid_native_stall_late_failure_keeps_player_extra() {
+    remaining_native_failure(MetadataFamily::Raids);
+}
+#[test]
+fn remaining_late_arrival_failure_keeps_all_fifteen_markers_and_omen() {
+    remaining_native_failure(MetadataFamily::Arrivals);
+}
+
+#[test]
+fn remaining_late_preflight_refusal_leaves_all_fifteen_owners_unacknowledged() {
+    let fixture = Fixture::new("remaining-late-preflight");
+    let mut game = fixture.game();
+    remaining_rich(&mut game);
+    let maps = game.maps.retained_metadata_test_snapshot(false);
+    let raids = game.retained_raids_fixture_snapshot();
+    let mut owner = NativeMetadata::begin(&mut game, Instant::now() + WAIT);
+    complete(&mut owner);
+    let cooldown = owner.game.portals.player.cooldown;
+    owner.game.portals.player.cooldown += 1;
+    let mut owner = match owner.acknowledge() {
+        Err(owner) => owner,
+        Ok(_) => panic!("changed last family acknowledged"),
+    };
+    let untouched = storage_dirty(owner.game)
+        && owner.game.maps.retained_metadata_test_snapshot(false) == maps
+        && owner.game.retained_raids_fixture_matches(&raids);
+    owner.game.portals.player.cooldown = cooldown;
+    let attempts = owner.next_attempt;
+    let retry = owner.retry(Instant::now() + WAIT).is_ok();
+    complete(&mut owner);
+    let _ = ack(owner);
+    assert!(untouched && retry);
+    assert_eq!(attempts, 1);
+}
+
+#[test]
+fn remaining_fresh_unloaded_and_clean_guards_preserve_actual_owners() {
+    use crate::game::{Dim, dragon::Fight};
+    let fixture = Fixture::new("remaining-guards");
+    let mut game = fixture.game();
+    game.fight = Fight::retained_metadata_fixture(false, true, true);
+    game.set_retained_trader_fixture(false, true);
+    game.set_retained_arrivals_fixture(false, false, false);
+    game.level.player_extra = None;
+    game.seed_retained_raids_fixture(None, true, true, Some([1, 2, 3]));
+    let raid = game.retained_raids_fixture_snapshot();
+    let mut owner = NativeMetadata::begin(&mut game, Instant::now() + WAIT);
+    complete(&mut owner);
+    let done = ack(owner);
+    assert_eq!(&done.effects[10..], &[MetadataEffect::Skipped; 5]);
+    assert!(game.retained_raids_fixture_matches(&raid));
+    assert!(game.level.player_extra.is_none());
+    assert!(game.fight.retained_metadata_test_dirty());
+    assert_eq!(game.retained_trader_fixture_state()[4], 1);
+    game.fight = Fight::retained_metadata_fixture(true, false, true);
+    game.set_retained_trader_fixture(true, false);
+    game.seed_retained_raids_fixture(Some(Dim::Nether), false, true, Some([1, 2, 3]));
+    let (_, fight) = game.prepare_retained_fight_metadata().unwrap();
+    assert_eq!(fight.write_native().effect, MetadataEffect::Skipped);
+    let (_, trader) = game.prepare_retained_trader_metadata();
+    assert_eq!(trader.write_native().effect, MetadataEffect::Skipped);
+    let (_, raids) = game.prepare_retained_raids_metadata().unwrap();
+    assert_eq!(raids.write_native().effect, MetadataEffect::Skipped);
+    assert!(!fight_file(&game).exists());
+    assert!(!raid_file(&game).exists());
+    assert!(
+        !game
+            .world_root
+            .join("data/minecraft/wandering_trader.dat")
+            .exists()
+    );
+}
+
+#[test]
+fn remaining_remote_guard_preserves_native_fight_and_trader_selection() {
+    let fixture = Fixture::new("remaining-remote");
+    let mut game = fixture.game();
+    let (client, server) = horizon_protocol::connection::Pipe::pair();
+    game.connect_local(client, "RemainingMetadata").unwrap();
+    remaining_rich(&mut game);
+    let extra = game.level.player_extra.clone();
+    let mut owner = NativeMetadata::begin(&mut game, Instant::now() + WAIT);
+    complete(&mut owner);
+    let done = ack(owner);
+    assert_eq!(
+        done.effects[MetadataFamily::Maps as usize],
+        MetadataEffect::Skipped
+    );
+    assert_eq!(
+        done.effects[MetadataFamily::Raids as usize],
+        MetadataEffect::Skipped
+    );
+    assert_eq!(
+        done.effects[MetadataFamily::Arrivals as usize],
+        MetadataEffect::Skipped
+    );
+    assert_eq!(
+        done.effects[MetadataFamily::Fight as usize],
+        MetadataEffect::Completed
+    );
+    assert_eq!(
+        done.effects[MetadataFamily::Trader as usize],
+        MetadataEffect::Completed
+    );
+    assert_eq!(game.maps.retained_metadata_test_dirty(), vec![3, 9]);
+    assert!(game.retained_raids_fixture_dirty());
+    assert!(game.retained_arrivals_fixture_state().dirty());
+    assert_eq!(game.level.player_extra, extra);
+    server.shutdown();
+    drop(server);
+    drop(game.remote.take());
+}
+
+#[test]
+fn remaining_fight_optional_omission_uses_native_end_file() {
+    use crate::game::dragon::Fight;
+    let fixture = Fixture::new("remaining-fight-optionals");
+    let mut game = fixture.game();
+    game.fight = Fight::retained_metadata_fixture(true, true, false);
+    let before = game.fight.retained_metadata_test_snapshot(true);
+    let mut owner = NativeMetadata::begin(&mut game, Instant::now() + WAIT);
+    complete(&mut owner);
+    let _ = ack(owner);
+    let root = save::read_dat(&fight_file(&game)).unwrap();
+    let data = root.get("data").unwrap();
+    for key in [
+        "exit_portal_location",
+        "respawn_stage",
+        "horizon_respawn_crystals",
+    ] {
+        assert!(data.get(key).is_none());
+    }
+    assert_eq!(data.get("respawn_time"), Some(&Tag::Int(0)));
+    assert_eq!(game.fight.retained_metadata_test_snapshot(true), before);
+}
+
+#[test]
+fn remaining_dirty_empty_unloaded_arrivals_replace_existing_without_wrapper() {
+    let fixture = Fixture::new("remaining-empty-arrivals");
+    let mut game = fixture.game();
+    game.set_retained_arrivals_fixture(false, false, true);
+    let mut owner = NativeMetadata::begin(&mut game, Instant::now() + WAIT);
+    complete(&mut owner);
+    let _ = ack(owner);
+    let path = game.world_root.join("data/horizon_portal_arrivals.dat");
+    let original = save::read_dat(&path).unwrap();
+    game.set_retained_arrivals_fixture(true, false, true);
+    let before = game.retained_arrivals_fixture_state();
+    let mut owner = NativeMetadata::begin(&mut game, Instant::now() + WAIT);
+    complete(&mut owner);
+    let done = ack(owner);
+    assert_eq!(
+        done.effects[MetadataFamily::Arrivals as usize],
+        MetadataEffect::Completed
+    );
+    assert_eq!(
+        save::read_dat(&path),
+        Some(Tag::compound([("arrivals", Tag::List(Vec::new()))]))
+    );
+    assert_eq!(
+        save::read_dat(&path.with_file_name("horizon_portal_arrivals.dat_old")),
+        Some(original)
+    );
+    assert!(before.runtime_eq(&game.retained_arrivals_fixture_state()));
+}
+
+fn remaining_omen_case(case: u8) {
+    use crate::game::Dim;
+    let fixture = Fixture::new("remaining-omen");
+    let mut game = fixture.game();
+    let original = match case {
+        0 => None,
+        1 => Some(Tag::compound([
+            ("opaque", Tag::Long(73)),
+            ("raid_omen_position", Tag::IntArray(vec![4, 5, 6])),
+        ])),
+        2 => Some(Tag::String("opaque non-compound".into())),
+        3 => Some(Tag::compound([(
+            "raid_omen_position",
+            Tag::IntArray(vec![4, 5, 6]),
+        )])),
+        _ => unreachable!(),
+    };
+    game.level.player_extra = original.clone();
+    game.seed_retained_raids_fixture(Some(Dim::Nether), true, case != 3, None);
+    let before = game.retained_raids_fixture_snapshot();
+    let mut owner = NativeMetadata::begin(&mut game, Instant::now() + WAIT);
+    complete(&mut owner);
+    let _ = ack(owner);
+    assert!(game.retained_raids_fixture_runtime_matches(&before));
+    match case {
+        0 => assert_eq!(
+            game.level.player_extra,
+            Some(Tag::compound(std::iter::empty::<(&str, Tag)>()))
+        ),
+        1 => assert_eq!(
+            game.level.player_extra,
+            Some(Tag::compound([("opaque", Tag::Long(73))]))
+        ),
+        2 | 3 => assert_eq!(game.level.player_extra, original),
+        _ => unreachable!(),
+    }
+}
+#[test]
+fn remaining_loaded_omen_none_extra_creates_empty_compound() {
+    remaining_omen_case(0);
+}
+#[test]
+fn remaining_loaded_omen_removal_preserves_opaque_player_keys() {
+    remaining_omen_case(1);
+}
+#[test]
+fn remaining_loaded_omen_noncompound_extra_is_unchanged() {
+    remaining_omen_case(2);
+}
+#[test]
+fn remaining_unloaded_omen_preserves_existing_player_extra() {
+    remaining_omen_case(3);
+}
+
+fn remaining_raid_corruption(orphan_map: bool) {
+    use crate::game::Dim;
+    let fixture = Fixture::new("remaining-raid-corruption");
+    let mut game = fixture.game();
+    game.seed_retained_raids_fixture(Some(Dim::Nether), true, true, Some([7, 8, 9]));
+    let (expected, input) = game.prepare_retained_raids_metadata().unwrap();
+    let written = input.write_native().result.unwrap();
+    game.corrupt_retained_raids_fixture(orphan_map);
+    assert!(game.prepare_retained_raids_metadata().is_err());
+    assert!(
+        game.preflight_retained_raids_metadata(&expected, &written)
+            .is_err()
+    );
+    assert!(game.retained_raids_fixture_dirty());
+}
+#[test]
+fn remaining_raid_map_only_membership_refuses_without_native_panic() {
+    remaining_raid_corruption(true);
+}
+#[test]
+fn remaining_raid_order_only_membership_refuses_without_native_panic() {
+    remaining_raid_corruption(false);
+}
+
+#[test]
+fn remaining_family_foreign_posts_and_route_state_staleness_refuse() {
+    let fixture = Fixture::new("remaining-association");
+    let mut game = fixture.game();
+    remaining_rich(&mut game);
+    let (expected, input) = game.prepare_retained_maps_metadata().unwrap();
+    let (_, foreign) = game.prepare_retained_maps_metadata().unwrap();
+    let actual = input.write_native().result.unwrap();
+    let foreign = foreign.write_native().result.unwrap();
+    assert!(
+        game.preflight_retained_maps_metadata(&expected, &foreign)
+            .is_err()
+    );
+    game.maps.data.get_mut(&3).unwrap().scale += 1;
+    assert!(
+        game.preflight_retained_maps_metadata(&expected, &actual)
+            .is_err()
+    );
+    game.maps.data.get_mut(&3).unwrap().scale -= 1;
+    let removed = game.maps.data.remove(&12).unwrap();
+    assert!(
+        game.preflight_retained_maps_metadata(&expected, &actual)
+            .is_err()
+    );
+    game.maps.data.insert(12, removed);
+    let original = std::mem::replace(
+        &mut game.maps,
+        crate::game::maps::Maps::retained_metadata_fixture(Some(13), &[9, 3], &[12]),
+    );
+    assert!(
+        game.preflight_retained_maps_metadata(&expected, &actual)
+            .is_err()
+    );
+    game.maps = original;
+    let original = std::mem::replace(
+        &mut game.maps,
+        crate::game::maps::Maps::retained_metadata_fixture(Some(12), &[3], &[9, 12]),
+    );
+    assert!(
+        game.preflight_retained_maps_metadata(&expected, &actual)
+            .is_err()
+    );
+    game.maps = original;
+    assert!(
+        game.preflight_retained_maps_metadata(&expected, &actual)
+            .is_ok()
+    );
+    let (expected, input) = game.prepare_retained_fight_metadata().unwrap();
+    let (_, foreign) = game.prepare_retained_fight_metadata().unwrap();
+    let actual = input.write_native().result.unwrap();
+    let foreign = foreign.write_native().result.unwrap();
+    assert!(
+        game.preflight_retained_fight_metadata(&expected, &foreign)
+            .is_err()
+    );
+    assert!(
+        game.preflight_retained_fight_metadata(&expected, &actual)
+            .is_ok()
+    );
+    let (expected, input) = game.prepare_retained_trader_metadata();
+    let (_, foreign) = game.prepare_retained_trader_metadata();
+    let actual = input.write_native().result.unwrap();
+    let foreign = foreign.write_native().result.unwrap();
+    assert!(
+        game.preflight_retained_trader_metadata(&expected, &foreign)
+            .is_err()
+    );
+    assert!(
+        game.preflight_retained_trader_metadata(&expected, &actual)
+            .is_ok()
+    );
+    let (expected, input) = game.prepare_retained_arrivals_metadata();
+    let (_, foreign) = game.prepare_retained_arrivals_metadata();
+    let actual = input.write_native().result.unwrap();
+    let foreign = foreign.write_native().result.unwrap();
+    assert!(
+        game.preflight_retained_arrivals_metadata(&expected, &foreign)
+            .is_err()
+    );
+    assert!(
+        game.preflight_retained_arrivals_metadata(&expected, &actual)
+            .is_ok()
+    );
+    let (expected, input) = game.prepare_retained_raids_metadata().unwrap();
+    let (_, foreign) = game.prepare_retained_raids_metadata().unwrap();
+    let actual = input.write_native().result.unwrap();
+    let foreign = foreign.write_native().result.unwrap();
+    assert!(
+        game.preflight_retained_raids_metadata(&expected, &foreign)
+            .is_err()
+    );
+    let original = game.level.player_extra.take();
+    assert!(
+        game.preflight_retained_raids_metadata(&expected, &actual)
+            .is_err()
+    );
+    game.level.player_extra = original;
+    game.dim = crate::game::Dim::End;
+    assert!(
+        game.preflight_retained_raids_metadata(&expected, &actual)
+            .is_err()
+    );
+    game.dim = crate::game::Dim::Overworld;
+    assert!(
+        game.preflight_retained_raids_metadata(&expected, &actual)
+            .is_ok()
+    );
 }

@@ -97,16 +97,348 @@ pub(super) struct Portals {
     pub(super) sections: horizon_client::portal_sections::PortalSections,
 }
 impl Portals {
+    fn native_arrivals_data(&self) -> Tag {
+        let list = self.arrivals.iter().map(arrival_tag).collect();
+        Tag::compound([("arrivals", Tag::List(list))])
+    }
     fn save_arrivals_to(&mut self, path: &std::path::Path, remote: bool) -> Result<()> {
         if !self.dirty || remote {
             return Ok(());
         }
-        let list = self.arrivals.iter().map(arrival_tag).collect();
-        let root = Tag::compound([("arrivals", Tag::List(list))]);
-        horizon_client::save::write_dat(path, root)
+        horizon_client::save::write_dat(path, self.native_arrivals_data())
             .map_err(|error| format!("{}: {error}", path.display()))?;
         self.dirty = false;
         Ok(())
+    }
+}
+
+#[cfg(feature = "paired-packages")]
+#[derive(Debug, PartialEq, Eq)]
+struct RetainedPortalState {
+    cooldown: i32,
+    process: Option<(BlockPos, i32, bool)>,
+}
+#[cfg(feature = "paired-packages")]
+fn retained_portal_state(state: PortalState) -> RetainedPortalState {
+    RetainedPortalState {
+        cooldown: state.cooldown,
+        process: state.process.map(|p| (p.entry, p.time, p.inside)),
+    }
+}
+#[cfg(feature = "paired-packages")]
+#[derive(Debug, PartialEq, Eq)]
+struct RetainedPlanState {
+    dim: Dim,
+    approximate: BlockPos,
+    entry_x_axis: bool,
+    offset: [u64; 3],
+    size: [u32; 2],
+    end: bool,
+}
+#[cfg(feature = "paired-packages")]
+fn retained_plan_state(plan: Plan) -> RetainedPlanState {
+    RetainedPlanState {
+        dim: plan.dim,
+        approximate: plan.approximate,
+        entry_x_axis: plan.entry_x_axis,
+        offset: [
+            plan.offset.x.to_bits(),
+            plan.offset.y.to_bits(),
+            plan.offset.z.to_bits(),
+        ],
+        size: [plan.width.to_bits(), plan.height.to_bits()],
+        end: plan.end,
+    }
+}
+#[cfg(feature = "paired-packages")]
+#[derive(Debug, PartialEq, Eq)]
+struct RetainedArrivalsState {
+    player: RetainedPortalState,
+    travel: Option<RetainedPlanState>,
+    client_inside: bool,
+    entities: HashMap<u32, RetainedPortalState>,
+    before: HashMap<u32, [u64; 3]>,
+    rows: Vec<Tag>,
+    loaded: bool,
+    dirty: bool,
+}
+#[cfg(feature = "paired-packages")]
+fn retained_arrivals_state(portals: &Portals) -> RetainedArrivalsState {
+    RetainedArrivalsState {
+        player: retained_portal_state(portals.player),
+        travel: portals.travel.map(retained_plan_state),
+        client_inside: portals.client_inside,
+        entities: portals
+            .entities
+            .iter()
+            .map(|(&id, &state)| (id, retained_portal_state(state)))
+            .collect(),
+        before: portals
+            .before
+            .iter()
+            .map(|(&id, p)| (id, [p.x.to_bits(), p.y.to_bits(), p.z.to_bits()]))
+            .collect(),
+        rows: portals.arrivals.iter().map(arrival_tag).collect(),
+        loaded: portals.loaded,
+        dirty: portals.dirty,
+    }
+}
+#[cfg(feature = "paired-packages")]
+pub(in crate::game) struct ArrivalsMetadataExpected {
+    projection: std::sync::Arc<()>,
+    root: std::path::PathBuf,
+    remote: bool,
+    state: RetainedArrivalsState,
+}
+#[cfg(feature = "paired-packages")]
+#[derive(Clone)]
+pub(in crate::game) struct ArrivalsMetadataInput {
+    projection: std::sync::Arc<()>,
+    path: std::path::PathBuf,
+    active: bool,
+    data: Tag,
+}
+#[cfg(feature = "paired-packages")]
+pub(in crate::game) struct ArrivalsMetadataPost {
+    projection: std::sync::Arc<()>,
+    wrote: bool,
+}
+#[cfg(feature = "paired-packages")]
+pub(in crate::game) struct ArrivalsMetadataIo {
+    pub effect: super::paired_close::MetadataEffect,
+    pub result: std::result::Result<ArrivalsMetadataPost, String>,
+}
+#[cfg(feature = "paired-packages")]
+impl ArrivalsMetadataInput {
+    pub(in crate::game) fn write_native(&self) -> ArrivalsMetadataIo {
+        use super::paired_close::MetadataEffect as E;
+        if !self.active {
+            return ArrivalsMetadataIo {
+                effect: E::Skipped,
+                result: Ok(ArrivalsMetadataPost {
+                    projection: self.projection.clone(),
+                    wrote: false,
+                }),
+            };
+        }
+        match horizon_client::save::write_dat(&self.path, self.data.clone()) {
+            Ok(()) => ArrivalsMetadataIo {
+                effect: E::Completed,
+                result: Ok(ArrivalsMetadataPost {
+                    projection: self.projection.clone(),
+                    wrote: true,
+                }),
+            },
+            Err(error) => ArrivalsMetadataIo {
+                effect: E::Unknown,
+                result: Err(format!("{}: {error}", self.path.display())),
+            },
+        }
+    }
+}
+#[cfg(feature = "paired-packages")]
+impl Game<'_> {
+    pub(in crate::game) fn prepare_retained_arrivals_metadata(
+        &self,
+    ) -> (ArrivalsMetadataExpected, ArrivalsMetadataInput) {
+        let projection = std::sync::Arc::new(());
+        (
+            ArrivalsMetadataExpected {
+                projection: projection.clone(),
+                root: self.world_root.clone(),
+                remote: self.remote.is_some(),
+                state: retained_arrivals_state(&self.portals),
+            },
+            ArrivalsMetadataInput {
+                projection,
+                path: self.arrivals_path(),
+                active: self.portals.dirty && self.remote.is_none(),
+                data: self.portals.native_arrivals_data(),
+            },
+        )
+    }
+    pub(in crate::game) fn preflight_retained_arrivals_metadata(
+        &self,
+        expected: &ArrivalsMetadataExpected,
+        post: &ArrivalsMetadataPost,
+    ) -> std::result::Result<(), String> {
+        if !std::sync::Arc::ptr_eq(&expected.projection, &post.projection)
+            || self.world_root != expected.root
+            || self.remote.is_some() != expected.remote
+            || retained_arrivals_state(&self.portals) != expected.state
+            || post.wrote != (expected.state.dirty && !expected.remote)
+        {
+            return Err("retained arrivals original owner state or projection changed".into());
+        }
+        Ok(())
+    }
+    pub(in crate::game) fn commit_retained_arrivals_metadata(
+        &mut self,
+        post: ArrivalsMetadataPost,
+    ) {
+        if post.wrote {
+            self.portals.dirty = false;
+        }
+        // The lexical Game guard keeps the original opaque PortalSections owner
+        // in place. No cache reconstruction or independent cache equality is used.
+    }
+}
+
+#[cfg(all(
+    test,
+    feature = "paired-packages",
+    feature = "native-writer-test-control",
+    debug_assertions
+))]
+#[derive(Debug, PartialEq, Eq)]
+pub(in crate::game) struct ArrivalsMetadataFixtureState(RetainedArrivalsState);
+#[cfg(all(
+    test,
+    feature = "paired-packages",
+    feature = "native-writer-test-control",
+    debug_assertions
+))]
+impl ArrivalsMetadataFixtureState {
+    pub(in crate::game) fn dirty(&self) -> bool {
+        self.0.dirty
+    }
+    /// The entire native root, exactly as write_dat receives it.
+    pub(in crate::game) fn native_data(&self) -> Tag {
+        Tag::compound([("arrivals", Tag::List(self.0.rows.clone()))])
+    }
+    pub(in crate::game) fn runtime_eq(&self, other: &Self) -> bool {
+        self.0.player == other.0.player
+            && self.0.travel == other.0.travel
+            && self.0.client_inside == other.0.client_inside
+            && self.0.entities == other.0.entities
+            && self.0.before == other.0.before
+            && self.0.rows == other.0.rows
+            && self.0.loaded == other.0.loaded
+    }
+}
+#[cfg(all(
+    test,
+    feature = "paired-packages",
+    feature = "native-writer-test-control",
+    debug_assertions
+))]
+impl Game<'_> {
+    pub(in crate::game) fn set_retained_arrivals_fixture(
+        &mut self,
+        empty: bool,
+        loaded: bool,
+        dirty: bool,
+    ) {
+        let first = Plan {
+            dim: Dim::End,
+            approximate: BlockPos::new(100, 50, 0),
+            entry_x_axis: false,
+            offset: Vec3::new(-0.0, 0.75, -0.5),
+            width: f32::from_bits(0x3f400001),
+            height: 1.25,
+            end: true,
+        };
+        let second = Plan {
+            dim: Dim::Nether,
+            approximate: BlockPos::new(-16, 70, 32),
+            entry_x_axis: true,
+            offset: Vec3::new(0.25, f64::from_bits(0x3fe0000000000001), 0.0),
+            width: 1.5,
+            height: 2.0,
+            end: false,
+        };
+        let portals = &mut self.portals;
+        portals.player = PortalState {
+            cooldown: 17,
+            process: Some(horizon_client::nether_portal::Process {
+                entry: BlockPos::new(1, 65, 2),
+                time: 9,
+                inside: true,
+            }),
+        };
+        portals.travel = Some(second);
+        portals.client_inside = true;
+        portals.entities = HashMap::from([
+            (
+                99,
+                PortalState {
+                    cooldown: 11,
+                    process: None,
+                },
+            ),
+            (
+                7,
+                PortalState {
+                    cooldown: 0,
+                    process: portals.player.process,
+                },
+            ),
+        ]);
+        portals.before = HashMap::from([
+            (99, Vec3::new(-0.0, 2.0, 3.0)),
+            (7, Vec3::new(4.0, 5.0, f64::from_bits(0x3fe0000000000001))),
+        ]);
+        portals.arrivals = if empty {
+            Vec::new()
+        } else {
+            [first, second]
+                .into_iter()
+                .enumerate()
+                .map(|(index, plan)| Arrival {
+                    plan,
+                    tag: Tag::compound([
+                        (
+                            "id",
+                            Tag::String(
+                                if index == 0 {
+                                    "minecraft:item"
+                                } else {
+                                    "minecraft:chest_minecart"
+                                }
+                                .into(),
+                            ),
+                        ),
+                        ("UUID", Tag::IntArray(vec![1, 2, 3, index as i32])),
+                        ("test:sequence", Tag::Int(index as i32)),
+                        (
+                            "Items",
+                            Tag::List(vec![Tag::compound([
+                                ("Slot", Tag::Byte(0)),
+                                ("id", Tag::String("minecraft:stone".into())),
+                                ("count", Tag::Int(3)),
+                                (
+                                    "components",
+                                    Tag::compound([("test:opaque", Tag::ByteArray(vec![1, 7, 9]))]),
+                                ),
+                            ])]),
+                        ),
+                        (
+                            "Passengers",
+                            Tag::List(vec![Tag::compound([
+                                ("id", Tag::String("minecraft:pig".into())),
+                                (
+                                    "test:nested",
+                                    Tag::List(vec![Tag::Long(123), Tag::Long(-456)]),
+                                ),
+                            ])]),
+                        ),
+                        (
+                            "test:custom",
+                            Tag::compound([(
+                                "name",
+                                Tag::String("preserve opaque payload".into()),
+                            )]),
+                        ),
+                    ]),
+                })
+                .collect()
+        };
+        portals.loaded = loaded;
+        portals.dirty = dirty;
+        // Do not replace or clear the original opaque sections cache.
+    }
+    pub(in crate::game) fn retained_arrivals_fixture_state(&self) -> ArrivalsMetadataFixtureState {
+        ArrivalsMetadataFixtureState(retained_arrivals_state(&self.portals))
     }
 }
 

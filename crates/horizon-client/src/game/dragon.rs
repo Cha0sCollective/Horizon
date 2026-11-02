@@ -56,10 +56,7 @@ pub(super) struct Fight {
     dirty: bool,
 }
 impl Fight {
-    fn save_to(&mut self, path: &std::path::Path) -> horizon_client::Result<()> {
-        if !self.loaded || !self.dirty {
-            return Ok(());
-        }
+    fn to_nbt(&self) -> Tag {
         let b = |v: bool| Tag::Byte(i8::from(v));
         let mut data = vec![
             ("needs_state_scanning", b(self.needs_scan)),
@@ -84,14 +81,200 @@ impl Fight {
                 ),
             ));
         }
-        let tag = Tag::compound([
+        Tag::compound([
             ("data", Tag::compound(data)),
             ("DataVersion", Tag::Int(horizon_world::DATA_VERSION)),
-        ]);
-        horizon_client::save::write_dat(path, tag)
+        ])
+    }
+    fn save_to(&mut self, path: &std::path::Path) -> horizon_client::Result<()> {
+        if !self.loaded || !self.dirty {
+            return Ok(());
+        }
+        horizon_client::save::write_dat(path, self.to_nbt())
             .map_err(|error| format!("{}: {error}", path.display()))?;
         self.dirty = false;
         Ok(())
+    }
+}
+#[cfg(feature = "paired-packages")]
+#[derive(Debug, PartialEq)]
+struct FightMetadataState {
+    loaded: bool,
+    dirty: bool,
+    native: Tag,
+    alive_crystals: i32,
+    crystal_scan: i32,
+    player_scan: i32,
+    players: bool,
+    respawn: Option<(Respawn, i32)>,
+    // Native storage floors these positions; ack must still compare the exact
+    // original runtime values, including signed zero and NaN payloads.
+    respawn_crystals: Vec<[u64; 3]>,
+    blast_by: Option<FightWho>,
+}
+#[cfg(feature = "paired-packages")]
+impl FightMetadataState {
+    fn capture(fight: &Fight) -> Self {
+        Self {
+            loaded: fight.loaded,
+            dirty: fight.dirty,
+            native: fight.to_nbt(),
+            alive_crystals: fight.alive_crystals,
+            crystal_scan: fight.crystal_scan,
+            player_scan: fight.player_scan,
+            players: fight.players,
+            respawn: fight.respawn,
+            respawn_crystals: fight
+                .respawn_crystals
+                .iter()
+                .map(|p| [p.x.to_bits(), p.y.to_bits(), p.z.to_bits()])
+                .collect(),
+            blast_by: fight.blast_by,
+        }
+    }
+}
+#[cfg(feature = "paired-packages")]
+pub(in crate::game) struct FightMetadataExpected {
+    identity: std::sync::Arc<()>,
+    path: std::path::PathBuf,
+    original: FightMetadataState,
+}
+#[cfg(feature = "paired-packages")]
+#[derive(Clone)]
+pub(in crate::game) struct FightMetadataInput {
+    identity: std::sync::Arc<()>,
+    path: std::path::PathBuf,
+    native: Option<Tag>,
+}
+#[cfg(feature = "paired-packages")]
+pub(in crate::game) struct FightMetadataPost {
+    identity: std::sync::Arc<()>,
+    selected: bool,
+}
+#[cfg(feature = "paired-packages")]
+pub(in crate::game) struct FightMetadataIo {
+    pub effect: super::paired_close::MetadataEffect,
+    pub result: Result<FightMetadataPost, String>,
+}
+#[cfg(feature = "paired-packages")]
+impl FightMetadataInput {
+    pub(in crate::game) fn write_native(&self) -> FightMetadataIo {
+        use super::paired_close::MetadataEffect as E;
+        let Some(tag) = &self.native else {
+            return FightMetadataIo {
+                effect: E::Skipped,
+                result: Ok(FightMetadataPost {
+                    identity: self.identity.clone(),
+                    selected: false,
+                }),
+            };
+        };
+        match horizon_client::save::write_dat(&self.path, tag.clone()) {
+            Ok(()) => FightMetadataIo {
+                effect: E::Completed,
+                result: Ok(FightMetadataPost {
+                    identity: self.identity.clone(),
+                    selected: true,
+                }),
+            },
+            Err(error) => FightMetadataIo {
+                effect: E::Unknown,
+                result: Err(format!("{}: {error}", self.path.display())),
+            },
+        }
+    }
+}
+#[cfg(feature = "paired-packages")]
+impl Game<'_> {
+    pub(in crate::game) fn prepare_retained_fight_metadata(
+        &self,
+    ) -> Result<(FightMetadataExpected, FightMetadataInput), String> {
+        let identity = std::sync::Arc::new(());
+        let original = FightMetadataState::capture(&self.fight);
+        let path = self.fight_path();
+        let native = (self.fight.loaded && self.fight.dirty).then(|| original.native.clone());
+        Ok((
+            FightMetadataExpected {
+                identity: identity.clone(),
+                path: path.clone(),
+                original,
+            },
+            FightMetadataInput {
+                identity,
+                path,
+                native,
+            },
+        ))
+    }
+    pub(in crate::game) fn preflight_retained_fight_metadata(
+        &self,
+        expected: &FightMetadataExpected,
+        post: &FightMetadataPost,
+    ) -> Result<(), String> {
+        if !std::sync::Arc::ptr_eq(&expected.identity, &post.identity)
+            || expected.path != self.fight_path()
+            || expected.original != FightMetadataState::capture(&self.fight)
+        {
+            return Err("retained fight metadata original state or projection changed".into());
+        }
+        Ok(())
+    }
+    pub(in crate::game) fn commit_retained_fight_metadata(&mut self, post: FightMetadataPost) {
+        if post.selected {
+            self.fight.dirty = false;
+        }
+    }
+}
+#[cfg(all(
+    test,
+    feature = "paired-packages",
+    feature = "native-writer-test-control",
+    debug_assertions
+))]
+#[derive(Debug, PartialEq)]
+pub(in crate::game) struct FightMetadataTestSnapshot(FightMetadataState);
+#[cfg(all(
+    test,
+    feature = "paired-packages",
+    feature = "native-writer-test-control",
+    debug_assertions
+))]
+impl Fight {
+    pub(in crate::game) fn retained_metadata_fixture(
+        loaded: bool,
+        dirty: bool,
+        optional: bool,
+    ) -> Self {
+        Self {
+            loaded,
+            dirty,
+            needs_scan: true,
+            killed: true,
+            previously_killed: true,
+            gateways: vec![19, 3, 7],
+            exit_portal: optional.then_some([-2, 64, 4]),
+            alive_crystals: 4,
+            crystal_scan: 13,
+            player_scan: 7,
+            players: true,
+            crystals_placed: true,
+            respawn: optional.then_some((Respawn::Pillars, 42)),
+            respawn_crystals: vec![Vec3::new(1.9, 64.8, -1.2), Vec3::new(-2.1, -65.9, 3.9)],
+            blast_by: Some(FightWho::Guest(9)),
+        }
+    }
+    pub(in crate::game) fn retained_metadata_test_snapshot(
+        &self,
+        ignore_dirty: bool,
+    ) -> FightMetadataTestSnapshot {
+        let mut state = FightMetadataState::capture(self);
+        if ignore_dirty {
+            state.dirty = false;
+        }
+        FightMetadataTestSnapshot(state)
+    }
+    pub(in crate::game) fn retained_metadata_test_dirty(&self) -> bool {
+        self.dirty
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

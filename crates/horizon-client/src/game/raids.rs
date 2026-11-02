@@ -61,6 +61,372 @@ impl Raiding {
     }
 }
 
+/// Native serialization indexes the map using its private order. Reject public
+/// map/order disagreement before entering that codec, without changing the order.
+#[cfg(feature = "paired-packages")]
+fn retained_raids_tag(raids: &Raids) -> Result<Tag, String> {
+    let ids = raids.ids();
+    let unique: HashSet<_> = ids.iter().copied().collect();
+    if ids.len() != raids.map.len()
+        || unique.len() != ids.len()
+        || ids.iter().any(|id| !raids.map.contains_key(id))
+    {
+        return Err("retained raids native order/map membership disagreement".into());
+    }
+    Ok(Tag::compound([
+        ("data", raids.to_nbt()),
+        ("DataVersion", Tag::Int(horizon_world::DATA_VERSION)),
+    ]))
+}
+
+#[cfg(feature = "paired-packages")]
+#[derive(PartialEq, Eq)]
+struct RetainedRaidRuntime {
+    id: i32,
+    bar_name: BarName,
+    bar_progress: u32,
+    bar_visible: bool,
+    bar_player: bool,
+    celebration_ticks: i32,
+    wave_spawn_pos: Option<[i32; 3]>,
+    leaders: std::collections::BTreeMap<i32, u32>,
+}
+
+#[cfg(feature = "paired-packages")]
+fn retained_raid_runtime(raids: &Raids) -> Vec<RetainedRaidRuntime> {
+    raids
+        .map
+        .iter()
+        .map(|(&id, raid)| RetainedRaidRuntime {
+            id,
+            bar_name: raid.bar.name,
+            bar_progress: raid.bar.progress.to_bits(),
+            bar_visible: raid.bar.visible,
+            bar_player: raid.bar.player,
+            celebration_ticks: raid.celebration_ticks,
+            wave_spawn_pos: raid.wave_spawn_pos,
+            leaders: raid.leaders.clone(),
+        })
+        .collect()
+}
+
+#[cfg(feature = "paired-packages")]
+pub(in crate::game) struct RaidsMetadataExpected {
+    association: std::sync::Arc<()>,
+    root: std::path::PathBuf,
+    current_dim: Dim,
+    loaded: Option<Dim>,
+    remote: bool,
+    dirty: bool,
+    tag: Tag,
+    ids: Vec<i32>,
+    runtime: Vec<RetainedRaidRuntime>,
+    patrol_next_tick: i32,
+    siege: (bool, bool, i32, i32, [i32; 3]),
+    omen_loaded: bool,
+    omen_position: Option<[i32; 3]>,
+    player_extra: Option<Tag>,
+    bar_hurts: HashMap<i32, u64>,
+    attributes: Option<std::sync::Arc<GameplayAttributes>>,
+    homes: HashMap<i32, (i64, std::sync::Arc<Vec<[i32; 3]>>)>,
+}
+
+#[cfg(feature = "paired-packages")]
+#[derive(Clone)]
+pub(in crate::game) struct RaidsMetadataInput {
+    association: std::sync::Arc<()>,
+    path: Option<std::path::PathBuf>,
+    active: bool,
+    tag: Tag,
+    /// Outer None means no CPU replacement; inner Option is the exact native
+    /// player-extra value prepared against the current level before any IO.
+    player_extra: Option<Option<Tag>>,
+}
+
+#[cfg(feature = "paired-packages")]
+pub(in crate::game) struct RaidsMetadataPost {
+    association: std::sync::Arc<()>,
+    path: Option<std::path::PathBuf>,
+    active: bool,
+    player_extra: Option<Option<Tag>>,
+}
+
+#[cfg(feature = "paired-packages")]
+pub(in crate::game) struct RaidsMetadataIo {
+    pub effect: super::paired_close::MetadataEffect,
+    pub result: Result<RaidsMetadataPost, String>,
+}
+
+#[cfg(feature = "paired-packages")]
+impl RaidsMetadataInput {
+    pub(in crate::game) fn write_native(&self) -> RaidsMetadataIo {
+        use super::paired_close::MetadataEffect as E;
+        let post = RaidsMetadataPost {
+            association: self.association.clone(),
+            path: self.path.clone(),
+            active: self.active,
+            player_extra: self.player_extra.clone(),
+        };
+        if !self.active {
+            return RaidsMetadataIo {
+                effect: E::Skipped,
+                result: Ok(post),
+            };
+        }
+        let Some(path) = &self.path else {
+            return RaidsMetadataIo {
+                effect: E::Unknown,
+                result: Err("retained selected raids have no native route".into()),
+            };
+        };
+        match horizon_client::save::write_dat(path, self.tag.clone()) {
+            Ok(()) => RaidsMetadataIo {
+                effect: E::Completed,
+                result: Ok(post),
+            },
+            Err(error) => RaidsMetadataIo {
+                effect: E::Unknown,
+                result: Err(format!(
+                    "could not save raids at {}: {error}",
+                    path.display()
+                )),
+            },
+        }
+    }
+}
+
+#[cfg(feature = "paired-packages")]
+impl RaidsMetadataExpected {
+    fn matches(&self, game: &Game<'_>, include_markers: bool) -> Result<bool, String> {
+        let state = &game.raiding;
+        // Validate again before encoding: a changed public map must return an
+        // error here, rather than panic inside the native private-order codec.
+        let tag = retained_raids_tag(&state.raids)?;
+        let attributes_match = match (&self.attributes, &state.attributes) {
+            (None, None) => true,
+            (Some(before), Some(now)) => std::sync::Arc::ptr_eq(before, now),
+            _ => false,
+        };
+        let homes_match = self.homes.len() == state.homes.len()
+            && self.homes.iter().all(|(id, (tick, homes))| {
+                state.homes.get(id).is_some_and(|(now_tick, now_homes)| {
+                    tick == now_tick && std::sync::Arc::ptr_eq(homes, now_homes)
+                })
+            });
+        Ok(game.world_root == self.root
+            && game.dim == self.current_dim
+            && state.loaded == self.loaded
+            && game.remote.is_some() == self.remote
+            && (!include_markers
+                || (state.raids.dirty == self.dirty
+                    && game.level.player_extra == self.player_extra))
+            && tag == self.tag
+            && state.raids.ids() == self.ids
+            && retained_raid_runtime(&state.raids) == self.runtime
+            && state.patrol.next_tick == self.patrol_next_tick
+            && (
+                state.siege.tonight,
+                state.siege.set_up,
+                state.siege.zombies_to_spawn,
+                state.siege.next_spawn_time,
+                state.siege.spot,
+            ) == self.siege
+            && state.omen_loaded == self.omen_loaded
+            && state.omen_position == self.omen_position
+            && state.bar_hurts == self.bar_hurts
+            && attributes_match
+            && homes_match)
+        // The original private Raid RNG, heroes and native-order owners are
+        // never cloned or replaced here. Their ownership stays with the same
+        // Game under the caller's exclusive lexical guard; this snapshot does
+        // not establish independent equality of those opaque internals.
+    }
+}
+
+#[cfg(feature = "paired-packages")]
+impl Game<'_> {
+    pub(in crate::game) fn prepare_retained_raids_metadata(
+        &self,
+    ) -> Result<(RaidsMetadataExpected, RaidsMetadataInput), String> {
+        let state = &self.raiding;
+        let tag = retained_raids_tag(&state.raids)?;
+        let active = state.loaded.is_some() && state.raids.dirty && self.remote.is_none();
+        let player_extra = if active && state.omen_loaded {
+            let mut replacement = self.level.player_extra.clone();
+            let extra = replacement.get_or_insert_with(|| Tag::Compound(Default::default()));
+            if let Tag::Compound(map) = extra {
+                match state.omen_position {
+                    Some(position) => {
+                        map.insert(
+                            "raid_omen_position".into(),
+                            Tag::IntArray(position.to_vec()),
+                        );
+                    }
+                    None => {
+                        map.remove(&"raid_omen_position".into());
+                    }
+                }
+            }
+            Some(replacement)
+        } else {
+            None
+        };
+        let association = std::sync::Arc::new(());
+        Ok((
+            RaidsMetadataExpected {
+                association: association.clone(),
+                root: self.world_root.clone(),
+                current_dim: self.dim,
+                loaded: state.loaded,
+                remote: self.remote.is_some(),
+                dirty: state.raids.dirty,
+                tag: tag.clone(),
+                ids: state.raids.ids(),
+                runtime: retained_raid_runtime(&state.raids),
+                patrol_next_tick: state.patrol.next_tick,
+                siege: (
+                    state.siege.tonight,
+                    state.siege.set_up,
+                    state.siege.zombies_to_spawn,
+                    state.siege.next_spawn_time,
+                    state.siege.spot,
+                ),
+                omen_loaded: state.omen_loaded,
+                omen_position: state.omen_position,
+                player_extra: self.level.player_extra.clone(),
+                bar_hurts: state.bar_hurts.clone(),
+                attributes: state.attributes.clone(),
+                homes: state.homes.clone(),
+            },
+            RaidsMetadataInput {
+                association,
+                path: state.loaded.map(|dim| self.raids_path(dim)),
+                active,
+                tag,
+                player_extra,
+            },
+        ))
+    }
+
+    pub(in crate::game) fn preflight_retained_raids_metadata(
+        &self,
+        expected: &RaidsMetadataExpected,
+        post: &RaidsMetadataPost,
+    ) -> Result<(), String> {
+        if !std::sync::Arc::ptr_eq(&expected.association, &post.association)
+            || post.path != expected.loaded.map(|dim| self.raids_path(dim))
+            || post.active != (expected.loaded.is_some() && expected.dirty && !expected.remote)
+            || !expected.matches(self, true)?
+        {
+            return Err("retained raids original owner state, association or route changed".into());
+        }
+        Ok(())
+    }
+
+    /// Only after every family preflight: move the prepared CPU value and clear
+    /// this selected marker. No encoding, IO or omen recomputation occurs here.
+    pub(in crate::game) fn commit_retained_raids_metadata(&mut self, post: RaidsMetadataPost) {
+        if post.active {
+            if let Some(replacement) = post.player_extra {
+                self.level.player_extra = replacement;
+            }
+            self.raiding.raids.dirty = false;
+        }
+    }
+}
+
+#[cfg(all(
+    test,
+    feature = "paired-packages",
+    feature = "native-writer-test-control",
+    debug_assertions
+))]
+impl Game<'_> {
+    pub(in crate::game) fn seed_retained_raids_fixture(
+        &mut self,
+        loaded: Option<Dim>,
+        dirty: bool,
+        omen_loaded: bool,
+        omen_position: Option<[i32; 3]>,
+    ) {
+        let mut state = Raiding {
+            loaded,
+            omen_loaded,
+            omen_position,
+            ..Raiding::default()
+        };
+        state.patrol.next_tick = 712;
+        state.siege = Siege {
+            tonight: true,
+            set_up: true,
+            zombies_to_spawn: 9,
+            next_spawn_time: 2,
+            spot: [91, 64, -31],
+        };
+        state.attributes = Some(std::sync::Arc::new(GameplayAttributes::default()));
+        for (center, seed) in [([31, 65, -17], 271), ([500, 70, 500], 819)] {
+            let (id, _) = state.raids.create_or_extend(center, 3, Some(2), seed);
+            let raid = state.raids.get_mut(id).expect("created native raid");
+            raid.add_hero([id, 2, 3, 4]);
+            raid.started = true;
+            raid.ticks_active = 143;
+            raid.total_health = f32::from_bits(0x8000_0000);
+            raid.bar.name = BarName::Remaining(3);
+            raid.bar.progress = f32::from_bits(0x7fc0_0042);
+            raid.bar.player = true;
+            raid.celebration_ticks = 7;
+            raid.wave_spawn_pos = Some([90, 70, -30]);
+            raid.leaders.insert(1, 817);
+            state.bar_hurts.insert(id, 613);
+            state
+                .homes
+                .insert(id, (311, std::sync::Arc::new(vec![[20, 64, 30]])));
+        }
+        state.raids.tick = 419;
+        state.raids.dirty = dirty;
+        self.raiding = state;
+    }
+
+    pub(in crate::game) fn retained_raids_fixture_snapshot(&self) -> RaidsMetadataExpected {
+        self.prepare_retained_raids_metadata()
+            .expect("consistent native raid fixture")
+            .0
+    }
+
+    pub(in crate::game) fn retained_raids_fixture_matches(
+        &self,
+        expected: &RaidsMetadataExpected,
+    ) -> bool {
+        expected.matches(self, true).unwrap_or(false)
+    }
+
+    pub(in crate::game) fn retained_raids_fixture_runtime_matches(
+        &self,
+        expected: &RaidsMetadataExpected,
+    ) -> bool {
+        expected.matches(self, false).unwrap_or(false)
+    }
+
+    pub(in crate::game) fn retained_raids_fixture_dirty(&self) -> bool {
+        self.raiding.raids.dirty
+    }
+
+    pub(in crate::game) fn retained_raids_fixture_tag(&self) -> Result<Tag, String> {
+        retained_raids_tag(&self.raiding.raids)
+    }
+
+    pub(in crate::game) fn corrupt_retained_raids_fixture(&mut self, orphan_map: bool) {
+        if orphan_map {
+            self.raiding
+                .raids
+                .map
+                .insert(999, raid::Raid::new([0, 64, 0], 2, 11));
+        } else if let Some(id) = self.raiding.raids.ids().first() {
+            self.raiding.raids.map.remove(id);
+        }
+    }
+}
+
 /// The dormant session primitive admits metadata for an empty native raid set,
 /// never the permissive native decoder's partial-result or default fallback.
 #[cfg(feature = "paired-packages")]

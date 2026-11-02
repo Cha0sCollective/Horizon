@@ -29,6 +29,7 @@ const HOST: u32 = u32::MAX;
 /// A player carrying a map, or seeing it framed
 /// (`MapItemSavedData.HoldingPlayer`): the column sweep's step, and what
 /// changed since the last `ClientboundMapItemDataPacket` it was sent.
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Holder {
     who: u32,
     /// The last tick it carried the map, and saw it framed.
@@ -57,6 +58,7 @@ impl Holder {
         self.carried + 1 >= now || self.framed + 10 >= now
     }
 }
+#[derive(Clone, Debug, PartialEq)]
 pub(super) struct MapData {
     pub center: [i32; 2],
     pub scale: u8,
@@ -272,7 +274,7 @@ impl MapData {
         })
     }
 }
-#[derive(Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub(super) struct Maps {
     pub data: HashMap<i32, MapData>,
     /// The highest map id handed out (`maps/last_id.dat`), loaded on first use.
@@ -304,6 +306,248 @@ impl Maps {
             horizon_client::save::write_dat(&directory.join("last_id.dat"), tag)?;
         }
         Ok(())
+    }
+}
+#[cfg(feature = "paired-packages")]
+pub(in crate::game) struct MapsMetadataExpected {
+    identity: std::sync::Arc<()>,
+    root: std::path::PathBuf,
+    remote: bool,
+    original: Maps,
+}
+#[cfg(feature = "paired-packages")]
+#[derive(Clone)]
+pub(in crate::game) struct MapsMetadataInput {
+    identity: std::sync::Arc<()>,
+    directory: std::path::PathBuf,
+    remote: bool,
+    maps: Vec<(i32, Tag)>,
+    last_id: Option<Tag>,
+}
+#[cfg(feature = "paired-packages")]
+pub(in crate::game) struct MapsMetadataPost {
+    identity: std::sync::Arc<()>,
+    dirty_ids: Vec<i32>,
+}
+/// Actual file outcomes only; these facts cannot authorize marker changes.
+#[cfg(feature = "paired-packages")]
+#[derive(Clone, Debug)]
+pub(in crate::game) struct MapsMetadataEvidence {
+    pub maps: Vec<(i32, super::paired_close::MetadataEffect)>,
+    pub last_id: super::paired_close::MetadataEffect,
+}
+#[cfg(feature = "paired-packages")]
+pub(in crate::game) struct MapsMetadataIo {
+    pub effect: super::paired_close::MetadataEffect,
+    pub result: Result<MapsMetadataPost, String>,
+    pub files: MapsMetadataEvidence,
+}
+#[cfg(feature = "paired-packages")]
+impl MapsMetadataInput {
+    pub(in crate::game) fn write_native(&self) -> MapsMetadataIo {
+        use super::paired_close::MetadataEffect as E;
+        let mut files = MapsMetadataEvidence {
+            maps: self
+                .maps
+                .iter()
+                .map(|(id, _)| (*id, E::Unattempted))
+                .collect(),
+            last_id: if self.last_id.is_some() {
+                E::Unattempted
+            } else {
+                E::Skipped
+            },
+        };
+        if self.remote {
+            for (_, effect) in &mut files.maps {
+                *effect = E::Skipped;
+            }
+            files.last_id = E::Skipped;
+            return MapsMetadataIo {
+                effect: E::Skipped,
+                result: Ok(MapsMetadataPost {
+                    identity: self.identity.clone(),
+                    dirty_ids: Vec::new(),
+                }),
+                files,
+            };
+        }
+        for (index, (id, tag)) in self.maps.iter().enumerate() {
+            files.maps[index].1 = E::Unknown;
+            if let Err(error) = horizon_client::save::write_dat(
+                &self.directory.join(format!("{id}.dat")),
+                tag.clone(),
+            ) {
+                return MapsMetadataIo {
+                    effect: E::Unknown,
+                    result: Err(error.to_string()),
+                    files,
+                };
+            }
+            files.maps[index].1 = E::Completed;
+        }
+        if let Some(tag) = &self.last_id {
+            files.last_id = E::Unknown;
+            if let Err(error) =
+                horizon_client::save::write_dat(&self.directory.join("last_id.dat"), tag.clone())
+            {
+                return MapsMetadataIo {
+                    effect: E::Unknown,
+                    result: Err(error.to_string()),
+                    files,
+                };
+            }
+            files.last_id = E::Completed;
+        }
+        MapsMetadataIo {
+            effect: if self.maps.is_empty() && self.last_id.is_none() {
+                E::Skipped
+            } else {
+                E::Completed
+            },
+            result: Ok(MapsMetadataPost {
+                identity: self.identity.clone(),
+                dirty_ids: self.maps.iter().map(|(id, _)| *id).collect(),
+            }),
+            files,
+        }
+    }
+}
+#[cfg(feature = "paired-packages")]
+impl Game<'_> {
+    pub(in crate::game) fn prepare_retained_maps_metadata(
+        &self,
+    ) -> Result<(MapsMetadataExpected, MapsMetadataInput), String> {
+        let identity = std::sync::Arc::new(());
+        let mut maps: Vec<_> = self
+            .maps
+            .data
+            .iter()
+            .filter(|(_, map)| map.dirty)
+            .map(|(id, map)| (*id, map.to_nbt()))
+            .collect();
+        maps.sort_by_key(|(id, _)| *id);
+        let last_id = self.maps.last_id.map(|last| {
+            Tag::compound([
+                ("data", Tag::compound([("map", Tag::Int(last))])),
+                ("DataVersion", Tag::Int(horizon_world::DATA_VERSION)),
+            ])
+        });
+        Ok((
+            MapsMetadataExpected {
+                identity: identity.clone(),
+                root: self.world_root.clone(),
+                remote: self.remote.is_some(),
+                original: self.maps.clone(),
+            },
+            MapsMetadataInput {
+                identity,
+                directory: self.world_root.join("data/minecraft/maps"),
+                remote: self.remote.is_some(),
+                maps,
+                last_id,
+            },
+        ))
+    }
+    pub(in crate::game) fn preflight_retained_maps_metadata(
+        &self,
+        expected: &MapsMetadataExpected,
+        post: &MapsMetadataPost,
+    ) -> Result<(), String> {
+        if !std::sync::Arc::ptr_eq(&expected.identity, &post.identity)
+            || expected.root != self.world_root
+            || expected.remote != self.remote.is_some()
+            || expected.original != self.maps
+        {
+            return Err("retained map metadata original state or projection changed".into());
+        }
+        Ok(())
+    }
+    pub(in crate::game) fn commit_retained_maps_metadata(&mut self, post: MapsMetadataPost) {
+        // Every family has already preflighted under the same exclusive Game borrow.
+        for id in post.dirty_ids {
+            if let Some(map) = self.maps.data.get_mut(&id) {
+                map.dirty = false;
+            }
+        }
+    }
+}
+#[cfg(all(
+    test,
+    feature = "paired-packages",
+    feature = "native-writer-test-control",
+    debug_assertions
+))]
+#[derive(Debug, PartialEq)]
+pub(in crate::game) struct MapsMetadataTestSnapshot(Maps);
+#[cfg(all(
+    test,
+    feature = "paired-packages",
+    feature = "native-writer-test-control",
+    debug_assertions
+))]
+impl Maps {
+    pub(in crate::game) fn retained_metadata_fixture(
+        last_id: Option<i32>,
+        dirty_ids: &[i32],
+        clean_ids: &[i32],
+    ) -> Self {
+        let mut maps = Self {
+            last_id,
+            ..Self::default()
+        };
+        for (&id, dirty) in dirty_ids
+            .iter()
+            .map(|id| (id, true))
+            .chain(clean_ids.iter().map(|id| (id, false)))
+        {
+            let mut map = MapData::fresh(123.0, -456.0, 2, "minecraft:the_nether");
+            map.locked = true;
+            map.unlimited = true;
+            map.colors[7] = 29;
+            map.decorations.push(Decoration {
+                sprite: "map/decorations/player",
+                x: -7,
+                y: 9,
+                rot: 3,
+                holder: Some(HOST),
+            });
+            let holder = map.holder(HOST);
+            holder.carried = 71;
+            holder.framed = 69;
+            holder.step = 13;
+            holder.dirty = Some([1, 2, 17, 23]);
+            holder.tick = 4;
+            map.dirty = dirty;
+            maps.data.insert(id, map);
+        }
+        if let Some(&id) = dirty_ids.first().or_else(|| clean_ids.first()) {
+            maps.slots.push((id, 2));
+        }
+        maps.missing.insert(-37);
+        maps
+    }
+    pub(in crate::game) fn retained_metadata_test_snapshot(
+        &self,
+        ignore_dirty: bool,
+    ) -> MapsMetadataTestSnapshot {
+        let mut original = self.clone();
+        if ignore_dirty {
+            for map in original.data.values_mut() {
+                map.dirty = false;
+            }
+        }
+        MapsMetadataTestSnapshot(original)
+    }
+    pub(in crate::game) fn retained_metadata_test_dirty(&self) -> Vec<i32> {
+        let mut ids: Vec<_> = self
+            .data
+            .iter()
+            .filter(|(_, map)| map.dirty)
+            .map(|(id, _)| *id)
+            .collect();
+        ids.sort_unstable();
+        ids
     }
 }
 /// `MapColor.getColorFromPackedId` as RGBA bytes (NONE is transparent).

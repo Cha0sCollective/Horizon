@@ -35,11 +35,8 @@ impl Default for Spawner {
     }
 }
 impl Spawner {
-    fn save_to(&mut self, path: &std::path::Path) -> horizon_client::Result<()> {
-        if !self.loaded || !self.dirty {
-            return Ok(());
-        }
-        let tag = Tag::compound([
+    fn native_data(&self) -> Tag {
+        Tag::compound([
             (
                 "data",
                 Tag::compound([
@@ -48,10 +45,142 @@ impl Spawner {
                 ]),
             ),
             ("DataVersion", Tag::Int(horizon_world::DATA_VERSION)),
-        ]);
-        write_dat(path, tag).map_err(|error| format!("{}: {error}", path.display()))?;
+        ])
+    }
+    fn save_to(&mut self, path: &std::path::Path) -> horizon_client::Result<()> {
+        if !self.loaded || !self.dirty {
+            return Ok(());
+        }
+        write_dat(path, self.native_data())
+            .map_err(|error| format!("{}: {error}", path.display()))?;
         self.dirty = false;
         Ok(())
+    }
+}
+
+#[cfg(feature = "paired-packages")]
+fn retained_trader_state(spawner: &Spawner) -> [i32; 5] {
+    [
+        spawner.tick_delay,
+        spawner.spawn_delay,
+        spawner.chance,
+        i32::from(spawner.loaded),
+        i32::from(spawner.dirty),
+    ]
+}
+
+#[cfg(feature = "paired-packages")]
+pub(in crate::game) struct TraderMetadataExpected {
+    projection: std::sync::Arc<()>,
+    root: std::path::PathBuf,
+    state: [i32; 5],
+}
+#[cfg(feature = "paired-packages")]
+#[derive(Clone)]
+pub(in crate::game) struct TraderMetadataInput {
+    projection: std::sync::Arc<()>,
+    path: std::path::PathBuf,
+    active: bool,
+    data: Tag,
+}
+#[cfg(feature = "paired-packages")]
+pub(in crate::game) struct TraderMetadataPost {
+    projection: std::sync::Arc<()>,
+    wrote: bool,
+}
+#[cfg(feature = "paired-packages")]
+pub(in crate::game) struct TraderMetadataIo {
+    pub effect: super::paired_close::MetadataEffect,
+    pub result: std::result::Result<TraderMetadataPost, String>,
+}
+#[cfg(feature = "paired-packages")]
+impl TraderMetadataInput {
+    pub(in crate::game) fn write_native(&self) -> TraderMetadataIo {
+        use super::paired_close::MetadataEffect as E;
+        if !self.active {
+            return TraderMetadataIo {
+                effect: E::Skipped,
+                result: Ok(TraderMetadataPost {
+                    projection: self.projection.clone(),
+                    wrote: false,
+                }),
+            };
+        }
+        match write_dat(&self.path, self.data.clone()) {
+            Ok(()) => TraderMetadataIo {
+                effect: E::Completed,
+                result: Ok(TraderMetadataPost {
+                    projection: self.projection.clone(),
+                    wrote: true,
+                }),
+            },
+            Err(error) => TraderMetadataIo {
+                effect: E::Unknown,
+                result: Err(format!("{}: {error}", self.path.display())),
+            },
+        }
+    }
+}
+#[cfg(feature = "paired-packages")]
+impl Game<'_> {
+    pub(in crate::game) fn prepare_retained_trader_metadata(
+        &self,
+    ) -> (TraderMetadataExpected, TraderMetadataInput) {
+        let projection = std::sync::Arc::new(());
+        let trader = &self.creatures.trader;
+        (
+            TraderMetadataExpected {
+                projection: projection.clone(),
+                root: self.world_root.clone(),
+                state: retained_trader_state(trader),
+            },
+            TraderMetadataInput {
+                projection,
+                path: self.trader_path(),
+                active: trader.loaded && trader.dirty,
+                data: trader.native_data(),
+            },
+        )
+    }
+    pub(in crate::game) fn preflight_retained_trader_metadata(
+        &self,
+        expected: &TraderMetadataExpected,
+        post: &TraderMetadataPost,
+    ) -> std::result::Result<(), String> {
+        if !std::sync::Arc::ptr_eq(&expected.projection, &post.projection)
+            || self.world_root != expected.root
+            || retained_trader_state(&self.creatures.trader) != expected.state
+            || post.wrote != (expected.state[3] != 0 && expected.state[4] != 0)
+        {
+            return Err("retained trader original owner state or projection changed".into());
+        }
+        Ok(())
+    }
+    pub(in crate::game) fn commit_retained_trader_metadata(&mut self, post: TraderMetadataPost) {
+        if post.wrote {
+            self.creatures.trader.dirty = false;
+        }
+    }
+}
+
+#[cfg(all(
+    test,
+    feature = "paired-packages",
+    feature = "native-writer-test-control",
+    debug_assertions
+))]
+impl Game<'_> {
+    pub(in crate::game) fn set_retained_trader_fixture(&mut self, loaded: bool, dirty: bool) {
+        self.creatures.trader = Spawner {
+            tick_delay: 17,
+            spawn_delay: 12345,
+            chance: 63,
+            loaded,
+            dirty,
+        };
+    }
+    pub(in crate::game) fn retained_trader_fixture_state(&self) -> [i32; 5] {
+        retained_trader_state(&self.creatures.trader)
     }
 }
 impl Creatures {
