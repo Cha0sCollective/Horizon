@@ -194,6 +194,35 @@ struct MeshSettings {
     smooth_lighting: bool,
     cutout_leaves: bool,
 }
+
+fn mesh_job(
+    region: &Region,
+    sy: i32,
+    settings: MeshSettings,
+    context: &WorkerContext,
+    faces: &mut Option<(Arc<MeshTables>, FaceVisibility)>,
+) -> SectionMesh {
+    let visibility = match faces.take() {
+        Some((tables, visibility)) if Arc::ptr_eq(&tables, &context.tables) => visibility,
+        _ => context.tables.visibility.clone(),
+    };
+    let mut mesher = Mesher {
+        nether_shading: settings.nether,
+        zoom: settings.zoom,
+        blend_radius: settings.blend_radius,
+        smooth_lighting: settings.smooth_lighting,
+        cutout_leaves: settings.cutout_leaves,
+        assets: &context.assets,
+        render: &context.render,
+        tables: &context.tables,
+        biomes: &context.biomes,
+        visibility,
+    };
+    let mut mesh = mesher.mesh(&borrow(region), sy);
+    mesh.sort_solid();
+    *faces = Some((context.tables.clone(), mesher.visibility));
+    mesh
+}
 /// The native producer, carried from submission rather than inferred from Done.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(usize)]
@@ -458,6 +487,8 @@ enum ResultStamp {
     Lit(i32, i32, u64),
     Meshed(i32, i32, i32, u64),
     Saved,
+    #[cfg(feature = "paired-packages")]
+    Remote(u64),
 }
 impl Done {
     fn stamp(&self) -> ResultStamp {
@@ -470,6 +501,8 @@ impl Done {
             Self::Saved(..) => ResultStamp::Saved,
             #[cfg(feature = "paired-packages")]
             Self::RetainedLoad(x, z, _) => ResultStamp::Generated(*x, *z),
+            #[cfg(feature = "paired-packages")]
+            Self::Remote(job) => ResultStamp::Remote(job.sequence),
         }
     }
 }
@@ -482,6 +515,8 @@ enum Job {
     /// Proto chunks checked out to be saved (`ChunkGenerator::save_protos`),
     /// off the main thread like vanilla's IOWorker.
     Save(Vec<((i32, i32), Proto)>),
+    #[cfg(feature = "paired-packages")]
+    Remote(Arc<retained_remote::JobOwner>),
 }
 pub enum Done {
     Generated(Chunk),
@@ -493,6 +528,8 @@ pub enum Done {
     Saved(Vec<((i32, i32), Proto)>, Result<(), String>),
     #[cfg(feature = "paired-packages")]
     RetainedLoad(i32, i32, Box<crate::save::RetainedNativeLoad>),
+    #[cfg(feature = "paired-packages")]
+    Remote(Arc<retained_remote::JobOwner>),
 }
 struct Queued {
     priority: i64,
@@ -757,6 +794,8 @@ pub struct Streaming {
     band_ranked: Option<(i32, i32, i32)>,
     #[cfg(feature = "paired-packages")]
     retained: Option<RetainedStream>,
+    #[cfg(feature = "paired-packages")]
+    remote_mode: Option<Arc<retained_remote::State>>,
 }
 
 /// A failed spawn retains the allocation and every successfully started worker.
@@ -982,6 +1021,8 @@ enum StreamingConstruction {
     Legacy,
     #[cfg(feature = "paired-packages")]
     Retained(Arc<crate::save::SaveDir>),
+    #[cfg(feature = "paired-packages")]
+    Remote(Arc<retained_remote::State>),
     #[cfg(all(
         feature = "paired-packages",
         feature = "native-writer-test-control",
@@ -1276,7 +1317,9 @@ impl Streaming {
     fn retained_sealed(&self) -> bool {
         #[cfg(feature = "paired-packages")]
         {
-            self.retained.as_ref().is_some_and(|r| r.close.is_some())
+            // Remote callers use only the checked wrapper, never native/legacy
+            // void scheduling or storage APIs, even before remote close.
+            self.remote_mode.is_some() || self.retained.as_ref().is_some_and(|r| r.close.is_some())
         }
         #[cfg(not(feature = "paired-packages"))]
         {
@@ -1365,6 +1408,11 @@ impl Streaming {
             let generator = generator.clone();
             Arc::new(move |p: &Proto| generator.light_view(p))
         };
+        #[cfg(feature = "paired-packages")]
+        let remote_mode = match &construction {
+            StreamingConstruction::Remote(mode) => Some(mode.clone()),
+            _ => None,
+        };
         // This owner exists before the first native thread can be acquired.
         let mut streaming = Self {
             shared,
@@ -1421,8 +1469,11 @@ impl Streaming {
             band: None,
             band_ranked: None,
             #[cfg(feature = "paired-packages")]
+            remote_mode,
+            #[cfg(feature = "paired-packages")]
             retained: match construction {
                 StreamingConstruction::Legacy => None,
+                StreamingConstruction::Remote(_) => None,
                 StreamingConstruction::Retained(save) => Some(RetainedStream {
                     save,
                     armed: true,
@@ -1467,7 +1518,38 @@ impl Streaming {
                 return Err(StreamingStartFailure { streaming, error });
             }
         }
+        #[cfg(feature = "paired-packages")]
+        if let Some(mode) = &streaming.remote_mode {
+            // The opaque remote owner is fully installed before native start.
+            // Keep this original result channel for its later borrowed start.
+            *mode.sender.lock().unwrap_or_else(|e| e.into_inner()) = Some(send);
+            streaming.remote = true;
+            streaming.constructor_complete = true;
+            return Ok(streaming);
+        }
+        if let Err(error) = Self::spawn_pool(&mut streaming, generator, context, threads, send) {
+            return Err(StreamingStartFailure { streaming, error });
+        }
+        Ok(streaming)
+    }
+
+    fn spawn_pool<G: ChunkGenerator>(
+        streaming: &mut Self,
+        generator: Arc<G>,
+        context: Arc<WorkerContext>,
+        threads: usize,
+        send: mpsc::Sender<Done>,
+    ) -> Result<(), String> {
         for i in 0..threads.max(1) {
+            #[cfg(feature = "paired-packages")]
+            let remote_mode = streaming.remote_mode.clone();
+            #[cfg(feature = "paired-packages")]
+            let (remote_release, remote_wait) = if remote_mode.is_some() {
+                let (release, wait) = mpsc::channel();
+                (Some(release), Some(wait))
+            } else {
+                (None, None)
+            };
             #[cfg(feature = "paired-packages")]
             let retained_mode = streaming.retained.is_some();
             #[cfg(feature = "paired-packages")]
@@ -1498,12 +1580,25 @@ impl Streaming {
                 feature = "native-writer-test-control",
                 debug_assertions
             ))]
-            let spawn_error = streaming
+            let mut spawn_error = streaming
                 .retained
                 .as_ref()
                 .and_then(|r| r.start_control.as_ref())
                 .filter(|c| c.fail_spawn == Some(i))
                 .map(|_| std::io::Error::other("controlled native worker spawn failure"));
+            #[cfg(all(
+                feature = "paired-packages",
+                feature = "native-writer-test-control",
+                debug_assertions
+            ))]
+            if remote_mode
+                .as_ref()
+                .is_some_and(|mode| mode.refuse_spawn(i))
+            {
+                spawn_error = Some(std::io::Error::other(
+                    "controlled remote worker spawn refusal",
+                ));
+            }
             #[cfg(not(all(
                 feature = "paired-packages",
                 feature = "native-writer-test-control",
@@ -1520,6 +1615,12 @@ impl Streaming {
                 thread::Builder::new()
                     .name(format!("horizon-worker-{i}"))
                     .spawn(move || {
+                        #[cfg(feature = "paired-packages")]
+                        let _remote_guard = remote_mode.as_ref().map(|mode| retained_remote::ActorGuard::new(mode.clone(), i));
+                        #[cfg(feature = "paired-packages")]
+                        if let Some(wait) = remote_wait && wait.recv().is_err() {
+                            return;
+                        }
                         let mut lifetime = WorkerLifetime {
                             book: shared.ownership.clone(),
                             initialized: false,
@@ -1536,6 +1637,8 @@ impl Streaming {
                         #[cfg(all(feature = "paired-packages", feature = "native-writer-test-control", debug_assertions))]
                         assert!(!panic_initialization,"controlled native initialization panic");
                         let mut worker = generator.worker();
+                        #[cfg(all(feature = "paired-packages", feature = "native-writer-test-control", debug_assertions))]
+                        if let Some(mode) = &remote_mode { mode.initialization_control(i); }
                         lifetime.initialized();
                         // The face visibility table and its occlusion cache stay with
                         // the worker across mesh jobs, like vanilla's per-thread cache:
@@ -1549,7 +1652,23 @@ impl Streaming {
                                         lifetime.stopped = true;
                                         return;
                                     }
+                                    #[cfg(feature = "paired-packages")]
+                                    if let Some(mode) = &remote_mode {
+                                        if mode.sealed() {
+                                            lifetime.stopped = true;
+                                            return;
+                                        }
+                                        if !queue.is_empty() {
+                                            mode.before_claim();
+                                            if !mode.claim() {
+                                                lifetime.stopped = true;
+                                                return;
+                                            }
+                                        }
+                                    }
                                     if let Some(job) = queue.pop() {
+                                        #[cfg(feature = "paired-packages")]
+                                        if let Job::Remote(input) = &job.job { input.mark_active(); }
                                         let mut owner =
                                             shared.queued_owners.lock().unwrap().remove(&job.order);
                                         if let Some(owner) = &mut owner {
@@ -1566,6 +1685,14 @@ impl Streaming {
                                                 .recv_timeout(std::time::Duration::from_secs(5))
                                                 .unwrap();
                                         }
+                                    }
+                                    #[cfg(feature = "paired-packages")]
+                                    if remote_mode.is_some() {
+                                        drop(queue);
+                                        if let Some(mode) = &remote_mode { mode.before_park(); }
+                                        thread::park();
+                                        queue = shared.queue.lock().unwrap_or_else(|e| e.into_inner());
+                                        continue;
                                     }
                                     queue = shared.ready.wait(queue).unwrap();
                                 }
@@ -1669,30 +1796,13 @@ impl Streaming {
                                 }
                                 Job::Mesh(x, sy, z, region, seq, settings) => {
                                     let context = shared.context.read().unwrap().clone();
-                                    let visibility = match faces.take() {
-                                        Some((tables, visibility))
-                                            if Arc::ptr_eq(&tables, &context.tables) =>
-                                        {
-                                            visibility
-                                        }
-                                        _ => context.tables.visibility.clone(),
-                                    };
-                                    let mut mesher = Mesher {
-                                        nether_shading: settings.nether,
-                                        zoom: settings.zoom,
-                                        blend_radius: settings.blend_radius,
-                                        smooth_lighting: settings.smooth_lighting,
-                                        cutout_leaves: settings.cutout_leaves,
-                                        assets: &context.assets,
-                                        render: &context.render,
-                                        tables: &context.tables,
-                                        biomes: &context.biomes,
-                                        visibility,
-                                    };
-                                    let mut mesh = mesher.mesh(&borrow(&region), sy);
-                                    mesh.sort_solid();
-                                    faces = Some((context.tables.clone(), mesher.visibility));
+                                    let mesh = mesh_job(&region, sy, settings, &context, &mut faces);
                                     Done::Meshed(x, sy, z, mesh, seq)
+                                }
+                                #[cfg(feature = "paired-packages")]
+                                Job::Remote(input) => {
+                                    input.execute(&mut faces);
+                                    Done::Remote(input)
                                 }
                             };
                             // One lock orders the native send and its receipt across workers.
@@ -1714,12 +1824,22 @@ impl Streaming {
                                     .result_disconnected = true;
                                 return;
                             }
+                            #[cfg(feature = "paired-packages")]
+                            if let Some(mode) = &remote_mode { mode.release_claim(); }
                         }
                     })
             };
             match spawned {
                 Ok(handle) => {
+                    #[cfg(feature = "paired-packages")]
+                    if let Some(mode) = &streaming.remote_mode {
+                        mode.register_wake(handle.thread().clone());
+                    }
                     streaming.threads.push(handle);
+                    #[cfg(feature = "paired-packages")]
+                    if let Some(release) = remote_release {
+                        let _ = release.send(());
+                    }
                     #[cfg(feature = "paired-packages")]
                     if let Some(retained) = &mut streaming.retained {
                         retained.workers += 1;
@@ -1731,12 +1851,12 @@ impl Streaming {
                     if let Some(retained) = &mut streaming.retained {
                         retained.startup_error = Some(error.clone());
                     }
-                    return Err(StreamingStartFailure { streaming, error });
+                    return Err(error);
                 }
             }
         }
         streaming.constructor_complete = true;
-        Ok(streaming)
+        Ok(())
     }
     /// Shares generation resources, but gives distant work its own worker state.
     pub fn lod_source(&self) -> Arc<dyn LodSource> {
@@ -1893,6 +2013,16 @@ impl Streaming {
     /// times four plus `bias`, which orders a column's jobs. A job without a
     /// column (a save) goes ahead of every other.
     fn submit(&mut self, at: Option<(i32, i32)>, bias: i64, job: Job) {
+        // Existing native/legacy scheduling retains its successful behavior.
+        // Their entry points exclude the fixed remote recipe before mutation.
+        self.try_submit(at, bias, job)
+            .unwrap_or_else(|_| unreachable!("remote input reached native scheduling"));
+    }
+    fn try_submit(&mut self, at: Option<(i32, i32)>, bias: i64, job: Job) -> Result<(), Job> {
+        #[cfg(feature = "paired-packages")]
+        if self.remote_mode.is_some() {
+            return Err(job);
+        }
         let origin = match &job {
             Job::Generate(..) => NativeWorkOrigin::Generate,
             Job::Decorate(..) => NativeWorkOrigin::Decorate,
@@ -1900,6 +2030,8 @@ impl Streaming {
             Job::Light(..) => NativeWorkOrigin::Light,
             Job::Mesh(..) => NativeWorkOrigin::Mesh,
             Job::Save(..) => NativeWorkOrigin::Save,
+            #[cfg(feature = "paired-packages")]
+            Job::Remote(input) => input.origin,
         };
         let owner = WorkLease::new(&self.shared.ownership, origin, WorkPhase::Queued);
         self.order += 1;
@@ -1928,6 +2060,7 @@ impl Streaming {
         });
         drop(queue);
         self.shared.ready.notify_one();
+        Ok(())
     }
     /// Rank the queued jobs again when what their priorities were computed
     /// from changed: the centre, the extra areas, the band, or the loading
@@ -2298,6 +2431,10 @@ impl Streaming {
                 Done::RetainedLoad(..) => {
                     unreachable!("retained native records remain owned for checked handoff")
                 }
+                #[cfg(feature = "paired-packages")]
+                Done::Remote(_) => {
+                    unreachable!("opaque remote results have their own checked handoff")
+                }
             }
         }
         // Unload far columns.
@@ -2442,6 +2579,10 @@ impl Streaming {
     // A proto failure halts new producers before any failed snapshot can be
     // evicted, checked out, finalized or borrowed by neighboring decoration.
     fn produce_terrain(&mut self, world: &World) {
+        #[cfg(feature = "paired-packages")]
+        if self.remote_mode.is_some() {
+            return;
+        }
         if self.generation_save_error.is_some() {
             return;
         }
@@ -2617,6 +2758,10 @@ impl Streaming {
         self.schedule_generation(world, workers);
     }
     fn schedule_generation(&mut self, world: &World, workers: usize) {
+        #[cfg(feature = "paired-packages")]
+        if self.remote_mode.is_some() {
+            return;
+        }
         if self.generation_save_error.is_some() {
             return;
         }
@@ -3972,6 +4117,7 @@ impl Streaming {
                     Done::Saved(..) => owner.origin == NativeWorkOrigin::Save,
                     Done::Lit(..) => owner.origin == NativeWorkOrigin::Light,
                     Done::Meshed(..) => owner.origin == NativeWorkOrigin::Mesh,
+                    Done::Remote(_) => false,
                 };
                 if !correct_origin || !Arc::ptr_eq(&owner.book, &shared.ownership) {
                     work.owner = Some(owner);
@@ -3988,6 +4134,14 @@ impl Streaming {
                 }
                 let world = world.as_deref_mut().unwrap();
                 match work.done {
+                    Done::Remote(input) => {
+                        close.current = Some(ReceivedWork {
+                            done: Done::Remote(input),
+                            owner: Some(owner),
+                        });
+                        return close
+                            .block("native producer cannot consume a remote streaming result");
+                    }
                     Done::RetainedLoad(x, z, load) => match load.into_parts() {
                         Ok((chunk, evidence)) => {
                             let collision = world.chunks.contains_key(&(chunk.x, chunk.z));
@@ -4746,6 +4900,20 @@ impl Ranges<'_> {
 impl Drop for Streaming {
     fn drop(&mut self) {
         #[cfg(feature = "paired-packages")]
+        if let Some(mode) = &self.remote_mode {
+            if mode.armed.load(Ordering::Acquire) {
+                use std::io::Write;
+                let _ = writeln!(
+                    std::io::stderr().lock(),
+                    "fatal: unresolved retained remote streaming owner"
+                );
+                std::process::abort();
+            }
+            // The opaque closed owner has checked every native join and owns
+            // all remaining original payloads; never invoke legacy Drop joins.
+            return;
+        }
+        #[cfg(feature = "paired-packages")]
         if let Some(retained) = &self.retained {
             if retained.armed {
                 use std::io::Write as _;
@@ -4839,6 +5007,1437 @@ impl Drop for Streaming {
             .unwrap_or_else(|e| e.into_inner())
             .clear();
         self.deferred_owners.clear();
+    }
+}
+
+#[cfg(feature = "paired-packages")]
+pub use retained_remote::{
+    ClosedRemoteStreaming, RemoteCloseStatus, RemoteHandoff, RemoteInput, RemoteObservation,
+    RemoteOutput, RemotePrepareRefusal, RemoteRefusal, RemoteRefusedInput, RetainedRemoteStreaming,
+};
+
+/// A fixed policy in the original pool, not another generator or storage owner.
+#[cfg(feature = "paired-packages")]
+mod retained_remote {
+    use super::*;
+    use std::{
+        fmt,
+        sync::{
+            MutexGuard, TryLockError,
+            atomic::{AtomicU8, AtomicU64},
+        },
+        time::Instant,
+    };
+    const CLOSED: u64 = 1 << 63;
+    const QUEUED: u8 = 0;
+    const ACTIVE: u8 = 1;
+    const STORED: u8 = 2;
+    const RECONCILING: u8 = 3;
+    const LIMIT: usize = 64;
+
+    fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+        mutex
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+    fn attempt<T>(mutex: &Mutex<T>) -> Option<MutexGuard<'_, T>> {
+        match mutex.try_lock() {
+            Ok(guard) => Some(guard),
+            Err(TryLockError::Poisoned(error)) => Some(error.into_inner()),
+            Err(TryLockError::WouldBlock) => None,
+        }
+    }
+    struct Provider;
+    impl ChunkGenerator for Provider {
+        type Worker = ();
+        fn worker(&self) {}
+        fn proto(&self, _: &mut (), _: i32, _: i32) -> Proto {
+            unreachable!("fixed remote admission excludes generation")
+        }
+        fn finish(&self, _: Proto) -> Chunk {
+            unreachable!("fixed remote admission excludes generation")
+        }
+        fn save_protos(&self, _: &[&Proto]) -> Result<(), String> {
+            Err("remote streaming owns no native storage".into())
+        }
+        fn save_finished(&self, _: &Arc<Chunk>) -> Result<(), String> {
+            Err("remote streaming owns no native storage".into())
+        }
+    }
+    #[derive(Clone, Copy)]
+    enum Kind {
+        Light {
+            x: i32,
+            z: i32,
+            sky: bool,
+        },
+        Mesh {
+            x: i32,
+            sy: i32,
+            z: i32,
+            settings: MeshSettings,
+        },
+    }
+    pub struct RemoteInput {
+        context: Arc<WorkerContext>,
+        region: Box<Region>,
+        kind: Kind,
+    }
+    impl RemoteInput {
+        fn position(&self) -> (i32, i32) {
+            match self.kind {
+                Kind::Light { x, z, .. } | Kind::Mesh { x, z, .. } => (x, z),
+            }
+        }
+        fn origin(&self) -> NativeWorkOrigin {
+            match self.kind {
+                Kind::Light { .. } => NativeWorkOrigin::Light,
+                Kind::Mesh { .. } => NativeWorkOrigin::Mesh,
+            }
+        }
+    }
+    pub enum RemoteOutput {
+        Light {
+            position: (i32, i32),
+            sequence: u64,
+            sections: Vec<crate::chunk::Light>,
+        },
+        Mesh {
+            section: (i32, i32, i32),
+            sequence: u64,
+            mesh: SectionMesh,
+        },
+    }
+    pub struct RemoteHandoff {
+        pub sequence: u64,
+        pub input: RemoteInput,
+        pub output: Option<RemoteOutput>,
+        /// Current means the original snapshot/sequence still matches, not upload/application.
+        pub current: bool,
+    }
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum RemoteRefusal {
+        InvalidWorkers,
+        InvalidSection,
+        MissingColumn,
+        NotRunning,
+        Closed,
+        Busy,
+        Full,
+        ForeignContext,
+        Exhausted,
+        Attempt,
+        Deadline,
+        State,
+    }
+    pub struct RemotePrepareRefusal {
+        pub reason: RemoteRefusal,
+        pub context: Arc<WorkerContext>,
+        pub workers: usize,
+    }
+    impl fmt::Debug for RemotePrepareRefusal {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("RemotePrepareRefusal")
+                .field("reason", &self.reason)
+                .field("workers", &self.workers)
+                .finish_non_exhaustive()
+        }
+    }
+    pub struct RemoteRefusedInput {
+        pub reason: RemoteRefusal,
+        pub input: RemoteInput,
+    }
+    impl fmt::Debug for RemoteRefusedInput {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("RemoteRefusedInput")
+                .field("reason", &self.reason)
+                .finish_non_exhaustive()
+        }
+    }
+    struct Payload {
+        input: Option<RemoteInput>,
+        output: Option<Done>,
+        receipt: Option<WorkLease>,
+    }
+    pub struct JobOwner {
+        pub(super) sequence: u64,
+        pub(super) origin: NativeWorkOrigin,
+        phase: AtomicU8,
+        payload: Mutex<Payload>,
+        mode: std::sync::Weak<State>,
+    }
+    impl JobOwner {
+        pub(super) fn mark_active(&self) {
+            self.phase.store(ACTIVE, Ordering::Release);
+        }
+        pub(super) fn execute(&self, faces: &mut Option<(Arc<MeshTables>, FaceVisibility)>) {
+            let mut payload = lock(&self.payload);
+            let mode = self
+                .mode
+                .upgrade()
+                .expect("original remote owner remains registered");
+            mode.control(Point::BeforeWork);
+            let input = payload.input.as_ref().unwrap();
+            let output = match input.kind {
+                Kind::Light { x, z, sky } => Done::Lit(
+                    x,
+                    z,
+                    light_chunk(&borrow(&input.region), &input.context.light, sky),
+                    self.sequence,
+                ),
+                Kind::Mesh { x, sy, z, settings } => Done::Meshed(
+                    x,
+                    sy,
+                    z,
+                    mesh_job(&input.region, sy, settings, &input.context, faces),
+                    self.sequence,
+                ),
+            };
+            payload.output = Some(output);
+            self.phase.store(STORED, Ordering::Release);
+            drop(payload);
+            mode.control(Point::AfterPublish);
+        }
+    }
+    pub(super) struct State {
+        pub(super) sender: Mutex<Option<mpsc::Sender<Done>>>,
+        pub(super) armed: AtomicBool,
+        gate: AtomicU64,
+        context: Arc<WorkerContext>,
+        slots: Mutex<VecDeque<Arc<JobOwner>>>,
+        wakes: Mutex<Vec<thread::Thread>>,
+        failures: Mutex<Vec<String>>,
+        #[cfg(all(
+            test,
+            feature = "native-writer-test-control",
+            debug_assertions,
+            target_os = "linux"
+        ))]
+        test: Mutex<Option<Arc<Control>>>,
+    }
+    impl State {
+        pub(super) fn sealed(&self) -> bool {
+            self.gate.load(Ordering::Acquire) & CLOSED != 0
+        }
+        pub(super) fn claim(&self) -> bool {
+            let mut observed = self.gate.load(Ordering::Acquire);
+            loop {
+                if observed & CLOSED != 0 {
+                    return false;
+                }
+                match self.gate.compare_exchange(
+                    observed,
+                    observed + 1,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => return true,
+                    Err(next) => observed = next,
+                }
+            }
+        }
+        pub(super) fn release_claim(&self) {
+            self.gate.fetch_sub(1, Ordering::AcqRel);
+        }
+        pub(super) fn register_wake(&self, wake: thread::Thread) {
+            lock(&self.wakes).push(wake);
+        }
+        fn seal(&self) {
+            self.gate.fetch_or(CLOSED, Ordering::AcqRel);
+        }
+        pub(super) fn before_claim(&self) {
+            #[cfg(all(
+                test,
+                feature = "native-writer-test-control",
+                debug_assertions,
+                target_os = "linux"
+            ))]
+            let _slots = lock(&self.test)
+                .as_ref()
+                .is_some_and(|test| test.point == Point::BeforeClaim)
+                .then(|| lock(&self.slots));
+            self.control(Point::BeforeClaim);
+        }
+        pub(super) fn before_park(&self) {
+            self.control(Point::BeforePark);
+        }
+        fn control(&self, point: Point) {
+            #[cfg(all(
+                test,
+                feature = "native-writer-test-control",
+                debug_assertions,
+                target_os = "linux"
+            ))]
+            {
+                let control = lock(&self.test).clone();
+                if let Some(control) = control {
+                    control.enter(point);
+                }
+            }
+            #[cfg(not(all(
+                test,
+                feature = "native-writer-test-control",
+                debug_assertions,
+                target_os = "linux"
+            )))]
+            let _ = point;
+        }
+        #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+        pub(super) fn refuse_spawn(&self, worker: usize) -> bool {
+            #[cfg(all(test, target_os = "linux"))]
+            {
+                lock(&self.test)
+                    .as_ref()
+                    .is_some_and(|test| test.fail_spawn == Some(worker))
+            }
+            #[cfg(not(all(test, target_os = "linux")))]
+            {
+                let _ = worker;
+                false
+            }
+        }
+        #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+        pub(super) fn initialization_control(&self, worker: usize) {
+            #[cfg(all(test, target_os = "linux"))]
+            if lock(&self.test)
+                .as_ref()
+                .is_some_and(|test| test.panic_init == Some(worker))
+            {
+                panic!("controlled remote initialization panic");
+            }
+            #[cfg(not(all(test, target_os = "linux")))]
+            let _ = worker;
+        }
+    }
+    pub(super) struct ActorGuard {
+        state: Arc<State>,
+        worker: usize,
+    }
+    impl ActorGuard {
+        pub(super) fn new(state: Arc<State>, worker: usize) -> Self {
+            Self { state, worker }
+        }
+    }
+    impl Drop for ActorGuard {
+        fn drop(&mut self) {
+            if thread::panicking() {
+                self.state.seal();
+                lock(&self.state.failures)
+                    .push(format!("original remote worker {} panicked", self.worker));
+                for wake in lock(&self.state.wakes).iter() {
+                    wake.unpark();
+                }
+            } else {
+                self.state.control(Point::BeforeExit);
+            }
+        }
+    }
+    #[derive(Clone, Debug)]
+    pub struct RemoteObservation {
+        pub sealed: bool,
+        pub started: bool,
+        pub workers: usize,
+        pub joined: usize,
+        pub owned: usize,
+        pub queued: usize,
+        pub active: usize,
+        pub stored: usize,
+        pub reconciling: usize,
+        pub failures: Vec<String>,
+        pub accounting_fault: bool,
+    }
+    #[derive(Debug)]
+    pub enum RemoteCloseStatus {
+        Pending {
+            attempt: u64,
+            observation: Option<RemoteObservation>,
+        },
+        Blocked {
+            attempt: u64,
+            observation: Option<RemoteObservation>,
+        },
+        Quiescent {
+            attempt: u64,
+            observation: Option<RemoteObservation>,
+        },
+    }
+    pub struct RetainedRemoteStreaming {
+        inner: Option<Streaming>,
+        mode: Arc<State>,
+        workers: usize,
+        started: bool,
+        spawned: usize,
+        joined: usize,
+        deadline: Option<Instant>,
+        attempt: u64,
+        ready: VecDeque<Arc<JobOwner>>,
+        incoming: Option<Done>,
+        failure: Option<String>,
+    }
+    pub struct ClosedRemoteStreaming {
+        inner: Streaming,
+        mode: Arc<State>,
+        started: bool,
+        joined: usize,
+        failure: Option<String>,
+    }
+    impl RetainedRemoteStreaming {
+        pub fn prepare(
+            context: Arc<WorkerContext>,
+            workers: usize,
+        ) -> Result<Self, RemotePrepareRefusal> {
+            if !(1..=8).contains(&workers) {
+                return Err(RemotePrepareRefusal {
+                    reason: RemoteRefusal::InvalidWorkers,
+                    context,
+                    workers,
+                });
+            }
+            let mode = Arc::new(State {
+                sender: Mutex::new(None),
+                armed: AtomicBool::new(true),
+                gate: AtomicU64::new(0),
+                context: context.clone(),
+                slots: Mutex::new(VecDeque::new()),
+                wakes: Mutex::new(Vec::new()),
+                failures: Mutex::new(Vec::new()),
+                #[cfg(all(
+                    test,
+                    feature = "native-writer-test-control",
+                    debug_assertions,
+                    target_os = "linux"
+                ))]
+                test: Mutex::new(None),
+            });
+            let inner = match Streaming::construct(
+                Arc::new(Provider),
+                context,
+                0,
+                StreamingConstruction::Remote(mode.clone()),
+            ) {
+                Ok(inner) => inner,
+                Err(_) => unreachable!(
+                    "inert fixed remote construction cannot spawn or validate a native writer"
+                ),
+            };
+            Ok(Self {
+                inner: Some(inner),
+                mode,
+                workers,
+                started: false,
+                spawned: 0,
+                joined: 0,
+                deadline: None,
+                attempt: 0,
+                ready: VecDeque::new(),
+                incoming: None,
+                failure: None,
+            })
+        }
+        pub fn start(&mut self) -> Result<(), RemoteRefusal> {
+            if self.mode.sealed() {
+                return Err(RemoteRefusal::Closed);
+            }
+            if self.started {
+                return Err(RemoteRefusal::State);
+            }
+            self.started = true;
+            let sender = lock(&self.mode.sender).as_ref().unwrap().clone();
+            let inner = self.inner.as_mut().unwrap();
+            let result = Streaming::spawn_pool(
+                inner,
+                Arc::new(Provider),
+                self.mode.context.clone(),
+                self.workers,
+                sender,
+            );
+            self.spawned = inner.threads.len();
+            if let Err(error) = result {
+                self.failure = Some(error);
+                self.mode.seal();
+                for handle in &inner.threads {
+                    handle.thread().unpark();
+                }
+                return Err(RemoteRefusal::State);
+            }
+            Ok(())
+        }
+        fn admission(&self) -> Result<(), RemoteRefusal> {
+            if self.mode.sealed() {
+                Err(RemoteRefusal::Closed)
+            } else if !self.started {
+                Err(RemoteRefusal::NotRunning)
+            } else {
+                Ok(())
+            }
+        }
+        pub fn mesh_input(
+            &self,
+            world: &World,
+            section: (i32, i32, i32),
+        ) -> Result<RemoteInput, RemoteRefusal> {
+            self.admission()?;
+            if !(0..SECTIONS as i32).contains(&section.1) {
+                return Err(RemoteRefusal::InvalidSection);
+            }
+            let inner = self.inner.as_ref().unwrap();
+            let region = Streaming::region(world, section.0, section.2)
+                .ok_or(RemoteRefusal::MissingColumn)?;
+            Ok(RemoteInput {
+                context: self.mode.context.clone(),
+                region,
+                kind: Kind::Mesh {
+                    x: section.0,
+                    sy: section.1,
+                    z: section.2,
+                    settings: MeshSettings {
+                        nether: inner.nether_shading,
+                        zoom: inner.biome_zoom,
+                        blend_radius: inner.biome_blend,
+                        smooth_lighting: inner.smooth_lighting,
+                        cutout_leaves: inner.cutout_leaves,
+                    },
+                },
+            })
+        }
+        pub fn light_input(
+            &self,
+            world: &World,
+            position: (i32, i32),
+        ) -> Result<RemoteInput, RemoteRefusal> {
+            self.admission()?;
+            let region = Streaming::region(world, position.0, position.1)
+                .ok_or(RemoteRefusal::MissingColumn)?;
+            Ok(RemoteInput {
+                context: self.mode.context.clone(),
+                region,
+                kind: Kind::Light {
+                    x: position.0,
+                    z: position.1,
+                    sky: self.inner.as_ref().unwrap().sky_light,
+                },
+            })
+        }
+        #[allow(clippy::result_large_err)] // Refusal returns the caller's original owned column.
+        pub fn try_insert_column(
+            &mut self,
+            world: &mut World,
+            chunk: Chunk,
+        ) -> Result<(), (RemoteRefusal, Chunk)> {
+            if let Err(reason) = self.admission() {
+                return Err((reason, chunk));
+            }
+            let inner = self.inner.as_mut().unwrap();
+            let Some(_queue) = attempt(&inner.shared.queue) else {
+                return Err((RemoteRefusal::Busy, chunk));
+            };
+            let Some(slots) = attempt(&self.mode.slots) else {
+                return Err((RemoteRefusal::Busy, chunk));
+            };
+            if slots.len() == LIMIT {
+                return Err((RemoteRefusal::Full, chunk));
+            }
+            if self.mode.sealed() {
+                return Err((RemoteRefusal::Closed, chunk));
+            }
+            let key = (chunk.x, chunk.z);
+            inner.lighting.remove(&key);
+            inner.lit.insert(key);
+            world.chunks.insert(key, Arc::new(chunk));
+            for dz in -1..=1 {
+                for dx in -1..=1 {
+                    for sy in 0..SECTIONS as i32 {
+                        world.dirty_sections.insert((key.0 + dx, sy, key.1 + dz));
+                    }
+                }
+            }
+            Ok(())
+        }
+        pub fn try_submit(&mut self, input: RemoteInput) -> Result<u64, RemoteRefusedInput> {
+            if let Err(reason) = self.admission() {
+                return Err(RemoteRefusedInput { reason, input });
+            }
+            if !Arc::ptr_eq(&input.context, &self.mode.context) {
+                return Err(RemoteRefusedInput {
+                    reason: RemoteRefusal::ForeignContext,
+                    input,
+                });
+            }
+            let inner = self.inner.as_mut().unwrap();
+            let Some(mut queue) = attempt(&inner.shared.queue) else {
+                return Err(RemoteRefusedInput {
+                    reason: RemoteRefusal::Busy,
+                    input,
+                });
+            };
+            let Some(mut queued) = attempt(&inner.shared.queued_owners) else {
+                return Err(RemoteRefusedInput {
+                    reason: RemoteRefusal::Busy,
+                    input,
+                });
+            };
+            let Some(mut book) = attempt(&inner.shared.ownership) else {
+                return Err(RemoteRefusedInput {
+                    reason: RemoteRefusal::Busy,
+                    input,
+                });
+            };
+            let Some(mut slots) = attempt(&self.mode.slots) else {
+                return Err(RemoteRefusedInput {
+                    reason: RemoteRefusal::Busy,
+                    input,
+                });
+            };
+            if self.mode.sealed() {
+                return Err(RemoteRefusedInput {
+                    reason: RemoteRefusal::Closed,
+                    input,
+                });
+            }
+            if slots.len() == LIMIT {
+                return Err(RemoteRefusedInput {
+                    reason: RemoteRefusal::Full,
+                    input,
+                });
+            }
+            let Some(sequence) = inner.order.checked_add(1) else {
+                return Err(RemoteRefusedInput {
+                    reason: RemoteRefusal::Exhausted,
+                    input,
+                });
+            };
+            let position = input.position();
+            let origin = input.origin();
+            match input.kind {
+                Kind::Light { x, z, .. } => {
+                    inner.lighting.insert((x, z), sequence);
+                }
+                Kind::Mesh { x, sy, z, .. } => {
+                    inner.meshing.insert((x, sy, z), sequence);
+                }
+            }
+            let owner = Arc::new(JobOwner {
+                sequence,
+                origin,
+                phase: AtomicU8::new(QUEUED),
+                payload: Mutex::new(Payload {
+                    input: Some(input),
+                    output: None,
+                    receipt: None,
+                }),
+                mode: Arc::downgrade(&self.mode),
+            });
+            let mut receipt = WorkLease::new_locked(&inner.shared.ownership, &mut book, origin);
+            receipt.advance_locked(&mut book, WorkPhase::Queued);
+            queued.insert(sequence, receipt);
+            queue.push(Queued {
+                priority: sequence as i64,
+                at: Some(position),
+                bias: 0,
+                order: sequence,
+                job: Job::Remote(owner.clone()),
+            });
+            slots.push_back(owner);
+            inner.order = sequence;
+            drop(slots);
+            drop(book);
+            drop(queued);
+            drop(queue);
+            for handle in &inner.threads {
+                handle.thread().unpark();
+            }
+            Ok(sequence)
+        }
+        pub fn try_reconcile(&mut self) -> Result<bool, RemoteRefusal> {
+            let inner = self.inner.as_mut().unwrap();
+            let Some(mut returned) = attempt(&inner.shared.returned) else {
+                return Err(RemoteRefusal::Busy);
+            };
+            let Some(mut book) = attempt(&inner.shared.ownership) else {
+                return Err(RemoteRefusal::Busy);
+            };
+            if self.incoming.is_none() {
+                match inner.results.try_recv() {
+                    Ok(done) => self.incoming = Some(done),
+                    Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => {
+                        return Ok(false);
+                    }
+                }
+            }
+            let Some(Done::Remote(job)) = &self.incoming else {
+                self.failure = Some("unexpected original remote result kind".into());
+                self.mode.seal();
+                return Err(RemoteRefusal::State);
+            };
+            let job = job.clone();
+            if !returned
+                .front()
+                .is_some_and(|(stamp, _)| *stamp == ResultStamp::Remote(job.sequence))
+            {
+                self.failure = Some("original remote result receipt mismatch".into());
+                self.mode.seal();
+                return Err(RemoteRefusal::State);
+            }
+            let Some(mut payload) = attempt(&job.payload) else {
+                // Keep the exact channel token for a later try, without
+                // popping its native receipt or fabricating an empty census.
+                return Err(RemoteRefusal::Busy);
+            };
+            let mut receipt = returned.pop_front().unwrap().1;
+            receipt.advance_locked(&mut book, WorkPhase::Reconciling);
+            payload.receipt = Some(receipt);
+            job.phase.store(RECONCILING, Ordering::Release);
+            drop(payload);
+            self.incoming.take();
+            self.ready.push_back(job);
+            Ok(true)
+        }
+        pub fn try_take(&mut self, world: &World) -> Option<RemoteHandoff> {
+            let inner = self.inner.as_mut().unwrap();
+            let job = self.ready.front()?;
+            let mut book = attempt(&inner.shared.ownership)?;
+            let mut slots = attempt(&self.mode.slots)?;
+            let mut payload = attempt(&job.payload)?;
+            if payload.input.is_none() || payload.output.is_none() || payload.receipt.is_none() {
+                return None;
+            }
+            let sequence = job.sequence;
+            let current = current(inner, world, payload.input.as_ref().unwrap(), job.sequence);
+            let input = payload.input.take().unwrap();
+            let output = output(payload.output.take().unwrap());
+            payload.receipt.take().unwrap().settle_locked(&mut book);
+            slots.retain(|owned| owned.sequence != job.sequence);
+            drop(payload);
+            drop(slots);
+            drop(book);
+            self.ready.pop_front();
+            Some(RemoteHandoff {
+                sequence,
+                input,
+                output: Some(output),
+                current,
+            })
+        }
+        pub fn try_observe(&self) -> Option<RemoteObservation> {
+            observation(
+                self.inner.as_ref().unwrap(),
+                &self.mode,
+                self.started,
+                self.joined,
+                &self.failure,
+            )
+        }
+        pub fn begin_close(&mut self, deadline: Instant) {
+            self.mode.seal();
+            if self.deadline.is_none() {
+                self.deadline = Some(deadline);
+                self.attempt = 1;
+            }
+            for handle in &self.inner.as_ref().unwrap().threads {
+                handle.thread().unpark();
+            }
+        }
+        pub fn retry_close(
+            &mut self,
+            expected: u64,
+            deadline: Instant,
+        ) -> Result<u64, RemoteRefusal> {
+            let now = Instant::now();
+            if self.deadline.is_none_or(|old| now < old)
+                || self.inner.as_ref().unwrap().threads.is_empty()
+            {
+                return Err(RemoteRefusal::State);
+            }
+            if expected != self.attempt {
+                return Err(RemoteRefusal::Attempt);
+            }
+            if deadline <= now {
+                return Err(RemoteRefusal::Deadline);
+            }
+            self.attempt = self
+                .attempt
+                .checked_add(1)
+                .ok_or(RemoteRefusal::Exhausted)?;
+            self.deadline = Some(deadline);
+            for handle in &self.inner.as_ref().unwrap().threads {
+                handle.thread().unpark();
+            }
+            Ok(self.attempt)
+        }
+        pub fn poll_close(&mut self) -> RemoteCloseStatus {
+            let inner = self.inner.as_mut().unwrap();
+            let mut index = 0;
+            while index < inner.threads.len() {
+                if inner.threads[index].is_finished() {
+                    let outcome = inner.threads.swap_remove(index).join();
+                    self.joined += 1;
+                    if outcome.is_err() {
+                        self.failure.get_or_insert_with(|| {
+                            "original remote worker checked join failed".into()
+                        });
+                    }
+                } else {
+                    index += 1;
+                }
+            }
+            let observation = self.try_observe();
+            if self.deadline.is_some()
+                && self.mode.sealed()
+                && self.joined == self.spawned
+                && self.inner.as_ref().unwrap().threads.is_empty()
+            {
+                RemoteCloseStatus::Quiescent {
+                    attempt: self.attempt,
+                    observation,
+                }
+            } else if self
+                .deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+            {
+                RemoteCloseStatus::Blocked {
+                    attempt: self.attempt,
+                    observation,
+                }
+            } else {
+                RemoteCloseStatus::Pending {
+                    attempt: self.attempt,
+                    observation,
+                }
+            }
+        }
+        #[allow(clippy::result_large_err)] // A refused handoff returns the same opaque original owner.
+        pub fn try_closed(mut self) -> Result<ClosedRemoteStreaming, Self> {
+            if !matches!(self.poll_close(), RemoteCloseStatus::Quiescent { .. }) {
+                return Err(self);
+            }
+            let inner = self.inner.take().unwrap();
+            // The same concrete Streaming and registry transfer together. Its
+            // native handles are checked terminal; no inner recovery is exposed.
+            let closed = ClosedRemoteStreaming {
+                inner,
+                mode: self.mode.clone(),
+                started: self.started,
+                joined: self.joined,
+                failure: self.failure.take(),
+            };
+            self.mode.armed.store(false, Ordering::Release);
+            Ok(closed)
+        }
+    }
+    fn current(inner: &Streaming, world: &World, input: &RemoteInput, sequence: u64) -> bool {
+        let position = input.position();
+        for (z, row) in input.region.iter().enumerate() {
+            for (x, original) in row.iter().enumerate() {
+                let at = (position.0 + x as i32 - 1, position.1 + z as i32 - 1);
+                match (original, world.chunks.get(&at)) {
+                    (Some(original), Some(current)) if Arc::ptr_eq(original, current) => {}
+                    (None, None) => {}
+                    _ => return false,
+                }
+            }
+        }
+        match input.kind {
+            Kind::Light { .. } => inner.lighting.get(&position) == Some(&sequence),
+            Kind::Mesh { sy, .. } => {
+                inner.meshing.get(&(position.0, sy, position.1)) == Some(&sequence)
+            }
+        }
+    }
+    fn output(done: Done) -> RemoteOutput {
+        match done {
+            Done::Lit(x, z, sections, sequence) => RemoteOutput::Light {
+                position: (x, z),
+                sequence,
+                sections,
+            },
+            Done::Meshed(x, sy, z, mesh, sequence) => RemoteOutput::Mesh {
+                section: (x, sy, z),
+                sequence,
+                mesh,
+            },
+            _ => unreachable!("fixed real remote Light/Mesh result"),
+        }
+    }
+    fn observation(
+        inner: &Streaming,
+        mode: &State,
+        started: bool,
+        joined: usize,
+        failure: &Option<String>,
+    ) -> Option<RemoteObservation> {
+        let slots = attempt(&mode.slots)?;
+        let failures = attempt(&mode.failures)?;
+        let book = attempt(&inner.shared.ownership)?;
+        let mut errors = failures.clone();
+        errors.extend(failure.iter().cloned());
+        let mut phases = [0; 4];
+        for slot in slots.iter() {
+            let phase = slot.phase.load(Ordering::Acquire);
+            *phases.get_mut(phase as usize)? += 1;
+        }
+        Some(RemoteObservation {
+            sealed: mode.sealed(),
+            started,
+            workers: inner.threads.len() + joined,
+            joined,
+            owned: slots.len(),
+            queued: phases[QUEUED as usize],
+            active: phases[ACTIVE as usize],
+            stored: phases[STORED as usize],
+            reconciling: phases[RECONCILING as usize],
+            failures: errors,
+            accounting_fault: book.accounting_fault
+                || book.receipt_mismatch
+                || book.result_disconnected,
+        })
+    }
+    impl ClosedRemoteStreaming {
+        pub fn try_observe(&self) -> Option<RemoteObservation> {
+            observation(
+                &self.inner,
+                &self.mode,
+                self.started,
+                self.joined,
+                &self.failure,
+            )
+        }
+        pub fn try_take(&mut self) -> Option<RemoteHandoff> {
+            let mut queue = attempt(&self.inner.shared.queue)?;
+            let mut queued = attempt(&self.inner.shared.queued_owners)?;
+            let mut returned = attempt(&self.inner.shared.returned)?;
+            let mut book = attempt(&self.inner.shared.ownership)?;
+            let mut slots = attempt(&self.mode.slots)?;
+            let job = slots.front()?;
+            let sequence = job.sequence;
+            let mut payload = attempt(&job.payload)?;
+            let input = payload.input.take()?;
+            let result = payload.output.take().map(output);
+            if let Some(receipt) = payload
+                .receipt
+                .take()
+                .or_else(|| queued.remove(&job.sequence))
+            {
+                receipt.settle_locked(&mut book);
+            }
+            if let Some(index) = returned
+                .iter()
+                .position(|(stamp, _)| *stamp == ResultStamp::Remote(job.sequence))
+            {
+                returned.remove(index).unwrap().1.settle_locked(&mut book);
+            }
+            queue.retain(|queued| queued.order != job.sequence);
+            drop(payload);
+            slots.pop_front();
+            Some(RemoteHandoff {
+                sequence,
+                input,
+                output: result,
+                current: false,
+            })
+        }
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Point {
+        BeforeClaim,
+        BeforeWork,
+        AfterPublish,
+        BeforePark,
+        BeforeExit,
+    }
+    #[cfg(all(
+        test,
+        feature = "native-writer-test-control",
+        debug_assertions,
+        target_os = "linux"
+    ))]
+    struct Control {
+        point: Point,
+        occurrence: usize,
+        visits: std::sync::atomic::AtomicUsize,
+        entered: AtomicBool,
+        released: AtomicBool,
+        panic: bool,
+        fail_spawn: Option<usize>,
+        panic_init: Option<usize>,
+    }
+    #[cfg(all(
+        test,
+        feature = "native-writer-test-control",
+        debug_assertions,
+        target_os = "linux"
+    ))]
+    impl Control {
+        fn enter(&self, point: Point) {
+            if self.point != point
+                || self.visits.fetch_add(1, Ordering::AcqRel) + 1 != self.occurrence
+            {
+                return;
+            }
+            self.entered.store(true, Ordering::Release);
+            // Do not consume the production Thread::unpark token while testing
+            // the exact empty-queue-to-park window.
+            while !self.released.load(Ordering::Acquire) {
+                thread::yield_now();
+            }
+            assert!(!self.panic, "controlled original remote work panic");
+        }
+    }
+
+    #[cfg(all(
+        test,
+        feature = "native-writer-test-control",
+        debug_assertions,
+        target_os = "linux"
+    ))]
+    mod tests {
+        use super::*;
+        use std::time::Duration;
+        fn until() -> Instant {
+            Instant::now() + Duration::from_secs(15)
+        }
+        fn fixture() -> (Arc<WorkerContext>, World) {
+            let context = super::super::native_work_tests::context();
+            let mut world = World::new(
+                context
+                    .assets
+                    .registry
+                    .default_state("minecraft:air")
+                    .unwrap(),
+                0,
+            );
+            let stone = context
+                .assets
+                .registry
+                .default_state("minecraft:stone")
+                .unwrap();
+            for z in -1..=1 {
+                for x in -1..=1 {
+                    let mut chunk = Chunk::empty(x, z);
+                    if (x, z) == (0, 0) {
+                        chunk.set(1, 0, 1, stone.0);
+                    }
+                    world.chunks.insert((x, z), Arc::new(chunk));
+                }
+            }
+            (context, world)
+        }
+        fn control(point: Point, occurrence: usize) -> Arc<Control> {
+            Arc::new(Control {
+                point,
+                occurrence,
+                visits: std::sync::atomic::AtomicUsize::new(0),
+                entered: AtomicBool::new(false),
+                released: AtomicBool::new(false),
+                panic: false,
+                fail_spawn: None,
+                panic_init: None,
+            })
+        }
+        fn controlled(
+            context: Arc<WorkerContext>,
+            workers: usize,
+            control: Arc<Control>,
+        ) -> RetainedRemoteStreaming {
+            let owner = RetainedRemoteStreaming::prepare(context, workers).unwrap();
+            *lock(&owner.mode.test) = Some(control);
+            owner
+        }
+        fn entered(control: &Control) {
+            let deadline = until();
+            while !control.entered.load(Ordering::Acquire) {
+                assert!(
+                    Instant::now() < deadline,
+                    "actual original remote worker gate missing"
+                );
+                thread::yield_now();
+            }
+        }
+        fn submit(owner: &mut RetainedRemoteStreaming, mut input: RemoteInput) -> u64 {
+            let deadline = until();
+            loop {
+                match owner.try_submit(input) {
+                    Ok(sequence) => return sequence,
+                    Err(refused) => {
+                        assert_eq!(refused.reason, RemoteRefusal::Busy);
+                        input = refused.input;
+                        assert!(Instant::now() < deadline);
+                        thread::yield_now();
+                    }
+                }
+            }
+        }
+        fn reconcile(owner: &mut RetainedRemoteStreaming) {
+            let deadline = until();
+            loop {
+                match owner.try_reconcile() {
+                    Ok(true) => return,
+                    Ok(false) | Err(RemoteRefusal::Busy) => {
+                        assert!(Instant::now() < deadline, "actual remote result missing");
+                        thread::yield_now();
+                    }
+                    other => panic!("remote reconciliation failed: {other:?}"),
+                }
+            }
+        }
+        fn close(mut owner: RetainedRemoteStreaming) -> ClosedRemoteStreaming {
+            owner.begin_close(until());
+            let deadline = until();
+            loop {
+                if matches!(owner.poll_close(), RemoteCloseStatus::Quiescent { .. }) {
+                    return match owner.try_closed() {
+                        Ok(closed) => closed,
+                        Err(_) => panic!("actual remote handoff refused"),
+                    };
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "actual remote worker join missing"
+                );
+                thread::yield_now();
+            }
+        }
+        #[test]
+        #[ignore = "owned prepared resources: actual received-column geometry and light"]
+        fn remote_stream_real_mesh_and_light() {
+            let (context, world) = fixture();
+            let mut owner = RetainedRemoteStreaming::prepare(context.clone(), 1).unwrap();
+            owner.start().unwrap();
+            let mesh = owner.mesh_input(&world, (0, 4, 0)).unwrap();
+            let light = owner.light_input(&world, (0, 0)).unwrap();
+            let sequences = [submit(&mut owner, mesh), submit(&mut owner, light)];
+            for (mesh_expected, sequence) in [true, false].into_iter().zip(sequences) {
+                reconcile(&mut owner);
+                let handoff = owner.try_take(&world).expect("original reconciled handoff");
+                assert_eq!(handoff.sequence, sequence);
+                assert!(handoff.current && Arc::ptr_eq(&handoff.input.context, &context));
+                match handoff.output.unwrap() {
+                    RemoteOutput::Mesh { section, mesh, .. } => {
+                        assert!(mesh_expected);
+                        assert_eq!(section, (0, 4, 0));
+                        assert_eq!(mesh.solid.len(), 24);
+                        assert!(mesh.translucent.is_empty());
+                        assert!(mesh.solid.iter().all(|v| [1.0, 2.0].contains(&v.pos[0])
+                            && [0.0, 1.0].contains(&v.pos[1])
+                            && [1.0, 2.0].contains(&v.pos[2])));
+                    }
+                    RemoteOutput::Light {
+                        position, sections, ..
+                    } => {
+                        assert!(!mesh_expected);
+                        assert_eq!(position, (0, 0));
+                        assert_eq!(sections.len(), SECTIONS);
+                        assert_eq!(sections[SECTIONS - 1].get(0), 0xf0);
+                        assert_eq!(sections[4].get(crate::chunk::index(8, 0, 8)), 0xf0);
+                        assert_eq!(sections[4].get(crate::chunk::index(1, 0, 1)), 0);
+                    }
+                }
+            }
+            // A newer received allocation invalidates a real stored mesh.
+            let stale = owner.mesh_input(&world, (0, 4, 0)).unwrap();
+            submit(&mut owner, stale);
+            reconcile(&mut owner);
+            let mut replacement = world;
+            assert!(
+                owner
+                    .try_insert_column(&mut replacement, Chunk::empty(0, 0))
+                    .is_ok()
+            );
+            assert!(!owner.try_take(&replacement).unwrap().current);
+            // Both real algorithms also retain a stale result when only a
+            // neighboring snapshot changes; the center allocation is unchanged.
+            for mesh in [true, false] {
+                let center = replacement.chunks.get(&(0, 0)).unwrap().clone();
+                let input = if mesh {
+                    owner.mesh_input(&replacement, (0, 4, 0)).unwrap()
+                } else {
+                    owner.light_input(&replacement, (0, 0)).unwrap()
+                };
+                let sequence = submit(&mut owner, input);
+                reconcile(&mut owner);
+                assert!(
+                    owner
+                        .try_insert_column(&mut replacement, Chunk::empty(1, 0))
+                        .is_ok()
+                );
+                assert!(Arc::ptr_eq(
+                    &center,
+                    replacement.chunks.get(&(0, 0)).unwrap()
+                ));
+                let handoff = owner
+                    .try_take(&replacement)
+                    .expect("stale neighbor result remains owned");
+                assert_eq!(handoff.sequence, sequence);
+                assert!(!handoff.current);
+                assert_eq!(
+                    matches!(handoff.output.as_ref(), Some(RemoteOutput::Mesh { .. })),
+                    mesh
+                );
+                assert!(handoff.output.is_some());
+            }
+            let observation = close(owner).try_observe().unwrap();
+            assert_eq!(observation.owned, 0);
+            assert_eq!(observation.joined, 1);
+            assert!(observation.failures.is_empty());
+        }
+        #[test]
+        #[ignore = "owned prepared resources: inert and partial native startup"]
+        fn remote_stream_prepare_and_partial_start() {
+            let (context, _) = fixture();
+            for workers in [0, 9] {
+                let refused = match RetainedRemoteStreaming::prepare(context.clone(), workers) {
+                    Err(refused) => refused,
+                    Ok(_) => panic!("invalid remote worker count accepted"),
+                };
+                assert!(Arc::ptr_eq(&refused.context, &context));
+                assert_eq!(refused.workers, workers);
+            }
+            let owner = RetainedRemoteStreaming::prepare(context.clone(), 2).unwrap();
+            assert!(!owner.try_observe().unwrap().started);
+            assert_eq!(owner.try_observe().unwrap().workers, 0);
+            assert!(!close(owner).try_observe().unwrap().started);
+            let mut failure = control(Point::BeforeWork, 1);
+            Arc::get_mut(&mut failure).unwrap().fail_spawn = Some(1);
+            let mut owner = controlled(context.clone(), 2, failure);
+            assert_eq!(owner.start(), Err(RemoteRefusal::State));
+            let observation = close(owner).try_observe().unwrap();
+            assert_eq!((observation.workers, observation.joined), (1, 1));
+            assert!(!observation.failures.is_empty());
+            let mut failure = control(Point::BeforeWork, 1);
+            Arc::get_mut(&mut failure).unwrap().panic_init = Some(0);
+            let mut owner = controlled(context, 1, failure);
+            owner.start().unwrap();
+            let observation = close(owner).try_observe().unwrap();
+            assert_eq!(observation.joined, 1);
+            assert!(!observation.failures.is_empty());
+        }
+        #[test]
+        #[ignore = "owned prepared resources: all64 mixed-phase slots and original refusal"]
+        fn remote_stream_capacity_and_handoff() {
+            let (context, mut world) = fixture();
+            let gate = control(Point::BeforeWork, 3);
+            let mut owner = controlled(context, 1, gate.clone());
+            owner.start().unwrap();
+            let first = owner.mesh_input(&world, (0, 4, 0)).unwrap();
+            let first_sequence = submit(&mut owner, first);
+            reconcile(&mut owner);
+            let mut expected_sequences = Vec::new();
+            for index in 1..64 {
+                let input = if index % 2 == 0 {
+                    owner.mesh_input(&world, (0, 4, 0)).unwrap()
+                } else {
+                    owner.light_input(&world, (0, 0)).unwrap()
+                };
+                expected_sequences.push(submit(&mut owner, input));
+            }
+            entered(&gate);
+            let census = owner.try_observe().unwrap();
+            assert_eq!(
+                (
+                    census.owned,
+                    census.reconciling,
+                    census.stored,
+                    census.active,
+                    census.queued
+                ),
+                (64, 1, 1, 1, 61)
+            );
+            assert_eq!(
+                census.queued + census.active + census.stored + census.reconciling,
+                census.owned
+            );
+            let extra = owner.mesh_input(&world, (0, 4, 0)).unwrap();
+            let original = extra.region[1][1].as_ref().unwrap().clone();
+            let refused = owner.try_submit(extra).unwrap_err();
+            assert_eq!(refused.reason, RemoteRefusal::Full);
+            assert!(Arc::ptr_eq(
+                &original,
+                refused.input.region[1][1].as_ref().unwrap()
+            ));
+            let membership = world.chunks.membership_revision();
+            let refused_column = owner.try_insert_column(&mut world, Chunk::empty(5, 5));
+            assert!(matches!(refused_column, Err((RemoteRefusal::Full, _))));
+            assert_eq!(world.chunks.membership_revision(), membership);
+            assert_eq!(
+                owner
+                    .try_take(&world)
+                    .expect("explicit first handoff")
+                    .sequence,
+                first_sequence
+            );
+            assert_eq!(owner.try_observe().unwrap().owned, 63);
+            expected_sequences.push(submit(&mut owner, refused.input));
+            assert_eq!(owner.try_observe().unwrap().owned, 64);
+            owner.begin_close(Instant::now());
+            gate.released.store(true, Ordering::Release);
+            let mut closed = close(owner);
+            assert_eq!(closed.try_observe().unwrap().owned, 64);
+            let mut handed = 0;
+            let mut outputs = 0;
+            let mut actual_sequences = Vec::new();
+            while let Some(handoff) = closed.try_take() {
+                handed += 1;
+                outputs += usize::from(handoff.output.is_some());
+                actual_sequences.push(handoff.sequence);
+            }
+            assert_eq!(actual_sequences, expected_sequences);
+            assert_eq!((handed, outputs), (64, 2));
+            assert_eq!(closed.try_observe().unwrap().owned, 0);
+        }
+        #[test]
+        #[ignore = "owned prepared resources: actual late work and deterministic fence/wake"]
+        fn remote_stream_close_late_and_claim_races() {
+            let (context, world) = fixture();
+            for point in [
+                Point::BeforeClaim,
+                Point::BeforePark,
+                Point::BeforeWork,
+                Point::BeforeExit,
+            ] {
+                let gate = control(point, 1);
+                let mut owner = controlled(context.clone(), 1, gate.clone());
+                owner.start().unwrap();
+                let mut spare = owner.mesh_input(&world, (0, 4, 0)).unwrap();
+                let original = spare.region[1][1].as_ref().unwrap().clone();
+                if point != Point::BeforePark && point != Point::BeforeExit {
+                    let input = owner.mesh_input(&world, (0, 4, 0)).unwrap();
+                    submit(&mut owner, input);
+                }
+                if point == Point::BeforeExit {
+                    owner.begin_close(Instant::now());
+                }
+                entered(&gate);
+                if point == Point::BeforeClaim {
+                    let refused = owner.try_submit(spare).unwrap_err();
+                    assert_eq!(refused.reason, RemoteRefusal::Busy);
+                    assert!(Arc::ptr_eq(
+                        &original,
+                        refused.input.region[1][1].as_ref().unwrap()
+                    ));
+                    spare = refused.input;
+                }
+                owner.begin_close(Instant::now());
+                owner.begin_close(until());
+                let refused = owner.try_submit(spare).unwrap_err();
+                assert_eq!(refused.reason, RemoteRefusal::Closed);
+                assert!(Arc::ptr_eq(
+                    &original,
+                    refused.input.region[1][1].as_ref().unwrap()
+                ));
+                match owner.poll_close() {
+                    RemoteCloseStatus::Blocked {
+                        attempt: 1,
+                        observation,
+                    } => {
+                        if point == Point::BeforeClaim {
+                            assert!(observation.is_none());
+                        }
+                    }
+                    _ => panic!("expired original remote close is not Blocked"),
+                }
+                assert_eq!(owner.retry_close(0, until()), Err(RemoteRefusal::Attempt));
+                assert_eq!(owner.retry_close(1, until()), Ok(2));
+                gate.released.store(true, Ordering::Release);
+                let mut closed = close(owner);
+                assert_eq!(closed.try_observe().unwrap().joined, 1);
+                if matches!(point, Point::BeforeClaim | Point::BeforeWork) {
+                    let handoff = closed
+                        .try_take()
+                        .expect("original queued or active input must return");
+                    assert_eq!(handoff.sequence, 1);
+                    assert_eq!(handoff.output.is_some(), point == Point::BeforeWork);
+                }
+                assert!(closed.try_take().is_none());
+            }
+        }
+        #[test]
+        #[ignore = "owned prepared resources: actual worker unwind keeps inputs and stored outputs"]
+        fn remote_stream_panics_preserve_originals() {
+            let (context, world) = fixture();
+            for point in [Point::BeforeWork, Point::AfterPublish] {
+                let mut gate = control(point, 2);
+                Arc::get_mut(&mut gate).unwrap().panic = true;
+                let mut owner = controlled(context.clone(), 1, gate.clone());
+                owner.start().unwrap();
+                let mut sequences = Vec::new();
+                for _ in 0..3 {
+                    let input = owner.mesh_input(&world, (0, 4, 0)).unwrap();
+                    sequences.push(submit(&mut owner, input));
+                }
+                entered(&gate);
+                owner.begin_close(until());
+                gate.released.store(true, Ordering::Release);
+                let mut closed = close(owner);
+                let census = closed.try_observe().unwrap();
+                assert_eq!(census.owned, 3);
+                assert!(!census.failures.is_empty());
+                assert_eq!(census.joined, 1);
+                let mut outputs = 0;
+                let mut inputs = 0;
+                let mut actual_sequences = Vec::new();
+                while let Some(handoff) = closed.try_take() {
+                    inputs += 1;
+                    outputs += usize::from(handoff.output.is_some());
+                    actual_sequences.push(handoff.sequence);
+                    assert!(Arc::ptr_eq(&handoff.input.context, &context));
+                }
+                assert_eq!(actual_sequences, sequences);
+                assert_eq!(inputs, 3);
+                assert_eq!(outputs, if point == Point::BeforeWork { 1 } else { 2 });
+            }
+        }
+        #[test]
+        #[ignore = "owned prepared resources: intrinsic mode excludes native generation/storage"]
+        fn remote_stream_intrinsic_profile_refusals() {
+            let (context, mut world) = fixture();
+            let mut owner = RetainedRemoteStreaming::prepare(context, 1).unwrap();
+            owner.start().unwrap();
+            let inner = owner.inner.as_mut().unwrap();
+            inner.remote = false;
+            inner.forced.insert((100, 100));
+            assert!(matches!(
+                inner.try_submit(Some((8, 8)), 0, Job::Generate(8, 8)),
+                Err(Job::Generate(8, 8))
+            ));
+            let submitted = inner.order;
+            inner.produce_terrain(&world);
+            inner.schedule_generation(&world, 1);
+            assert_eq!(inner.order, submitted);
+            assert!(inner.update(&mut world).0.is_empty());
+            assert!(inner.save(&mut world, false).is_err());
+            assert!(inner.poll_save(&mut world).is_err());
+            assert!(
+                inner
+                    .native_write_fence_until(&mut world, until(), || panic!(
+                        "remote mode invoked native callback"
+                    ))
+                    .is_err()
+            );
+            assert!(inner.begin_retained_close(Some(&world), until()).is_err());
+            assert!(inner.take_sealed().is_none());
+            let observation = close(owner).try_observe().unwrap();
+            assert_eq!(observation.owned, 0);
+            assert!(observation.failures.is_empty());
+        }
+        #[test]
+        #[ignore = "isolated fatal child: owned resources and HORIZON_RETAINED_REMOTE_STREAM_FATAL=1"]
+        fn remote_stream_unresolved_native_owner_aborts() {
+            assert_eq!(
+                std::env::var("HORIZON_RETAINED_REMOTE_STREAM_FATAL").as_deref(),
+                Ok("1")
+            );
+            let (context, world) = fixture();
+            let gate = control(Point::BeforeWork, 1);
+            let mut owner = controlled(context, 1, gate.clone());
+            owner.start().unwrap();
+            let input = owner.mesh_input(&world, (0, 4, 0)).unwrap();
+            submit(&mut owner, input);
+            entered(&gate);
+            assert_eq!(owner.try_observe().unwrap().active, 1);
+            println!("S1RW1_REMOTE_WORKER_HELD");
+            drop(owner);
+            panic!("unresolved original remote owner drop returned");
+        }
     }
 }
 #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
@@ -6831,7 +8430,7 @@ mod native_work_tests {
     use std::time::{Duration, Instant};
     const WAIT: Duration = Duration::from_secs(5);
 
-    fn context() -> Arc<WorkerContext> {
+    pub(super) fn context() -> Arc<WorkerContext> {
         use crate::{assets::Assets, biome::Biomes, blocks::BlockFacts, models};
         static CONTEXT: std::sync::OnceLock<Arc<WorkerContext>> = std::sync::OnceLock::new();
         CONTEXT
