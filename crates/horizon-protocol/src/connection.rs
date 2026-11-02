@@ -8,7 +8,7 @@ use std::{
     io::{Read, Write},
     net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs},
     sync::{
-        Arc, Condvar, Mutex,
+        Arc, Condvar, Mutex, Weak,
         atomic::{AtomicI64, Ordering},
     },
     time::{Duration, Instant},
@@ -127,7 +127,7 @@ impl Write for Pipe {
 
 /// What a connection runs over.
 enum Stream {
-    Tcp(TcpStream),
+    Tcp(Arc<TcpStream>),
     Memory(Pipe),
 }
 impl Stream {
@@ -152,7 +152,7 @@ impl Stream {
     }
     fn try_clone(&self) -> std::io::Result<Self> {
         Ok(match self {
-            Self::Tcp(s) => Self::Tcp(s.try_clone()?),
+            Self::Tcp(s) => Self::Tcp(s.clone()),
             Self::Memory(p) => Self::Memory(p.try_clone()),
         })
     }
@@ -177,7 +177,7 @@ impl Stream {
 impl Read for Stream {
     fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
         match self {
-            Self::Tcp(s) => s.read(out),
+            Self::Tcp(s) => (&**s).read(out),
             Self::Memory(p) => p.read(out),
         }
     }
@@ -185,13 +185,13 @@ impl Read for Stream {
 impl Write for Stream {
     fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
         match self {
-            Self::Tcp(s) => s.write(data),
+            Self::Tcp(s) => (&**s).write(data),
             Self::Memory(p) => p.write(data),
         }
     }
     fn flush(&mut self) -> std::io::Result<()> {
         match self {
-            Self::Tcp(s) => s.flush(),
+            Self::Tcp(s) => (&**s).flush(),
             Self::Memory(p) => p.flush(),
         }
     }
@@ -231,7 +231,55 @@ pub struct Connection {
     pub reader: ConnReader,
     pub writer: ConnWriter,
 }
+
+/// Close-only access to the original transport, independent of codec or writer
+/// locks. Clones and their destruction do not keep an endpoint alive or close it.
+/// This is an interruption request, never evidence that any worker has finished.
+#[derive(Clone)]
+pub struct ConnectionShutdown {
+    transport: ShutdownTransport,
+}
+
+#[derive(Clone)]
+enum ShutdownTransport {
+    Tcp(Weak<TcpStream>),
+    Memory(PipeShutdown),
+}
+
+impl ConnectionShutdown {
+    /// Interrupt both directions, including IO started before splitting. A TCP
+    /// endpoint is briefly retained during the native syscall only. If it has
+    /// already gone, this does nothing. Actual OS errors (including a repeated
+    /// shutdown's platform-specific errors) are returned unchanged.
+    ///
+    /// Memory shutdown uses the existing channel state locks. No writer mutex or
+    /// thread join is involved; this does not promise hard real-time latency.
+    pub fn shutdown(&self) -> std::io::Result<()> {
+        match &self.transport {
+            ShutdownTransport::Tcp(endpoint) => match endpoint.upgrade() {
+                Some(socket) => socket.shutdown(Shutdown::Both),
+                None => Ok(()),
+            },
+            ShutdownTransport::Memory(pipe) => {
+                pipe.shutdown();
+                Ok(())
+            }
+        }
+    }
+}
+
 impl Connection {
+    /// Obtain a capability before handshake IO or [`Self::split`]. It always
+    /// targets this endpoint, even after its actual reader/writer are dropped.
+    pub fn shutdown_handle(&self) -> ConnectionShutdown {
+        ConnectionShutdown {
+            transport: match &self.reader.stream {
+                Stream::Tcp(socket) => ShutdownTransport::Tcp(Arc::downgrade(socket)),
+                Stream::Memory(pipe) => ShutdownTransport::Memory(pipe.shutdown_handle()),
+            },
+        }
+    }
+
     pub fn connect(host: &str, port: u16, timeout: Duration) -> Result<Self> {
         let addrs: Vec<_> = (host, port)
             .to_socket_addrs()
@@ -261,7 +309,7 @@ impl Connection {
     }
     pub fn from_stream(stream: TcpStream) -> Result<Self> {
         stream.set_nodelay(true)?;
-        Self::over(Stream::Tcp(stream))
+        Self::over(Stream::Tcp(Arc::new(stream)))
     }
     /// A connection over one end of an in-memory [`Pipe`].
     pub fn local(pipe: Pipe) -> Self {
@@ -480,6 +528,199 @@ fn remaining(deadline: Instant) -> Result<Duration> {
 mod tests {
     use super::*;
     use std::net::TcpListener;
+
+    fn shutdown_pair(memory: bool) -> (Connection, Connection) {
+        let (a, b) = if memory {
+            let (a, b) = Pipe::pair();
+            (Connection::local(a), Connection::local(b))
+        } else {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let a = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let (b, _) = listener.accept().unwrap();
+            (
+                Connection::from_stream(a).unwrap(),
+                Connection::from_stream(b).unwrap(),
+            )
+        };
+        for c in [&a, &b] {
+            c.reader
+                .set_read_timeout(Some(Duration::from_secs(7)))
+                .unwrap();
+            c.writer
+                .stream
+                .set_write_timeout(Some(Duration::from_secs(7)))
+                .unwrap();
+        }
+        (a, b)
+    }
+
+    #[test]
+    fn connection_shutdown_drop_is_inert_for_tcp_and_memory() {
+        for memory in [false, true] {
+            let (mut a, mut b) = shutdown_pair(memory);
+            let close = a.shutdown_handle();
+            let other = close.clone();
+            drop(close);
+            drop(other);
+            a.send(&[3, 7]).unwrap();
+            assert_eq!(b.recv().unwrap(), (3, vec![7]));
+            b.send(&[4, 8]).unwrap();
+            assert_eq!(a.recv().unwrap(), (4, vec![8]));
+        }
+    }
+
+    #[test]
+    fn connection_shutdown_does_not_retain_endpoint_or_target_another() {
+        for memory in [false, true] {
+            let (a, mut b) = shutdown_pair(memory);
+            let close = a.shutdown_handle();
+            let other = close.clone();
+            let (reader, mut writer) = a.split();
+            drop(reader);
+            writer.send(&[1, 9]).unwrap();
+            assert_eq!(b.recv().unwrap(), (1, vec![9]));
+            drop(writer);
+            let start = Instant::now();
+            let eof = b.recv().is_err();
+            assert!(eof && start.elapsed() < Duration::from_secs(2));
+            if let ShutdownTransport::Tcp(endpoint) = &close.transport {
+                assert!(endpoint.upgrade().is_none());
+            }
+            let (mut fresh, mut peer) = shutdown_pair(memory);
+            close.shutdown().unwrap();
+            other.shutdown().unwrap();
+            fresh.send(&[2, 10]).unwrap();
+            assert_eq!(peer.recv().unwrap(), (2, vec![10]));
+            peer.send(&[3, 11]).unwrap();
+            assert_eq!(fresh.recv().unwrap(), (3, vec![11]));
+        }
+    }
+
+    #[test]
+    fn connection_shutdown_interrupts_partial_reads_before_and_after_split() {
+        for memory in [false, true] {
+            for split in [false, true] {
+                let (mut a, mut b) = shutdown_pair(memory);
+                let close = a.shutdown_handle();
+                let counters = a.reader.counters.clone();
+                b.writer.stream.write_all(&[5, 1]).unwrap();
+                let (done, result) = std::sync::mpsc::channel();
+                let worker = std::thread::spawn(move || {
+                    let failed = if split {
+                        let (mut reader, _writer) = a.split();
+                        reader.recv().is_err()
+                    } else {
+                        a.recv().is_err()
+                    };
+                    let _ = done.send(failed);
+                    failed
+                });
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while counters.bytes_in.load(Ordering::Relaxed) < 2
+                    && !worker.is_finished()
+                    && Instant::now() < deadline
+                {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                // Real framing IO consumed the partial body, and no complete
+                // packet exists. Never infer this from a scheduling sleep alone.
+                let observed = counters.bytes_in.load(Ordering::Relaxed) == 2
+                    && result.try_recv() == Err(std::sync::mpsc::TryRecvError::Empty);
+                let started = Instant::now();
+                let requested = close.shutdown();
+                let outcome = result.recv_timeout(Duration::from_secs(2));
+                let elapsed = started.elapsed();
+                // Wake and reap the original worker before any failing assertion.
+                b.writer.shutdown();
+                drop(b);
+                let joined = worker.join();
+                assert!(
+                    observed,
+                    "partial read precondition: memory={memory}, split={split}"
+                );
+                assert!(requested.is_ok(), "{requested:?}");
+                assert_eq!(outcome.ok(), Some(true));
+                assert_eq!(joined.ok(), Some(true));
+                assert!(elapsed < Duration::from_secs(2));
+            }
+        }
+    }
+
+    #[test]
+    fn connection_shutdown_clones_close_both_split_halves() {
+        for memory in [false, true] {
+            let (a, mut b) = shutdown_pair(memory);
+            let close = a.shutdown_handle();
+            let clone = close.clone();
+            let (mut reader, mut writer) = a.split();
+            clone.shutdown().unwrap();
+            // Repeated native shutdown can report an already-disconnected OS
+            // error. Its result never substitutes for the actual IO observations.
+            let _ = close.shutdown();
+            assert!(reader.recv().is_err());
+            assert!(writer.send(&[1]).is_err());
+            assert!(b.recv().is_err());
+        }
+    }
+
+    #[test]
+    fn connection_shutdown_interrupts_observed_full_tcp_writer_without_writer_access() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut socket = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (peer, _) = listener.accept().unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let mut filled = 0usize;
+        let mut full = false;
+        while filled < (64 << 20) {
+            match socket.write(&[0; 65536]) {
+                Ok(0) => panic!("unexpected closed send queue"),
+                Ok(n) => filled += n,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    full = true;
+                    break;
+                }
+                Err(e) => panic!("queue filling failed: {e}"),
+            }
+        }
+        assert!(
+            full && filled > 0,
+            "must observe the actual native full queue"
+        );
+        socket.set_nonblocking(false).unwrap();
+        socket
+            .set_write_timeout(Some(Duration::from_secs(7)))
+            .unwrap();
+        let c = Connection::from_stream(socket).unwrap();
+        let close = c.shutdown_handle();
+        let (_reader, mut writer) = c.split();
+        let (started, starting) = std::sync::mpsc::channel();
+        let (done, outcome) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let body = vec![0; frame::MAX_FRAME];
+            let _ = started.send(());
+            let failed = writer.send(&body).is_err();
+            let _ = done.send(failed);
+            failed
+        });
+        let began = starting.recv_timeout(Duration::from_secs(2)).is_ok();
+        let stalled = outcome.recv_timeout(Duration::from_millis(100))
+            == Err(std::sync::mpsc::RecvTimeoutError::Timeout);
+        let start = Instant::now();
+        let requested = close.shutdown();
+        let result = outcome.recv_timeout(Duration::from_secs(2));
+        let elapsed = start.elapsed();
+        let _ = peer.shutdown(Shutdown::Both);
+        drop(peer);
+        let joined = worker.join();
+        assert!(
+            began && stalled,
+            "writer must remain unresolved before shutdown"
+        );
+        assert!(requested.is_ok(), "{requested:?}");
+        assert_eq!(result.ok(), Some(true));
+        assert_eq!(joined.ok(), Some(true));
+        assert!(elapsed < Duration::from_secs(2));
+    }
 
     #[test]
     fn total_read_deadline_stalled_partial_prefix_body_and_trickle_restore_timeout() {
