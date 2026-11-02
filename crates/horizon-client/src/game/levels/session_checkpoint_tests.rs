@@ -764,6 +764,698 @@ struct Session<'a> {
     target: CounterTarget,
     receivers: Vec<mpsc::Receiver<Out>>,
 }
+
+/// Genuine healthy source for the dormant owned close tests. These helpers keep
+/// every populated participant and its actual receiver alive across the handoff.
+#[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+pub(in crate::game) struct CoherentCloseFixture<'a> {
+    pub game: Box<Game<'a>>,
+    pub counter: RuntimeCounterKey,
+    pub slot: SlotKey,
+    pub archive: PathBuf,
+    pub type_id: String,
+    pub target: CounterTarget,
+    pub receivers: Vec<mpsc::Receiver<Out>>,
+}
+#[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+impl CoherentCloseFixture<'_> {
+    pub(in crate::game) fn recovery_request(&self, destination: PathBuf) -> RecoveryRequest {
+        RecoveryRequest {
+            expected_world: self.counter.placement().world,
+            expected_target: self.target.clone(),
+            expected_type: self.type_id.clone(),
+            archive_root: self.archive.clone(),
+            destination,
+            deadline: until(),
+        }
+    }
+}
+#[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+pub(in crate::game) fn coherent_close_fixture<'a>(
+    fixture: &'a Fixture,
+    label: &str,
+) -> CoherentCloseFixture<'a> {
+    let mut source = session(fixture, label, 2, true);
+    source.game.lan.as_mut().unwrap().hub.guests[0].inventory[1] = Some(session_items_rich());
+    source.game.spawn_item(
+        session_items_rich(),
+        [3.5, 121.0, 3.5],
+        [0.125, 0.0, 0.0],
+        17,
+    );
+    source.game.save_game_with(false).unwrap();
+    source.game.session_fence(until()).unwrap();
+    assert_eq!(
+        source
+            .game
+            .world
+            .read_persistent_counter(&source.counter)
+            .unwrap()
+            .counter(),
+        3
+    );
+    assert!(!source.game.dropped.is_empty());
+    assert!(!source.game.lan.as_ref().unwrap().hub.guests.is_empty());
+    CoherentCloseFixture {
+        game: Box::new(source.game),
+        counter: source.counter,
+        slot: source.slot,
+        archive: source.archive,
+        type_id: source.type_id,
+        target: source.target,
+        receivers: source.receivers,
+    }
+}
+#[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+pub(in crate::game) fn recover_coherent_close_fixture<'a>(
+    fixture: &'a Fixture,
+    request: RecoveryRequest,
+) -> (Game<'a>, RecoveryReceipt, Vec<mpsc::Receiver<Out>>) {
+    let mut candidate = fresh_with_role(fixture, ExecutionRole::IntegratedServer);
+    let (host, receivers) = make_host(&mut candidate, true, [110, 220], false);
+    let (game, receipt) = candidate.recover_session_checkpoint(request, host).unwrap();
+    (game, receipt, receivers)
+}
+#[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+pub(in crate::game) fn coherent_close_item_total(game: &Game<'_>, slot: &SlotKey) -> u64 {
+    session_items_total(game, slot)
+}
+
+#[cfg(all(
+    test,
+    feature = "paired-packages",
+    feature = "native-writer-test-control",
+    debug_assertions
+))]
+fn cold_retained_game<'a>(fixture: &'a Fixture, label: &str) -> Game<'a> {
+    use crate::game::world_loading::{
+        PreparationCloseStatus, PreparedOutcome, RetainedWorldLoader,
+    };
+    let mut game = fresh_with_role(fixture, ExecutionRole::IntegratedServer);
+    game.fresh_session_candidate()
+        .expect("genuinely cold title-idle fixture Game");
+    let root = fixture
+        .game()
+        .world_root
+        .parent()
+        .unwrap()
+        .join(format!("retained-native-{label}"));
+    let mut request = WorldRequest::new(
+        "unused",
+        Some("Retained close fixture"),
+        Some(17),
+        false,
+        None,
+    )
+    .unwrap()
+    .with_identity_intent(IdentityIntent::CreateNewIdentity);
+    request.save_root = root;
+    let mut loader = RetainedWorldLoader::start(
+        request,
+        game.res.clone(),
+        game.pack.clone(),
+        game.options.clone(),
+        game.settings.clone(),
+    )
+    .unwrap();
+    let outcome = loop {
+        if let Some(outcome) = loader.poll_retained_outcome() {
+            break outcome.expect("actual retained fixture worker returned");
+        }
+        std::thread::yield_now();
+    };
+    drop(loader); // Its actual handle was harvested, never detached.
+    let mut refused = match outcome {
+        PreparedOutcome::Ready(ready) => match ready.into_cold_prepared_for_test() {
+            Ok(prepared) => {
+                let save = prepared.save.clone();
+                let world = prepared.session_lock.expected_world().copied();
+                game.finish_open_world(prepared).unwrap();
+                assert!(Arc::ptr_eq(&save, &game.save));
+                assert_eq!(
+                    game.session_lock
+                        .as_ref()
+                        .and_then(|s| s.expected_world())
+                        .copied(),
+                    world
+                );
+                let _ = game.advancement_tree();
+                return game;
+            }
+            Err(ready) => PreparedOutcome::Ready(ready),
+        },
+        failed => failed,
+    };
+    // Any fixture construction refusal follows its original explicit close path
+    // before reporting failure. No armed preparation is discarded to pass setup.
+    refused.begin_close(until());
+    loop {
+        match refused.poll_close(&game) {
+            PreparationCloseStatus::Pending => std::thread::yield_now(),
+            PreparationCloseStatus::Complete => break,
+            PreparationCloseStatus::Blocked(error) => {
+                panic!("retained fixture preparation close blocked: {error}")
+            }
+        }
+    }
+    assert!(refused.finish_close().is_ok());
+    panic!("genuine retained fixture preparation refused")
+}
+
+#[cfg(all(
+    test,
+    feature = "paired-packages",
+    feature = "native-writer-test-control",
+    debug_assertions
+))]
+pub(in crate::game) fn retained_native_close_game<'a>(
+    fixture: &'a Fixture,
+    label: &str,
+) -> Box<Game<'a>> {
+    Box::new(cold_retained_game(fixture, label))
+}
+#[cfg(all(
+    test,
+    feature = "paired-packages",
+    feature = "native-writer-test-control",
+    debug_assertions
+))]
+#[derive(Clone, Copy, Debug)]
+pub(in crate::game) enum RetainedCloseFixtureSetup {
+    Healthy,
+    MalformedOldLevelBackup,
+}
+#[cfg(all(
+    test,
+    feature = "paired-packages",
+    feature = "native-writer-test-control",
+    debug_assertions
+))]
+pub(in crate::game) struct RetainedCloseFixtureObservation {
+    pub counter: Result<u64, String>,
+    pub items: Result<u64, String>,
+    pub players: Result<Vec<SessionPlayerRow>, String>,
+    pub dimension: Dim,
+    pub level_uuid: Option<[i32; 4]>,
+    pub uuids: BTreeMap<u32, [i32; 4]>,
+    pub raw: BTreeMap<u32, Tag>,
+    pub clocks: (i64, i64),
+    pub random: u64,
+}
+#[cfg(all(
+    test,
+    feature = "paired-packages",
+    feature = "native-writer-test-control",
+    debug_assertions
+))]
+pub(in crate::game) struct RetainedCloseFixtureToken {
+    save: Arc<save::SaveDir>,
+    shared: Arc<horizon_client::lan::Shared>,
+    world: WorldId,
+    root: PathBuf,
+    counter: RuntimeCounterKey,
+    slot: SlotKey,
+    archive: PathBuf,
+    target: CounterTarget,
+    type_id: String,
+}
+#[cfg(all(
+    test,
+    feature = "paired-packages",
+    feature = "native-writer-test-control",
+    debug_assertions
+))]
+impl RetainedCloseFixtureToken {
+    pub(in crate::game) fn matches(&self, game: &Game<'_>) -> bool {
+        Arc::ptr_eq(&self.save, &game.save)
+            && self.root == game.world_root
+            && game.session_lock.as_ref().and_then(|s| s.expected_world()) == Some(&self.world)
+            && game.lan.as_ref().is_some_and(|host| {
+                Arc::ptr_eq(&self.shared, &host.hub.lan.shared)
+                    && !host.hub.lan.shared.config.listen
+                    && !host.hub.lan.shared.config.announce
+                    && host.hub.lan.shared.config.online.is_none()
+            })
+    }
+    pub(in crate::game) fn observe(&self, game: &Game<'_>) -> RetainedCloseFixtureObservation {
+        let counter = game
+            .world
+            .read_persistent_counter(&self.counter)
+            .map(|row| row.counter())
+            .map_err(|e| e.to_string());
+        let items = game
+            .world
+            .read_world_slot(&self.slot)
+            .map(|row| row.slot.stack().map_or(0, session_items_stack_count))
+            .map_err(|e| format!("{e:?}"))
+            .and_then(|machine| {
+                game.lan
+                    .as_ref()
+                    .map(|host| {
+                        machine
+                            + game
+                                .dropped
+                                .iter()
+                                .map(|e| session_items_stack_count(&e.stack))
+                                .sum::<u64>()
+                            + host
+                                .hub
+                                .guests
+                                .iter()
+                                .flat_map(|g| {
+                                    g.inventory
+                                        .iter()
+                                        .chain(&g.armor)
+                                        .chain(std::iter::once(&g.offhand))
+                                        .chain(&g.ender_items)
+                                        .flatten()
+                                })
+                                .map(session_items_stack_count)
+                                .sum::<u64>()
+                    })
+                    .ok_or_else(|| "original fixture participants absent".into())
+            });
+        let players = game
+            .observe_checkpoint_participants()
+            .map_err(|e| format!("{e:?}"))
+            .and_then(|roster| {
+                game.project_session_participant_rows(&roster)
+                    .map_err(|e| e.to_string())
+            });
+        RetainedCloseFixtureObservation {
+            counter,
+            items,
+            players,
+            dimension: game.dim,
+            level_uuid: game.level.player_uuid,
+            uuids: game
+                .persist
+                .uuids
+                .iter()
+                .map(|(id, uuid)| (*id, *uuid))
+                .collect(),
+            raw: game
+                .persist
+                .raw
+                .iter()
+                .map(|(id, tag)| (*id, tag.clone()))
+                .collect(),
+            clocks: (game.world.game_time, game.world.day_time),
+            random: game.world.random.state(),
+        }
+    }
+    pub(in crate::game) fn recovery_request(
+        &self,
+        destination: PathBuf,
+        deadline: Instant,
+    ) -> RecoveryRequest {
+        RecoveryRequest {
+            expected_world: self.world,
+            expected_target: self.target.clone(),
+            expected_type: self.type_id.clone(),
+            archive_root: self.archive.clone(),
+            destination,
+            deadline,
+        }
+    }
+}
+#[cfg(all(
+    test,
+    feature = "paired-packages",
+    feature = "native-writer-test-control",
+    debug_assertions
+))]
+pub(in crate::game) fn retained_coherent_close_fixture<'a>(
+    fixture: &'a Fixture,
+    label: &str,
+    setup: RetainedCloseFixtureSetup,
+    deadline: Instant,
+) -> crate::game::paired_close::TestCloseCustody<'a> {
+    let game = cold_retained_game(fixture, label);
+    let root = game.world_root.clone();
+    let mut source = session_opened_game(game, root, label, 2, true, false);
+    source.game.lan.as_mut().unwrap().hub.guests[0].inventory[1] = Some(session_items_rich());
+    source.game.spawn_item(
+        session_items_rich(),
+        [3.5, 121.0, 3.5],
+        [0.125, 0.0, 0.0],
+        17,
+    );
+    source.game.save_game_with(false).unwrap();
+    source.game.session_fence(until()).unwrap();
+    if matches!(setup, RetainedCloseFixtureSetup::MalformedOldLevelBackup) {
+        fs::write(
+            source.game.world_root.join("level.dat_old"),
+            b"malformed retained old Level backup",
+        )
+        .unwrap();
+    }
+    let game = Box::new(source.game);
+    let profile = crate::game::paired_close::CloseProfile::CoherentSession {
+        archive: source.archive.clone(),
+    };
+    // Mint only at uninterrupted final handoff. No Game/Lan/Shared reference or
+    // connector-capable handle escapes after this private construction point.
+    let token = RetainedCloseFixtureToken {
+        save: game.save.clone(),
+        shared: game.lan.as_ref().unwrap().hub.lan.shared.clone(),
+        world: *game
+            .session_lock
+            .as_ref()
+            .unwrap()
+            .expected_world()
+            .unwrap(),
+        root: game.world_root.clone(),
+        counter: source.counter,
+        slot: source.slot,
+        archive: source.archive,
+        target: source.target,
+        type_id: source.type_id,
+    };
+    crate::game::paired_close::TestCloseCustody::from_constructor(
+        game,
+        profile,
+        deadline,
+        token,
+        source.receivers,
+    )
+}
+#[cfg(all(
+    test,
+    feature = "paired-packages",
+    feature = "native-writer-test-control",
+    debug_assertions
+))]
+#[test]
+#[ignore = "isolated pinned resources + prebuilt pair: complete owned read refuses malformed old native backup before identities or final writes"]
+fn coherent_image_old_level_backup_refuses_before_final_preparation() {
+    let fixture = Fixture::new("coherent-old-level-backup");
+    let _retain = RetainOnPanic::new(&fixture);
+    let mut source = coherent_close_fixture(&fixture, "coherent-old-level-backup");
+    source
+        .game
+        .spawn_item(session_items_rich(), [4.5, 121.0, 4.5], [0.0; 3], 17);
+    let unassigned = source.game.dropped.last().unwrap().id;
+    assert!(!source.game.persist.uuids.contains_key(&unassigned));
+    fs::write(
+        source.game.world_root.join("level.dat_old"),
+        b"malformed old native level backup",
+    )
+    .unwrap();
+    let files = tree(&source.game.world_root, &["session.lock"]).unwrap();
+    let uuids = source.game.persist.uuids.clone();
+    let raw = source.game.persist.raw.clone();
+    let entity_head = source.game.next_entity;
+    let dropped = source.game.dropped.len();
+    let context = source
+        .game
+        .prepare_coherent_image_context(&source.archive)
+        .unwrap();
+    let error = match context.read_preflight_input(until()).run() {
+        Ok(_) => panic!("malformed original native backup produced a read witness"),
+        Err(error) => error,
+    };
+    assert_eq!(error.publication, Publication::NotPublished);
+    assert_eq!(error.item_identities_assigned, 0);
+    assert_eq!(source.game.persist.uuids, uuids);
+    assert_eq!(source.game.persist.raw, raw);
+    assert!(!source.game.persist.uuids.contains_key(&unassigned));
+    assert_eq!(source.game.next_entity, entity_head);
+    assert_eq!(source.game.dropped.len(), dropped);
+    assert_eq!(
+        tree(&source.game.world_root, &["session.lock"]).unwrap(),
+        files
+    );
+    assert!(tree(&source.archive, &[]).unwrap().files.is_empty());
+    assert!(tree(&source.archive, &[]).unwrap().directories.is_empty());
+}
+
+#[test]
+fn native_read_opaque_profile_inspects_without_rewriting_bytes_or_weakening_d() {
+    let opaque = Tag::compound([
+        ("UUID", Tag::IntArray(vec![7, 8, 9, 10])),
+        ("id", Tag::String("example:opaque_entity".into())),
+        ("test:float", Tag::Float(0x7fc0_0073)),
+        ("test:double", Tag::Double((-0.0f64).to_bits())),
+        (
+            "test:java",
+            Tag::String(nbt::JavaString(vec![0xd800, 0x0061])),
+        ),
+        (
+            "Passengers",
+            Tag::List(vec![Tag::compound([
+                ("id", Tag::String("example:opaque_passenger".into())),
+                ("UUID", Tag::IntArray(vec![11, 12, 13, 14])),
+            ])]),
+        ),
+    ]);
+    let named = NamedTag {
+        name: "native named root".into(),
+        tag: opaque.clone(),
+    };
+    let raw = nbt::write_named(&named, limits()).unwrap();
+    let original_bytes = raw.clone();
+    let view = raw_native_nbt(&raw).unwrap();
+    assert_eq!(view.name, named.name);
+    assert_eq!(view.tag.get("UUID"), opaque.get("UUID"));
+    assert_eq!(view.tag.get("test:java"), opaque.get("test:java"));
+    // This temporary native inspection view is never installed or serialized:
+    // the native reader normalizes zero, and its writer canonicalizes NaNs.
+    assert_eq!(view.tag.get("test:double"), Some(&Tag::Double(0)));
+    assert_eq!(view.tag.get("test:float"), Some(&Tag::Float(0x7fc0_0000)));
+    assert_eq!(raw, original_bytes);
+    assert!(raw_nbt(&raw).is_err());
+    assert!(raw_item_nbt(&raw).is_err());
+    let mut current = BTreeMap::new();
+    native_entity_uuids(
+        std::slice::from_ref(&opaque),
+        (Dim::Nether, (3, -4)),
+        &mut current,
+    )
+    .unwrap();
+    assert_eq!(current.len(), 2);
+    assert!(native_entity_uuids(&[opaque], (Dim::End, (4, 5)), &mut current).is_err());
+    let mut trailing = raw;
+    trailing.push(0);
+    assert!(raw_native_nbt(&trailing).is_err());
+    let duplicate = [
+        10, 0, 0, 3, 0, 1, b'x', 0, 0, 0, 1, 3, 0, 1, b'x', 0, 0, 0, 2, 0,
+    ];
+    assert!(raw_native_nbt(&duplicate).is_err());
+}
+
+#[test]
+fn native_read_record_nbt_suffixes_and_zlib_lz4_suffixes_refuse() {
+    let named = NamedTag {
+        name: "".into(),
+        tag: Tag::compound([
+            (
+                "Entities",
+                Tag::List(vec![Tag::compound([("test:raw", Tag::Float(0x7fc0_0000))])]),
+            ),
+            ("Position", Tag::IntArray(vec![0, 0])),
+        ]),
+    };
+    for codec in [
+        Compression::Gzip,
+        Compression::Zlib,
+        Compression::None,
+        Compression::Lz4,
+    ] {
+        let record =
+            horizon_world::region::ChunkRecord::from_nbt(&named, codec, 7, limits()).unwrap();
+        assert_eq!(
+            raw_native_nbt(&items::native_record_bytes(&record).unwrap()).unwrap(),
+            named
+        );
+        let mut raw = nbt::write_named(&named, limits()).unwrap();
+        raw.push(0);
+        let changed = horizon_world::region::ChunkRecord {
+            compression: codec,
+            compressed: codec.encode(&raw).unwrap(),
+            timestamp: 7,
+        };
+        assert!(raw_native_nbt(&items::native_record_bytes(&changed).unwrap()).is_err());
+        if matches!(codec, Compression::Zlib | Compression::Lz4) {
+            let mut suffix = record.clone();
+            suffix.compressed.extend([1, 2, 3]);
+            assert!(items::native_record_bytes(&suffix).is_err());
+        }
+    }
+}
+
+#[test]
+fn native_read_dimension_and_opaque_entity_envelopes_are_routed_without_decoding() {
+    let column = |y| {
+        Tag::compound([
+            ("xPos", Tag::Int(2)),
+            ("zPos", Tag::Int(-3)),
+            ("yPos", Tag::Int(i32::from(y))),
+            ("Status", Tag::String("minecraft:full".into())),
+            (
+                "sections",
+                Tag::List(vec![Tag::compound([("Y", Tag::Byte(y))])]),
+            ),
+            ("test:unknown", Tag::ByteArray(vec![9, 1, 7])),
+        ])
+    };
+    native_column_envelope(&column(0), (2, -3), LevelShape::NETHER).unwrap();
+    native_column_envelope(&column(-4), (2, -3), LevelShape::OVERWORLD).unwrap();
+    assert!(native_column_envelope(&column(-4), (2, -3), LevelShape::NETHER).is_err());
+    assert!(native_column_envelope(&column(0), (3, -3), LevelShape::END).is_err());
+    let poi = |section: &str, pos: [i32; 3]| {
+        Tag::compound([(
+            "Sections",
+            Tag::compound([(
+                section,
+                Tag::compound([(
+                    "Records",
+                    Tag::List(vec![Tag::compound([
+                        ("pos", Tag::IntArray(pos.to_vec())),
+                        ("type", Tag::String("example:unknown_poi".into())),
+                        ("free_tickets", Tag::Int(2)),
+                        ("test:opaque", Tag::Double(0x7ff8_0000_0000_0073)),
+                    ])]),
+                )]),
+            )]),
+        )])
+    };
+    native_poi_envelope(&poi("4", [33, 70, -47]), (2, -3), LevelShape::NETHER).unwrap();
+    native_poi_envelope(&poi("-4", [33, -64, -47]), (2, -3), LevelShape::OVERWORLD).unwrap();
+    assert!(native_poi_envelope(&poi("4", [49, 70, -47]), (2, -3), LevelShape::NETHER).is_err());
+    assert!(native_poi_envelope(&poi("4", [33, 70, -31]), (2, -3), LevelShape::NETHER).is_err());
+    assert!(native_poi_envelope(&poi("3", [33, 70, -47]), (2, -3), LevelShape::NETHER).is_err());
+    assert!(native_poi_envelope(&poi("4", [33, -1, -47]), (2, -3), LevelShape::NETHER).is_err());
+    assert!(native_poi_envelope(&poi("4", [33, 256, -47]), (2, -3), LevelShape::NETHER).is_err());
+    assert!(native_poi_envelope(&poi("16", [33, 256, -47]), (2, -3), LevelShape::NETHER).is_err());
+    assert!(
+        native_poi_envelope(
+            &Tag::compound([("Sections", Tag::List(Vec::new()))]),
+            (2, -3),
+            LevelShape::END
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn native_read_uuid_reservoir_and_exact_row_coverage_preserve_current_ownership() {
+    use std::collections::HashSet;
+    let player = [1, 2, 3, 4];
+    let entity = [5, 6, 7, 8];
+    let historical = [9, 10, 11, 12];
+    let mut players = HashSet::new();
+    let mut records = HashSet::new();
+    let filename = format!("{}.dat", save::uuid_text(player));
+    native_player_record(
+        &filename,
+        &Tag::compound([("UUID", Tag::IntArray(player.to_vec()))]),
+        true,
+        &mut players,
+        &mut records,
+    )
+    .unwrap();
+    native_player_record(
+        &filename,
+        &Tag::compound([("UUID", Tag::IntArray(player.to_vec()))]),
+        false,
+        &mut players,
+        &mut records,
+    )
+    .unwrap();
+    native_player_record(
+        &format!("{}.dat", save::uuid_text(historical)),
+        &Tag::compound([("UUID", Tag::IntArray(historical.to_vec()))]),
+        false,
+        &mut players,
+        &mut records,
+    )
+    .unwrap();
+    assert_eq!(records.len(), 1);
+    assert!(!players.contains(&historical));
+    assert!(
+        native_player_record(
+            &format!("{}.dat", save::uuid_text(entity)),
+            &Tag::compound([("UUID", Tag::IntArray(player.to_vec()))]),
+            true,
+            &mut players,
+            &mut records
+        )
+        .is_err()
+    );
+    // Use the clean expected current set after the intentionally rejected row.
+    let players = HashSet::from([player]);
+    let old = (Dim::Nether, (3, -4));
+    let current = BTreeMap::from([(entity, old)]);
+    assert_eq!(
+        native_uuid_reservoir(&current, &players),
+        HashSet::from([entity, player])
+    );
+    let final_rows = [(Dim::End, (7, 8), entity)];
+    assert!(
+        native_final_uuid_coverage(
+            &current,
+            &HashSet::new(),
+            &players,
+            &HashSet::new(),
+            &HashSet::new(),
+            &final_rows
+        )
+        .is_err()
+    );
+    native_final_uuid_coverage(
+        &current,
+        &HashSet::new(),
+        &players,
+        &HashSet::from([old]),
+        &HashSet::new(),
+        &final_rows,
+    )
+    .unwrap();
+    // A separate entity sidecar overwrite cannot erase embedded legacy data.
+    assert!(
+        native_final_uuid_coverage(
+            &current,
+            &HashSet::from([entity]),
+            &players,
+            &HashSet::from([old]),
+            &HashSet::new(),
+            &final_rows
+        )
+        .is_err()
+    );
+    native_final_uuid_coverage(
+        &current,
+        &HashSet::from([entity]),
+        &players,
+        &HashSet::new(),
+        &HashSet::from([old]),
+        &final_rows,
+    )
+    .unwrap();
+    assert!(
+        native_final_uuid_coverage(
+            &current,
+            &HashSet::new(),
+            &players,
+            &HashSet::from([old]),
+            &HashSet::new(),
+            &[(Dim::End, (7, 8), player)]
+        )
+        .is_err()
+    );
+    assert!(
+        native_final_uuid_coverage(
+            &current,
+            &HashSet::new(),
+            &players,
+            &HashSet::from([old]),
+            &HashSet::new(),
+            &[final_rows[0], final_rows[0]]
+        )
+        .is_err()
+    );
+}
 fn session<'a>(fixture: &'a Fixture, label: &str, radius: i32, owner: bool) -> Session<'a> {
     let game = fresh_with_role(
         fixture,
@@ -790,6 +1482,16 @@ fn session_with_game<'a>(
     registered: bool,
 ) -> Session<'a> {
     open_native(&mut game, &root);
+    session_opened_game(game, root, label, radius, owner, registered)
+}
+fn session_opened_game<'a>(
+    mut game: Game<'a>,
+    root: PathBuf,
+    label: &str,
+    radius: i32,
+    owner: bool,
+    registered: bool,
+) -> Session<'a> {
     residency(&mut game, radius, (0, 0));
     let catalog = game.options.mod_packages.catalog().unwrap();
     let (prepared, ty) = catalog

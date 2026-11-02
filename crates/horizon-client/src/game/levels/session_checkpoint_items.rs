@@ -183,6 +183,12 @@ impl ItemBudget {
 /// Bound the borrowed graph BEFORE invoking recursive native encoders. Runtime
 /// bundle selection must be inspected explicitly: ItemStack::eq ignores it.
 pub(in crate::game) fn validate_live_stack(game: &Game<'_>, stack: &ItemStack) -> SResult<usize> {
+    validate_live_stack_context(&SessionValidationContext::from_game(game), stack)
+}
+fn validate_live_stack_context(
+    context: &SessionValidationContext,
+    stack: &ItemStack,
+) -> SResult<usize> {
     let mut work = vec![(stack, 0usize)];
     let mut nodes = 0usize;
     let mut budget = ItemBudget::default();
@@ -197,7 +203,7 @@ pub(in crate::game) fn validate_live_stack(game: &Game<'_>, stack: &ItemStack) -
                 && stack.count <= i32::MAX as u32
                 && stack.damage <= i32::MAX as u32
                 && &*stack.item != "minecraft:air"
-                && game.res.items().get(&stack.item).is_some(),
+                && context.res.items().get(&stack.item).is_some(),
             "live item ID/count/damage",
         )?;
         if let Some(data) = stack.data() {
@@ -326,7 +332,7 @@ pub(in crate::game) fn validate_live_stack(game: &Game<'_>, stack: &ItemStack) -
         }
     }
     let tag = save::item_to_nbt(stack);
-    validate_player_items(game, &tag)?;
+    validate_player_items_context(context, &tag)?;
     require(
         lan::session_player_payload_supported(&tag),
         "item encoded structural bound",
@@ -443,12 +449,18 @@ pub(in crate::game) fn validate_item_tag(
     game: &Game<'_>,
     tag: &Tag,
 ) -> SResult<([i32; 4], ItemRow)> {
+    validate_item_tag_context(&SessionValidationContext::from_game(game), tag)
+}
+pub(super) fn validate_item_tag_context(
+    context: &SessionValidationContext,
+    tag: &Tag,
+) -> SResult<([i32; 4], ItemRow)> {
     let (identity, decoded) = decode_native_item_profile(tag)?;
-    validate_player_items(
-        game,
+    validate_player_items_context(
+        context,
         tag.get("Item").ok_or_else(|| fail("native Item missing"))?,
     )?;
-    validate_live_stack(game, &decoded.stack)?;
+    validate_live_stack_context(context, &decoded.stack)?;
     Ok((
         identity,
         ItemRow {
@@ -463,11 +475,24 @@ fn insert_item(
     tag: &Tag,
     at: (i32, i32),
 ) -> SResult<()> {
+    insert_item_context(
+        &SessionValidationContext::from_game(game),
+        projection,
+        tag,
+        at,
+    )
+}
+fn insert_item_context(
+    context: &SessionValidationContext,
+    projection: &mut ItemProjection,
+    tag: &Tag,
+    at: (i32, i32),
+) -> SResult<()> {
     require(
         projection.rows.len() < ITEM_LIMIT,
         "session dropped item bound",
     )?;
-    let (uuid, row) = validate_item_tag(game, tag)?;
+    let (uuid, row) = validate_item_tag_context(context, tag)?;
     require(row.column == at, "native item/record column mismatch")?;
     require(
         projection.rows.insert(uuid, row).is_none(),
@@ -509,6 +534,9 @@ pub(super) fn native_region(path: &str) -> SResult<(bool, ChunkPos)> {
 pub(in crate::game) fn read_item_record(
     record: &horizon_world::region::ChunkRecord,
 ) -> SResult<NamedTag> {
+    raw_item_nbt(&native_record_bytes(record)?)
+}
+pub(super) fn native_record_bytes(record: &horizon_world::region::ChunkRecord) -> SResult<Vec<u8>> {
     let raw = checked(
         record
             .compression
@@ -567,10 +595,23 @@ pub(in crate::game) fn read_item_record(
         }
         _ => {}
     }
-    raw_item_nbt(&raw)
+    Ok(raw)
 }
 pub(super) fn read_session_checkpoint_items(
     game: &Game<'_>,
+    root: &Path,
+    residents: &BTreeSet<(i32, i32)>,
+    blocks: &BTreeMap<(i32, i32), Arc<Chunk>>,
+) -> SResult<CheckedSessionItems> {
+    read_session_checkpoint_items_context(
+        &SessionValidationContext::from_game(game),
+        root,
+        residents,
+        blocks,
+    )
+}
+pub(super) fn read_session_checkpoint_items_context(
+    context: &SessionValidationContext,
     root: &Path,
     residents: &BTreeSet<(i32, i32)>,
     blocks: &BTreeMap<(i32, i32), Arc<Chunk>>,
@@ -619,7 +660,7 @@ pub(super) fn read_session_checkpoint_items(
                 )?;
             }
             for tag in tags {
-                insert_item(game, &mut projection, tag, key)?;
+                insert_item_context(context, &mut projection, tag, key)?;
             }
         }
         require(

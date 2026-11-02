@@ -198,11 +198,19 @@ impl RaidsMetadataInput {
 #[cfg(feature = "paired-packages")]
 impl RaidsMetadataExpected {
     fn matches(&self, game: &Game<'_>, include_markers: bool) -> Result<bool, String> {
-        let state = &game.raiding;
+        self.matches_level(&game.raiding, game, include_markers)
+    }
+    fn matches_level(
+        &self,
+        state: &Raiding,
+        game: &Game<'_>,
+        include_markers: bool,
+    ) -> Result<bool, String> {
+        let global = &game.raiding;
         // Validate again before encoding: a changed public map must return an
         // error here, rather than panic inside the native private-order codec.
         let tag = retained_raids_tag(&state.raids)?;
-        let attributes_match = match (&self.attributes, &state.attributes) {
+        let attributes_match = match (&self.attributes, &global.attributes) {
             (None, None) => true,
             (Some(before), Some(now)) => std::sync::Arc::ptr_eq(before, now),
             _ => false,
@@ -223,16 +231,16 @@ impl RaidsMetadataExpected {
             && tag == self.tag
             && state.raids.ids() == self.ids
             && retained_raid_runtime(&state.raids) == self.runtime
-            && state.patrol.next_tick == self.patrol_next_tick
+            && global.patrol.next_tick == self.patrol_next_tick
             && (
-                state.siege.tonight,
-                state.siege.set_up,
-                state.siege.zombies_to_spawn,
-                state.siege.next_spawn_time,
-                state.siege.spot,
+                global.siege.tonight,
+                global.siege.set_up,
+                global.siege.zombies_to_spawn,
+                global.siege.next_spawn_time,
+                global.siege.spot,
             ) == self.siege
-            && state.omen_loaded == self.omen_loaded
-            && state.omen_position == self.omen_position
+            && global.omen_loaded == self.omen_loaded
+            && global.omen_position == self.omen_position
             && state.bar_hurts == self.bar_hurts
             && attributes_match
             && homes_match)
@@ -248,14 +256,24 @@ impl Game<'_> {
     pub(in crate::game) fn prepare_retained_raids_metadata(
         &self,
     ) -> Result<(RaidsMetadataExpected, RaidsMetadataInput), String> {
-        let state = &self.raiding;
+        self.raiding.prepare_retained_metadata(self)
+    }
+}
+#[cfg(feature = "paired-packages")]
+impl Raiding {
+    fn prepare_retained_metadata(
+        &self,
+        game: &Game<'_>,
+    ) -> Result<(RaidsMetadataExpected, RaidsMetadataInput), String> {
+        let state = self;
+        let global = &game.raiding;
         let tag = retained_raids_tag(&state.raids)?;
-        let active = state.loaded.is_some() && state.raids.dirty && self.remote.is_none();
-        let player_extra = if active && state.omen_loaded {
-            let mut replacement = self.level.player_extra.clone();
+        let active = state.loaded.is_some() && state.raids.dirty && game.remote.is_none();
+        let player_extra = if active && global.omen_loaded {
+            let mut replacement = game.level.player_extra.clone();
             let extra = replacement.get_or_insert_with(|| Tag::Compound(Default::default()));
             if let Tag::Compound(map) = extra {
-                match state.omen_position {
+                match global.omen_position {
                     Some(position) => {
                         map.insert(
                             "raid_omen_position".into(),
@@ -275,39 +293,41 @@ impl Game<'_> {
         Ok((
             RaidsMetadataExpected {
                 association: association.clone(),
-                root: self.world_root.clone(),
-                current_dim: self.dim,
+                root: game.world_root.clone(),
+                current_dim: game.dim,
                 loaded: state.loaded,
-                remote: self.remote.is_some(),
+                remote: game.remote.is_some(),
                 dirty: state.raids.dirty,
                 tag: tag.clone(),
                 ids: state.raids.ids(),
                 runtime: retained_raid_runtime(&state.raids),
-                patrol_next_tick: state.patrol.next_tick,
+                patrol_next_tick: global.patrol.next_tick,
                 siege: (
-                    state.siege.tonight,
-                    state.siege.set_up,
-                    state.siege.zombies_to_spawn,
-                    state.siege.next_spawn_time,
-                    state.siege.spot,
+                    global.siege.tonight,
+                    global.siege.set_up,
+                    global.siege.zombies_to_spawn,
+                    global.siege.next_spawn_time,
+                    global.siege.spot,
                 ),
-                omen_loaded: state.omen_loaded,
-                omen_position: state.omen_position,
-                player_extra: self.level.player_extra.clone(),
+                omen_loaded: global.omen_loaded,
+                omen_position: global.omen_position,
+                player_extra: game.level.player_extra.clone(),
                 bar_hurts: state.bar_hurts.clone(),
-                attributes: state.attributes.clone(),
+                attributes: global.attributes.clone(),
                 homes: state.homes.clone(),
             },
             RaidsMetadataInput {
                 association,
-                path: state.loaded.map(|dim| self.raids_path(dim)),
+                path: state.loaded.map(|dim| game.raids_path(dim)),
                 active,
                 tag,
                 player_extra,
             },
         ))
     }
-
+}
+#[cfg(feature = "paired-packages")]
+impl Game<'_> {
     pub(in crate::game) fn preflight_retained_raids_metadata(
         &self,
         expected: &RaidsMetadataExpected,
@@ -331,6 +351,146 @@ impl Game<'_> {
                 self.level.player_extra = replacement;
             }
             self.raiding.raids.dirty = false;
+        }
+    }
+}
+
+#[cfg(feature = "paired-packages")]
+pub(in crate::game) struct LevelRaidsExpected {
+    levels: Vec<(Dim, RaidsMetadataExpected)>,
+}
+#[cfg(feature = "paired-packages")]
+#[derive(Clone)]
+pub(in crate::game) struct LevelRaidsInput {
+    levels: Vec<(Dim, RaidsMetadataInput)>,
+    player_extra: Option<Option<Tag>>,
+}
+#[cfg(feature = "paired-packages")]
+pub(in crate::game) struct LevelRaidsPost {
+    levels: Vec<(Dim, RaidsMetadataPost)>,
+    player_extra: Option<Option<Tag>>,
+}
+#[cfg(feature = "paired-packages")]
+pub(in crate::game) struct LevelRaidsIo {
+    pub effect: super::paired_close::MetadataEffect,
+    pub result: Result<LevelRaidsPost, String>,
+}
+#[cfg(feature = "paired-packages")]
+impl LevelRaidsInput {
+    pub(in crate::game) fn apply_to_level(&self, level: &mut horizon_client::save::Level) {
+        if let Some(replacement) = &self.player_extra {
+            level.player_extra = replacement.clone();
+        }
+    }
+    pub(in crate::game) fn write_native(&self) -> LevelRaidsIo {
+        use super::paired_close::MetadataEffect as E;
+        let mut posts = Vec::new();
+        let mut effect = E::Skipped;
+        for (dimension, input) in &self.levels {
+            let io = input.write_native();
+            match io.result {
+                Ok(post) => {
+                    posts.push((*dimension, post));
+                    if io.effect == E::Completed {
+                        effect = E::Completed;
+                    }
+                }
+                Err(error) => {
+                    return LevelRaidsIo {
+                        effect: E::Unknown,
+                        result: Err(error),
+                    };
+                }
+            }
+        }
+        LevelRaidsIo {
+            effect,
+            result: Ok(LevelRaidsPost {
+                levels: posts,
+                player_extra: self.player_extra.clone(),
+            }),
+        }
+    }
+}
+#[cfg(feature = "paired-packages")]
+impl Game<'_> {
+    pub(in crate::game) fn prepare_retained_level_raids_metadata(
+        &self,
+    ) -> Result<(LevelRaidsExpected, LevelRaidsInput), String> {
+        let mut expected = Vec::new();
+        let mut inputs = Vec::new();
+        let mut player_extra = None;
+        let mut routes = HashSet::new();
+        for dimension in self.retained_level_dimensions()? {
+            let state = self
+                .retained_raiding_for_level(dimension)
+                .ok_or("native close raid level disappeared")?;
+            let (before, mut input) = state.prepare_retained_metadata(self)?;
+            if input.active {
+                if !routes.insert(input.path.clone()) {
+                    return Err("native close duplicate loaded raid route".into());
+                }
+                if let Some(replacement) = input.player_extra.take() {
+                    if player_extra.as_ref().is_some_and(|old| old != &replacement) {
+                        return Err("native close player omen projection disagrees".into());
+                    }
+                    player_extra = Some(replacement);
+                }
+            }
+            expected.push((dimension, before));
+            inputs.push((dimension, input));
+        }
+        Ok((
+            LevelRaidsExpected { levels: expected },
+            LevelRaidsInput {
+                levels: inputs,
+                player_extra,
+            },
+        ))
+    }
+    pub(in crate::game) fn preflight_retained_level_raids_metadata(
+        &self,
+        expected: &LevelRaidsExpected,
+        post: &LevelRaidsPost,
+    ) -> Result<(), String> {
+        let dimensions = self.retained_level_dimensions()?;
+        if dimensions
+            != expected
+                .levels
+                .iter()
+                .map(|(dim, _)| *dim)
+                .collect::<Vec<_>>()
+            || post.levels.len() != expected.levels.len()
+        {
+            return Err("native close raid membership changed".into());
+        }
+        for ((dimension, before), (written_dim, written)) in
+            expected.levels.iter().zip(&post.levels)
+        {
+            let state = self
+                .retained_raiding_for_level(*dimension)
+                .ok_or("native close raid level absent")?;
+            if dimension != written_dim
+                || !std::sync::Arc::ptr_eq(&before.association, &written.association)
+                || written.path != before.loaded.map(|dim| self.raids_path(dim))
+                || written.active != (before.loaded.is_some() && before.dirty && !before.remote)
+                || !before.matches_level(state, self, true)?
+            {
+                return Err("native close raid state, marker, route or association changed".into());
+            }
+        }
+        Ok(())
+    }
+    pub(in crate::game) fn commit_retained_level_raids_metadata(&mut self, post: LevelRaidsPost) {
+        for (dimension, written) in post.levels {
+            if written.active
+                && let Some(state) = self.retained_raiding_for_level_mut(dimension)
+            {
+                state.raids.dirty = false;
+            }
+        }
+        if let Some(replacement) = post.player_extra {
+            self.level.player_extra = replacement;
         }
     }
 }
@@ -385,6 +545,34 @@ impl Game<'_> {
         state.raids.tick = 419;
         state.raids.dirty = dirty;
         self.raiding = state;
+    }
+    pub(in crate::game) fn seed_retained_parked_raids_fixture(
+        &mut self,
+        dimension: Dim,
+        loaded: Dim,
+        dirty: bool,
+    ) -> Result<(), String> {
+        if dimension == self.dim {
+            return Err("parked raid fixture requires different actual level".into());
+        }
+        let state = self
+            .retained_raiding_for_level_mut(dimension)
+            .ok_or("parked raid fixture level missing")?;
+        state.loaded = Some(loaded);
+        let (id, _) = state.raids.create_or_extend([31, 65, -17], 3, Some(2), 271);
+        let raid = state
+            .raids
+            .get_mut(id)
+            .ok_or("parked native raid creation missing")?;
+        raid.started = true;
+        raid.ticks_active = 143;
+        raid.add_hero([id, 2, 3, 4]);
+        state.bar_hurts.insert(id, 613);
+        state
+            .homes
+            .insert(id, (311, std::sync::Arc::new(vec![[20, 64, 30]])));
+        state.raids.dirty = dirty;
+        Ok(())
     }
 
     pub(in crate::game) fn retained_raids_fixture_snapshot(&self) -> RaidsMetadataExpected {
@@ -743,7 +931,7 @@ impl Game<'_> {
     }
     /// `dimensions/<dimension>/data/minecraft/raids.dat`: each dimension
     /// keeps its own raids.
-    fn raids_path(&self, dim: Dim) -> std::path::PathBuf {
+    pub(in crate::game) fn raids_path(&self, dim: Dim) -> std::path::PathBuf {
         horizon_client::save::dimension_dir(&self.world_root, dim.id())
             .join("data/minecraft/raids.dat")
     }

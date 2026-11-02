@@ -416,6 +416,73 @@ impl RetainedPreparedWorld {
                 .as_ref()
                 .is_some_and(|original| original.matches(entry))
     }
+    /// Fixed cold-fixture transfer only. Ordinary startup retains its separate
+    /// guarded adoption path; no live legacy world may be replaced through this.
+    #[cfg(all(
+        test,
+        feature = "paired-packages",
+        feature = "native-writer-test-control",
+        debug_assertions
+    ))]
+    pub(in crate::game) fn into_cold_prepared_for_test(
+        mut self,
+    ) -> std::result::Result<PreparedWorld, Self> {
+        let owner = &self.owner;
+        if !owner.armed
+            || owner.cancelled
+            || owner.original_error.is_some()
+            || owner.close_deadline.is_some()
+            || owner.close_error.is_some()
+            || owner.sealed.is_some()
+            || owner.producer_acknowledged
+            || owner.writer.is_some()
+            || owner.writer_closed.is_some()
+            || owner.authority.is_some()
+            || owner.level.is_none()
+            || owner.world.is_none()
+            || owner.streaming.is_none()
+            || owner.save.is_none()
+            || owner.session.is_none()
+            || owner.rand_sequences.is_none()
+            || owner.native_checkpoint_origin.is_none()
+        {
+            return Err(self);
+        }
+        let level = owner.level.as_ref().unwrap();
+        if owner
+            .session
+            .as_ref()
+            .and_then(WorldSession::expected_world)
+            .is_none()
+            || owner
+                .native_checkpoint_origin
+                .as_ref()
+                .unwrap()
+                .validate(
+                    &owner.request.save_root,
+                    Dim::from_id(&level.dimension),
+                    owner.save.as_ref().unwrap(),
+                )
+                .is_err()
+        {
+            return Err(self);
+        }
+        // Every refusal is above all takes. Construct the complete transfer from
+        // SAME original owners before disarming the old preparation backstop.
+        let prepared = PreparedWorld {
+            save_root: self.owner.request.save_root.clone(),
+            level: self.owner.level.take().unwrap(),
+            world: *self.owner.world.take().unwrap(),
+            streaming: self.owner.streaming.take().unwrap(),
+            save: self.owner.save.take().unwrap(),
+            session_lock: self.owner.session.take().unwrap(),
+            rand_sequences: self.owner.rand_sequences.take().unwrap(),
+            locator: self.owner.locator.take(),
+            native_checkpoint_origin: self.owner.native_checkpoint_origin.take(),
+        };
+        self.owner.armed = false;
+        Ok(prepared)
+    }
 }
 #[cfg(feature = "paired-packages")]
 #[allow(dead_code)]
@@ -763,9 +830,7 @@ impl PrepareOwner {
             self.native_checkpoint_origin = self
                 .session
                 .as_ref()
-                .unwrap()
-                .expected_world()
-                .is_some()
+                .is_some_and(|session| session.expected_world().is_some())
                 .then(|| NativeCheckpointOrigin {
                     root: self.request.save_root.clone(),
                     dimension: dim,
@@ -1047,6 +1112,132 @@ impl PrepareOwner {
     }
 }
 
+/// Genuine retained construction for an additional native level. It borrows the
+/// existing identified Game session; it never acquires/relabels a legacy owner
+/// or issues initial-Overworld checkpoint provenance for a parked level.
+#[cfg(feature = "paired-packages")]
+#[allow(dead_code)] // Dormant retained factory, separate from ordinary activation.
+pub(in crate::game) struct RetainedParkedConstruction {
+    owner: Box<PrepareOwner>,
+    dimension: Dim,
+    parent_save: Arc<SaveDir>,
+}
+#[cfg(feature = "paired-packages")]
+#[allow(dead_code)] // Owned transfer exists for the dormant retained factory only.
+pub(in crate::game) struct RetainedParkedParts {
+    pub world: World,
+    pub streaming: Streaming,
+    pub save: Arc<SaveDir>,
+    pub locator: Option<Arc<VanillaTerrain>>,
+}
+#[cfg(feature = "paired-packages")]
+impl std::fmt::Debug for RetainedParkedConstruction {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RetainedParkedConstruction")
+            .field("dimension", &self.dimension)
+            .field("error", &self.error())
+            .finish_non_exhaustive()
+    }
+}
+#[cfg(feature = "paired-packages")]
+#[allow(dead_code)] // Keep the retained factory available without ordinary wiring.
+impl RetainedParkedConstruction {
+    pub(in crate::game) fn start(game: &Game<'_>, dimension: Dim) -> Self {
+        let request = WorldRequest {
+            save_root: game.world_root.clone(),
+            folder: "retained-native-level".into(),
+            name: None,
+            seed: Some(game.level.seed),
+            creative: game.creative,
+            create: None,
+            identity_intent: IdentityIntent::Legacy,
+            authority_namespace: None,
+            expected_checkpoint_world: None,
+        };
+        let mut owner = PrepareOwner::new(request);
+        owner.save = Some(Arc::new(SaveDir::new_retained(
+            horizon_client::save::dimension_dir(&game.world_root, dimension.id()),
+        )));
+        let mut world = Box::new(World::new(game.res.facts().air, game.level.seed));
+        world.fast_lava = dimension == Dim::Nether;
+        world.game_time = game.world.game_time;
+        world.day_time = game.world.day_time;
+        world.weather = game.world.weather;
+        owner.world = Some(world);
+        let result = if game
+            .session_lock
+            .as_ref()
+            .and_then(WorldSession::expected_world)
+            .is_none()
+        {
+            Err(
+                "retained parked native construction requires original identified Game session"
+                    .into(),
+            )
+        } else {
+            owner.prepare_streaming(
+                &game.res,
+                &game.pack,
+                &game.options,
+                &game.settings,
+                dimension,
+                game.level.seed,
+            )
+        };
+        if let Err(error) = result {
+            owner.original_error = Some(error.to_string());
+        }
+        Self {
+            owner,
+            dimension,
+            parent_save: game.save.clone(),
+        }
+    }
+    pub(in crate::game) fn error(&self) -> Option<&str> {
+        self.owner.original_error.as_deref()
+    }
+    pub(in crate::game) fn dimension(&self) -> Dim {
+        self.dimension
+    }
+    pub(in crate::game) fn matches_game(&self, game: &Game<'_>) -> bool {
+        self.owner.request.save_root == game.world_root
+            && Arc::ptr_eq(&self.parent_save, &game.save)
+    }
+    pub(in crate::game) fn begin_close(&mut self, deadline: std::time::Instant) {
+        self.owner.close_deadline.get_or_insert(deadline);
+    }
+    pub(in crate::game) fn poll_close(&mut self, game: &Game<'_>) -> PreparationCloseStatus {
+        self.owner.poll_close(game)
+    }
+    pub(in crate::game) fn retry_close(&mut self, deadline: std::time::Instant) -> Result<()> {
+        self.owner.retry_close(deadline)
+    }
+    pub(in crate::game) fn into_parts(mut self) -> std::result::Result<RetainedParkedParts, Self> {
+        if self.owner.original_error.is_some()
+            || self.owner.streaming.is_none()
+            || self.owner.world.is_none()
+            || self.owner.save.is_none()
+            || self.owner.close_deadline.is_some()
+        {
+            return Err(self);
+        }
+        // All checks precede every ownership take. Native retained owners remain
+        // armed in their final Parked allocation, whose close has not begun yet.
+        let world = *self.owner.world.take().unwrap();
+        let streaming = self.owner.streaming.take().unwrap();
+        let save = self.owner.save.take().unwrap();
+        let locator = self.owner.locator.take();
+        self.owner.armed = false;
+        Ok(RetainedParkedParts {
+            world,
+            streaming,
+            save,
+            locator,
+        })
+    }
+}
+
 /// The retained initialization handle is never replaced by a disposal thread.
 #[cfg(feature = "paired-packages")]
 #[allow(dead_code)]
@@ -1179,7 +1370,46 @@ fn validate_retained_column(
         std::collections::BTreeSet<[i32; 4]>,
     )>,
 > {
-    use super::levels::session_checkpoint::{checked, fail, items, require, validate_column};
+    validate_retained_column_context(
+        &game.capture_native_validation_context(),
+        &game.pack,
+        &game.res,
+        &game.persist.uuids,
+        root,
+        level,
+        world,
+        session,
+        save,
+        origin,
+        accepted,
+        chunk,
+        evidence,
+    )
+}
+
+#[cfg(feature = "paired-packages")]
+#[allow(clippy::too_many_arguments)]
+pub(in crate::game) fn validate_retained_column_context(
+    context: &super::levels::session_checkpoint::SessionValidationContext,
+    pack: &PackResources,
+    res: &Resources,
+    live_uuids: &std::collections::HashMap<u32, [i32; 4]>,
+    root: &std::path::Path,
+    level: Option<&Level>,
+    world: Option<&World>,
+    session: Option<&WorldSession>,
+    save: &Arc<SaveDir>,
+    origin: Option<&NativeCheckpointOrigin>,
+    accepted: &std::collections::BTreeSet<[i32; 4]>,
+    chunk: &Arc<horizon_client::chunk::Chunk>,
+    evidence: Option<&horizon_client::save::RetainedLoadedRecords>,
+) -> Result<
+    Option<(
+        horizon_client::streaming::RetainedColumnDisposition,
+        std::collections::BTreeSet<[i32; 4]>,
+    )>,
+> {
+    use super::levels::session_checkpoint::{checked, fail, items, require};
     use horizon_client::save::LevelShape;
     let validate = || -> super::levels::session_checkpoint::SResult<_> {
         let level = level.ok_or_else(|| fail("late native column without original Level"))?;
@@ -1199,7 +1429,7 @@ fn validate_retained_column(
             !world.chunks.contains_key(&at),
             "late native column collides with frozen resident owner",
         )?;
-        let tables = horizon_client::save::SaveTables::new(&game.pack.assets);
+        let tables = horizon_client::save::SaveTables::new(&pack.assets);
         let encoded = if chunk.fresh {
             require(
                 evidence.is_none(),
@@ -1207,8 +1437,8 @@ fn validate_retained_column(
             )?;
             horizon_client::save::encode_with(
                 chunk,
-                game.pack.assets.registry,
-                game.res.biomes(),
+                pack.assets.registry,
+                res.biomes(),
                 Some(&tables),
                 LevelShape::OVERWORLD,
             )
@@ -1231,9 +1461,13 @@ fn validate_retained_column(
                 }
                 Some(true) => {}
             }
-            let column = retained_record_tag(game, evidence.column(), at, false)?
-                .ok_or_else(|| fail("loaded late native column has proven absent column source"))?;
-            let entities = retained_record_tag(game, evidence.entities(), at, true)?;
+            let column =
+                retained_record_tag_context(context, pack, res, evidence.column(), at, false)?
+                    .ok_or_else(|| {
+                        fail("loaded late native column has proven absent column source")
+                    })?;
+            let entities =
+                retained_record_tag_context(context, pack, res, evidence.entities(), at, true)?;
             let tags = match &entities {
                 None => &[][..],
                 Some(named) => {
@@ -1277,12 +1511,12 @@ fn validate_retained_column(
                     original.entities == chunk.entities,
                     "original pending column entities were discarded by sidecar replacement",
                 )?;
-                let original_decoded = validate_column(game, &column, at, world.game_time)?;
+                let original_decoded = context.validate_column(&column, at, world.game_time)?;
                 validate_retained_projection(original, &column, &original_decoded)?;
             }
             column
         };
-        let decoded = validate_column(game, &encoded, at, world.game_time)?;
+        let decoded = context.validate_column(&encoded, at, world.game_time)?;
         validate_retained_projection(chunk, &encoded, &decoded)?;
         require(
             chunk.entities.len() <= items::ITEM_LIMIT,
@@ -1291,20 +1525,19 @@ fn validate_retained_column(
         let mut identities = std::collections::BTreeSet::new();
         let mut bytes = 0usize;
         for tag in &chunk.entities {
-            let (uuid, row) = items::validate_item_tag(game, tag)?;
+            let (uuid, row) = context.validate_item_tag(tag)?;
             require(row.column == at, "late native entity column mismatch")?;
             require(
                 identities.insert(uuid) && !accepted.contains(&uuid),
                 "duplicate late native item UUID",
             )?;
             require(
-                level.player_uuid != Some(uuid)
-                    && !game.persist.uuids.values().any(|known| *known == uuid),
+                level.player_uuid != Some(uuid) && !live_uuids.values().any(|known| *known == uuid),
                 "late native item/player or live UUID collision",
             )?;
             for (_, tags) in &world.loaded_entities {
                 for resident in tags {
-                    let (known, _) = items::validate_item_tag(game, resident)?;
+                    let (known, _) = context.validate_item_tag(resident)?;
                     require(
                         known != uuid,
                         "late native item/frozen arrival UUID collision",
@@ -1404,8 +1637,10 @@ fn validate_retained_projection(
 /// Interpret only the original factory-issued storage evidence. IO and raw
 /// header validation already ran on its native worker before any constructor.
 #[cfg(feature = "paired-packages")]
-fn retained_record_tag(
-    game: &Game<'_>,
+fn retained_record_tag_context(
+    _context: &super::levels::session_checkpoint::SessionValidationContext,
+    pack: &PackResources,
+    res: &Resources,
     record: horizon_client::save::RetainedRecordView<'_>,
     at: (i32, i32),
     entities: bool,
@@ -1488,10 +1723,9 @@ fn retained_record_tag(
                     require(
                         chunk.is_some()
                             && registry.is_some_and(|registry| {
-                                std::ptr::eq(registry, game.pack.assets.registry)
+                                std::ptr::eq(registry, pack.assets.registry)
                             })
-                            && biomes
-                                .is_some_and(|biomes| std::ptr::eq(biomes, &**game.res.biomes()))
+                            && biomes.is_some_and(|biomes| std::ptr::eq(biomes, &**res.biomes()))
                             && shape == Some(LevelShape::OVERWORLD),
                         "native pending Chunk encoding context mismatch",
                     )?;

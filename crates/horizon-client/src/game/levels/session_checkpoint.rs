@@ -59,6 +59,56 @@ pub(in crate::game) type SResult<T> = std::result::Result<T, SessionCheckpointEr
 #[path = "session_checkpoint_items.rs"]
 pub(in crate::game) mod items;
 use items::{CheckedSessionItems, ItemProjection, read_session_checkpoint_items};
+
+/// Actual immutable native decoder owners, with no Game, renderer, UI or worker
+/// pointer. Only a Game can capture this context; recovery wrappers use the same
+/// complete validators as the owned close worker.
+#[derive(Clone)]
+pub(in crate::game) struct SessionValidationContext {
+    res: Arc<crate::game::Resources>,
+    assets: Arc<horizon_client::assets::Assets>,
+    packages: crate::game::mod_packages::Packages,
+    advancement_tree: Arc<horizon_client::advancements::Tree>,
+}
+impl SessionValidationContext {
+    fn from_game(game: &Game<'_>) -> Self {
+        Self {
+            res: game.res.clone(),
+            assets: game.pack.assets.clone(),
+            packages: game.options.mod_packages.clone(),
+            advancement_tree: game.adv.tree.clone(),
+        }
+    }
+    fn same_owners(&self, game: &Game<'_>) -> bool {
+        Arc::ptr_eq(&self.res, &game.res)
+            && Arc::ptr_eq(&self.assets, &game.pack.assets)
+            && Arc::ptr_eq(&self.advancement_tree, &game.adv.tree)
+            && match (self.packages.catalog(), game.options.mod_packages.catalog()) {
+                (Some(before), Some(now)) => std::ptr::eq(before, now),
+                (None, None) => true,
+                _ => false,
+            }
+    }
+    pub(in crate::game) fn validate_column(
+        &self,
+        named: &NamedTag,
+        position: (i32, i32),
+        clock: i64,
+    ) -> SResult<Chunk> {
+        validate_column_context(self, named, position, clock)
+    }
+    pub(in crate::game) fn validate_item_tag(
+        &self,
+        tag: &Tag,
+    ) -> SResult<([i32; 4], items::ItemRow)> {
+        items::validate_item_tag_context(self, tag)
+    }
+}
+impl Game<'_> {
+    pub(in crate::game) fn capture_native_validation_context(&self) -> SessionValidationContext {
+        SessionValidationContext::from_game(self)
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::game) enum Publication {
     NotPublished,
@@ -556,6 +606,7 @@ struct NbtScan<'a> {
     at: usize,
     nodes: usize,
     exact_items: bool,
+    native_opaque: bool,
     entity_list_depth: Option<usize>,
 }
 impl NbtScan<'_> {
@@ -580,7 +631,11 @@ impl NbtScan<'_> {
     fn string(&mut self) -> SResult<nbt::JavaString> {
         let len = u16::from_be_bytes(self.take(2)?.try_into().unwrap()) as usize;
         require(
-            len <= if self.exact_items { 4096 * 3 } else { 4096 },
+            len <= if self.exact_items || self.native_opaque {
+                4096 * 3
+            } else {
+                4096
+            },
             "NBT string bound",
         )?;
         let value = self.take(len)?;
@@ -589,7 +644,7 @@ impl NbtScan<'_> {
         encoded.extend_from_slice(value);
         let (named, used) = checked(nbt::read_named(&encoded, limits()))?;
         require(used == encoded.len(), "NBT string trailing bytes")?;
-        if self.exact_items {
+        if self.exact_items || self.native_opaque {
             require(
                 checked(nbt::write_named(&named, limits()))? == encoded,
                 "noncanonical/malformed native item modified UTF-8",
@@ -599,7 +654,9 @@ impl NbtScan<'_> {
             return Err(fail("NBT string"));
         };
         require(
-            value.0.len() <= 4096 && char::decode_utf16(value.0.iter().copied()).all(|v| v.is_ok()),
+            value.0.len() <= 4096
+                && (self.native_opaque
+                    || char::decode_utf16(value.0.iter().copied()).all(|v| v.is_ok())),
             "invalid UTF16",
         )?;
         Ok(value)
@@ -622,7 +679,10 @@ impl NbtScan<'_> {
             }
             5 => {
                 let bits = u32::from_be_bytes(self.take(4)?.try_into().unwrap());
-                require(f32::from_bits(bits).is_finite(), "nonfinite NBT float")?;
+                require(
+                    self.native_opaque || f32::from_bits(bits).is_finite(),
+                    "nonfinite NBT float",
+                )?;
                 require(
                     !self.exact_items || bits != (-0.0f32).to_bits(),
                     "native item float signed-zero coercion",
@@ -630,7 +690,10 @@ impl NbtScan<'_> {
             }
             6 => {
                 let bits = u64::from_be_bytes(self.take(8)?.try_into().unwrap());
-                require(f64::from_bits(bits).is_finite(), "nonfinite NBT double")?;
+                require(
+                    self.native_opaque || f64::from_bits(bits).is_finite(),
+                    "nonfinite NBT double",
+                )?;
                 require(
                     !self.exact_items || bits != (-0.0f64).to_bits(),
                     "native item double signed-zero coercion",
@@ -702,6 +765,12 @@ fn raw_item_nbt(raw: &[u8]) -> SResult<NamedTag> {
     raw_nbt_profile(raw, true)
 }
 fn raw_nbt_profile(raw: &[u8], exact_items: bool) -> SResult<NamedTag> {
+    raw_nbt_profile_native(raw, exact_items, false)
+}
+fn raw_native_nbt(raw: &[u8]) -> SResult<NamedTag> {
+    raw_nbt_profile_native(raw, false, true)
+}
+fn raw_nbt_profile_native(raw: &[u8], exact_items: bool, native_opaque: bool) -> SResult<NamedTag> {
     require(
         !raw.is_empty() && raw.len() <= STRUCTURED_LIMIT,
         "NBT byte bound",
@@ -711,6 +780,7 @@ fn raw_nbt_profile(raw: &[u8], exact_items: bool) -> SResult<NamedTag> {
         at: 0,
         nodes: 0,
         exact_items,
+        native_opaque,
         entity_list_depth: None,
     };
     let kind = scanner.byte()?;
@@ -720,7 +790,7 @@ fn raw_nbt_profile(raw: &[u8], exact_items: bool) -> SResult<NamedTag> {
     require(scanner.at == raw.len(), "trailing NBT")?;
     let (named, used) = checked(nbt::read_named(raw, limits()))?;
     require(
-        used == raw.len() && named.name.0.is_empty(),
+        used == raw.len() && (native_opaque || named.name.0.is_empty()),
         "trailing or nonempty named NBT root",
     )?;
     Ok(named)
@@ -863,6 +933,19 @@ pub(in crate::game) fn validate_column(
     position: (i32, i32),
     clock: i64,
 ) -> SResult<Chunk> {
+    validate_column_context(
+        &SessionValidationContext::from_game(game),
+        named,
+        position,
+        clock,
+    )
+}
+fn validate_column_context(
+    context: &SessionValidationContext,
+    named: &NamedTag,
+    position: (i32, i32),
+    clock: i64,
+) -> SResult<Chunk> {
     let tag = &named.tag;
     compound(
         tag,
@@ -986,7 +1069,7 @@ pub(in crate::game) fn validate_column(
                     Tag::String(name) => {
                         let name = checked(name.to_string())?;
                         return require(
-                            game.pack.assets.registry.default_state(&name).is_some(),
+                            context.assets.registry.default_state(&name).is_some(),
                             "unresolved default native state",
                         );
                     }
@@ -1006,7 +1089,7 @@ pub(in crate::game) fn validate_column(
                     _ => return Err(fail("block palette entry type")),
                 };
                 require(
-                    game.pack.assets.registry.id(&state).is_some(),
+                    context.assets.registry.id(&state).is_some(),
                     "unresolved native palette state",
                 )
             },
@@ -1017,9 +1100,9 @@ pub(in crate::game) fn validate_column(
             1,
             |biome| {
                 let name = text(Some(biome))?;
-                let id = game.res.biomes().id(&name);
+                let id = context.res.biomes().id(&name);
                 require(
-                    game.res.biomes().get(id).name == name,
+                    context.res.biomes().get(id).name == name,
                     "unresolved native biome",
                 )
             },
@@ -1037,7 +1120,7 @@ pub(in crate::game) fn validate_column(
             }
         }
     }
-    let mut chunk = save::decode(named, game.pack.assets.registry, game.res.biomes())
+    let mut chunk = save::decode(named, context.assets.registry, context.res.biomes())
         .ok_or_else(|| fail("native full decoder refused"))?;
     save::load_light(tag, &mut chunk, LevelShape::OVERWORLD.sky_light);
     require(
@@ -1046,12 +1129,12 @@ pub(in crate::game) fn validate_column(
     )?;
     // Palettes/indices were independently checked above. A fresh native re-encode
     // also proves native decoding did not silently drop a supported section value.
-    let tables = save::SaveTables::new(&game.pack.assets);
+    let tables = save::SaveTables::new(&context.assets);
     let tables = tag.get("Heightmaps").is_some().then_some(&tables);
     let encoded = save::encode_with(
         &chunk,
-        game.pack.assets.registry,
-        game.res.biomes(),
+        context.assets.registry,
+        context.res.biomes(),
         tables,
         LevelShape::OVERWORLD,
     );
@@ -1080,6 +1163,13 @@ pub(in crate::game) fn validate_column(
     Ok(chunk)
 }
 fn columns(game: &Game<'_>, root: &Path, clock: i64) -> SResult<BTreeMap<(i32, i32), Arc<Chunk>>> {
+    columns_context(&SessionValidationContext::from_game(game), root, clock)
+}
+fn columns_context(
+    context: &SessionValidationContext,
+    root: &Path,
+    clock: i64,
+) -> SResult<BTreeMap<(i32, i32), Arc<Chunk>>> {
     let inventory = tree(root, &["session.lock"])?;
     let mut result = BTreeMap::new();
     for row in &inventory.files {
@@ -1117,7 +1207,7 @@ fn columns(game: &Game<'_>, root: &Path, clock: i64) -> SResult<BTreeMap<(i32, i
                     .decode(&record.compressed, STRUCTURED_LIMIT),
             )?;
             let named = raw_nbt(&raw)?;
-            let chunk = validate_column(game, &named, at, clock)?;
+            let chunk = validate_column_context(context, &named, at, clock)?;
             require(
                 result.insert(at, Arc::new(chunk)).is_none(),
                 "duplicate native column",
@@ -1131,9 +1221,14 @@ fn columns(game: &Game<'_>, root: &Path, clock: i64) -> SResult<BTreeMap<(i32, i
     Ok(result)
 }
 fn binding(game: &Game<'_>, frame: &SessionCounter) -> SResult<NativeBinding> {
-    let catalog = game
-        .options
-        .mod_packages
+    binding_context(&SessionValidationContext::from_game(game), frame)
+}
+fn binding_context(
+    context: &SessionValidationContext,
+    frame: &SessionCounter,
+) -> SResult<NativeBinding> {
+    let catalog = context
+        .packages
         .catalog()
         .ok_or_else(|| fail("captured package catalog missing"))?;
     let mut matches = catalog
@@ -1148,7 +1243,7 @@ fn binding(game: &Game<'_>, frame: &SessionCounter) -> SResult<NativeBinding> {
         let binding = checked(NativeBinding::from_registered_guest_prepared(
             prepared,
             &frame.type_id,
-            game.pack.assets.registry,
+            context.assets.registry,
         ))?;
         let identity = binding
             .package_identity()
@@ -1165,12 +1260,12 @@ fn binding(game: &Game<'_>, frame: &SessionCounter) -> SResult<NativeBinding> {
     }
     let binding = checked(match checked(frame.binding_profile())? {
         NativeBindingProfile::LegacyIron => {
-            NativeBinding::from_prepared(prepared, &frame.type_id, game.pack.assets.registry)
+            NativeBinding::from_prepared(prepared, &frame.type_id, context.assets.registry)
         }
         NativeBindingProfile::RegisteredCube => NativeBinding::from_registered_prepared(
             prepared,
             &frame.type_id,
-            game.pack.assets.registry,
+            context.assets.registry,
         ),
     })?;
     let package = binding
@@ -1411,6 +1506,17 @@ fn player_rows(
     root: &Path,
     descriptors: &[PlayerDescriptor],
 ) -> SResult<Vec<SessionPlayerRow>> {
+    player_rows_context(
+        &SessionValidationContext::from_game(game),
+        root,
+        descriptors,
+    )
+}
+fn player_rows_context(
+    context: &SessionValidationContext,
+    root: &Path,
+    descriptors: &[PlayerDescriptor],
+) -> SResult<Vec<SessionPlayerRow>> {
     require(descriptors.len() <= NODES, "participant structured bound")?;
     let mut profiles = BTreeSet::new();
     let mut records = BTreeSet::new();
@@ -1458,8 +1564,8 @@ fn player_rows(
             )?,
             STRUCTURED_LIMIT,
         )?;
-        validate_player_items(game, &player)?;
-        validate_player_json(game, &advancements, &stats)?;
+        validate_player_items_context(context, &player)?;
+        validate_player_json_context(context, &advancements, &stats)?;
         rows.push(SessionPlayerRow {
             conn: 0,
             profile_uuid,
@@ -1571,6 +1677,23 @@ fn verify_image(
     expected_target: &CounterTarget,
     expected_type: &str,
 ) -> SResult<Verified> {
+    verify_image_context(
+        &SessionValidationContext::from_game(game),
+        root,
+        epoch,
+        expected_world,
+        expected_target,
+        expected_type,
+    )
+}
+fn verify_image_context(
+    context: &SessionValidationContext,
+    root: &Path,
+    epoch: u64,
+    expected_world: WorldId,
+    expected_target: &CounterTarget,
+    expected_type: &str,
+) -> SResult<Verified> {
     let manifest: Manifest = json(
         &read(&root.join("manifest.json"), MANIFEST_LIMIT)?,
         MANIFEST_LIMIT,
@@ -1593,7 +1716,7 @@ fn verify_image(
     )?;
     let world = root.join("world");
     identity(&world, expected_world)?;
-    checked(game.options.mod_packages.check_world(&world))?;
+    checked(context.packages.check_world(&world))?;
     // Require actual bounded pins even when an empty package setup would otherwise
     // let `check_world` accept their absence.
     let _: Value = json(&read(&world.join(PIN), 64 << 10)?, 64 << 10)?;
@@ -1604,24 +1727,24 @@ fn verify_image(
         &counter_bytes,
         manifest.kind == GUEST_KIND,
     ))?;
-    let _ = binding(game, &counter)?;
+    let _ = binding_context(context, &counter)?;
     let slot_bytes = read(&root.join(SLOT), STRUCTURED_LIMIT)?;
     let _ = raw_nbt(&slot_bytes)?;
-    let slot = checked(counter.decode_slot(&slot_bytes, game.res.items()))?;
+    let slot = checked(counter.decode_slot(&slot_bytes, context.res.items()))?;
     correlate(&manifest, &counter, &slot)?;
-    let rows = player_rows(game, root, &manifest.players)?;
+    let rows = player_rows_context(context, root, &manifest.players)?;
     sidecars(&world, &manifest.players)?;
     let raids = raid_metadata(&world)?;
     validate_native_local_player(&world, &manifest.players)?;
-    let columns = columns(game, &world, manifest.saved_clock)?;
+    let columns = columns_context(context, &world, manifest.saved_clock)?;
     for coordinate in &manifest.resident {
         require(
             columns.contains_key(coordinate),
             "resident native full record missing",
         )?;
     }
-    let items = read_session_checkpoint_items(
-        game,
+    let items = items::read_session_checkpoint_items_context(
+        context,
         &world,
         &manifest.resident.iter().copied().collect(),
         &columns,
@@ -1634,14 +1757,13 @@ fn verify_image(
     let target = columns
         .get(&at)
         .ok_or_else(|| fail("target full record absent"))?;
-    let binding = binding(game, &counter)?;
+    let binding = binding_context(context, &counter)?;
     let current = target.block(
         expected_target.position[0] & 15,
         expected_target.position[1],
         expected_target.position[2] & 15,
     );
-    let actual = game
-        .pack
+    let actual = context
         .assets
         .registry
         .state(current)
@@ -1734,6 +1856,1532 @@ fn same_players(a: &[SessionPlayerRow], b: &[SessionPlayerRow]) -> bool {
                 })
         })
 }
+
+/// NativeWorld has a separate bounded readability profile. This is not the D
+/// image profile, an entity decoder, or a claim of arbitrary-world semantics.
+struct NativeReadLevel {
+    dimension: Dim,
+    save: Arc<save::SaveDir>,
+    prefix: String,
+    shape: LevelShape,
+}
+pub(in crate::game) struct NativeWorldReadContext {
+    association: Arc<()>,
+    validation: SessionValidationContext,
+    root: PathBuf,
+    active: Dim,
+    had_lock: bool,
+    expected_world: Option<WorldId>,
+    levels: Vec<NativeReadLevel>,
+}
+#[derive(Clone)]
+pub(in crate::game) struct NativeWorldReadInput {
+    context: Arc<NativeWorldReadContext>,
+    until: Instant,
+    #[cfg(all(
+        test,
+        feature = "paired-packages",
+        feature = "native-writer-test-control",
+        debug_assertions
+    ))]
+    control: Option<CoherentImageTestControl>,
+}
+pub(in crate::game) struct NativeWorldReadPost {
+    context: Arc<NativeWorldReadContext>,
+    inventory: Tree,
+    current_entities: BTreeMap<[i32; 4], (Dim, (i32, i32))>,
+    embedded_entities: std::collections::HashSet<[i32; 4]>,
+    player_reserved: std::collections::HashSet<[i32; 4]>,
+}
+impl NativeWorldReadContext {
+    pub(in crate::game) fn game_matches(
+        &self,
+        game: &Game<'_>,
+        levels: &super::RetainedNativeLevels,
+    ) -> SResult<()> {
+        checked(game.preflight_native_membership(levels))?;
+        require(
+            Arc::ptr_eq(&self.association, &levels.association)
+                && self.root == game.world_root
+                && self.active == game.dim
+                && self.had_lock == game.session_lock.is_some()
+                && self.expected_world
+                    == game
+                        .session_lock
+                        .as_ref()
+                        .and_then(|lock| lock.expected_world())
+                        .copied()
+                && Arc::ptr_eq(&self.validation.res, &game.res)
+                && Arc::ptr_eq(&self.validation.assets, &game.pack.assets)
+                && match (
+                    self.validation.packages.catalog(),
+                    game.options.mod_packages.catalog(),
+                ) {
+                    (Some(before), Some(now)) => std::ptr::eq(before, now),
+                    (None, None) => true,
+                    _ => false,
+                },
+            "native read original allocation, identity or resource context changed",
+        )?;
+        require(
+            self.levels.len() == levels.levels.len()
+                && self.levels.iter().zip(&levels.levels).all(|(a, b)| {
+                    a.dimension == b.dimension
+                        && Arc::ptr_eq(&a.save, &b.save)
+                        && a.shape == b.save.shape
+                        && b.save.root == save::dimension_dir(&self.root, b.dimension.id())
+                }),
+            "native read fixed dimensions or SaveDir changed",
+        )
+    }
+    pub(in crate::game) fn read_preflight_input(
+        self: &Arc<Self>,
+        until: Instant,
+    ) -> NativeWorldReadInput {
+        NativeWorldReadInput {
+            context: self.clone(),
+            until,
+            #[cfg(all(
+                test,
+                feature = "paired-packages",
+                feature = "native-writer-test-control",
+                debug_assertions
+            ))]
+            control: None,
+        }
+    }
+}
+impl NativeWorldReadPost {
+    pub(in crate::game) fn reserved_uuids(&self) -> std::collections::HashSet<[i32; 4]> {
+        native_uuid_reservoir(&self.current_entities, &self.player_reserved)
+    }
+    pub(in crate::game) fn preflight_final_payloads(
+        &self,
+        payloads: &super::RetainedNativePayloads,
+    ) -> SResult<()> {
+        require(
+            Arc::ptr_eq(&self.context.association, &payloads.association)
+                && payloads.levels().len() == self.context.levels.len()
+                && payloads
+                    .levels()
+                    .iter()
+                    .zip(&self.context.levels)
+                    .all(|(a, b)| a.dimension() == b.dimension && Arc::ptr_eq(a.save(), &b.save)),
+            "native source witness/final payload allocation association differs",
+        )?;
+        let covered: std::collections::HashSet<_> =
+            payloads.overwritten_entity_rows().into_iter().collect();
+        let covered_columns: std::collections::HashSet<_> = payloads
+            .levels()
+            .iter()
+            .flat_map(|level| {
+                level
+                    .chunks()
+                    .iter()
+                    .map(move |chunk| (level.dimension(), (chunk.x, chunk.z)))
+            })
+            .collect();
+        native_final_uuid_coverage(
+            &self.current_entities,
+            &self.embedded_entities,
+            &self.player_reserved,
+            &covered,
+            &covered_columns,
+            &checked(payloads.entity_uuid_rows())?,
+        )
+    }
+}
+fn native_uuid_reservoir(
+    current: &BTreeMap<[i32; 4], (Dim, (i32, i32))>,
+    players: &std::collections::HashSet<[i32; 4]>,
+) -> std::collections::HashSet<[i32; 4]> {
+    current
+        .keys()
+        .copied()
+        .chain(players.iter().copied())
+        .collect()
+}
+fn native_final_uuid_coverage(
+    current: &BTreeMap<[i32; 4], (Dim, (i32, i32))>,
+    embedded: &std::collections::HashSet<[i32; 4]>,
+    players: &std::collections::HashSet<[i32; 4]>,
+    covered: &std::collections::HashSet<(Dim, (i32, i32))>,
+    covered_columns: &std::collections::HashSet<(Dim, (i32, i32))>,
+    final_rows: &[(Dim, (i32, i32), [i32; 4])],
+) -> SResult<()> {
+    let mut seen = std::collections::HashSet::new();
+    for (_, _, uuid) in final_rows {
+        require(seen.insert(*uuid), "duplicate final native entity UUID")?;
+        require(
+            !players.contains(uuid),
+            "final entity UUID collides with native player identity",
+        )?;
+        if let Some(old_row) = current.get(uuid) {
+            // Full native column encoding removes its embedded legacy list;
+            // rewriting only entities/ at that position does not remove it.
+            let overwritten = if embedded.contains(uuid) {
+                covered_columns.contains(old_row)
+            } else {
+                covered.contains(old_row)
+            };
+            require(
+                overwritten,
+                "final entity UUID collides with untouched original native entity row",
+            )?;
+        }
+    }
+    Ok(())
+}
+impl Game<'_> {
+    pub(in crate::game) fn prepare_native_world_read_context(
+        &self,
+        levels: &super::RetainedNativeLevels,
+    ) -> SResult<Arc<NativeWorldReadContext>> {
+        checked(self.preflight_native_membership(levels))?;
+        require(
+            levels.error.is_none()
+                && !levels.prepared
+                && levels.levels.iter().all(|level| level.sealed.is_some()),
+            "native old-source capture requires actual sealed original levels before identities",
+        )?;
+        let mut fixed = Vec::new();
+        for level in &levels.levels {
+            let prefix = checked(level.save.root.strip_prefix(&self.world_root))?
+                .to_str()
+                .ok_or_else(|| fail("native dimension root is not UTF8"))?
+                .replace('\\', "/");
+            relative(&prefix)?;
+            fixed.push(NativeReadLevel {
+                dimension: level.dimension,
+                save: level.save.clone(),
+                prefix,
+                shape: level.save.shape,
+            });
+        }
+        Ok(Arc::new(NativeWorldReadContext {
+            association: levels.association.clone(),
+            validation: self.capture_native_validation_context(),
+            root: self.world_root.clone(),
+            active: self.dim,
+            had_lock: self.session_lock.is_some(),
+            expected_world: self
+                .session_lock
+                .as_ref()
+                .and_then(|lock| lock.expected_world())
+                .copied(),
+            levels: fixed,
+        }))
+    }
+    pub(in crate::game) fn preflight_native_world_read(
+        &self,
+        context: &Arc<NativeWorldReadContext>,
+        levels: &super::RetainedNativeLevels,
+        post: &NativeWorldReadPost,
+    ) -> SResult<()> {
+        require(
+            Arc::ptr_eq(context, &post.context),
+            "foreign native source read witness",
+        )?;
+        let _ = &post.inventory;
+        context.game_matches(self, levels)
+    }
+}
+fn native_uuid(tag: Option<&Tag>) -> SResult<Option<[i32; 4]>> {
+    match tag {
+        None => Ok(None),
+        Some(Tag::IntArray(uuid)) => Ok(Some(checked(uuid.as_slice().try_into())?)),
+        _ => Err(fail("native UUID is not an exact four-int array")),
+    }
+}
+fn native_uuid_name(name: &str) -> SResult<[i32; 4]> {
+    let compact = name.replace('-', "");
+    require(
+        compact.len() == 32 && compact.bytes().all(|b| b.is_ascii_hexdigit()),
+        "native player UUID filename",
+    )?;
+    let bytes = checked(u128::from_str_radix(&compact, 16))?.to_be_bytes();
+    Ok(std::array::from_fn(|i| {
+        i32::from_be_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap())
+    }))
+}
+fn native_version(tag: &Tag) -> SResult<()> {
+    require(
+        matches!(tag.get("DataVersion"), None | Some(Tag::Int(_))),
+        "native DataVersion type",
+    )
+}
+fn native_player_record(
+    name: &str,
+    tag: &Tag,
+    current: bool,
+    reserved: &mut std::collections::HashSet<[i32; 4]>,
+    current_records: &mut std::collections::HashSet<[i32; 4]>,
+) -> SResult<()> {
+    let uuid_name = name
+        .strip_suffix(".dat")
+        .ok_or_else(|| fail("native player filename"))?;
+    let named_uuid = native_uuid_name(uuid_name)?;
+    if current {
+        reserved.insert(named_uuid);
+    }
+    if let Some(uuid) = native_uuid(tag.get("UUID"))?
+        && current
+    {
+        require(
+            current_records.insert(uuid),
+            "duplicate current native player record UUID",
+        )?;
+        reserved.insert(uuid);
+    }
+    Ok(())
+}
+fn native_dat(bytes: &[u8]) -> SResult<Tag> {
+    let codec = if bytes.starts_with(&[0x1f, 0x8b]) {
+        Compression::Gzip
+    } else {
+        Compression::None
+    };
+    Ok(raw_native_nbt(&checked(codec.decode(bytes, STRUCTURED_LIMIT))?)?.tag)
+}
+fn native_entity_uuids(
+    tags: &[Tag],
+    row: (Dim, (i32, i32)),
+    current: &mut BTreeMap<[i32; 4], (Dim, (i32, i32))>,
+) -> SResult<()> {
+    let mut work: Vec<_> = tags.iter().collect();
+    while let Some(tag) = work.pop() {
+        require(
+            matches!(tag, Tag::Compound(_)),
+            "native entity/passenger is not a compound",
+        )?;
+        if let Some(uuid) = native_uuid(tag.get("UUID"))? {
+            require(
+                current.insert(uuid, row).is_none(),
+                "duplicate current native entity UUID",
+            )?;
+        }
+        if let Some(passengers) = tag.get("Passengers") {
+            work.extend(list(Some(passengers))?);
+        }
+    }
+    Ok(())
+}
+fn native_column_envelope(tag: &Tag, at: (i32, i32), shape: LevelShape) -> SResult<()> {
+    native_version(tag)?;
+    require(
+        tag.get("xPos") == Some(&Tag::Int(at.0)) && tag.get("zPos") == Some(&Tag::Int(at.1)),
+        "native column/region coordinates differ",
+    )?;
+    require(
+        matches!(tag.get("Status"), Some(Tag::String(_))),
+        "native column Status type",
+    )?;
+    if let Some(y) = tag.get("yPos") {
+        require(
+            y == &Tag::Int(shape.min_y >> 4),
+            "native column dimension height differs",
+        )?;
+    }
+    let mut ys = BTreeSet::new();
+    for section in list(tag.get("sections"))? {
+        let Some(Tag::Byte(y)) = section.get("Y") else {
+            return Err(fail("native section Y type"));
+        };
+        require(
+            i32::from(*y) >= shape.min_y >> 4
+                && i32::from(*y) < (shape.min_y + shape.height) >> 4
+                && ys.insert(*y),
+            "native section dimension range/duplicate",
+        )?;
+        for key in ["block_states", "biomes"] {
+            if let Some(palette) = section.get(key) {
+                require(
+                    matches!(palette, Tag::Compound(_)),
+                    "native palette envelope type",
+                )?;
+                let _ = list(palette.get("palette"))?;
+                require(
+                    matches!(palette.get("data"), None | Some(Tag::LongArray(_))),
+                    "native palette storage type",
+                )?;
+            }
+        }
+    }
+    for key in ["block_entities", "entities"] {
+        if let Some(entries) = tag.get(key) {
+            require(
+                list(Some(entries))?
+                    .iter()
+                    .all(|entry| matches!(entry, Tag::Compound(_))),
+                "native embedded owner list type",
+            )?;
+        }
+    }
+    Ok(())
+}
+fn native_poi_envelope(tag: &Tag, at: (i32, i32), shape: LevelShape) -> SResult<()> {
+    native_version(tag)?;
+    let Some(Tag::Compound(sections)) = tag.get("Sections") else {
+        return Err(fail("native POI Sections type"));
+    };
+    for (key, section) in sections {
+        let y: i32 = checked(checked(key.to_string())?.parse())?;
+        require(
+            y >= shape.min_y >> 4
+                && y < (shape.min_y + shape.height) >> 4
+                && matches!(section, Tag::Compound(_)),
+            "native POI section range/type",
+        )?;
+        if let Some(records) = section.get("Records") {
+            for record in list(Some(records))? {
+                require(
+                    matches!(record, Tag::Compound(_))
+                        && matches!(record.get("pos"), Some(Tag::IntArray(pos)) if pos.len() == 3)
+                        && matches!(record.get("type"), Some(Tag::String(_)))
+                        && matches!(record.get("free_tickets"), None | Some(Tag::Int(_))),
+                    "native POI record envelope",
+                )?;
+                if let Some(Tag::IntArray(pos)) = record.get("pos") {
+                    require(
+                        pos[0].div_euclid(16) == at.0
+                            && pos[2].div_euclid(16) == at.1
+                            && pos[1].div_euclid(16) == y
+                            && pos[1] >= shape.min_y
+                            && pos[1] < shape.min_y + shape.height,
+                        "native POI record column/section/height differs",
+                    )?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+impl NativeWorldReadInput {
+    #[cfg(all(
+        test,
+        feature = "paired-packages",
+        feature = "native-writer-test-control",
+        debug_assertions
+    ))]
+    pub(in crate::game) fn with_test_control(mut self, control: CoherentImageTestControl) -> Self {
+        self.control = Some(control);
+        self
+    }
+    pub(in crate::game) fn run(&self) -> SResult<NativeWorldReadPost> {
+        deadline(self.until)?;
+        #[cfg(all(
+            test,
+            feature = "paired-packages",
+            feature = "native-writer-test-control",
+            debug_assertions
+        ))]
+        if let Some(control) = &self.control {
+            control.visit(CoherentImageTestPoint::Read)?;
+        }
+        let context = &self.context;
+        let root = directory(&context.root)?;
+        if let Some(world) = context.expected_world {
+            identity(&root, world)?;
+        }
+        checked(context.validation.packages.check_world(&root))?;
+        let inventory = tree(&root, &["session.lock"])?;
+        let mut current_entities = BTreeMap::new();
+        let mut embedded_entities = std::collections::HashSet::new();
+        let mut player_reserved = std::collections::HashSet::new();
+        let mut current_player_records = std::collections::HashSet::new();
+        for member_row in &inventory.files {
+            deadline(self.until)?;
+            let name = &member_row.path;
+            let base = name.strip_suffix("_old").unwrap_or(name);
+            let current = base == name;
+            let player = base
+                .strip_prefix("players/data/")
+                .or_else(|| base.strip_prefix("playerdata/"));
+            let saved_data = (base.starts_with("data/minecraft/")
+                || ["overworld", "the_nether", "the_end"]
+                    .iter()
+                    .any(|dimension| {
+                        base.starts_with(&format!(
+                            "dimensions/minecraft/{dimension}/data/minecraft/"
+                        ))
+                    }))
+                && base.ends_with(".dat");
+            if base == "level.dat"
+                || player.is_some_and(|p| p.ends_with(".dat"))
+                || saved_data
+                || base == "data/horizon_portal_arrivals.dat"
+            {
+                let tag = native_dat(&read(&root.join(name), STRUCTURED_LIMIT)?)?;
+                native_version(&tag)?;
+                if base == "level.dat" {
+                    let Some(Tag::Compound(data)) = tag.get("Data") else {
+                        return Err(fail("native Level Data envelope"));
+                    };
+                    if let Some(uuid) = native_uuid(data.get(&"singleplayer_uuid".into()))?
+                        && current
+                    {
+                        player_reserved.insert(uuid);
+                    }
+                    if let Some(player) = data.get(&"Player".into()) {
+                        require(
+                            matches!(player, Tag::Compound(_)),
+                            "native legacy player envelope",
+                        )?;
+                        if let Some(uuid) = native_uuid(player.get("UUID"))?
+                            && current
+                        {
+                            player_reserved.insert(uuid);
+                        }
+                    }
+                } else if let Some(player) = player {
+                    native_player_record(
+                        player,
+                        &tag,
+                        current,
+                        &mut player_reserved,
+                        &mut current_player_records,
+                    )?;
+                } else if saved_data {
+                    require(
+                        matches!(tag.get("data"), Some(Tag::Compound(_))),
+                        "native saved-data envelope",
+                    )?;
+                } else {
+                    let _ = list(tag.get("arrivals"))?;
+                }
+            } else if base == "horizon-world-identity.json"
+                || base == PIN
+                || ((base.starts_with("players/advancements/")
+                    || base.starts_with("players/stats/"))
+                    && base.ends_with(".json"))
+            {
+                let bytes = read(&root.join(name), STRUCTURED_LIMIT)?;
+                let _: Value = json(&bytes, STRUCTURED_LIMIT)?;
+                if base == "horizon-world-identity.json" {
+                    let record: Identity = json(&bytes, 1024)?;
+                    require(record.format == 1, "native identity version")?;
+                }
+            }
+            for level in &context.levels {
+                let Some(within) = name.strip_prefix(&format!("{}/", level.prefix)) else {
+                    continue;
+                };
+                let Some((folder, filename)) = within.split_once('/') else {
+                    continue;
+                };
+                if !matches!(folder, "region" | "entities" | "poi") {
+                    continue;
+                }
+                if !filename.ends_with(".mca") {
+                    require(
+                        !filename.contains(".mca")
+                            && !filename.ends_with(".mcc")
+                            && !filename.starts_with("r."),
+                        "unsupported native region backup/external naming",
+                    )?;
+                    continue;
+                }
+                require(!filename.contains('/'), "nested native region member")?;
+                let path = root.join(name);
+                let position = checked(horizon_world::region::position_from_path(&path))?;
+                require(
+                    filename == format!("r.{}.{}.mca", position.x, position.z),
+                    "noncanonical native region filename",
+                )?;
+                for coordinate in [position.x, position.z] {
+                    require(
+                        coordinate
+                            .checked_mul(32)
+                            .and_then(|v| v.checked_add(31))
+                            .is_some(),
+                        "native region coordinate overflow",
+                    )?;
+                }
+                let bytes = read(&path, FILE_LIMIT)?;
+                let entries = checked(save::retained_region_locations(&bytes))?;
+                let mut region = checked(RegionFile::open(&path))?;
+                let actual: BTreeSet<_> = region.chunks().map(|(p, _)| (p.x, p.z)).collect();
+                let expected: BTreeSet<_> = entries
+                    .iter()
+                    .map(|i| {
+                        (
+                            position.x * 32 + (i % 32) as i32,
+                            position.z * 32 + (i / 32) as i32,
+                        )
+                    })
+                    .collect();
+                require(
+                    actual == expected,
+                    "native region header/enumeration differs",
+                )?;
+                for at in expected {
+                    deadline(self.until)?;
+                    let record = checked(region.read(ChunkPos::new(at.0, at.1)))?
+                        .ok_or_else(|| fail("native region slot vanished"))?;
+                    let named = raw_native_nbt(&items::native_record_bytes(&record)?)?;
+                    match folder {
+                        "region" => {
+                            native_column_envelope(&named.tag, at, level.shape)?;
+                            if let Some(tags) = named.tag.get("entities") {
+                                let mut embedded = BTreeMap::new();
+                                native_entity_uuids(
+                                    list(Some(tags))?,
+                                    (level.dimension, at),
+                                    &mut embedded,
+                                )?;
+                                for (uuid, row) in embedded {
+                                    require(
+                                        current_entities.insert(uuid, row).is_none(),
+                                        "duplicate embedded/sidecar current entity UUID",
+                                    )?;
+                                    embedded_entities.insert(uuid);
+                                }
+                            }
+                        }
+                        "entities" => {
+                            native_version(&named.tag)?;
+                            require(
+                                named.tag.get("Position") == Some(&Tag::IntArray(vec![at.0, at.1])),
+                                "native entity sidecar Position differs",
+                            )?;
+                            native_entity_uuids(
+                                list(named.tag.get("Entities"))?,
+                                (level.dimension, at),
+                                &mut current_entities,
+                            )?;
+                        }
+                        _ => native_poi_envelope(&named.tag, at, level.shape)?,
+                    }
+                }
+                require(
+                    member(&root, name.clone())? == *member_row,
+                    "native region changed while scanning",
+                )?;
+            }
+        }
+        require(
+            current_entities
+                .keys()
+                .all(|uuid| !player_reserved.contains(uuid)),
+            "current native entity/player UUID collision",
+        )?;
+        require(
+            tree(&root, &["session.lock"])? == inventory,
+            "native source inventory changed while scanning",
+        )?;
+        deadline(self.until)?;
+        Ok(NativeWorldReadPost {
+            context: context.clone(),
+            inventory,
+            current_entities,
+            embedded_entities,
+            player_reserved,
+        })
+    }
+}
+
+/// Captured before identity preparation. Construction proves actual CPU owners;
+/// its worker performs the complete old-source validation before final writes.
+pub(in crate::game) struct CoherentImageContext {
+    validation: SessionValidationContext,
+    save: Arc<save::SaveDir>,
+    source_root: PathBuf,
+    archive_root: PathBuf,
+    world: WorldId,
+    counter: SessionCounter,
+    slot: Vec<u8>,
+    roster: lan::ParticipantRoster,
+    players: Vec<SessionPlayerRow>,
+    residents: Vec<(i32, i32)>,
+    live_raids: Option<Tag>,
+    local_uuid: Option<[i32; 4]>,
+    clocks: (i64, i64),
+    random: u64,
+    entity_head: u32,
+}
+#[derive(Clone)]
+pub(in crate::game) struct CoherentImageReadInput {
+    context: Arc<CoherentImageContext>,
+    until: Instant,
+    #[cfg(all(
+        test,
+        feature = "paired-packages",
+        feature = "native-writer-test-control",
+        debug_assertions
+    ))]
+    control: Option<CoherentImageTestControl>,
+}
+pub(in crate::game) struct CoherentImageReadPost {
+    context: Arc<CoherentImageContext>,
+    source: PathBuf,
+    archive: PathBuf,
+    raids: Option<Tag>,
+    local_uuid: [i32; 4],
+    next_epoch: u64,
+    old_inventory: Tree,
+    old_item_uuids: Vec<[i32; 4]>,
+}
+impl CoherentImageReadPost {
+    pub(in crate::game) fn next_epoch(&self) -> u64 {
+        self.next_epoch
+    }
+    pub(in crate::game) fn reserved_item_identities(&self) -> Vec<[i32; 4]> {
+        player_item_reserved_identities(&self.context.players)
+            .into_iter()
+            .chain(self.old_item_uuids.iter().copied())
+            .collect()
+    }
+    pub(in crate::game) fn reserved_uuids(&self) -> std::collections::HashSet<[i32; 4]> {
+        self.reserved_item_identities().into_iter().collect()
+    }
+}
+impl CoherentImageContext {
+    pub(in crate::game) fn read_preflight_input(
+        self: &Arc<Self>,
+        until: Instant,
+    ) -> CoherentImageReadInput {
+        CoherentImageReadInput {
+            context: self.clone(),
+            until,
+            #[cfg(all(
+                test,
+                feature = "paired-packages",
+                feature = "native-writer-test-control",
+                debug_assertions
+            ))]
+            control: None,
+        }
+    }
+    pub(in crate::game) fn game_matches(&self, game: &Game<'_>) -> SResult<()> {
+        self.matches_cpu(game)
+    }
+    fn matches_cpu(&self, game: &Game<'_>) -> SResult<()> {
+        require(
+            self.validation.same_owners(game),
+            "coherent image native resource owners changed",
+        )?;
+        require(
+            Arc::ptr_eq(&self.save, &game.save),
+            "coherent image native writer allocation changed",
+        )?;
+        require(
+            game.session_context_cpu()? == self.world
+                && game.world_root == self.source_root
+                && game.level.player_uuid == self.local_uuid
+                && (game.world.game_time, game.world.day_time) == self.clocks
+                && game.world.random.state() == self.random
+                && game.next_entity == self.entity_head
+                && game.world.chunks.keys().copied().collect::<Vec<_>>() == self.residents
+                && checked(SessionCounter::from_world(&game.world))? == self.counter
+                && checked(
+                    self.counter
+                        .slot_bytes(&game.world, self.validation.res.items()),
+                )? == self.slot
+                && checked(game.session_checkpoint_raids())? == self.live_raids,
+            "coherent image original frame, native route or owner state changed",
+        )?;
+        checked(
+            game.preflight_checkpoint_participants(&self.roster)
+                .map_err(|e| format!("{e:?}")),
+        )?;
+        let players = checked(game.project_session_participant_rows(&self.roster))?;
+        require(
+            same_players(&self.players, &players)
+                && self.players.iter().all(|a| {
+                    players
+                        .iter()
+                        .any(|b| a.profile_uuid == b.profile_uuid && a.conn == b.conn)
+                }),
+            "coherent image original participant state changed",
+        )?;
+        checked(game.inspect_session_checkpoint_owners())
+    }
+}
+impl CoherentImageReadInput {
+    #[cfg(all(
+        test,
+        feature = "paired-packages",
+        feature = "native-writer-test-control",
+        debug_assertions
+    ))]
+    pub(in crate::game) fn with_test_control(mut self, control: CoherentImageTestControl) -> Self {
+        self.control = Some(control);
+        self
+    }
+    pub(in crate::game) fn run(&self) -> SResult<CoherentImageReadPost> {
+        deadline(self.until)?;
+        #[cfg(all(
+            test,
+            feature = "paired-packages",
+            feature = "native-writer-test-control",
+            debug_assertions
+        ))]
+        if let Some(control) = &self.control {
+            control.visit(CoherentImageTestPoint::Read)?;
+        }
+        let context = &self.context;
+        let source = directory(&context.source_root)?;
+        let archive = directory(&context.archive_root)?;
+        require(
+            !archive.starts_with(&source) && !source.starts_with(&archive),
+            "overlapping archive/world",
+        )?;
+        identity(&source, context.world)?;
+        checked(context.validation.packages.check_world(&source))?;
+        let _: Value = json(&read(&source.join(PIN), 64 << 10)?, 64 << 10)?;
+        let old_inventory = tree(&source, &["session.lock"])?;
+        let old_columns = columns_context(&context.validation, &source, context.clocks.0)?;
+        let old_items = items::read_session_checkpoint_items_context(
+            &context.validation,
+            &source,
+            &context.residents.iter().copied().collect(),
+            &old_columns,
+        )?;
+        check_item_player_identities(&old_items.projection, &context.players)?;
+        let descriptors = context.players.iter().map(descriptor).collect::<Vec<_>>();
+        // Validate every original sidecar, including native backups, before a
+        // later final save can rotate a malformed predecessor out of view.
+        sidecars(&source, &descriptors)?;
+        let local_uuid = validate_native_local_player(&source, &descriptors)?;
+        require(
+            context.local_uuid == Some(local_uuid),
+            "live/native singleplayer UUID mismatch",
+        )?;
+        // Validate current and backup even if the live set supplies the effective
+        // value: a native rotation must not hide malformed old metadata.
+        let raids = context.live_raids.clone().or(raid_metadata(&source)?);
+        require(
+            tree(&source, &["session.lock"])? == old_inventory,
+            "old source changed during coherent read preflight",
+        )?;
+        deadline(self.until)?;
+        let next_epoch = next_session_checkpoint_epoch(&archive)?;
+        Ok(CoherentImageReadPost {
+            context: context.clone(),
+            source,
+            archive,
+            raids,
+            local_uuid,
+            next_epoch,
+            old_inventory,
+            old_item_uuids: old_items.projection.rows.keys().copied().collect(),
+        })
+    }
+}
+
+struct CoherentImageProjection {
+    context: Arc<CoherentImageContext>,
+    source: PathBuf,
+    archive: PathBuf,
+    minimum_epoch: u64,
+    last_attempt_epoch: std::sync::atomic::AtomicU64,
+    snapshot: Snapshot,
+}
+#[derive(Clone)]
+pub(in crate::game) struct CoherentImageBuildInput {
+    projection: Arc<CoherentImageProjection>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(in crate::game) enum CoherentImagePhase {
+    Prepared,
+    Copying,
+    Copied,
+    Overlaid,
+    MembersSynced,
+    ManifestCompleted,
+    Verified,
+    BeforePromotion,
+    Promoted,
+    ParentSynced,
+}
+/// Original owner retains this before dispatch and before every filesystem
+/// effect. Atomic observations never acquire a worker-held progress mutex.
+pub(in crate::game) struct CoherentImageAttempt {
+    association: Arc<()>,
+    projection: Arc<CoherentImageProjection>,
+    epoch: u64,
+    pending: PathBuf,
+    published: PathBuf,
+    until: Instant,
+    phase: std::sync::atomic::AtomicU8,
+    uncertain: std::sync::atomic::AtomicBool,
+    started: std::sync::atomic::AtomicBool,
+    #[cfg(all(
+        test,
+        feature = "paired-packages",
+        feature = "native-writer-test-control",
+        debug_assertions
+    ))]
+    control: Option<CoherentImageTestControl>,
+}
+impl CoherentImageAttempt {
+    pub(in crate::game) fn epoch(&self) -> u64 {
+        self.epoch
+    }
+    pub(in crate::game) fn pending(&self) -> &Path {
+        &self.pending
+    }
+    pub(in crate::game) fn published(&self) -> &Path {
+        &self.published
+    }
+    pub(in crate::game) fn publication(&self) -> Publication {
+        if self.uncertain.load(std::sync::atomic::Ordering::Acquire) {
+            Publication::Uncertain
+        } else {
+            Publication::NotPublished
+        }
+    }
+    pub(in crate::game) fn phase(&self) -> CoherentImagePhase {
+        use CoherentImagePhase as P;
+        match self.phase.load(std::sync::atomic::Ordering::Acquire) {
+            0 => P::Prepared,
+            1 => P::Copying,
+            2 => P::Copied,
+            3 => P::Overlaid,
+            4 => P::MembersSynced,
+            5 => P::ManifestCompleted,
+            6 => P::Verified,
+            7 => P::BeforePromotion,
+            8 => P::Promoted,
+            _ => P::ParentSynced,
+        }
+    }
+    fn advance(&self, phase: CoherentImagePhase) {
+        self.phase
+            .store(phase as u8, std::sync::atomic::Ordering::Release);
+    }
+}
+pub(in crate::game) struct CoherentImageWritten {
+    projection: Arc<CoherentImageProjection>,
+    association: Arc<()>,
+    receipt: CheckpointReceipt,
+}
+impl CoherentImageWritten {
+    pub(in crate::game) fn receipt(&self) -> &CheckpointReceipt {
+        &self.receipt
+    }
+}
+impl CoherentImageBuildInput {
+    pub(in crate::game) fn attempt(
+        &self,
+        epoch: u64,
+        until: Instant,
+    ) -> SResult<Arc<CoherentImageAttempt>> {
+        require(
+            epoch >= self.projection.minimum_epoch && epoch > 0,
+            "coherent image epoch precedes read preflight",
+        )?;
+        let mut previous = self
+            .projection
+            .last_attempt_epoch
+            .load(std::sync::atomic::Ordering::Acquire);
+        loop {
+            require(
+                epoch > previous,
+                "coherent image attempt epoch must strictly increase",
+            )?;
+            match self.projection.last_attempt_epoch.compare_exchange_weak(
+                previous,
+                epoch,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(observed) => previous = observed,
+            }
+        }
+        Ok(Arc::new(CoherentImageAttempt {
+            association: Arc::new(()),
+            projection: self.projection.clone(),
+            epoch,
+            pending: self
+                .projection
+                .archive
+                .join(format!(".pending-{epoch:020}")),
+            published: self.projection.archive.join(format!("epoch-{epoch:020}")),
+            until,
+            phase: std::sync::atomic::AtomicU8::new(CoherentImagePhase::Prepared as u8),
+            uncertain: std::sync::atomic::AtomicBool::new(false),
+            started: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(all(
+                test,
+                feature = "paired-packages",
+                feature = "native-writer-test-control",
+                debug_assertions
+            ))]
+            control: None,
+        }))
+    }
+    #[cfg(all(
+        test,
+        feature = "paired-packages",
+        feature = "native-writer-test-control",
+        debug_assertions
+    ))]
+    pub(in crate::game) fn attempt_with_test_control(
+        &self,
+        epoch: u64,
+        until: Instant,
+        control: CoherentImageTestControl,
+    ) -> SResult<Arc<CoherentImageAttempt>> {
+        let mut attempt = self.attempt(epoch, until)?;
+        Arc::get_mut(&mut attempt)
+            .expect("new private image attempt has one owner")
+            .control = Some(control);
+        Ok(attempt)
+    }
+    pub(in crate::game) fn build_verify_publish(
+        &self,
+        attempt: &CoherentImageAttempt,
+    ) -> SResult<CoherentImageWritten> {
+        let result = self.build_verify_publish_inner(attempt);
+        result.map_err(|mut error| {
+            error.publication = attempt.publication();
+            error
+        })
+    }
+    fn build_verify_publish_inner(
+        &self,
+        attempt: &CoherentImageAttempt,
+    ) -> SResult<CoherentImageWritten> {
+        use CoherentImagePhase as P;
+        require(
+            Arc::ptr_eq(&self.projection, &attempt.projection),
+            "foreign coherent image attempt",
+        )?;
+        deadline(attempt.until)?;
+        require(
+            !attempt
+                .started
+                .swap(true, std::sync::atomic::Ordering::AcqRel),
+            "coherent image attempt already started",
+        )?;
+        let projection = &self.projection;
+        let context = &projection.context;
+        let validation = &context.validation;
+        let before = &projection.snapshot;
+        let source = directory(&projection.source)?;
+        let archive = directory(&projection.archive)?;
+        require(
+            source == projection.source && archive == projection.archive,
+            "coherent image canonical route changed",
+        )?;
+        let minimum_epoch = next_session_checkpoint_epoch(&archive)?;
+        require(
+            attempt.epoch >= minimum_epoch,
+            "epoch must increase monotonically across published and pending artifacts",
+        )?;
+        require(
+            !attempt.pending.try_exists().map_err(fail)?
+                && !attempt.published.try_exists().map_err(fail)?,
+            "epoch path already exists",
+        )?;
+        identity(&source, context.world)?;
+        checked(validation.packages.check_world(&source))?;
+        let _: Value = json(&read(&source.join(PIN), 64 << 10)?, 64 << 10)?;
+        let saved_columns = columns_context(validation, &source, before.clocks.0)?;
+        let saved_items = items::read_session_checkpoint_items_context(
+            validation,
+            &source,
+            &before.residents.iter().copied().collect(),
+            &saved_columns,
+        )?;
+        require(
+            saved_items.projection == before.items,
+            "saved native item projection mismatch",
+        )?;
+        let source_inventory = tree(&source, &["session.lock"])?;
+        attempt.advance(P::Copying);
+        checked(fs::create_dir(&attempt.pending))?;
+        #[cfg(all(
+            test,
+            feature = "paired-packages",
+            feature = "native-writer-test-control",
+            debug_assertions
+        ))]
+        if let Some(control) = &attempt.control {
+            control.visit(CoherentImageTestPoint::Copy)?;
+        }
+        copy_tree(
+            &source,
+            &attempt.pending.join("world"),
+            &source_inventory,
+            attempt.until,
+        )?;
+        require(
+            tree(&source, &["session.lock"])? == source_inventory,
+            "source inventory/hash changed during copy",
+        )?;
+        attempt.advance(P::Copied);
+        #[cfg(all(
+            test,
+            feature = "paired-packages",
+            feature = "native-writer-test-control",
+            debug_assertions
+        ))]
+        if let Some(control) = &attempt.control {
+            control.visit(CoherentImageTestPoint::Copied)?;
+        }
+        for row in &before.players {
+            let descriptor = descriptor(row);
+            for (kind, bytes) in [
+                ("data", nbt_bytes(&row.player)?),
+                (
+                    "advancements",
+                    json_bytes(&row.advancements, STRUCTURED_LIMIT)?,
+                ),
+                ("stats", json_bytes(&row.stats, STRUCTURED_LIMIT)?),
+            ] {
+                overlay(
+                    &parents(&attempt.pending, &player_path(&descriptor, kind))?,
+                    &bytes,
+                )?;
+            }
+        }
+        write_new(
+            &parents(&attempt.pending, COUNTER)?,
+            &checked(before.counter.encode())?,
+        )?;
+        write_new(&parents(&attempt.pending, SLOT)?, &before.slot)?;
+        attempt.advance(P::Overlaid);
+        let physical = tree(&attempt.pending, &[])?;
+        let manifest = Manifest {
+            format: 1,
+            kind: before.counter.image_kind().into(),
+            epoch: attempt.epoch,
+            world_uuid: context.world,
+            dimension: Dim::Overworld.id().into(),
+            saved_clock: before.clocks.0,
+            target: checked(CounterTarget::new(
+                &before.counter.dimension,
+                before.counter.position,
+            ))?,
+            type_id: before.counter.type_id.clone(),
+            counter: COUNTER.into(),
+            slot: SLOT.into(),
+            resident: before.residents.clone(),
+            players: before.players.iter().map(descriptor).collect(),
+            directories: physical.directories,
+            files: physical.files,
+        };
+        manifest_shape(&manifest, attempt.epoch)?;
+        sync_tree(&attempt.pending)?;
+        attempt.advance(P::MembersSynced);
+        write_new(
+            &attempt.pending.join("manifest.json"),
+            &json_bytes(&manifest, MANIFEST_LIMIT)?,
+        )?;
+        sync_dir(&attempt.pending)?;
+        attempt.advance(P::ManifestCompleted);
+        #[cfg(all(
+            test,
+            feature = "paired-packages",
+            feature = "native-writer-test-control",
+            debug_assertions
+        ))]
+        if let Some(control) = &attempt.control {
+            control.visit(CoherentImageTestPoint::Verify)?;
+        }
+        let verified = verify_image_context(
+            validation,
+            &attempt.pending,
+            attempt.epoch,
+            context.world,
+            &manifest.target,
+            &manifest.type_id,
+        )?;
+        require(
+            same_players(&before.players, verified.players.rows()),
+            "detached player image changed",
+        )?;
+        require(
+            before.items == verified.items.projection
+                && saved_items.projection == verified.items.projection,
+            "copied native item projection mismatch",
+        )?;
+        require(
+            before.raids == verified.raids && raid_metadata(&source)? == before.raids,
+            "copied/current native raid metadata mismatch",
+        )?;
+        for (at, expected) in &before.columns {
+            let actual = verified
+                .columns
+                .get(at)
+                .ok_or_else(|| fail("native saved resident record missing"))?;
+            let tables = expected
+                .tag
+                .get("Heightmaps")
+                .is_some()
+                .then(|| save::SaveTables::new(&validation.assets));
+            let actual = save::encode_with(
+                actual,
+                validation.assets.registry,
+                validation.res.biomes(),
+                tables.as_ref(),
+                LevelShape::OVERWORLD,
+            );
+            require(
+                lan::session_player_tags_equal(&expected.tag, &actual.tag),
+                "saved native resident projection mismatch",
+            )?;
+        }
+        require(
+            tree(&source, &["session.lock"])? == source_inventory,
+            "source changed after candidate validation",
+        )?;
+        attempt.advance(P::Verified);
+        deadline(attempt.until)?;
+        attempt.advance(P::BeforePromotion);
+        // Set BEFORE rename, including panics or uncertain OS return values.
+        attempt
+            .uncertain
+            .store(true, std::sync::atomic::Ordering::Release);
+        #[cfg(all(
+            test,
+            feature = "paired-packages",
+            feature = "native-writer-test-control",
+            debug_assertions
+        ))]
+        if let Some(control) = &attempt.control {
+            control.visit(CoherentImageTestPoint::BeforeRename)?;
+        }
+        checked(fs::rename(&attempt.pending, &attempt.published))?;
+        attempt.advance(P::Promoted);
+        #[cfg(all(
+            test,
+            feature = "paired-packages",
+            feature = "native-writer-test-control",
+            debug_assertions
+        ))]
+        if let Some(control) = &attempt.control {
+            control.visit(CoherentImageTestPoint::Promoted)?;
+        }
+        sync_dir(&archive)?;
+        attempt.advance(P::ParentSynced);
+        Ok(CoherentImageWritten {
+            projection: self.projection.clone(),
+            association: attempt.association.clone(),
+            receipt: CheckpointReceipt {
+                epoch: attempt.epoch,
+                root: attempt.published.clone(),
+            },
+        })
+    }
+}
+
+#[cfg(all(
+    test,
+    feature = "paired-packages",
+    feature = "native-writer-test-control",
+    debug_assertions
+))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::game) enum CoherentImageTestAction {
+    HoldRead,
+    HoldCopy,
+    HoldVerify,
+    HoldBeforeRename,
+    FailCopied,
+    FailPromoted,
+    PanicBeforeRename,
+    PanicPromoted,
+    PanicRead,
+}
+#[cfg(all(
+    test,
+    feature = "paired-packages",
+    feature = "native-writer-test-control",
+    debug_assertions
+))]
+enum CoherentImageTestPoint {
+    Read,
+    Copy,
+    Copied,
+    Verify,
+    BeforeRename,
+    Promoted,
+}
+#[cfg(all(
+    test,
+    feature = "paired-packages",
+    feature = "native-writer-test-control",
+    debug_assertions
+))]
+struct CoherentImageTestGate {
+    entered: std::sync::atomic::AtomicBool,
+    released: std::sync::atomic::AtomicBool,
+    fired: std::sync::atomic::AtomicBool,
+    wait: std::sync::Mutex<()>,
+    changed: std::sync::Condvar,
+}
+#[cfg(all(
+    test,
+    feature = "paired-packages",
+    feature = "native-writer-test-control",
+    debug_assertions
+))]
+#[derive(Clone)]
+pub(in crate::game) struct CoherentImageTestControl {
+    action: CoherentImageTestAction,
+    gate: Arc<CoherentImageTestGate>,
+}
+#[cfg(all(
+    test,
+    feature = "paired-packages",
+    feature = "native-writer-test-control",
+    debug_assertions
+))]
+pub(in crate::game) struct CoherentImageTestReceipt {
+    gate: Arc<CoherentImageTestGate>,
+}
+#[cfg(all(
+    test,
+    feature = "paired-packages",
+    feature = "native-writer-test-control",
+    debug_assertions
+))]
+impl CoherentImageTestControl {
+    pub(in crate::game) fn new(
+        action: CoherentImageTestAction,
+    ) -> (Self, CoherentImageTestReceipt) {
+        let gate = Arc::new(CoherentImageTestGate {
+            entered: false.into(),
+            released: false.into(),
+            fired: false.into(),
+            wait: std::sync::Mutex::new(()),
+            changed: std::sync::Condvar::new(),
+        });
+        (
+            Self {
+                action,
+                gate: gate.clone(),
+            },
+            CoherentImageTestReceipt { gate },
+        )
+    }
+    fn visit(&self, point: CoherentImageTestPoint) -> SResult<()> {
+        use CoherentImageTestAction as A;
+        use CoherentImageTestPoint as P;
+        let selected = matches!(
+            (self.action, point),
+            (A::HoldRead | A::PanicRead, P::Read)
+                | (A::HoldCopy, P::Copy)
+                | (A::FailCopied, P::Copied)
+                | (A::HoldVerify, P::Verify)
+                | (A::HoldBeforeRename | A::PanicBeforeRename, P::BeforeRename)
+                | (A::FailPromoted | A::PanicPromoted, P::Promoted)
+        );
+        if !selected
+            || self
+                .gate
+                .fired
+                .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return Ok(());
+        }
+        self.gate
+            .entered
+            .store(true, std::sync::atomic::Ordering::Release);
+        match self.action {
+            A::FailCopied | A::FailPromoted => Err(fail("injected owned image phase failure")),
+            A::PanicBeforeRename | A::PanicPromoted | A::PanicRead => {
+                panic!("injected owned image phase panic")
+            }
+            _ => {
+                let mut waiting = self
+                    .gate
+                    .wait
+                    .lock()
+                    .map_err(|_| fail("image test gate poisoned"))?;
+                while !self
+                    .gate
+                    .released
+                    .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    // Release is atomic and never takes this worker-only mutex.
+                    // A timed recheck also covers notification before wait entry.
+                    waiting = self
+                        .gate
+                        .changed
+                        .wait_timeout(waiting, std::time::Duration::from_millis(10))
+                        .map_err(|_| fail("image test gate poisoned"))?
+                        .0;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+#[cfg(all(
+    test,
+    feature = "paired-packages",
+    feature = "native-writer-test-control",
+    debug_assertions
+))]
+impl CoherentImageTestReceipt {
+    pub(in crate::game) fn entered(&self) -> bool {
+        self.gate.entered.load(std::sync::atomic::Ordering::Acquire)
+    }
+    pub(in crate::game) fn release(&self) {
+        self.gate
+            .released
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.gate.changed.notify_all();
+    }
+}
+#[cfg(all(
+    test,
+    feature = "paired-packages",
+    feature = "native-writer-test-control",
+    debug_assertions
+))]
+impl Drop for CoherentImageTestReceipt {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+impl Game<'_> {
+    pub(in crate::game) fn prepare_coherent_image_context(
+        &self,
+        archive_root: &Path,
+    ) -> SResult<Arc<CoherentImageContext>> {
+        let world = self.session_context_cpu()?;
+        let validation = SessionValidationContext::from_game(self);
+        let counter = checked(SessionCounter::from_world(&self.world))?;
+        let _ = binding_context(&validation, &counter)?;
+        let slot = checked(counter.slot_bytes(&self.world, validation.res.items()))?;
+        let parsed = checked(counter.decode_slot(&slot, validation.res.items()))?;
+        let roster = checked(
+            self.observe_checkpoint_participants()
+                .map_err(|e| format!("{e:?}")),
+        )?;
+        let players = checked(self.project_session_participant_rows(&roster))?;
+        checked(self.inspect_session_checkpoint_owners())?;
+        if players.iter().all(|row| !row.integrated_owner) {
+            require(
+                lan::session_empty_native_player(&self.level.player_tag()),
+                "dedicated cached local player authority",
+            )?;
+        }
+        let residents = self.world.chunks.keys().copied().collect::<Vec<_>>();
+        let manifest = Manifest {
+            format: 1,
+            kind: counter.image_kind().into(),
+            epoch: 1,
+            world_uuid: world,
+            dimension: self.dim.id().into(),
+            saved_clock: self.world.game_time,
+            target: checked(CounterTarget::new(&counter.dimension, counter.position))?,
+            type_id: counter.type_id.clone(),
+            counter: COUNTER.into(),
+            slot: SLOT.into(),
+            resident: residents.clone(),
+            players: players.iter().map(descriptor).collect(),
+            directories: Vec::new(),
+            files: Vec::new(),
+        };
+        correlate(&manifest, &counter, &parsed)?;
+        for row in &players {
+            checked(lan::validate_session_player_tag(&row.player))?;
+            validate_player_items_context(&validation, &row.player)?;
+            validate_player_json_context(&validation, &row.advancements, &row.stats)?;
+            let _ = nbt_bytes(&row.player)?;
+            let _ = json_bytes(&row.advancements, STRUCTURED_LIMIT)?;
+            let _ = json_bytes(&row.stats, STRUCTURED_LIMIT)?;
+        }
+        Ok(Arc::new(CoherentImageContext {
+            validation,
+            save: self.save.clone(),
+            source_root: self.world_root.clone(),
+            archive_root: archive_root.to_owned(),
+            world,
+            counter,
+            slot,
+            roster,
+            players,
+            residents,
+            live_raids: checked(self.session_checkpoint_raids())?,
+            local_uuid: self.level.player_uuid,
+            clocks: (self.world.game_time, self.world.day_time),
+            random: self.world.random.state(),
+            entity_head: self.next_entity,
+        }))
+    }
+    pub(in crate::game) fn freeze_coherent_image_input(
+        &self,
+        context: &Arc<CoherentImageContext>,
+        read: &CoherentImageReadPost,
+    ) -> SResult<CoherentImageBuildInput> {
+        require(
+            Arc::ptr_eq(context, &read.context),
+            "foreign coherent source preflight",
+        )?;
+        context.matches_cpu(self)?;
+        // The returned private read witness retains its exact old inventory;
+        // no owner-side filesystem operation reconstructs that evidence.
+        let _ = &read.old_inventory;
+        let raids = checked(self.session_checkpoint_raids())?.or_else(|| read.raids.clone());
+        let snapshot = self.session_snapshot_cpu(raids, read.local_uuid)?;
+        Ok(CoherentImageBuildInput {
+            projection: Arc::new(CoherentImageProjection {
+                context: context.clone(),
+                source: read.source.clone(),
+                archive: read.archive.clone(),
+                minimum_epoch: read.next_epoch,
+                last_attempt_epoch: std::sync::atomic::AtomicU64::new(read.next_epoch - 1),
+                snapshot,
+            }),
+        })
+    }
+    pub(in crate::game) fn preflight_coherent_image(
+        &self,
+        input: &CoherentImageBuildInput,
+        attempt: &CoherentImageAttempt,
+        written: &CoherentImageWritten,
+    ) -> SResult<()> {
+        require(
+            Arc::ptr_eq(&input.projection, &written.projection)
+                && Arc::ptr_eq(&input.projection, &attempt.projection)
+                && Arc::ptr_eq(&attempt.association, &written.association)
+                && written.receipt.epoch == attempt.epoch
+                && written.receipt.root == attempt.published
+                && attempt.phase() == CoherentImagePhase::ParentSynced,
+            "foreign or incomplete coherent image result",
+        )?;
+        let projection = &input.projection;
+        projection.context.matches_cpu(self)?;
+        let before = &projection.snapshot;
+        let after = self.session_snapshot_cpu(
+            before.raids.clone(),
+            projection
+                .context
+                .local_uuid
+                .ok_or_else(|| fail("coherent local UUID absent"))?,
+        )?;
+        require(
+            before.counter == after.counter
+                && before.slot == after.slot
+                && same_players(&before.players, &after.players)
+                && before.players.iter().all(|a| {
+                    after
+                        .players
+                        .iter()
+                        .any(|b| a.profile_uuid == b.profile_uuid && a.conn == b.conn)
+                })
+                && before.columns == after.columns
+                && before.residents == after.residents
+                && before.raids == after.raids
+                && before.items == after.items
+                && before.item_memory == after.item_memory
+                && before.item_portals == after.item_portals
+                && before.clocks == after.clocks
+                && before.random == after.random
+                && before.entity_head == after.entity_head,
+            "coherent image original final projection changed",
+        )
+    }
+}
 impl Game<'_> {
     /// Full owner/player/profile preflight precedes the explicit UUID stage.
     pub(in crate::game) fn session_checkpoint_identity_preflight(&self) -> SResult<Vec<[i32; 4]>> {
@@ -1816,6 +3464,13 @@ impl Game<'_> {
         )
     }
     fn session_context(&self) -> SResult<WorldId> {
+        let world = self.session_context_cpu()?;
+        identity(&self.world_root, world)?;
+        checked(self.options.mod_packages.check_world(&self.world_root))?;
+        let _: Value = json(&read(&self.world_root.join(PIN), 64 << 10)?, 64 << 10)?;
+        Ok(world)
+    }
+    fn session_context_cpu(&self) -> SResult<WorldId> {
         self.session_warden_tracker()?;
         require(
             self.remote.is_none()
@@ -1852,9 +3507,6 @@ impl Game<'_> {
                 .ok_or_else(|| fail("constructor-issued native origin absent"))?
                 .validate(&self.world_root, self.dim, &self.save),
         )?;
-        identity(&self.world_root, world)?;
-        checked(self.options.mod_packages.check_world(&self.world_root))?;
-        let _: Value = json(&read(&self.world_root.join(PIN), 64 << 10)?, 64 << 10)?;
         if self.world.has_persistent_guest_counter() {
             let view = checked(self.world.guest_storage_view())?;
             let catalog = self
@@ -1909,7 +3561,18 @@ impl Game<'_> {
         )
     }
     fn session_snapshot(&self) -> SResult<Snapshot> {
-        let world = self.session_context()?;
+        self.session_context()?;
+        let raids = self.effective_session_raids()?;
+        let local_uuid = native_local_uuid(&self.world_root)?;
+        let snapshot = self.session_snapshot_cpu(raids, local_uuid)?;
+        validate_native_local_player(
+            &self.world_root,
+            &snapshot.players.iter().map(descriptor).collect::<Vec<_>>(),
+        )?;
+        Ok(snapshot)
+    }
+    fn session_snapshot_cpu(&self, raids: Option<Tag>, local_uuid: [i32; 4]) -> SResult<Snapshot> {
+        let world = self.session_context_cpu()?;
         let counter = checked(SessionCounter::from_world(&self.world))?;
         let slot = checked(counter.slot_bytes(&self.world, self.res.items()))?;
         let parsed = checked(counter.decode_slot(&slot, self.res.items()))?;
@@ -1926,9 +3589,7 @@ impl Game<'_> {
             self.portals
                 .project_session_item_portal_owners(&self.dropped),
         )?;
-        let raids = self.effective_session_raids()?;
         let descriptors = players.iter().map(descriptor).collect::<Vec<_>>();
-        let local_uuid = validate_native_local_player(&self.world_root, &descriptors)?;
         require(
             self.level.player_uuid == Some(local_uuid),
             "live/native singleplayer UUID mismatch",
@@ -3211,7 +4872,7 @@ fn verify_recovery_final(
 
 #[cfg(all(test, feature = "paired-packages", target_os = "linux"))]
 #[path = "session_checkpoint_tests.rs"]
-mod tests;
+pub(in crate::game) mod tests;
 
 fn saved_data(tag: &Tag) -> SResult<&Tag> {
     let fields = compound(tag, &["DataVersion", "data"])?;
@@ -3396,6 +5057,9 @@ fn native_local_uuid(root: &Path) -> SResult<[i32; 4]> {
 }
 
 fn validate_player_items(game: &Game<'_>, tag: &Tag) -> SResult<()> {
+    validate_player_items_context(&SessionValidationContext::from_game(game), tag)
+}
+fn validate_player_items_context(context: &SessionValidationContext, tag: &Tag) -> SResult<()> {
     let mut work = vec![tag];
     let mut nodes = 0;
     while let Some(value) = work.pop() {
@@ -3406,7 +5070,7 @@ fn validate_player_items(game: &Game<'_>, tag: &Tag) -> SResult<()> {
                 if let Some(id) = value.get("id") {
                     let id = text(Some(id))?;
                     require(
-                        game.res.items().get(&id).is_some() && id != "minecraft:air",
+                        context.res.items().get(&id).is_some() && id != "minecraft:air",
                         "unresolved player item ID",
                     )?;
                     require(
@@ -3454,9 +5118,20 @@ fn validate_player_items(game: &Game<'_>, tag: &Tag) -> SResult<()> {
     Ok(())
 }
 fn validate_player_json(game: &Game<'_>, advancements: &Value, stats: &Value) -> SResult<()> {
+    validate_player_json_context(
+        &SessionValidationContext::from_game(game),
+        advancements,
+        stats,
+    )
+}
+fn validate_player_json_context(
+    context: &SessionValidationContext,
+    advancements: &Value,
+    stats: &Value,
+) -> SResult<()> {
     let progress = horizon_client::advancements::Progress::from_json(advancements);
     require(
-        progress.to_json(&game.adv.tree, DATA_VERSION) == *advancements,
+        progress.to_json(&context.advancement_tree, DATA_VERSION) == *advancements,
         "coercive native player advancements",
     )?;
     let values = stats

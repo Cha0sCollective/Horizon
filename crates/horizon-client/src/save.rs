@@ -2639,8 +2639,31 @@ impl SaveDir {
             .collect()
     }
     pub fn save_forced_chunks(&self, forced: &HashSet<(i32, i32)>) -> Result<()> {
+        #[cfg(feature = "paired-packages")]
+        let _admission = if let Some(state) = &self.retained {
+            let admission = state
+                .admission
+                .lock()
+                .map_err(|_| "retained admission poisoned")?;
+            if admission.phase != retained_writer::Phase::Open {
+                return Err("retained writer admission sealed".into());
+            }
+            Some(admission)
+        } else {
+            None
+        };
+        self.write_forced_chunks(forced)
+    }
+    fn write_forced_chunks(&self, forced: &HashSet<(i32, i32)>) -> Result<()> {
+        match self.forced_chunks_projection(forced) {
+            Some(root) => write_dat(&saved_data_path(&self.root, "chunk_tickets"), root),
+            None => Ok(()),
+        }
+    }
+    /// The native read/merge and wrapper, before any saved-data mutation.
+    fn forced_chunks_projection(&self, forced: &HashSet<(i32, i32)>) -> Option<Tag> {
         if forced.is_empty() && !saved_data_path(&self.root, "chunk_tickets").exists() {
-            return Ok(());
+            return None;
         }
         let mut data = compound_or_empty(read_saved_data(&self.root, "chunk_tickets"));
         // Preserve persistent tickets Horizon does not simulate.
@@ -2662,7 +2685,7 @@ impl SaveDir {
             ])
         }));
         put(&mut data, "tickets", Tag::List(tickets));
-        write_saved_data(&self.root, "chunk_tickets", data)
+        Some(saved_data_root(data))
     }
     fn region_path(&self, folder: &str, rx: i32, rz: i32) -> PathBuf {
         region_path(&self.root, folder, rx, rz)
@@ -3243,7 +3266,11 @@ impl SaveDir {
 
 /// Opt-in native writer ownership. No ordinary world caller selects this service.
 #[cfg(feature = "paired-packages")]
-pub use retained_writer::{NativeWriterClose, NativeWriterClosed, RetainedWriterStatus};
+pub use retained_writer::{
+    NativeWriterClose, NativeWriterClosed, NativeWriterDurable, NativeWriterFinal,
+    NativeWriterFinalInput, NativeWriterFinalSubmitted, NativeWriterStaged,
+    NativeWriterStagedStatus, RetainedWriterStatus,
+};
 
 #[cfg(feature = "paired-packages")]
 mod retained_writer {
@@ -3260,7 +3287,7 @@ mod retained_writer {
         Complete,
     }
     #[derive(Clone, Copy, PartialEq, Eq)]
-    enum Phase {
+    pub(super) enum Phase {
         Open,
         Sealed,
         Closed,
@@ -3332,10 +3359,20 @@ mod retained_writer {
         send: mpsc::Sender<Batch>,
         thread: std::thread::JoinHandle<()>,
     }
-    struct Admission {
-        phase: Phase,
+    pub(super) struct Admission {
+        pub(super) phase: Phase,
         owner: Weak<()>,
         writer: Option<OpenWriter>,
+        staged: Option<StagedPhase>,
+        final_input: Option<Arc<()>>,
+        final_attempt: u64,
+    }
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum StagedPhase {
+        Historical,
+        Durable,
+        Submitting,
+        Draining,
     }
     #[derive(Default)]
     struct Ledger {
@@ -3360,7 +3397,7 @@ mod retained_writer {
         retry_success: Option<u64>,
     }
     pub(super) struct State {
-        admission: Mutex<Admission>,
+        pub(super) admission: Mutex<Admission>,
         ledger: Arc<Mutex<Ledger>>,
         #[cfg(test)]
         fail_spawn: std::sync::atomic::AtomicBool,
@@ -3424,6 +3461,9 @@ mod retained_writer {
                     phase: Phase::Open,
                     owner: Weak::new(),
                     writer: None,
+                    staged: None,
+                    final_input: None,
+                    final_attempt: 0,
                 }),
                 ledger: Arc::new(Mutex::new(Ledger {
                     verified: Some(Verification::default()),
@@ -3467,6 +3507,7 @@ mod retained_writer {
         epoch: u64,
         fault: Option<String>,
         armed: bool,
+        terminal: bool,
     }
     impl Drop for NativeWriterClose {
         fn drop(&mut self) {
@@ -3517,6 +3558,13 @@ mod retained_writer {
             self: &Arc<Self>,
             deadline: Instant,
         ) -> Result<Option<NativeWriterClose>> {
+            self.begin_writer_close(deadline, true)
+        }
+        fn begin_writer_close(
+            self: &Arc<Self>,
+            deadline: Instant,
+            terminal: bool,
+        ) -> Result<Option<NativeWriterClose>> {
             let state = self
                 .retained
                 .as_ref()
@@ -3529,6 +3577,7 @@ mod retained_writer {
             }
             let identity = Arc::new(());
             admission.phase = Phase::Sealed;
+            admission.staged = (!terminal).then_some(StagedPhase::Historical);
             admission.owner = Arc::downgrade(&identity);
             let thread = admission.writer.take().map(|writer| {
                 drop(writer.send);
@@ -3543,6 +3592,7 @@ mod retained_writer {
                 epoch: 0,
                 fault: None,
                 armed: true,
+                terminal,
             }))
         }
         pub(super) fn queue_retained(
@@ -3551,13 +3601,30 @@ mod retained_writer {
             records: Vec<((i32, i32), Record)>,
             wait: bool,
         ) -> Result<()> {
+            self.queue_retained_with(folder, records, wait, None)
+        }
+        fn queue_retained_with(
+            &self,
+            folder: Folder,
+            records: Vec<((i32, i32), Record)>,
+            wait: bool,
+            close_identity: Option<&Arc<()>>,
+        ) -> Result<()> {
             let state = self.retained.as_ref().expect("retained dispatch");
             // All producer publication is serialized with seal. The worker never takes admission.
             let mut admission = state
                 .admission
                 .lock()
                 .map_err(|_| "retained admission poisoned")?;
-            if admission.phase != Phase::Open {
+            let permitted = match close_identity {
+                None => admission.phase == Phase::Open,
+                Some(identity) => {
+                    admission.phase == Phase::Sealed
+                        && admission.staged == Some(StagedPhase::Submitting)
+                        && admission.owner.ptr_eq(&Arc::downgrade(identity))
+                }
+            };
+            if !permitted {
                 return Err("retained writer admission sealed".into());
             }
             if records.is_empty() {
@@ -3709,6 +3776,9 @@ mod retained_writer {
             ledger.unsettled = unsettled;
             ledger.version = version;
             ledger.verified = None;
+            if close_identity.is_some() {
+                ledger.retry_success = None;
+            }
             ledger.facts.insert(
                 id,
                 Fact {
@@ -4528,7 +4598,9 @@ mod retained_writer {
                 if error.is_some() {
                     return Err("uncorrelated sticky native writer error".into());
                 }
-                admission.phase = Phase::Closed;
+                if self.terminal {
+                    admission.phase = Phase::Closed;
+                }
                 Ok(Some(()))
             })();
             match attempt {
@@ -4681,7 +4753,10 @@ mod retained_writer {
             Ok(())
         }
         pub fn finish(mut self) -> std::result::Result<NativeWriterClosed, Self> {
-            if self.status != RetainedWriterStatus::Complete || self.thread.is_some() {
+            if !self.terminal
+                || self.status != RetainedWriterStatus::Complete
+                || self.thread.is_some()
+            {
                 return Err(self);
             }
             self.armed = false;
@@ -4689,6 +4764,667 @@ mod retained_writer {
                 save: self.save.take().unwrap(),
                 _identity: self.identity.clone(),
             })
+        }
+    }
+
+    /// Historical durability is deliberately distinct from terminal writer closure.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum NativeWriterStagedStatus {
+        Pending,
+        Blocked(String),
+        Durable,
+        Submitting,
+        Complete,
+    }
+    #[must_use = "retain and explicitly finish the original staged native writer"]
+    pub struct NativeWriterStaged {
+        close: Box<NativeWriterClose>,
+        final_gate: Option<Arc<Mutex<()>>>,
+    }
+    impl std::fmt::Debug for NativeWriterStaged {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("NativeWriterStaged")
+                .field("close", &self.close)
+                .finish_non_exhaustive()
+        }
+    }
+    /// A checked, nonterminal historical durability observation. Beginning final
+    /// submission invalidates it even before the first record is accepted.
+    #[must_use = "keep historical durability separate from terminal NativeWriterClosed"]
+    pub struct NativeWriterDurable {
+        save: Arc<SaveDir>,
+        identity: Arc<()>,
+        verification: Verification,
+    }
+    impl NativeWriterDurable {
+        pub fn save(&self) -> &Arc<SaveDir> {
+            &self.save
+        }
+        pub fn poll_current(&self) -> std::result::Result<Option<bool>, String> {
+            let state = self
+                .save
+                .retained
+                .as_ref()
+                .ok_or("historical writer is not retained")?;
+            let Some(admission) = nonwaiting(&state.admission)? else {
+                return Ok(None);
+            };
+            let Some(mut ledger) = nonwaiting(&state.ledger)? else {
+                return Ok(None);
+            };
+            let Some(error) = nonwaiting(&self.save.outstanding.error)? else {
+                return Ok(None);
+            };
+            if !check_error(&mut ledger, &error) || ledger.fault.is_some() {
+                return Err("historical durability lost original writer accounting".into());
+            }
+            Ok(Some(
+                admission.phase == Phase::Sealed
+                    && admission.staged == Some(StagedPhase::Durable)
+                    && admission.owner.ptr_eq(&Arc::downgrade(&self.identity))
+                    && admission.writer.is_none()
+                    && ledger.error.is_none()
+                    && ledger.verified == Some(self.verification)
+                    && Verification::capture(&ledger, 0) == self.verification,
+            ))
+        }
+    }
+    type FinalNativeBatch = (Folder, Vec<((i32, i32), Record)>);
+    #[derive(Clone)]
+    enum FinalForcedProjection {
+        Skipped,
+        Write(Tag),
+    }
+    /// Pure immutable native inputs. Clones preserve the same projection identity
+    /// and original chunk/encoding/table/tag owners across worker attempts.
+    #[derive(Clone)]
+    pub struct NativeWriterFinalInput {
+        save: Arc<SaveDir>,
+        identity: Arc<()>,
+        records: Vec<FinalNativeBatch>,
+        forced: HashSet<(i32, i32)>,
+        // This worker-only memo belongs to the retained input, not a disposable
+        // worker result. None means uncaptured, not a native sparse skip.
+        forced_projection: Arc<Mutex<Option<FinalForcedProjection>>>,
+        #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+        forced_after_backup: Arc<Mutex<Option<DatAfterBackupControl>>>,
+    }
+    impl NativeWriterFinalInput {
+        pub fn new(
+            save: &Arc<SaveDir>,
+            chunks: &[Arc<Chunk>],
+            entities: &[((i32, i32), Vec<Tag>)],
+            forced: &HashSet<(i32, i32)>,
+            protected_nonresident: &HashSet<(i32, i32)>,
+            registry: &'static BlockRegistry,
+            biomes: &Arc<Biomes>,
+        ) -> Result<Self> {
+            if save.retained.is_none() {
+                return Err("final native input requires the original retained SaveDir".into());
+            }
+            let mut residents = HashSet::new();
+            for chunk in chunks {
+                let key = (chunk.x, chunk.z);
+                if !residents.insert(key) || protected_nonresident.contains(&key) {
+                    return Err(
+                        "final native resident duplicates or conflicts with protected C0a input"
+                            .into(),
+                    );
+                }
+            }
+            let mut entity_positions = HashSet::new();
+            for (key, _) in entities {
+                if !entity_positions.insert(*key) || protected_nonresident.contains(key) {
+                    return Err(
+                        "final native entities duplicate or conflict with protected C0a input"
+                            .into(),
+                    );
+                }
+            }
+            let encoding = Arc::new(Encoding {
+                registry,
+                biomes: biomes.clone(),
+                tables: save.tables.get().cloned(),
+                shape: save.shape,
+            });
+            let mut records = vec![
+                (
+                    Folder::Region,
+                    chunks
+                        .iter()
+                        .map(|c| ((c.x, c.z), Record::Chunk(c.clone(), encoding.clone())))
+                        .collect(),
+                ),
+                (
+                    Folder::Entities,
+                    entities
+                        .iter()
+                        .map(|((x, z), tags)| {
+                            (
+                                (*x, *z),
+                                entity_record(*x, *z, tags.clone())
+                                    .map_or(Record::Delete, |tag| Record::Tag(Arc::new(tag))),
+                            )
+                        })
+                        .collect(),
+                ),
+            ];
+            if let Some(tables) = save.tables.get() {
+                records.push((
+                    Folder::Poi,
+                    chunks
+                        .iter()
+                        .map(|c| ((c.x, c.z), Record::Poi(c.clone(), tables.clone())))
+                        .collect(),
+                ));
+            }
+            Ok(Self {
+                save: save.clone(),
+                identity: Arc::new(()),
+                records,
+                forced: forced.clone(),
+                forced_projection: Arc::default(),
+                #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+                forced_after_backup: Arc::default(),
+            })
+        }
+        pub fn save(&self) -> &Arc<SaveDir> {
+            &self.save
+        }
+        fn write_forced(&self) -> Result<()> {
+            let projection = {
+                let mut captured = self
+                    .forced_projection
+                    .lock()
+                    .map_err(|_| "final forced projection poisoned")?;
+                captured
+                    .get_or_insert_with(|| match self.save.forced_chunks_projection(&self.forced) {
+                        Some(root) => FinalForcedProjection::Write(root),
+                        None => FinalForcedProjection::Skipped,
+                    })
+                    .clone()
+            };
+            let FinalForcedProjection::Write(root) = projection else {
+                return Ok(());
+            };
+            #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+            let after_backup = self
+                .forced_after_backup
+                .lock()
+                .map_err(|_| "final forced publication control poisoned")?
+                .take();
+            write_dat_native(
+                &saved_data_path(&self.save.root, "chunk_tickets"),
+                root,
+                #[cfg(all(
+                    test,
+                    feature = "paired-packages",
+                    feature = "native-writer-test-control",
+                    debug_assertions
+                ))]
+                after_backup,
+            )
+        }
+    }
+    /// Close-specific admission, never an ordinary producer-admission reopening.
+    /// Keep this and the immutable input outside each disposable worker return.
+    pub struct NativeWriterFinal {
+        save: Arc<SaveDir>,
+        identity: Arc<()>,
+        gate: Arc<Mutex<()>>,
+    }
+    #[must_use = "final submission is acceptance only; retain until actual terminal durability"]
+    pub struct NativeWriterFinalSubmitted {
+        save: Arc<SaveDir>,
+        identity: Arc<()>,
+        input: Arc<()>,
+        attempt: u64,
+    }
+    impl NativeWriterFinal {
+        pub fn save(&self) -> &Arc<SaveDir> {
+            &self.save
+        }
+        /// Worker-side native encoding/enqueue and forced savedata IO. Errors
+        /// preserve accepted ledger records and the caller's complete frozen input.
+        pub fn submit_native(
+            &self,
+            input: &NativeWriterFinalInput,
+        ) -> Result<NativeWriterFinalSubmitted> {
+            if !Arc::ptr_eq(&self.save, &input.save) {
+                return Err("final native input belongs to a different SaveDir allocation".into());
+            }
+            let _gate = self
+                .gate
+                .lock()
+                .map_err(|_| "final native submission gate poisoned")?;
+            let state = self.save.retained.as_ref().unwrap();
+            let attempt = {
+                let mut admission = state
+                    .admission
+                    .lock()
+                    .map_err(|_| "retained admission poisoned")?;
+                if admission.phase != Phase::Sealed
+                    || admission.staged != Some(StagedPhase::Submitting)
+                    || !admission.owner.ptr_eq(&Arc::downgrade(&self.identity))
+                {
+                    return Err("close-only final native admission is sealed or foreign".into());
+                }
+                if admission
+                    .final_input
+                    .as_ref()
+                    .is_some_and(|id| !Arc::ptr_eq(id, &input.identity))
+                {
+                    return Err("final native retry changed the original frozen input".into());
+                }
+                let attempt = admission
+                    .final_attempt
+                    .checked_add(1)
+                    .ok_or("final native attempt exhausted")?;
+                admission.final_input = Some(input.identity.clone());
+                admission.final_attempt = attempt;
+                attempt
+            };
+            for (folder, records) in &input.records {
+                self.save.queue_retained_with(
+                    *folder,
+                    records.clone(),
+                    false,
+                    Some(&self.identity),
+                )?;
+            }
+            input.write_forced()?;
+            Ok(NativeWriterFinalSubmitted {
+                save: self.save.clone(),
+                identity: self.identity.clone(),
+                input: input.identity.clone(),
+                attempt,
+            })
+        }
+    }
+    impl SaveDir {
+        /// Busy does not seal or acquire an owner. Ordinary queues stay sealed
+        /// from this point through both historical and final native durability.
+        pub fn begin_staged_writer_close(
+            self: &Arc<Self>,
+            deadline: Instant,
+        ) -> Result<Option<NativeWriterStaged>> {
+            Ok(self
+                .begin_writer_close(deadline, false)?
+                .map(|close| NativeWriterStaged {
+                    close: Box::new(close),
+                    final_gate: None,
+                }))
+        }
+    }
+    impl NativeWriterStaged {
+        pub fn save(&self) -> &Arc<SaveDir> {
+            self.close.save()
+        }
+        pub fn failure_count(&self) -> Result<Option<usize>> {
+            self.close.failure_count()
+        }
+        pub fn poll(&mut self) -> NativeWriterStagedStatus {
+            if !self.close.terminal
+                && let Some(gate) = self.final_gate.clone()
+            {
+                let save = self.save().clone();
+                let state = save.retained.as_ref().unwrap();
+                let inspect = (|| -> std::result::Result<(), String> {
+                    let Some(_gate) = nonwaiting(&gate)? else {
+                        return Ok(());
+                    };
+                    let Some(mut admission) = nonwaiting(&state.admission)? else {
+                        return Ok(());
+                    };
+                    if admission.phase != Phase::Sealed
+                        || admission.staged != Some(StagedPhase::Submitting)
+                        || !admission
+                            .owner
+                            .ptr_eq(&Arc::downgrade(&self.close.identity))
+                    {
+                        return Err("close-only final native admission changed".into());
+                    }
+                    if admission
+                        .writer
+                        .as_ref()
+                        .is_some_and(|writer| writer.thread.is_finished())
+                    {
+                        let writer = admission.writer.take().unwrap();
+                        drop(writer.send);
+                        admission.staged = Some(StagedPhase::Draining);
+                        self.close.thread = Some(writer.thread);
+                        self.close.status = RetainedWriterStatus::Pending;
+                        return Err("close-only native writer exited before final seal".into());
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = inspect {
+                    self.close.fault.get_or_insert(error);
+                }
+                if let Some(fault) = self.close.fault.clone() {
+                    // Only is_finished handles were moved above. The original
+                    // ledger and missing/held payload accounting remain intact.
+                    self.close.poll();
+                    return NativeWriterStagedStatus::Blocked(fault);
+                }
+                if Instant::now() >= self.close.deadline {
+                    return NativeWriterStagedStatus::Blocked(
+                        "final native submission deadline expired; owners retained".into(),
+                    );
+                }
+                return NativeWriterStagedStatus::Submitting;
+            }
+            match self.close.poll() {
+                RetainedWriterStatus::Pending => NativeWriterStagedStatus::Pending,
+                RetainedWriterStatus::Blocked(error) => NativeWriterStagedStatus::Blocked(error),
+                RetainedWriterStatus::Complete if self.close.terminal => {
+                    NativeWriterStagedStatus::Complete
+                }
+                RetainedWriterStatus::Complete => {
+                    let state = self.save().retained.as_ref().unwrap();
+                    match nonwaiting(&state.admission) {
+                        Ok(Some(mut admission))
+                            if admission.phase == Phase::Sealed
+                                && admission
+                                    .owner
+                                    .ptr_eq(&Arc::downgrade(&self.close.identity))
+                                && matches!(
+                                    admission.staged,
+                                    Some(StagedPhase::Historical | StagedPhase::Durable)
+                                ) =>
+                        {
+                            admission.staged = Some(StagedPhase::Durable);
+                            NativeWriterStagedStatus::Durable
+                        }
+                        Ok(None) => NativeWriterStagedStatus::Pending,
+                        _ => NativeWriterStagedStatus::Blocked(
+                            "staged historical writer phase changed".into(),
+                        ),
+                    }
+                }
+            }
+        }
+        pub fn retry(&mut self, deadline: Instant) -> Result<()> {
+            if !self.close.terminal
+                && self.final_gate.is_none()
+                && self.close.status == RetainedWriterStatus::Complete
+            {
+                if deadline <= Instant::now()
+                    || self.close.fault.is_some()
+                    || self.close.thread.is_some()
+                {
+                    return Err(
+                        "historical durable retry requires a future deadline and intact owner"
+                            .into(),
+                    );
+                }
+                let save = self.save().clone();
+                let state = save.retained.as_ref().unwrap();
+                let Some(admission) = nonwaiting(&state.admission)? else {
+                    return Err("historical durable retry admission busy".into());
+                };
+                if admission.phase != Phase::Sealed
+                    || admission.staged != Some(StagedPhase::Durable)
+                    || !admission
+                        .owner
+                        .ptr_eq(&Arc::downgrade(&self.close.identity))
+                    || admission.writer.is_some()
+                {
+                    return Err("historical durable retry original owner or phase changed".into());
+                }
+                let Some(count) = nonwaiting(&save.outstanding.count)? else {
+                    return Err("historical durable retry count busy".into());
+                };
+                let Some(pending) = nonwaiting(&save.pending)? else {
+                    return Err("historical durable retry pending busy".into());
+                };
+                let Some(ledger) = nonwaiting(&state.ledger)? else {
+                    return Err("historical durable retry ledger busy".into());
+                };
+                let Some(error) = nonwaiting(&save.outstanding.error)? else {
+                    return Err("historical durable retry error cell busy".into());
+                };
+                if ledger.fault.is_some()
+                    || !error_correlated(&ledger, &error)
+                    || ledger.error.is_some()
+                    || *count != 0
+                    || !pending.is_empty()
+                    || ledger.unsettled != 0
+                    || ledger.completed.checked_add(ledger.unsent) != Some(ledger.accepted)
+                    || u64::try_from(ledger.facts.len()).ok() != Some(ledger.accepted)
+                    || ledger.verified != Some(Verification::capture(&ledger, 0))
+                {
+                    return Err(
+                        "historical durable retry original verification or accounting changed"
+                            .into(),
+                    );
+                }
+                // Only an explicit reaped-global-IO retry renews the deadline.
+                // The original nonterminal proof and every native fact survive.
+                self.close.deadline = deadline;
+                return Ok(());
+            }
+            if !self.close.terminal
+                && let Some(gate) = self.final_gate.as_ref()
+            {
+                if self.close.fault.is_some() {
+                    return Err("final native writer has an unrepaired owner fault".into());
+                }
+                if deadline <= Instant::now() {
+                    return Err("final native submission retry requires a future deadline".into());
+                }
+                let Some(_guard) = nonwaiting(gate)? else {
+                    return Err("final native submission is still busy".into());
+                };
+                let save = self.save().clone();
+                let state = save.retained.as_ref().unwrap();
+                let Some(admission) = nonwaiting(&state.admission)? else {
+                    return Err("final native retry admission busy".into());
+                };
+                if admission.phase != Phase::Sealed
+                    || admission.staged != Some(StagedPhase::Submitting)
+                    || !admission
+                        .owner
+                        .ptr_eq(&Arc::downgrade(&self.close.identity))
+                    || self.close.thread.is_some()
+                    || admission
+                        .writer
+                        .as_ref()
+                        .is_some_and(|writer| writer.thread.is_finished())
+                {
+                    return Err("final native retry original owner or phase changed".into());
+                }
+                let Some(count) = nonwaiting(&save.outstanding.count)? else {
+                    return Err("final native retry count busy".into());
+                };
+                let Some(pending) = nonwaiting(&save.pending)? else {
+                    return Err("final native retry pending busy".into());
+                };
+                let Some(ledger) = nonwaiting(&state.ledger)? else {
+                    return Err("final native retry ledger busy".into());
+                };
+                let Some(error) = nonwaiting(&save.outstanding.error)? else {
+                    return Err("final native retry error cell busy".into());
+                };
+                let remaining = ledger
+                    .accepted
+                    .checked_sub(ledger.completed)
+                    .and_then(|n| n.checked_sub(ledger.unsent));
+                if ledger.fault.is_some()
+                    || !error_correlated(&ledger, &error)
+                    || remaining != u64::try_from(*count).ok()
+                    || ledger.unsettled != pending.len()
+                    || u64::try_from(ledger.facts.len()).ok() != Some(ledger.accepted)
+                {
+                    return Err(
+                        "final native retry original accounting or error witness changed".into(),
+                    );
+                }
+                // Root calls only after its actual global IO handle is reaped.
+                // This renews no work, admission, receipt, error or native handle.
+                self.close.deadline = deadline;
+                return Ok(());
+            }
+            self.close.retry(deadline)
+        }
+        pub fn durability(&self) -> Result<Option<NativeWriterDurable>> {
+            if self.close.terminal
+                || self.close.status != RetainedWriterStatus::Complete
+                || self.final_gate.is_some()
+            {
+                return Err("historical durability is not ready".into());
+            }
+            let state = self.save().retained.as_ref().unwrap();
+            let Some(admission) = nonwaiting(&state.admission)? else {
+                return Ok(None);
+            };
+            let Some(mut ledger) = nonwaiting(&state.ledger)? else {
+                return Ok(None);
+            };
+            let Some(error) = nonwaiting(&self.save().outstanding.error)? else {
+                return Ok(None);
+            };
+            if !check_error(&mut ledger, &error) {
+                return Err("historical durability found an uncorrelated error cell".into());
+            }
+            if admission.phase != Phase::Sealed
+                || admission.staged != Some(StagedPhase::Durable)
+                || admission.writer.is_some()
+                || !admission
+                    .owner
+                    .ptr_eq(&Arc::downgrade(&self.close.identity))
+            {
+                return Err("historical durability original owner changed".into());
+            }
+            let verification = ledger
+                .verified
+                .ok_or("historical native verification missing")?;
+            if verification != Verification::capture(&ledger, 0)
+                || ledger.error.is_some()
+                || ledger.fault.is_some()
+            {
+                return Err("historical native verification changed".into());
+            }
+            Ok(Some(NativeWriterDurable {
+                save: self.save().clone(),
+                identity: self.close.identity.clone(),
+                verification,
+            }))
+        }
+        /// No final IO is performed here. This invalidates the intermediate
+        /// proof before a close-only capability can accept even its first record.
+        pub fn begin_final(
+            &mut self,
+            durable: &NativeWriterDurable,
+        ) -> Result<Option<NativeWriterFinal>> {
+            if !Arc::ptr_eq(self.save(), &durable.save)
+                || !Arc::ptr_eq(&self.close.identity, &durable.identity)
+            {
+                return Err("historical durability belongs to a different native owner".into());
+            }
+            match durable.poll_current()? {
+                None => return Ok(None),
+                Some(false) => return Err("historical durability is stale".into()),
+                Some(true) => {}
+            }
+            let state = self.save().retained.as_ref().unwrap();
+            let Some(mut admission) = nonwaiting(&state.admission)? else {
+                return Ok(None);
+            };
+            if self.close.terminal
+                || self.close.status != RetainedWriterStatus::Complete
+                || admission.phase != Phase::Sealed
+                || admission.staged != Some(StagedPhase::Durable)
+                || !admission
+                    .owner
+                    .ptr_eq(&Arc::downgrade(&self.close.identity))
+                || admission.writer.is_some()
+                || self.final_gate.is_some()
+            {
+                return Err("final native capability already issued".into());
+            }
+            let Some(mut ledger) = nonwaiting(&state.ledger)? else {
+                return Ok(None);
+            };
+            let Some(error) = nonwaiting(&self.save().outstanding.error)? else {
+                return Ok(None);
+            };
+            if !check_error(&mut ledger, &error)
+                || ledger.error.is_some()
+                || ledger.fault.is_some()
+                || ledger.verified != Some(durable.verification)
+                || Verification::capture(&ledger, 0) != durable.verification
+            {
+                return Err("historical durability changed before final admission".into());
+            }
+            let gate = Arc::new(Mutex::new(()));
+            admission.staged = Some(StagedPhase::Submitting);
+            let capability = NativeWriterFinal {
+                save: self.save().clone(),
+                identity: self.close.identity.clone(),
+                gate: gate.clone(),
+            };
+            drop(error);
+            drop(ledger);
+            drop(admission);
+            self.final_gate = Some(gate);
+            Ok(Some(capability))
+        }
+        /// Requires a successful acceptance receipt for this exact frozen input
+        /// and latest submission attempt. Busy retains capability and owner.
+        pub fn seal_final(&mut self, submitted: &NativeWriterFinalSubmitted) -> Result<Option<()>> {
+            if !Arc::ptr_eq(self.save(), &submitted.save)
+                || !Arc::ptr_eq(&self.close.identity, &submitted.identity)
+            {
+                return Err("final native receipt belongs to a different writer".into());
+            }
+            let gate = self
+                .final_gate
+                .as_ref()
+                .ok_or("final native admission never began")?
+                .clone();
+            let Some(_gate) = nonwaiting(&gate)? else {
+                return Ok(None);
+            };
+            let save = self.save().clone();
+            let state = save.retained.as_ref().unwrap();
+            let Some(mut admission) = nonwaiting(&state.admission)? else {
+                return Ok(None);
+            };
+            if admission.phase != Phase::Sealed
+                || admission.staged != Some(StagedPhase::Submitting)
+                || !admission
+                    .owner
+                    .ptr_eq(&Arc::downgrade(&self.close.identity))
+                || admission.final_attempt != submitted.attempt
+                || !admission
+                    .final_input
+                    .as_ref()
+                    .is_some_and(|id| Arc::ptr_eq(id, &submitted.input))
+            {
+                return Err("final native receipt is stale or admission changed".into());
+            }
+            admission.staged = Some(StagedPhase::Draining);
+            self.close.thread = admission.writer.take().map(|writer| {
+                drop(writer.send);
+                writer.thread
+            });
+            self.close.terminal = true;
+            self.close.status = RetainedWriterStatus::Pending;
+            Ok(Some(()))
+        }
+        pub fn finish(self) -> std::result::Result<NativeWriterClosed, Self> {
+            if !self.close.terminal || self.final_gate.is_none() {
+                return Err(self);
+            }
+            let Self { close, final_gate } = self;
+            match (*close).finish() {
+                Ok(closed) => Ok(closed),
+                Err(close) => Err(Self {
+                    close: Box::new(close),
+                    final_gate,
+                }),
+            }
         }
     }
     #[cfg(test)]
@@ -4754,6 +5490,730 @@ mod retained_writer {
         fn queue(save: &SaveDir, folder: Folder, x: i32, value: Arc<NamedTag>) {
             save.queue(folder, vec![((x, 0), Record::Tag(value))], false)
                 .unwrap();
+        }
+        #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+        fn staged(save: &Arc<SaveDir>) -> NativeWriterStaged {
+            loop {
+                if let Some(close) = save.begin_staged_writer_close(deadline()).unwrap() {
+                    return close;
+                }
+                std::thread::yield_now();
+            }
+        }
+        #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+        fn staged_until(close: &mut NativeWriterStaged, wanted: NativeWriterStagedStatus) {
+            let end = deadline();
+            loop {
+                let status = close.poll();
+                if status == wanted {
+                    return;
+                }
+                assert!(
+                    Instant::now() < end,
+                    "staged writer did not reach {wanted:?}: {status:?}"
+                );
+                std::thread::yield_now();
+            }
+        }
+        #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+        fn staged_durable(close: &mut NativeWriterStaged) -> NativeWriterDurable {
+            staged_until(close, NativeWriterStagedStatus::Durable);
+            loop {
+                if let Some(durable) = close.durability().unwrap() {
+                    return durable;
+                }
+                std::thread::yield_now();
+            }
+        }
+        #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+        fn staged_cap(
+            close: &mut NativeWriterStaged,
+            durable: &NativeWriterDurable,
+        ) -> NativeWriterFinal {
+            loop {
+                if let Some(cap) = close.begin_final(durable).unwrap() {
+                    return cap;
+                }
+                std::thread::yield_now();
+            }
+        }
+        #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+        fn staged_seal(close: &mut NativeWriterStaged, submitted: &NativeWriterFinalSubmitted) {
+            loop {
+                if close.seal_final(submitted).unwrap().is_some() {
+                    return;
+                }
+                std::thread::yield_now();
+            }
+        }
+        #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+        fn staged_finish(mut close: NativeWriterStaged) -> NativeWriterClosed {
+            staged_until(&mut close, NativeWriterStagedStatus::Complete);
+            close.finish().unwrap()
+        }
+        #[test]
+        #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+        fn staged_explicit_preexpiry_retry_renews_only_idle_original_writer_and_fixed_input() {
+            let path = root("staged-preexpiry-retry");
+            write_saved_data(
+                &path,
+                "chunk_tickets",
+                Tag::compound([
+                    ("tickets", Tag::List(Vec::new())),
+                    ("test:original", Tag::Long(731)),
+                ]),
+            )
+            .unwrap();
+            let save = Arc::new(SaveDir::new_retained(path.clone()));
+            let historical = tag(87);
+            queue(&save, Folder::Region, 0, historical.clone());
+            let mut close = staged(&save);
+            let durable = staged_durable(&mut close);
+            let historical_before = {
+                let ledger = save.retained.as_ref().unwrap().ledger.lock().unwrap();
+                (
+                    Verification::capture(&ledger, 0),
+                    ledger.verified,
+                    ledger.history.len(),
+                    ledger.facts.len(),
+                )
+            };
+            let historical_deadline = close.close.deadline;
+            let historical_renewed_deadline = historical_deadline + Duration::from_secs(15);
+            let historical_before_expiry = Instant::now() < historical_deadline;
+            let historical_renewed = close.retry(historical_renewed_deadline).is_ok();
+            let historical_after = {
+                let ledger = save.retained.as_ref().unwrap().ledger.lock().unwrap();
+                (
+                    Verification::capture(&ledger, 0),
+                    ledger.verified,
+                    ledger.history.len(),
+                    ledger.facts.len(),
+                )
+            };
+            let historical_proof_current = durable.poll_current().unwrap() == Some(true)
+                && close.close.deadline == historical_renewed_deadline;
+            let cap = Arc::new(staged_cap(&mut close, &durable));
+            // Fixed real forced-only data needs no chunk registry. This creates
+            // no receipt/capability: submit_native still performs the native IO.
+            let input = NativeWriterFinalInput {
+                save: save.clone(),
+                identity: Arc::new(()),
+                records: Vec::new(),
+                forced: HashSet::from([(7, 9)]),
+                forced_projection: Arc::default(),
+                forced_after_backup: Arc::default(),
+            };
+            let (entered, observed) = mpsc::channel();
+            let (release, wait) = mpsc::channel();
+            *input.forced_after_backup.lock().unwrap() = Some((entered, wait));
+            let old_deadline = close.close.deadline;
+            let new_deadline = old_deadline + Duration::from_secs(15);
+            let worker_cap = cap.clone();
+            let worker_input = input.clone();
+            let handle = std::thread::Builder::new()
+                .name("fixed-native-retry-renewal-test".into())
+                .spawn(move || {
+                    worker_cap
+                        .submit_native(&worker_input)
+                        .map_err(|error| error.to_string())
+                })
+                .unwrap();
+            observed.recv_timeout(Duration::from_secs(5)).unwrap();
+            let busy = close.retry(new_deadline).is_err() && close.close.deadline == old_deadline;
+            let ordinary_sealed = save.queue(Folder::Region, Vec::new(), false).is_err();
+            let nominal = saved_data_path(&path, "chunk_tickets");
+            fs::create_dir(&nominal).unwrap();
+            release.send(()).unwrap();
+            let end = deadline();
+            while !handle.is_finished() {
+                if Instant::now() >= end {
+                    std::process::exit(92);
+                }
+                std::thread::yield_now();
+            }
+            let actual_error = handle.join().unwrap().is_err();
+            let before = {
+                let ledger = save.retained.as_ref().unwrap().ledger.lock().unwrap();
+                (
+                    ledger.accepted,
+                    ledger.completed,
+                    ledger.unsent,
+                    ledger.version,
+                    ledger.error_generation,
+                    ledger.expected.len(),
+                    ledger.history.len(),
+                    ledger.unsettled,
+                )
+            };
+            let attempt_before = save
+                .retained
+                .as_ref()
+                .unwrap()
+                .admission
+                .lock()
+                .unwrap()
+                .final_attempt;
+            let before_expiry = Instant::now() < old_deadline;
+            let polled_without_renewal = close.poll() == NativeWriterStagedStatus::Submitting
+                && close.close.deadline == old_deadline;
+            let renewed = close.retry(new_deadline).is_ok();
+            let after = {
+                let ledger = save.retained.as_ref().unwrap().ledger.lock().unwrap();
+                (
+                    ledger.accepted,
+                    ledger.completed,
+                    ledger.unsent,
+                    ledger.version,
+                    ledger.error_generation,
+                    ledger.expected.len(),
+                    ledger.history.len(),
+                    ledger.unsettled,
+                )
+            };
+            let same_binding = {
+                let admission = save.retained.as_ref().unwrap().admission.lock().unwrap();
+                admission.final_attempt == attempt_before
+                    && admission
+                        .final_input
+                        .as_ref()
+                        .is_some_and(|id| Arc::ptr_eq(id, &input.identity))
+                    && admission
+                        .owner
+                        .ptr_eq(&Arc::downgrade(&close.close.identity))
+                    && admission.phase == Phase::Sealed
+                    && admission.staged == Some(StagedPhase::Submitting)
+            };
+            fs::remove_dir(nominal).unwrap();
+            let submitted = cap.submit_native(&input.clone()).unwrap();
+            staged_seal(&mut close, &submitted);
+            let sealed_without_renewal = close.close.deadline == new_deadline;
+            let closed = staged_finish(close);
+            assert!(
+                historical_before_expiry
+                    && historical_renewed
+                    && historical_proof_current
+                    && historical_before == historical_after
+            );
+            assert!(
+                busy && ordinary_sealed
+                    && actual_error
+                    && before_expiry
+                    && polled_without_renewal
+                    && renewed
+                    && same_binding
+                    && sealed_without_renewal
+            );
+            assert_eq!(before, after);
+            assert_eq!(save.load_forced_chunks(), HashSet::from([(7, 9)]));
+            assert_eq!(
+                read_saved_data(&path, "chunk_tickets")
+                    .unwrap()
+                    .get("test:original"),
+                Some(&Tag::Long(731))
+            );
+            assert_eq!(
+                disk(&path, Folder::Region, 0, 0),
+                Some((*historical).clone())
+            );
+            assert!(Arc::ptr_eq(closed.save(), &save));
+            drop(closed);
+            drop(submitted);
+            drop(cap);
+            drop(input);
+            drop(durable);
+            drop(save);
+            fs::remove_dir_all(path).unwrap();
+        }
+        #[test]
+        #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+        #[ignore = "pinned native resources: historical repair, close-only final native records and same-allocation terminal witness"]
+        fn staged_historical_repair_then_final_native_payload_and_terminal_join() {
+            let resources = PathBuf::from(
+                std::env::var_os("HORIZON_TEST_RESOURCES").expect("pinned resources mandatory"),
+            );
+            let assets = crate::assets::Assets::load(&resources).unwrap();
+            let biomes = Arc::new(Biomes::load(&resources).unwrap());
+            let tables = Arc::new(SaveTables::new(&assets));
+            let path = root("staged-history");
+            let file = region_path(&path, "region", 0, 0);
+            fs::create_dir_all(&file).unwrap();
+            let save = Arc::new(SaveDir::new_retained(path.clone()));
+            save.tables.set(tables.clone()).ok().unwrap();
+            let original = tag(17);
+            queue(&save, Folder::Region, 0, original.clone());
+            let mut close = staged(&save);
+            until_harvest(&mut close.close);
+            let failed = matches!(close.poll(), NativeWriterStagedStatus::Blocked(_));
+            let retained = matches!(&save.pending.lock().unwrap()[&(Folder::Region,0,0)].1,Record::Tag(value) if Arc::ptr_eq(value,&original));
+            let historical_failures = close.failure_count().unwrap().unwrap();
+            fs::remove_dir(&file).unwrap();
+            close.retry(deadline()).unwrap();
+            let durable = staged_durable(&mut close);
+            let ordinary_closed = save.queue(Folder::Region, Vec::new(), false).is_err()
+                && save.save_forced_chunks(&HashSet::new()).is_err();
+            let current = durable.poll_current().unwrap();
+            let mut chunk = Chunk::empty(1, 0);
+            chunk.set(
+                5,
+                71,
+                5,
+                assets.registry.default_state("minecraft:bell").unwrap().0,
+            );
+            let chunk = Arc::new(chunk);
+            let entities = vec![(
+                (1, 0),
+                vec![Tag::compound([
+                    ("id", Tag::String("minecraft:chest_minecart".into())),
+                    ("test:opaque", Tag::Long(31)),
+                ])],
+            )];
+            let forced = HashSet::from([(1, 0), (-2, 3)]);
+            let input = NativeWriterFinalInput::new(
+                &save,
+                std::slice::from_ref(&chunk),
+                &entities,
+                &forced,
+                &HashSet::new(),
+                assets.registry,
+                &biomes,
+            )
+            .unwrap();
+            let input_kept = matches!(&input.records[0].1[0].1,Record::Chunk(value,_) if Arc::ptr_eq(value,&chunk));
+            let cap = staged_cap(&mut close, &durable);
+            let stale = durable.poll_current().unwrap() == Some(false)
+                && close.begin_final(&durable).is_err();
+            let submitted = cap.submit_native(&input).unwrap();
+            staged_seal(&mut close, &submitted);
+            let sealed_cap = cap.submit_native(&input).is_err();
+            let closed = staged_finish(close);
+            let same_allocation = Arc::ptr_eq(closed.save(), &save);
+            let native_region = disk(&path, Folder::Region, 1, 0).unwrap();
+            let native_entities = disk(&path, Folder::Entities, 1, 0).unwrap();
+            let native_poi = disk(&path, Folder::Poi, 1, 0).unwrap();
+            assert!(
+                failed
+                    && retained
+                    && historical_failures > 0
+                    && ordinary_closed
+                    && current == Some(true)
+                    && stale
+                    && input_kept
+                    && sealed_cap
+                    && same_allocation
+            );
+            assert_eq!(
+                native_region,
+                encode_with(&chunk, assets.registry, &biomes, Some(&tables), save.shape)
+            );
+            assert_eq!(
+                native_entities,
+                entity_record(1, 0, entities[0].1.clone()).unwrap()
+            );
+            assert_eq!(native_poi, encode_poi(&chunk, &tables).unwrap());
+            assert_eq!(save.load_forced_chunks(), forced);
+            assert!(save.queue(Folder::Entities, Vec::new(), false).is_err());
+            drop(closed);
+            drop(cap);
+            drop(durable);
+            drop(input);
+            drop(submitted);
+            drop(save);
+            fs::remove_dir_all(path).unwrap();
+        }
+        #[test]
+        #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+        #[ignore = "pinned native resources: partial final forced error, same-input resubmission, actual final writer repair"]
+        fn staged_partial_final_error_keeps_fixed_input_and_repairs_latest_records() {
+            let resources = PathBuf::from(
+                std::env::var_os("HORIZON_TEST_RESOURCES").expect("pinned resources mandatory"),
+            );
+            let assets = crate::assets::Assets::load(&resources).unwrap();
+            let biomes = Arc::new(Biomes::load(&resources).unwrap());
+            let path = root("staged-final");
+            let save = Arc::new(SaveDir::new_retained(path.clone()));
+            let mut close = staged(&save);
+            let durable = staged_durable(&mut close);
+            let cap = staged_cap(&mut close, &durable);
+            let chunk = Arc::new(Chunk::empty(0, 0));
+            let entities = vec![((0, 0), vec![Tag::compound([("test:opaque", Tag::Int(9))])])];
+            let forced = HashSet::from([(0, 0)]);
+            let input = NativeWriterFinalInput::new(
+                &save,
+                std::slice::from_ref(&chunk),
+                &entities,
+                &forced,
+                &HashSet::new(),
+                assets.registry,
+                &biomes,
+            )
+            .unwrap();
+            let forced_file = saved_data_path(&path, "chunk_tickets");
+            let forced_block = forced_file.with_extension("dat_new");
+            fs::create_dir_all(&forced_block).unwrap();
+            let region_file = region_path(&path, "region", 0, 0);
+            fs::create_dir_all(&region_file).unwrap();
+            save.retained
+                .as_ref()
+                .unwrap()
+                .fail_spawn
+                .store(true, Ordering::SeqCst);
+            let spawn_refused = cap.submit_native(&input).is_err();
+            let unsent_original = {
+                let ledger = save.retained.as_ref().unwrap().ledger.lock().unwrap();
+                ledger.unsent_batches.len() == 1
+                    && matches!(&ledger.unsent_batches[0].records[0].1,Record::Chunk(value,_) if Arc::ptr_eq(value,&chunk))
+            };
+            let mut control = save
+                .arm_native_writer_test_control(NativeWriterTestAction::Block)
+                .unwrap();
+            let first_failed = cap.submit_native(&input).is_err();
+            control.wait_entered(Duration::from_secs(5)).unwrap();
+            let held_original = matches!(&save.pending.lock().unwrap()[&(Folder::Region,0,0)].1,Record::Chunk(value,_) if Arc::ptr_eq(value,&chunk));
+            fs::remove_dir(forced_block).unwrap();
+            let submitted = cap.submit_native(&input).unwrap();
+            control.trigger().unwrap();
+            drop(control);
+            staged_seal(&mut close, &submitted);
+            until_harvest(&mut close.close);
+            let blocked = matches!(close.poll(), NativeWriterStagedStatus::Blocked(_));
+            let failure_count = close.failure_count().unwrap().unwrap();
+            let original_latest = matches!(&save.pending.lock().unwrap()[&(Folder::Region,0,0)].1,Record::Chunk(value,_) if Arc::ptr_eq(value,&chunk));
+            fs::remove_dir(region_file).unwrap();
+            close.retry(deadline()).unwrap();
+            let closed = staged_finish(close);
+            assert!(
+                spawn_refused
+                    && unsent_original
+                    && first_failed
+                    && held_original
+                    && blocked
+                    && failure_count > 0
+                    && original_latest
+            );
+            assert_eq!(
+                disk(&path, Folder::Entities, 0, 0).unwrap(),
+                entity_record(0, 0, entities[0].1.clone()).unwrap()
+            );
+            assert_eq!(save.load_forced_chunks(), forced);
+            assert!(save.pending.lock().unwrap().is_empty());
+            drop(closed);
+            drop(cap);
+            drop(durable);
+            drop(input);
+            drop(submitted);
+            drop(save);
+            fs::remove_dir_all(path).unwrap();
+        }
+        #[test]
+        #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+        #[ignore = "pinned native resources: actual backup/final-rename failure reuses frozen complete forced projection for empty and nonempty sets"]
+        fn staged_forced_partial_publication_retry_keeps_nonforced_tickets_and_unknown_fields() {
+            let resources = PathBuf::from(
+                std::env::var_os("HORIZON_TEST_RESOURCES").expect("pinned resources mandatory"),
+            );
+            let assets = crate::assets::Assets::load(&resources).unwrap();
+            let biomes = Arc::new(Biomes::load(&resources).unwrap());
+            for forced in [HashSet::new(), HashSet::from([(-3, 4), (9, 2)])] {
+                let path = root("staged-forced-publication");
+                let old_forced = Tag::compound([
+                    ("type", Tag::String("minecraft:forced".into())),
+                    ("level", Tag::Int(31)),
+                    ("chunk_pos", Tag::IntArray(vec![1, 2])),
+                ]);
+                let nonforced = Tag::compound([
+                    ("type", Tag::String("test:persistent_owner".into())),
+                    ("chunk_pos", Tag::IntArray(vec![17, -9])),
+                    (
+                        "test:opaque",
+                        Tag::compound([("values", Tag::LongArray(vec![71, -4, 99]))]),
+                    ),
+                ]);
+                let other_ticket = Tag::compound([
+                    ("type", Tag::String("minecraft:portal".into())),
+                    ("level", Tag::Int(30)),
+                    ("test:owner", Tag::ByteArray(vec![7, 1, 9])),
+                ]);
+                let unknown = Tag::compound([
+                    ("raw", Tag::ByteArray(vec![0, 127, 255])),
+                    ("bits", Tag::Double(0x3fe0000000000001)),
+                ]);
+                let old_data = Tag::compound([
+                    (
+                        "tickets",
+                        Tag::List(vec![old_forced, nonforced.clone(), other_ticket.clone()]),
+                    ),
+                    ("test:unknown", unknown.clone()),
+                    ("test:sequence", Tag::Long(1234567)),
+                ]);
+                write_saved_data(&path, "chunk_tickets", old_data.clone()).unwrap();
+                let nominal = saved_data_path(&path, "chunk_tickets");
+                let backup = nominal.with_file_name("chunk_tickets.dat_old");
+                let save = Arc::new(SaveDir::new_retained(path.clone()));
+                let mut close = staged(&save);
+                let durable = staged_durable(&mut close);
+                let cap = Arc::new(staged_cap(&mut close, &durable));
+                let input = NativeWriterFinalInput::new(
+                    &save,
+                    &[],
+                    &[],
+                    &forced,
+                    &HashSet::new(),
+                    assets.registry,
+                    &biomes,
+                )
+                .unwrap();
+                let (entered, observed) = mpsc::channel();
+                let (release, wait) = mpsc::channel();
+                *input.forced_after_backup.lock().unwrap() = Some((entered, wait));
+                let worker_cap = cap.clone();
+                let worker_input = input.clone();
+                let shared_projection =
+                    Arc::ptr_eq(&input.forced_projection, &worker_input.forced_projection);
+                let handle = std::thread::Builder::new()
+                    .name("fixed-forced-publication-test".into())
+                    .spawn(move || {
+                        worker_cap
+                            .submit_native(&worker_input)
+                            .map_err(|error| error.to_string())
+                    })
+                    .unwrap();
+                observed.recv_timeout(Duration::from_secs(5)).unwrap();
+                let nominal_absent_after_backup = !nominal.exists();
+                let original_backup = read_dat(&backup) == Some(saved_data_root(old_data.clone()));
+                fs::create_dir(&nominal).unwrap();
+                release.send(()).unwrap();
+                let end = deadline();
+                while !handle.is_finished() {
+                    if Instant::now() >= end {
+                        std::process::exit(92);
+                    }
+                    std::thread::yield_now();
+                }
+                let actual_rename_failed = handle.join().unwrap().is_err();
+                // The first native attempt moved the old nominal path away.
+                // Retrying a clone must use the already merged complete root,
+                // not absence/tolerant disk rereads or a reconstructed receipt.
+                fs::remove_dir(&nominal).unwrap();
+                let submitted = cap.submit_native(&input.clone()).unwrap();
+                staged_seal(&mut close, &submitted);
+                let closed = staged_finish(close);
+                let mut expected_tickets = vec![nonforced, other_ticket];
+                if !forced.is_empty() {
+                    expected_tickets.extend([(-3, 4), (9, 2)].map(|(x, z)| {
+                        Tag::compound([
+                            ("type", Tag::String("minecraft:forced".into())),
+                            ("level", Tag::Int(31)),
+                            ("chunk_pos", Tag::IntArray(vec![x, z])),
+                        ])
+                    }));
+                }
+                let expected = saved_data_root(Tag::compound([
+                    ("tickets", Tag::List(expected_tickets)),
+                    ("test:unknown", unknown),
+                    ("test:sequence", Tag::Long(1234567)),
+                ]));
+                assert!(
+                    shared_projection
+                        && nominal_absent_after_backup
+                        && original_backup
+                        && actual_rename_failed
+                );
+                assert_eq!(read_dat(&nominal), Some(expected));
+                assert_eq!(read_dat(&backup), Some(saved_data_root(old_data)));
+                assert_eq!(save.load_forced_chunks(), forced);
+                assert!(Arc::ptr_eq(closed.save(), &save));
+                drop(closed);
+                drop(submitted);
+                drop(cap);
+                drop(input);
+                drop(durable);
+                drop(save);
+                fs::remove_dir_all(path).unwrap();
+            }
+        }
+        #[test]
+        #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+        #[ignore = "pinned native resources: wrong allocation, stale successful final receipt and protected nonresident conflict refusal"]
+        fn staged_wrong_allocation_stale_receipt_and_protected_columns_refuse_without_loss() {
+            let resources = PathBuf::from(
+                std::env::var_os("HORIZON_TEST_RESOURCES").expect("pinned resources mandatory"),
+            );
+            let assets = crate::assets::Assets::load(&resources).unwrap();
+            let biomes = Arc::new(Biomes::load(&resources).unwrap());
+            let a = root("staged-owner-a");
+            let b = root("staged-owner-b");
+            let first = Arc::new(SaveDir::new_retained(a.clone()));
+            let second = Arc::new(SaveDir::new_retained(b.clone()));
+            let mut first_close = staged(&first);
+            let mut second_close = staged(&second);
+            let first_durable = staged_durable(&mut first_close);
+            let second_durable = staged_durable(&mut second_close);
+            let foreign_proof = first_close.begin_final(&second_durable).is_err();
+            let first_cap = staged_cap(&mut first_close, &first_durable);
+            let second_cap = staged_cap(&mut second_close, &second_durable);
+            let chunk = Arc::new(Chunk::empty(0, 0));
+            let entities = vec![(
+                (64, 0),
+                vec![Tag::compound([("test:original", Tag::Long(71))])],
+            )];
+            let forced = HashSet::from([(0, 0)]);
+            let protected = HashSet::from([(64, 0)]);
+            let conflict = NativeWriterFinalInput::new(
+                &first,
+                std::slice::from_ref(&chunk),
+                &entities,
+                &forced,
+                &protected,
+                assets.registry,
+                &biomes,
+            )
+            .is_err();
+            let input = NativeWriterFinalInput::new(
+                &first,
+                std::slice::from_ref(&chunk),
+                &entities,
+                &forced,
+                &HashSet::new(),
+                assets.registry,
+                &biomes,
+            )
+            .unwrap();
+            let other = NativeWriterFinalInput::new(
+                &second,
+                &[],
+                &[],
+                &HashSet::new(),
+                &HashSet::new(),
+                assets.registry,
+                &biomes,
+            )
+            .unwrap();
+            let equal_but_foreign = NativeWriterFinalInput::new(
+                &first,
+                std::slice::from_ref(&chunk),
+                &entities,
+                &forced,
+                &HashSet::new(),
+                assets.registry,
+                &biomes,
+            )
+            .unwrap();
+            let wrong_input = first_cap.submit_native(&other).is_err();
+            let old_receipt = first_cap.submit_native(&input).unwrap();
+            let changed_projection = first_cap.submit_native(&equal_but_foreign).is_err();
+            let wrong_receipt = second_close.seal_final(&old_receipt).is_err();
+            let obstruction =
+                saved_data_path(&a, "chunk_tickets").with_file_name("chunk_tickets.dat_new");
+            fs::create_dir(&obstruction).unwrap();
+            let retry_failed = first_cap.submit_native(&input).is_err();
+            let stale_receipt = first_close.seal_final(&old_receipt).is_err();
+            fs::remove_dir(obstruction).unwrap();
+            let accepted = first_cap.submit_native(&input).unwrap();
+            let second_accepted = second_cap.submit_native(&other).unwrap();
+            staged_seal(&mut first_close, &accepted);
+            staged_seal(&mut second_close, &second_accepted);
+            let first_done = staged_finish(first_close);
+            let second_done = staged_finish(second_close);
+            assert!(
+                foreign_proof
+                    && conflict
+                    && wrong_input
+                    && changed_projection
+                    && wrong_receipt
+                    && retry_failed
+                    && stale_receipt
+            );
+            assert!(
+                Arc::ptr_eq(first_done.save(), &first) && Arc::ptr_eq(second_done.save(), &second)
+            );
+            assert_eq!(
+                disk(&a, Folder::Entities, 64, 0).unwrap(),
+                entity_record(64, 0, entities[0].1.clone()).unwrap()
+            );
+            drop(first_done);
+            drop(second_done);
+            drop(first_cap);
+            drop(second_cap);
+            drop(first_durable);
+            drop(second_durable);
+            drop(old_receipt);
+            drop(accepted);
+            drop(second_accepted);
+            drop(input);
+            drop(other);
+            drop(equal_but_foreign);
+            drop(first);
+            drop(second);
+            fs::remove_dir_all(a).unwrap();
+            fs::remove_dir_all(b).unwrap();
+        }
+        #[test]
+        #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+        #[ignore = "external fatal fixture: fixed actual final writer panic retains original payload/controller and cannot become complete"]
+        fn fatal_staged_final_writer_panic_retains_original_payload_and_controller() {
+            let resources = PathBuf::from(
+                std::env::var_os("HORIZON_TEST_RESOURCES").expect("pinned resources mandatory"),
+            );
+            let assets = crate::assets::Assets::load(&resources).unwrap();
+            let biomes = Arc::new(Biomes::load(&resources).unwrap());
+            let save = Arc::new(SaveDir::new_retained(root("fatal-staged-final-panic")));
+            let mut close = staged(&save);
+            let durable = staged_durable(&mut close);
+            let cap = staged_cap(&mut close, &durable);
+            let chunk = Arc::new(Chunk::empty(0, 0));
+            let input = NativeWriterFinalInput::new(
+                &save,
+                std::slice::from_ref(&chunk),
+                &[],
+                &HashSet::new(),
+                &HashSet::new(),
+                assets.registry,
+                &biomes,
+            )
+            .unwrap();
+            let mut control = save
+                .arm_native_writer_test_control(NativeWriterTestAction::Panic)
+                .unwrap();
+            let submitted = cap.submit_native(&input).unwrap();
+            control.wait_entered(Duration::from_secs(5)).unwrap();
+            // Model a lost disposable worker return: the actual accepted input
+            // and capability remain outside it, but no receipt is reconstructed.
+            drop(submitted);
+            control.trigger().unwrap();
+            drop(control);
+            let end = deadline();
+            loop {
+                close.poll();
+                if close.close.fault.is_some()
+                    && close.close.thread.is_none()
+                    && save
+                        .retained
+                        .as_ref()
+                        .unwrap()
+                        .admission
+                        .lock()
+                        .unwrap()
+                        .writer
+                        .is_none()
+                {
+                    break;
+                }
+                if Instant::now() >= end {
+                    std::process::exit(92);
+                }
+                std::thread::yield_now();
+            }
+            let blocked = matches!(close.poll(), NativeWriterStagedStatus::Blocked(_));
+            let kept = matches!(&save.pending.lock().unwrap()[&(Folder::Region,0,0)].1,Record::Chunk(value,_) if Arc::ptr_eq(value,&chunk));
+            if !blocked || !kept || close.retry(deadline()).is_ok() || close.close.thread.is_some()
+            {
+                std::process::exit(92);
+            }
+            marker("staged-final-worker-panic-original-accounting");
+            drop(close);
+            // A returned controller Drop must not be masked by SaveDir Drop.
+            std::process::exit(91);
         }
         fn native_gate(save: &SaveDir) -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
             let (entered, observed) = mpsc::channel();
@@ -6126,12 +7586,24 @@ impl Drop for SaveDir {
 }
 
 pub fn read_dat(path: &Path) -> Option<Tag> {
-    let bytes = fs::read(path).ok()?;
+    read_dat_native(path).ok().flatten()
+}
+fn read_dat_native(path: &Path) -> Result<Option<Tag>> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
     let raw = match Compression::Gzip.decode(&bytes, 64 << 20) {
         Ok(raw) => raw,
         Err(_) => bytes,
     };
-    Some(nbt::read_named(&raw, Limits::default()).ok()?.0.tag)
+    Ok(Some(
+        nbt::read_named(&raw, Limits::default())
+            .map_err(|error| error.to_string())?
+            .0
+            .tag,
+    ))
 }
 /// Optional overworld controls for the concrete world-clock save handoff.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -6210,7 +7682,17 @@ pub fn write_world_clocks(
     missing_end_ticks: Option<i64>,
     controls: Option<ClockControls>,
 ) -> Result<()> {
-    let mut root = read_world_clocks(world)?.unwrap_or_else(|| Tag::Compound(Compound::new()));
+    let root = read_world_clocks(world)?.unwrap_or_else(|| Tag::Compound(Compound::new()));
+    let root = merged_world_clocks(root, overworld_ticks, missing_end_ticks, controls);
+    let path = saved_data_path(world, "world_clocks");
+    write_dat(&path, root).map_err(|error| format!("{}: {error}", path.display()).into())
+}
+fn merged_world_clocks(
+    mut root: Tag,
+    overworld_ticks: i64,
+    missing_end_ticks: Option<i64>,
+    controls: Option<ClockControls>,
+) -> Tag {
     let mut data = root
         .get("data")
         .cloned()
@@ -6256,11 +7738,40 @@ pub fn write_world_clocks(
     }
     put(&mut root, "data", data);
     put(&mut root, "DataVersion", Tag::Int(DATA_VERSION));
-    let path = saved_data_path(world, "world_clocks");
-    write_dat(&path, root).map_err(|error| format!("{}: {error}", path.display()).into())
+    root
 }
 /// Write a gzip NBT file the way vanilla does (`<name>_new`, keep `_old`).
 pub fn write_dat(path: &Path, tag: Tag) -> Result<()> {
+    write_dat_native(
+        path,
+        tag,
+        #[cfg(all(
+            test,
+            feature = "paired-packages",
+            feature = "native-writer-test-control",
+            debug_assertions
+        ))]
+        None,
+    )
+}
+#[cfg(all(
+    test,
+    feature = "paired-packages",
+    feature = "native-writer-test-control",
+    debug_assertions
+))]
+type DatAfterBackupControl = (mpsc::Sender<()>, mpsc::Receiver<()>);
+fn write_dat_native(
+    path: &Path,
+    tag: Tag,
+    #[cfg(all(
+        test,
+        feature = "paired-packages",
+        feature = "native-writer-test-control",
+        debug_assertions
+    ))]
+    after_backup: Option<DatAfterBackupControl>,
+) -> Result<()> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }
@@ -6286,6 +7797,18 @@ pub fn write_dat(path: &Path, tag: Tag) -> Result<()> {
         };
         // Util.safeReplaceFile: no backup, no replacement.
         fs::rename(path, old).map_err(|e| format!("{}: {e}", path.display()))?;
+        #[cfg(all(
+            test,
+            feature = "paired-packages",
+            feature = "native-writer-test-control",
+            debug_assertions
+        ))]
+        if let Some((entered, release)) = after_backup {
+            let _ = entered.send(());
+            release
+                .recv_timeout(std::time::Duration::from_secs(15))
+                .map_err(|error| format!("fixed native after-backup control: {error}"))?;
+        }
     }
     fs::rename(temporary, path)?;
     Ok(())
@@ -6313,10 +7836,10 @@ pub fn world_gen_settings(world: &Path) -> Option<Tag> {
     })
 }
 fn write_saved_data(world: &Path, name: &str, data: Tag) -> Result<()> {
-    write_dat(
-        &saved_data_path(world, name),
-        Tag::compound([("data", data), ("DataVersion", Tag::Int(DATA_VERSION))]),
-    )
+    write_dat(&saved_data_path(world, name), saved_data_root(data))
+}
+fn saved_data_root(data: Tag) -> Tag {
+    Tag::compound([("data", data), ("DataVersion", Tag::Int(DATA_VERSION))])
 }
 pub use horizon_client_core::uuid::{uuid_from_text, uuid_text};
 /// A random (version 4) UUID as vanilla's four-int form.
@@ -6492,6 +8015,13 @@ pub fn write_world_gen_settings_with(
     flat_settings: Option<Tag>,
 ) -> Result<()> {
     fs::create_dir_all(dir)?;
+    write_saved_data(
+        dir,
+        "world_gen_settings",
+        native_world_gen_data(seed, options, flat_settings),
+    )
+}
+fn native_world_gen_data(seed: i64, options: WorldGen, flat_settings: Option<Tag>) -> Tag {
     // worldgen/world_preset/flat.json's overworld: the classic flat layers.
     let layer = |block: &str, height: i32| {
         Tag::compound([("block", string(block)), ("height", Tag::Int(height))])
@@ -6547,51 +8077,47 @@ pub fn write_world_gen_settings_with(
             ("preset", string(p)),
         ])
     };
-    write_saved_data(
-        dir,
-        "world_gen_settings",
-        Tag::compound([
-            ("seed", Tag::Long(seed)),
-            (
-                "generate_structures",
-                Tag::Byte(i8::from(options.structures)),
-            ),
-            ("bonus_chest", Tag::Byte(i8::from(options.bonus_chest))),
-            (
-                "dimensions",
-                Tag::compound([
-                    (
-                        "minecraft:overworld",
-                        if options.flat {
-                            flat
-                        } else {
-                            dimension(
-                                "minecraft:overworld",
-                                "minecraft:overworld",
-                                preset("minecraft:overworld"),
-                            )
-                        },
-                    ),
-                    (
+    Tag::compound([
+        ("seed", Tag::Long(seed)),
+        (
+            "generate_structures",
+            Tag::Byte(i8::from(options.structures)),
+        ),
+        ("bonus_chest", Tag::Byte(i8::from(options.bonus_chest))),
+        (
+            "dimensions",
+            Tag::compound([
+                (
+                    "minecraft:overworld",
+                    if options.flat {
+                        flat
+                    } else {
+                        dimension(
+                            "minecraft:overworld",
+                            "minecraft:overworld",
+                            preset("minecraft:overworld"),
+                        )
+                    },
+                ),
+                (
+                    "minecraft:the_nether",
+                    dimension(
                         "minecraft:the_nether",
-                        dimension(
-                            "minecraft:the_nether",
-                            "minecraft:nether",
-                            preset("minecraft:nether"),
-                        ),
+                        "minecraft:nether",
+                        preset("minecraft:nether"),
                     ),
-                    (
+                ),
+                (
+                    "minecraft:the_end",
+                    dimension(
                         "minecraft:the_end",
-                        dimension(
-                            "minecraft:the_end",
-                            "minecraft:end",
-                            Tag::compound([("type", string("minecraft:the_end"))]),
-                        ),
+                        "minecraft:end",
+                        Tag::compound([("type", string("minecraft:the_end"))]),
                     ),
-                ]),
-            ),
-        ]),
-    )
+                ),
+            ]),
+        ),
+    ])
 }
 #[derive(Clone, Debug, Default)]
 pub struct Level {
@@ -6664,6 +8190,13 @@ pub struct Level {
     /// The player compound as loaded, for fields Horizon does not model
     /// (ender chest, effects, abilities, recipe book, attributes, ...).
     pub player_extra: Option<Tag>,
+}
+struct NativeLevelDataPrefix {
+    data: Tag,
+    spawn: [i32; 3],
+    history: Vec<Tag>,
+    brands: Vec<Tag>,
+    difficulty: Tag,
 }
 impl Level {
     /// Initialize the offline single-player identity before saving or dropping items.
@@ -7127,13 +8660,7 @@ impl Level {
         }
         p
     }
-    /// Write every file; a world without a player UUID gets a random one.
-    pub fn write(&mut self, dir: &Path) -> Result<()> {
-        fs::create_dir_all(dir)?;
-        let existing = read_dat(&dir.join("level.dat")).and_then(|r| r.get("Data").cloned());
-        let legacy = existing
-            .as_ref()
-            .is_some_and(|d| d.get("Player").is_some() || d.get("WorldGenSettings").is_some());
+    fn clean_native_level_data(existing: Option<Tag>) -> Tag {
         let mut data = compound_or_empty(existing);
         if let Tag::Compound(map) = &mut data {
             // Pre-26.3 keys now stored elsewhere (a legacy Horizon level.dat).
@@ -7174,17 +8701,9 @@ impl Level {
                 map.remove(&JavaString::from(key));
             }
         }
-        let uuid = self.ensure_player_uuid();
-        // A new world's first spawn point is its world spawn.
-        if self.world_spawn.is_none() {
-            self.world_spawn = self.spawn.map(|s| {
-                [
-                    s[0].floor() as i32,
-                    s[1].floor() as i32,
-                    s[2].floor() as i32,
-                ]
-            });
-        }
+        data
+    }
+    fn native_level_data_prefix(&self, data: Tag) -> NativeLevelDataPrefix {
         let spawn = self.world_spawn.unwrap_or([0, 64, 0]);
         let mut history: Vec<Tag> = match data.get("version_history") {
             Some(Tag::List(l)) => l.clone(),
@@ -7220,9 +8739,27 @@ impl Level {
             "locked",
             Tag::Byte(i8::from(self.difficulty_locked)),
         );
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_millis() as i64);
+        NativeLevelDataPrefix {
+            data,
+            spawn,
+            history,
+            brands,
+            difficulty,
+        }
+    }
+    fn finish_native_level_data(
+        &self,
+        prefix: NativeLevelDataPrefix,
+        uuid: [i32; 4],
+        now: i64,
+    ) -> Tag {
+        let NativeLevelDataPrefix {
+            mut data,
+            spawn,
+            history,
+            brands,
+            difficulty,
+        } = prefix;
         for (key, value) in [
             ("DataVersion", Tag::Int(DATA_VERSION)),
             (
@@ -7281,36 +8818,64 @@ impl Level {
                 ])
             });
         }
+        data
+    }
+    fn native_weather_data(&self) -> Tag {
+        Tag::compound([
+            ("clear_weather_time", Tag::Int(self.weather.clear_time)),
+            ("rain_time", Tag::Int(self.weather.rain_time)),
+            ("thunder_time", Tag::Int(self.weather.thunder_time)),
+            ("raining", Tag::Byte(i8::from(self.weather.raining))),
+            ("thundering", Tag::Byte(i8::from(self.weather.thundering))),
+        ])
+    }
+    fn native_game_rules_data(&self) -> Tag {
+        // Only rules vanilla knows: an unknown key makes it reject the file.
+        let mut rules = Tag::Compound(Compound::new());
+        for (name, default) in GAME_RULES {
+            let value = self.game_rules.get(name).copied().unwrap_or(default);
+            let tag = if INT_RULES.contains(&name) {
+                Tag::Int(value)
+            } else {
+                Tag::Byte(i8::from(value != 0))
+            };
+            put(&mut rules, &format!("minecraft:{name}"), tag);
+        }
+        rules
+    }
+    /// Write every file; a world without a player UUID gets a random one.
+    pub fn write(&mut self, dir: &Path) -> Result<()> {
+        fs::create_dir_all(dir)?;
+        let existing = read_dat(&dir.join("level.dat")).and_then(|r| r.get("Data").cloned());
+        let legacy = existing
+            .as_ref()
+            .is_some_and(|d| d.get("Player").is_some() || d.get("WorldGenSettings").is_some());
+        let data = Self::clean_native_level_data(existing);
+        let uuid = self.ensure_player_uuid();
+        // A new world's first spawn point is its world spawn.
+        if self.world_spawn.is_none() {
+            self.world_spawn = self.spawn.map(|s| {
+                [
+                    s[0].floor() as i32,
+                    s[1].floor() as i32,
+                    s[2].floor() as i32,
+                ]
+            });
+        }
+        let prefix = self.native_level_data_prefix(data);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as i64);
+        let data = self.finish_native_level_data(prefix, uuid, now);
         // Saved data: weather, clocks, and (when missing or legacy) world
         // generation settings and game rules.
-        write_saved_data(
-            dir,
-            "weather",
-            Tag::compound([
-                ("clear_weather_time", Tag::Int(self.weather.clear_time)),
-                ("rain_time", Tag::Int(self.weather.rain_time)),
-                ("thunder_time", Tag::Int(self.weather.thunder_time)),
-                ("raining", Tag::Byte(i8::from(self.weather.raining))),
-                ("thundering", Tag::Byte(i8::from(self.weather.thundering))),
-            ]),
-        )?;
+        write_saved_data(dir, "weather", self.native_weather_data())?;
         write_world_clocks(dir, self.day_time, Some(self.time), None)?;
         if legacy || !saved_data_path(dir, "world_gen_settings").exists() {
             write_world_gen_settings(dir, self.seed, WorldGen::default())?;
         }
         if !saved_data_path(dir, "game_rules").exists() || !self.game_rules.is_empty() {
-            // Only rules vanilla knows: an unknown key makes it reject the file.
-            let mut rules = Tag::Compound(Compound::new());
-            for (name, default) in GAME_RULES {
-                let value = self.game_rules.get(name).copied().unwrap_or(default);
-                let tag = if INT_RULES.contains(&name) {
-                    Tag::Int(value)
-                } else {
-                    Tag::Byte(i8::from(value != 0))
-                };
-                put(&mut rules, &format!("minecraft:{name}"), tag);
-            }
-            write_saved_data(dir, "game_rules", rules)?;
+            write_saved_data(dir, "game_rules", self.native_game_rules_data())?;
         }
         write_dat(
             &dir.join("players")
@@ -7322,6 +8887,537 @@ impl Level {
         Ok(())
     }
 }
+/// Diagnostic native per-file effects, never live marker acknowledgment.
+#[cfg(feature = "paired-packages")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeLevelWriteEffect {
+    Unattempted,
+    Skipped,
+    Completed,
+    Unknown,
+}
+#[cfg(feature = "paired-packages")]
+pub struct NativeLevelWriteIo {
+    /// Weather, clocks, world generation, game rules, player, level.dat.
+    pub effects: [NativeLevelWriteEffect; 6],
+    pub result: std::result::Result<(), String>,
+}
+#[cfg(feature = "paired-packages")]
+struct NativeLevelWritePlan {
+    roots: [Option<Tag>; 6],
+    player_path: PathBuf,
+}
+/// A modeled final Level and one complete worker-captured native write plan.
+/// Clones share capture; no retry may read changed native files or resample time.
+#[cfg(feature = "paired-packages")]
+#[derive(Clone)]
+pub struct NativeLevelWriteInput {
+    root: PathBuf,
+    level: Arc<Level>,
+    controls: ClockControls,
+    plan: Arc<Mutex<Option<Arc<NativeLevelWritePlan>>>>,
+    #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+    level_after_backup: Arc<Mutex<Option<DatAfterBackupControl>>>,
+}
+#[cfg(feature = "paired-packages")]
+impl NativeLevelWriteInput {
+    /// Pure construction. Required native identity/spawn preparation belongs to
+    /// the original owner before its entity/leash projection is frozen.
+    pub fn new(root: PathBuf, level: Level, controls: ClockControls) -> Self {
+        Self {
+            root,
+            level: Arc::new(level),
+            controls,
+            plan: Arc::default(),
+            #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+            level_after_backup: Arc::default(),
+        }
+    }
+    /// Worker-only. A refused capture publishes no partial plan and writes no
+    /// file, including when strict clock input or an existence check fails.
+    pub fn capture_native(&self) -> std::result::Result<(), String> {
+        let mut memo = self.plan.lock().map_err(|_| "native Level plan poisoned")?;
+        if memo.is_some() {
+            return Ok(());
+        }
+        let level = &self.level;
+        let uuid = level
+            .player_uuid
+            .ok_or("final Level player UUID was not prepared")?;
+        if level.world_spawn.is_none() && level.spawn.is_some() {
+            return Err("final Level world spawn was not prepared".into());
+        }
+        let existing = read_dat_native(&self.root.join("level.dat"))
+            .map_err(|error| format!("{}: {error}", self.root.join("level.dat").display()))?
+            .and_then(|root| root.get("Data").cloned());
+        let legacy = existing.as_ref().is_some_and(|data| {
+            data.get("Player").is_some() || data.get("WorldGenSettings").is_some()
+        });
+        let data = Level::clean_native_level_data(existing);
+        let prefix = level.native_level_data_prefix(data);
+        let last_played = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as i64);
+        let data = level.finish_native_level_data(prefix, uuid, last_played);
+        let clocks = read_world_clocks(&self.root)
+            .map_err(|error| error.to_string())?
+            .unwrap_or_else(|| Tag::Compound(Compound::new()));
+        let clocks = merged_world_clocks(
+            clocks,
+            level.day_time,
+            Some(level.time),
+            Some(self.controls),
+        );
+        let world_gen = if legacy
+            || !saved_data_path(&self.root, "world_gen_settings")
+                .try_exists()
+                .map_err(|error| error.to_string())?
+        {
+            Some(saved_data_root(native_world_gen_data(
+                level.seed,
+                WorldGen::default(),
+                None,
+            )))
+        } else {
+            None
+        };
+        let rules = if !saved_data_path(&self.root, "game_rules")
+            .try_exists()
+            .map_err(|error| error.to_string())?
+            || !level.game_rules.is_empty()
+        {
+            Some(saved_data_root(level.native_game_rules_data()))
+        } else {
+            None
+        };
+        let plan = NativeLevelWritePlan {
+            roots: [
+                Some(saved_data_root(level.native_weather_data())),
+                Some(clocks),
+                world_gen,
+                rules,
+                Some(level.player_tag()),
+                Some(Tag::compound([("Data", data)])),
+            ],
+            player_path: self
+                .root
+                .join("players")
+                .join("data")
+                .join(format!("{}.dat", uuid_text(uuid))),
+        };
+        *memo = Some(Arc::new(plan));
+        Ok(())
+    }
+    /// Worker-only, using the already complete captured native plan. A failure
+    /// retains all planned roots and reports partial effects without rollback.
+    pub fn write_native(&self) -> NativeLevelWriteIo {
+        use NativeLevelWriteEffect as E;
+        let mut effects = [E::Unattempted; 6];
+        let plan = match self.plan.lock() {
+            Ok(memo) => match memo.as_ref() {
+                Some(plan) => plan.clone(),
+                None => {
+                    return NativeLevelWriteIo {
+                        effects,
+                        result: Err(
+                            "native Level plan was not captured before final metadata".into()
+                        ),
+                    };
+                }
+            },
+            Err(_) => {
+                return NativeLevelWriteIo {
+                    effects,
+                    result: Err("native Level plan poisoned".into()),
+                };
+            }
+        };
+        let paths = [
+            saved_data_path(&self.root, "weather"),
+            saved_data_path(&self.root, "world_clocks"),
+            saved_data_path(&self.root, "world_gen_settings"),
+            saved_data_path(&self.root, "game_rules"),
+            plan.player_path.clone(),
+            self.root.join("level.dat"),
+        ];
+        for (index, (path, root)) in paths.iter().zip(&plan.roots).enumerate() {
+            let Some(root) = root else {
+                effects[index] = E::Skipped;
+                continue;
+            };
+            effects[index] = E::Unknown;
+            #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+            let after_backup = if index == 5 {
+                match self.level_after_backup.lock() {
+                    Ok(mut gate) => gate.take(),
+                    Err(_) => {
+                        return NativeLevelWriteIo {
+                            effects,
+                            result: Err("native Level publication control poisoned".into()),
+                        };
+                    }
+                }
+            } else {
+                None
+            };
+            let result = write_dat_native(
+                path,
+                root.clone(),
+                #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+                after_backup,
+            );
+            if let Err(error) = result {
+                let error = if index == 1 {
+                    format!("{}: {error}", path.display())
+                } else {
+                    error.to_string()
+                };
+                return NativeLevelWriteIo {
+                    effects,
+                    result: Err(error),
+                };
+            }
+            effects[index] = E::Completed;
+        }
+        NativeLevelWriteIo {
+            effects,
+            result: Ok(()),
+        }
+    }
+}
+
+#[cfg(all(
+    test,
+    feature = "paired-packages",
+    feature = "native-writer-test-control",
+    debug_assertions
+))]
+mod retained_level_write_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn root(label: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "retained-level-{}-{nonce}-{label}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+    fn modeled() -> Level {
+        Level {
+            name: "fixed native Level".into(),
+            seed: 817,
+            time: 1234,
+            day_time: 5678,
+            player_uuid: Some([1, 2, 3, 4]),
+            world_spawn: Some([8, 71, -3]),
+            position: Some([8.5, 71.0, -2.5]),
+            health: 17.0,
+            food: 13,
+            player_extra: Some(Tag::compound([(
+                "test:player",
+                Tag::ByteArray(vec![3, 1, 9]),
+            )])),
+            ..Level::default()
+        }
+    }
+    fn controls() -> ClockControls {
+        ClockControls {
+            partial: 0.25,
+            rate: 1.5,
+            paused: true,
+        }
+    }
+    fn old_clocks() -> Tag {
+        Tag::compound([
+            ("DataVersion", Tag::Int(DATA_VERSION)),
+            ("test:root", Tag::ByteArray(vec![9, 7, 1])),
+            (
+                "data",
+                Tag::compound([
+                    (
+                        "minecraft:overworld",
+                        Tag::compound([
+                            ("total_ticks", Tag::Long(99)),
+                            ("test:overworld", Tag::LongArray(vec![7, -2, 41])),
+                        ]),
+                    ),
+                    (
+                        "minecraft:the_end",
+                        Tag::compound([("total_ticks", Tag::Long(444))]),
+                    ),
+                    (
+                        "test:other_clock",
+                        Tag::compound([("opaque", Tag::String("keep".into()))]),
+                    ),
+                ]),
+            ),
+        ])
+    }
+
+    #[test]
+    fn retained_level_partial_publication_freezes_last_played_unknowns_controls_and_existing_sidecars()
+     {
+        use NativeLevelWriteEffect as E;
+        let root = root("partial");
+        let old_data = Tag::compound([
+            (
+                "test:level",
+                Tag::compound([("opaque", Tag::LongArray(vec![7, -9, 113]))]),
+            ),
+            (
+                "difficulty_settings",
+                Tag::compound([("test:unknown", Tag::Int(37))]),
+            ),
+            ("LastPlayed", Tag::Long(-11)),
+        ]);
+        let old_root = Tag::compound([("Data", old_data)]);
+        write_dat(&root.join("level.dat"), old_root.clone()).unwrap();
+        write_dat(&saved_data_path(&root, "world_clocks"), old_clocks()).unwrap();
+        write_saved_data(
+            &root,
+            "world_gen_settings",
+            Tag::compound([("test:existing", Tag::Byte(1))]),
+        )
+        .unwrap();
+        write_saved_data(
+            &root,
+            "game_rules",
+            Tag::compound([("test:existing", Tag::Byte(2))]),
+        )
+        .unwrap();
+        let level = modeled();
+        let expected_player = level.player_tag();
+        let input = NativeLevelWriteInput::new(root.clone(), level, controls());
+        input.capture_native().unwrap();
+        let plan = input.plan.lock().unwrap().as_ref().unwrap().clone();
+        let expected_level = plan.roots[5].as_ref().unwrap().clone();
+        let expected_clocks = plan.roots[1].as_ref().unwrap().clone();
+        let fixed_last_played = expected_level
+            .get("Data")
+            .unwrap()
+            .get("LastPlayed")
+            .cloned();
+        let (entered, observed) = mpsc::channel();
+        let (release, wait) = mpsc::channel();
+        *input.level_after_backup.lock().unwrap() = Some((entered, wait));
+        let worker_input = input.clone();
+        let handle = std::thread::Builder::new()
+            .name("fixed-level-publication-test".into())
+            .spawn(move || worker_input.write_native())
+            .unwrap();
+        observed.recv_timeout(Duration::from_secs(5)).unwrap();
+        let nominal = root.join("level.dat");
+        let moved_original =
+            !nominal.exists() && read_dat(&root.join("level.dat_old")) == Some(old_root.clone());
+        fs::create_dir(&nominal).unwrap();
+        release.send(()).unwrap();
+        let end = Instant::now() + Duration::from_secs(15);
+        while !handle.is_finished() {
+            if Instant::now() >= end {
+                std::process::exit(92);
+            }
+            std::thread::yield_now();
+        }
+        let failed = handle.join().unwrap();
+        fs::remove_dir(&nominal).unwrap();
+        // Earlier native attempts can move these paths away. Captured clocks
+        // and captured sparse sidecar selections must not be reread on retry.
+        fs::remove_file(saved_data_path(&root, "world_clocks")).unwrap();
+        fs::remove_file(saved_data_path(&root, "world_gen_settings")).unwrap();
+        fs::remove_file(saved_data_path(&root, "game_rules")).unwrap();
+        let retry_input = input.clone();
+        retry_input.capture_native().unwrap();
+        let retried = retry_input.write_native();
+        assert!(moved_original && failed.result.is_err());
+        assert_eq!(
+            failed.effects,
+            [
+                E::Completed,
+                E::Completed,
+                E::Skipped,
+                E::Skipped,
+                E::Completed,
+                E::Unknown
+            ]
+        );
+        assert!(retried.result.is_ok());
+        assert_eq!(
+            retried.effects,
+            [
+                E::Completed,
+                E::Completed,
+                E::Skipped,
+                E::Skipped,
+                E::Completed,
+                E::Completed
+            ]
+        );
+        assert_eq!(read_dat(&nominal), Some(expected_level));
+        assert_eq!(
+            read_dat(&nominal)
+                .unwrap()
+                .get("Data")
+                .unwrap()
+                .get("LastPlayed"),
+            fixed_last_played.as_ref()
+        );
+        assert_eq!(read_dat(&root.join("level.dat_old")), Some(old_root));
+        assert_eq!(
+            read_dat(&saved_data_path(&root, "world_clocks")),
+            Some(expected_clocks.clone())
+        );
+        let overworld = expected_clocks
+            .get("data")
+            .unwrap()
+            .get("minecraft:overworld")
+            .unwrap();
+        assert_eq!(overworld.get("total_ticks"), Some(&Tag::Long(5678)));
+        assert_eq!(
+            overworld.get("partial_tick"),
+            Some(&Tag::Float(0.25f32.to_bits()))
+        );
+        assert_eq!(overworld.get("rate"), Some(&Tag::Float(1.5f32.to_bits())));
+        assert_eq!(overworld.get("paused"), Some(&Tag::Byte(1)));
+        assert_eq!(
+            expected_clocks.get("test:root"),
+            old_clocks().get("test:root")
+        );
+        assert_eq!(
+            expected_clocks
+                .get("data")
+                .unwrap()
+                .get("minecraft:the_end")
+                .unwrap()
+                .get("total_ticks"),
+            Some(&Tag::Long(444))
+        );
+        assert_eq!(read_dat(&plan.player_path), Some(expected_player));
+        assert!(
+            !saved_data_path(&root, "world_gen_settings").exists()
+                && !saved_data_path(&root, "game_rules").exists()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn retained_level_capture_refuses_before_writes_then_freezes_missing_and_legacy_sidecars() {
+        use NativeLevelWriteEffect as E;
+        for legacy in [false, true] {
+            let root = root("capture");
+            let mut level = modeled();
+            if legacy {
+                write_dat(
+                    &root.join("level.dat"),
+                    Tag::compound([(
+                        "Data",
+                        Tag::compound([
+                            ("WorldGenSettings", Tag::compound([("seed", Tag::Long(-1))])),
+                            ("test:legacy_unknown", Tag::Int(71)),
+                        ]),
+                    )]),
+                )
+                .unwrap();
+                write_saved_data(
+                    &root,
+                    "world_gen_settings",
+                    Tag::compound([("test:old", Tag::Int(1))]),
+                )
+                .unwrap();
+                write_saved_data(
+                    &root,
+                    "game_rules",
+                    Tag::compound([("test:old", Tag::Int(2))]),
+                )
+                .unwrap();
+                level.game_rules.insert("keep_inventory".into(), 1);
+            }
+            let clocks = saved_data_path(&root, "world_clocks");
+            write_dat(
+                &clocks,
+                Tag::compound([("DataVersion", Tag::String("wrong type".into()))]),
+            )
+            .unwrap();
+            let before = fs::read(&clocks).unwrap();
+            let input = NativeLevelWriteInput::new(root.clone(), level, controls());
+            assert!(!saved_data_path(&root, "weather").exists());
+            assert!(input.write_native().result.is_err());
+            assert!(input.capture_native().is_err());
+            assert!(input.plan.lock().unwrap().is_none());
+            let not_captured = input.write_native();
+            assert_eq!(not_captured.effects, [E::Unattempted; 6]);
+            assert!(not_captured.result.is_err());
+            assert_eq!(fs::read(&clocks).unwrap(), before);
+            assert!(!saved_data_path(&root, "weather").exists() && !root.join("players").exists());
+            fs::remove_file(&clocks).unwrap();
+            write_dat(&clocks, old_clocks()).unwrap();
+            input.capture_native().unwrap();
+            // Once complete, capture is idempotent even if an earlier native
+            // operation later leaves the clock source malformed or absent.
+            fs::write(&clocks, b"malformed after complete native capture").unwrap();
+            input.clone().capture_native().unwrap();
+            let io = input.write_native();
+            assert!(io.result.is_ok());
+            assert_eq!(io.effects, [E::Completed; 6]);
+            assert_eq!(
+                read_saved_data(&root, "world_gen_settings")
+                    .unwrap()
+                    .get("seed"),
+                Some(&Tag::Long(817))
+            );
+            let rules = read_saved_data(&root, "game_rules").unwrap();
+            assert_eq!(
+                rules.get("minecraft:keep_inventory"),
+                Some(&Tag::Byte(i8::from(legacy)))
+            );
+            assert!(rules.get("test:old").is_none());
+            let written = read_dat(&root.join("level.dat")).unwrap();
+            let data = written.get("Data").unwrap();
+            assert!(data.get("WorldGenSettings").is_none());
+            if legacy {
+                assert_eq!(data.get("test:legacy_unknown"), Some(&Tag::Int(71)));
+            }
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn ordinary_level_write_keeps_weather_before_clock_error_and_required_field_assignment() {
+        let root = root("ordinary-order");
+        let original = Tag::compound([("Data", Tag::compound([("test:original", Tag::Int(19))]))]);
+        write_dat(&root.join("level.dat"), original.clone()).unwrap();
+        let clocks = saved_data_path(&root, "world_clocks");
+        write_dat(
+            &clocks,
+            Tag::compound([("data", Tag::String("invalid clock data".into()))]),
+        )
+        .unwrap();
+        let clock_before = fs::read(&clocks).unwrap();
+        let mut level = Level {
+            spawn: Some([3.75, 70.5, -2.25]),
+            ..Level::default()
+        };
+        level.weather.rain_time = 811;
+        let failed = level.write(&root).is_err();
+        assert!(failed && level.player_uuid.is_some());
+        assert_eq!(level.world_spawn, Some([3, 70, -3]));
+        assert_eq!(
+            read_saved_data(&root, "weather").unwrap().get("rain_time"),
+            Some(&Tag::Int(811))
+        );
+        assert_eq!(fs::read(clocks).unwrap(), clock_before);
+        assert_eq!(read_dat(&root.join("level.dat")), Some(original));
+        assert!(!saved_data_path(&root, "world_gen_settings").exists());
+        assert!(!saved_data_path(&root, "game_rules").exists() && !root.join("players").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
 /// Loads saved chunks before falling back to generation.
 pub struct Persistent<G> {
     pub inner: Arc<G>,

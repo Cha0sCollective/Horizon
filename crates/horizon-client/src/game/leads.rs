@@ -22,6 +22,25 @@ fn abgr(r: f32, g: f32, b: f32) -> u32 {
     let c = |v: f32| (v * 255.0) as u32 & 255;
     0xFF00_0000 | c(b) << 16 | c(g) << 8 | c(r)
 }
+/// The native saved leash spelling, shared by active and directly borrowed levels.
+pub(super) fn native_write_leash(
+    tag: &mut Tag,
+    holder: Option<Holder>,
+    pending: Option<Pending>,
+    uuid: Option<[i32; 4]>,
+) {
+    let Tag::Compound(map) = tag else { return };
+    map.remove(&"leash".into());
+    let value = match (holder, pending) {
+        (Some(h), _) => leash::to_nbt(h, uuid),
+        (None, Some(Pending::Knot(p))) => leash::to_nbt(Holder::Knot(p), None),
+        (None, Some(Pending::Uuid(u))) => leash::to_nbt(Holder::Player, Some(u)),
+        _ => None,
+    };
+    if let Some(v) = value {
+        map.insert("leash".into(), v);
+    }
+}
 impl Game<'_> {
     fn lead_sound(&mut self, sound: &str, at: [f64; 3]) {
         self.audio
@@ -117,9 +136,11 @@ impl Game<'_> {
         }
     }
     /// The `leash` tag of a mob about to be saved.
+    #[allow(dead_code)] // Preserve the ordinary Game entry; borrowed native saves share its codec below.
     pub(super) fn write_leash(&mut self, tag: &mut Tag, index: usize) {
-        let Tag::Compound(map) = tag else { return };
-        map.remove(&"leash".into());
+        if !matches!(tag, Tag::Compound(_)) {
+            return;
+        }
         let m = &self.mobs[index];
         let holder = m.extra.leash;
         let pending = m.extra.leash_pending;
@@ -129,15 +150,7 @@ impl Game<'_> {
             (_, Some(Pending::Uuid(u))) => Some(u),
             _ => None,
         };
-        let value = match (holder, pending) {
-            (Some(h), _) => leash::to_nbt(h, uuid),
-            (None, Some(Pending::Knot(p))) => leash::to_nbt(Holder::Knot(p), None),
-            (None, Some(Pending::Uuid(u))) => leash::to_nbt(Holder::Player, Some(u)),
-            _ => None,
-        };
-        if let Some(v) = value {
-            map.insert("leash".into(), v);
-        }
+        native_write_leash(tag, holder, pending, uuid);
     }
     /// `Entity.interact`'s leash part for a mob. Returns whether it was used.
     pub(super) fn interact_leash(&mut self, index: usize, item: &str) -> bool {

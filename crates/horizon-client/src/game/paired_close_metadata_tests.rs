@@ -95,7 +95,7 @@ fn until_settled(owner: &mut NativeMetadata<'_, '_>) -> MetadataStatus {
 fn reap(owner: &mut NativeMetadata<'_, '_>) {
     // Call only after releasing every intentional stall. No assertion can
     // unwind an intentionally held worker or drop its original owner.
-    while owner.handle.is_some() || owner.tree.unresolved() {
+    while owner.state.handle.is_some() || owner.state.tree.unresolved() {
         owner.poll();
         std::thread::yield_now();
     }
@@ -455,7 +455,7 @@ fn primary_write_failure(family: MetadataFamily) {
     fs::create_dir_all(&path).unwrap();
     let (control, receipt) = MetadataTestControl::new(MetadataTestAction::HoldBeforeFamily(family));
     let mut owner = NativeMetadata::begin(&mut game, Instant::now() + WAIT);
-    owner.control = Some(control);
+    owner.state.control = Some(control);
     owner.poll();
     let until = Instant::now() + WAIT;
     while !receipt.entered() && Instant::now() < until {
@@ -463,8 +463,8 @@ fn primary_write_failure(family: MetadataFamily) {
         std::thread::yield_now();
     }
     let entered = receipt.entered();
-    let input = owner.input.clone();
-    owner.deadline = Instant::now();
+    let input = owner.state.input.clone();
+    owner.state.deadline = Instant::now();
     let blocked = matches!(owner.poll(), MetadataStatus::Blocked(_));
     let busy = owner.retry(Instant::now() + WAIT) == Err(MetadataRetryRefusal::Busy);
     receipt.release();
@@ -473,13 +473,14 @@ fn primary_write_failure(family: MetadataFamily) {
     let effects = owner.effects();
     let dirty = storage_dirty(owner.game);
     let failure = owner
+        .state
         .outcome
         .as_ref()
         .is_some_and(|outcome| outcome.error.is_some());
     fs::remove_dir(&path).unwrap();
     let retry = owner.retry(Instant::now() + WAIT).is_ok();
     complete(&mut owner);
-    let same = Arc::ptr_eq(input.as_ref().unwrap(), owner.input.as_ref().unwrap());
+    let same = Arc::ptr_eq(input.as_ref().unwrap(), owner.state.input.as_ref().unwrap());
     let done = ack(owner);
     assert!(entered && blocked && busy && late_blocked && failure && dirty && retry && same);
     assert_eq!(effects[family as usize], MetadataEffect::Unknown);
@@ -515,13 +516,13 @@ fn native_ready_result_cannot_ack_after_unpolled_deadline() {
     rich(&mut game);
     let mut owner = NativeMetadata::begin(&mut game, Instant::now() + WAIT);
     complete(&mut owner);
-    owner.deadline = Instant::now();
+    owner.state.deadline = Instant::now();
     let mut owner = match owner.acknowledge() {
         Err(owner) => owner,
         Ok(_) => panic!("expired ack"),
     };
     let dirty = storage_dirty(owner.game);
-    let attempts = owner.next_attempt;
+    let attempts = owner.state.next_attempt;
     let retry = owner.retry(Instant::now() + WAIT).is_ok();
     complete(&mut owner);
     let _ = ack(owner);
@@ -565,7 +566,7 @@ fn native_metadata_delay_deadline_busy_and_explicit_late_success() {
     rich(&mut game);
     let (control, receipt) = MetadataTestControl::new(MetadataTestAction::HoldBeforeIo);
     let mut owner = NativeMetadata::begin(&mut game, Instant::now() + WAIT);
-    owner.control = Some(control);
+    owner.state.control = Some(control);
     owner.poll();
     let until = Instant::now() + WAIT;
     while !receipt.entered() && Instant::now() < until {
@@ -573,12 +574,12 @@ fn native_metadata_delay_deadline_busy_and_explicit_late_success() {
     }
     let entered = receipt.entered();
     let sample = owner.sampled_ms();
-    let input = owner.input.clone();
+    let input = owner.state.input.clone();
     let mut pending = true;
     for _ in 0..16 {
         pending &= owner.poll() == MetadataStatus::Pending;
     }
-    owner.deadline = Instant::now();
+    owner.state.deadline = Instant::now();
     let expired = matches!(owner.poll(), MetadataStatus::Blocked(_));
     let busy = owner.retry(Instant::now() + WAIT) == Err(MetadataRetryRefusal::Busy);
     receipt.release();
@@ -588,8 +589,8 @@ fn native_metadata_delay_deadline_busy_and_explicit_late_success() {
     let retry = owner.retry(Instant::now() + WAIT).is_ok();
     let same_input = input
         .as_ref()
-        .is_some_and(|i| Arc::ptr_eq(i, owner.input.as_ref().unwrap()));
-    let attempts = owner.next_attempt;
+        .is_some_and(|i| Arc::ptr_eq(i, owner.state.input.as_ref().unwrap()));
+    let attempts = owner.state.next_attempt;
     complete(&mut owner);
     let done = ack(owner);
     assert!(entered && pending && expired && busy && blocked && dirty && retry && same_input);
@@ -604,17 +605,17 @@ fn controlled_refusal(action: MetadataTestAction) {
     rich(&mut game);
     let (control, receipt) = MetadataTestControl::new(action);
     let mut owner = NativeMetadata::begin(&mut game, Instant::now() + WAIT);
-    owner.control = Some(control);
+    owner.state.control = Some(control);
     let blocked = matches!(until_settled(&mut owner), MetadataStatus::Blocked(_));
     reap(&mut owner);
     receipt.release();
-    let input = owner.input.clone();
+    let input = owner.state.input.clone();
     let dirty = storage_dirty(owner.game);
     let retry = owner.retry(Instant::now() + WAIT).is_ok();
     complete(&mut owner);
     let same = input
         .as_ref()
-        .is_some_and(|i| Arc::ptr_eq(i, owner.input.as_ref().unwrap()));
+        .is_some_and(|i| Arc::ptr_eq(i, owner.state.input.as_ref().unwrap()));
     let done = ack(owner);
     assert!(blocked && dirty && retry && same);
     assert!(!done.failures.is_empty());
@@ -635,7 +636,7 @@ fn native_metadata_actual_worker_panic_replays_fixed_input() {
     rich(&mut game);
     let (control, receipt) = MetadataTestControl::new(MetadataTestAction::HoldThenPanic);
     let mut owner = NativeMetadata::begin(&mut game, Instant::now() + WAIT);
-    owner.control = Some(control);
+    owner.state.control = Some(control);
     owner.poll();
     let until = Instant::now() + WAIT;
     while !receipt.entered() && Instant::now() < until {
@@ -645,14 +646,14 @@ fn native_metadata_actual_worker_panic_replays_fixed_input() {
     receipt.release();
     reap(&mut owner);
     let blocked = matches!(owner.poll(), MetadataStatus::Blocked(_));
-    let input = owner.input.clone();
+    let input = owner.state.input.clone();
     let unknown = owner
         .failures()
         .iter()
         .any(|f| f.effects == [MetadataEffect::Unknown; MetadataFamily::ALL.len()]);
     let retry = owner.retry(Instant::now() + WAIT).is_ok();
     complete(&mut owner);
-    let same = Arc::ptr_eq(input.as_ref().unwrap(), owner.input.as_ref().unwrap());
+    let same = Arc::ptr_eq(input.as_ref().unwrap(), owner.state.input.as_ref().unwrap());
     let done = ack(owner);
     assert!(entered && blocked && unknown && retry && same);
     assert_eq!(done.effects[9], MetadataEffect::Completed);
@@ -784,18 +785,18 @@ fn native_equal_bytes_foreign_batch_and_attempt_refuse_then_original_acks() {
     complete(&mut owner);
     // Real native output, retained intact. Only private association is changed
     // to prove equality cannot substitute for its original owner/attempt.
-    let original = owner.outcome.as_ref().unwrap().batch.clone();
-    owner.outcome.as_mut().unwrap().batch = Arc::new(BatchIdentity);
+    let original = owner.state.outcome.as_ref().unwrap().batch.clone();
+    owner.state.outcome.as_mut().unwrap().batch = Arc::new(BatchIdentity);
     let refused_batch = owner.preflight().is_err();
     let dirty_batch = storage_dirty(owner.game);
-    owner.outcome.as_mut().unwrap().batch = original;
-    let original = owner.outcome.as_ref().unwrap().attempt.clone();
-    owner.outcome.as_mut().unwrap().attempt = Arc::new(AttemptIdentity {
+    owner.state.outcome.as_mut().unwrap().batch = original;
+    let original = owner.state.outcome.as_ref().unwrap().attempt.clone();
+    owner.state.outcome.as_mut().unwrap().attempt = Arc::new(AttemptIdentity {
         number: original.number,
     });
     let refused_attempt = owner.preflight().is_err();
     let dirty_attempt = storage_dirty(owner.game);
-    owner.outcome.as_mut().unwrap().attempt = original;
+    owner.state.outcome.as_mut().unwrap().attempt = original;
     let _done = ack(owner);
     assert!(refused_batch && refused_attempt && dirty_batch && dirty_attempt);
 }
@@ -807,7 +808,7 @@ fn native_deadline_before_start_requires_explicit_retry() {
     loaded(&mut game);
     let mut owner = NativeMetadata::begin(&mut game, Instant::now());
     let blocked = matches!(owner.poll(), MetadataStatus::Blocked(_));
-    let unstarted = owner.input.is_none() && !owner.tree_started;
+    let unstarted = owner.state.input.is_none() && !owner.state.tree_started;
     let retry = owner.retry(Instant::now() + WAIT).is_ok();
     complete(&mut owner);
     let _done = ack(owner);
@@ -827,9 +828,9 @@ fn controlled_tree(action: crate::game::advancements::RetainedTreeTestAction) {
     fs::create_dir_all(game.options.resources.join("data")).unwrap();
     let (control, receipt) = RetainedTreeTestControl::new(action);
     let mut owner = NativeMetadata::begin(&mut game, Instant::now() + WAIT);
-    owner.tree.set_test_control(control).unwrap();
+    owner.state.tree.set_test_control(control).unwrap();
     owner.poll();
-    let refused = matches!(owner.tree.status(), RetainedTreeStatus::Failed(_));
+    let refused = matches!(owner.state.tree.status(), RetainedTreeStatus::Failed(_));
     let mut held = true;
     let mut entered = true;
     if !refused {
@@ -841,7 +842,7 @@ fn controlled_tree(action: crate::game::advancements::RetainedTreeTestAction) {
         for _ in 0..16 {
             held &= owner.poll() == MetadataStatus::Preparing;
         }
-        owner.deadline = Instant::now();
+        owner.state.deadline = Instant::now();
         owner.poll();
     }
     receipt.release();
@@ -849,8 +850,8 @@ fn controlled_tree(action: crate::game::advancements::RetainedTreeTestAction) {
     let blocked = matches!(owner.poll(), MetadataStatus::Blocked(_));
     let retry = owner.retry(Instant::now() + WAIT).is_ok();
     complete(&mut owner);
-    let legitimate_empty =
-        owner.game.adv.tree.list.is_empty() && *owner.tree.status() == RetainedTreeStatus::Ready;
+    let legitimate_empty = owner.game.adv.tree.list.is_empty()
+        && *owner.state.tree.status() == RetainedTreeStatus::Ready;
     let done = ack(owner);
     assert!(entered && held && blocked && retry && legitimate_empty);
     assert_eq!(
@@ -879,7 +880,7 @@ fn native_existing_prefetch_is_reaped_even_when_unloaded() {
     let actual = game.adv.pending_tree.is_some();
     let mut owner = NativeMetadata::begin(&mut game, Instant::now() + WAIT);
     complete(&mut owner);
-    let reaped = owner.game.adv.pending_tree.is_none() && !owner.tree.unresolved();
+    let reaped = owner.game.adv.pending_tree.is_none() && !owner.state.tree.unresolved();
     let done = ack(owner);
     assert!(actual && reaped);
     assert_eq!(done.effects[2], MetadataEffect::Skipped);
@@ -896,7 +897,7 @@ fn native_metadata_unresolved_drop_child() {
     rich(&mut game);
     let (control, receipt) = MetadataTestControl::new(MetadataTestAction::HoldBeforeIo);
     let mut owner = NativeMetadata::begin(&mut game, Instant::now() + WAIT);
-    owner.control = Some(control);
+    owner.state.control = Some(control);
     owner.poll();
     let until = Instant::now() + WAIT;
     while !receipt.entered() && Instant::now() < until {
@@ -1103,7 +1104,7 @@ fn remaining_map_failure(index: bool) {
     let (control, receipt) =
         MetadataTestControl::new(MetadataTestAction::HoldBeforeFamily(MetadataFamily::Maps));
     let mut owner = NativeMetadata::begin(&mut game, Instant::now() + WAIT);
-    owner.control = Some(control);
+    owner.state.control = Some(control);
     owner.poll();
     let until = Instant::now() + WAIT;
     while !receipt.entered() && Instant::now() < until {
@@ -1111,7 +1112,7 @@ fn remaining_map_failure(index: bool) {
         std::thread::yield_now();
     }
     let entered = receipt.entered();
-    owner.deadline = Instant::now();
+    owner.state.deadline = Instant::now();
     owner.poll();
     let busy = owner.retry(Instant::now() + WAIT) == Err(MetadataRetryRefusal::Busy);
     receipt.release();
@@ -1120,12 +1121,12 @@ fn remaining_map_failure(index: bool) {
     let unchanged = owner.game.maps.retained_metadata_test_snapshot(false) == before
         && owner.game.level.player_extra == extra
         && storage_dirty(owner.game);
-    let evidence = owner.outcome.as_ref().and_then(|v| v.maps.clone());
-    let input = owner.input.clone();
+    let evidence = owner.state.outcome.as_ref().and_then(|v| v.maps.clone());
+    let input = owner.state.input.clone();
     fs::remove_dir(&obstruction).unwrap();
     let retry = owner.retry(Instant::now() + WAIT).is_ok();
     complete(&mut owner);
-    let same = Arc::ptr_eq(input.as_ref().unwrap(), owner.input.as_ref().unwrap());
+    let same = Arc::ptr_eq(input.as_ref().unwrap(), owner.state.input.as_ref().unwrap());
     let done = ack(owner);
     assert!(entered && busy && blocked && unchanged && retry && same);
     let evidence = evidence.unwrap();
@@ -1210,7 +1211,7 @@ fn remaining_native_failure(family: MetadataFamily) {
     let arrivals = game.retained_arrivals_fixture_state();
     let (control, receipt) = MetadataTestControl::new(MetadataTestAction::HoldBeforeFamily(family));
     let mut owner = NativeMetadata::begin(&mut game, Instant::now() + WAIT);
-    owner.control = Some(control);
+    owner.state.control = Some(control);
     owner.poll();
     let until = Instant::now() + WAIT;
     while !receipt.entered() && Instant::now() < until {
@@ -1218,7 +1219,7 @@ fn remaining_native_failure(family: MetadataFamily) {
         std::thread::yield_now();
     }
     let entered = receipt.entered();
-    owner.deadline = Instant::now();
+    owner.state.deadline = Instant::now();
     owner.poll();
     let busy = owner.retry(Instant::now() + WAIT) == Err(MetadataRetryRefusal::Busy);
     receipt.release();
@@ -1231,11 +1232,11 @@ fn remaining_native_failure(family: MetadataFamily) {
         && owner.game.retained_raids_fixture_matches(&raids)
         && owner.game.retained_arrivals_fixture_state() == arrivals
         && storage_dirty(owner.game);
-    let input = owner.input.clone();
+    let input = owner.state.input.clone();
     fs::remove_dir(&path).unwrap();
     let retry = owner.retry(Instant::now() + WAIT).is_ok();
     complete(&mut owner);
-    let same = Arc::ptr_eq(input.as_ref().unwrap(), owner.input.as_ref().unwrap());
+    let same = Arc::ptr_eq(input.as_ref().unwrap(), owner.state.input.as_ref().unwrap());
     let _ = ack(owner);
     assert!(entered && busy && blocked && unchanged && retry && same);
     assert_eq!(effects[family as usize], MetadataEffect::Unknown);
@@ -1286,7 +1287,7 @@ fn remaining_late_preflight_refusal_leaves_all_fifteen_owners_unacknowledged() {
         && owner.game.maps.retained_metadata_test_snapshot(false) == maps
         && owner.game.retained_raids_fixture_matches(&raids);
     owner.game.portals.player.cooldown = cooldown;
-    let attempts = owner.next_attempt;
+    let attempts = owner.state.next_attempt;
     let retry = owner.retry(Instant::now() + WAIT).is_ok();
     complete(&mut owner);
     let _ = ack(owner);

@@ -15,9 +15,10 @@ use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
 };
+pub(in crate::game) type NativeAnonIdentity = (String, [u64; 3], usize);
 
 /// What Horizon remembers about loaded entities to save them faithfully.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct EntityMemory {
     /// UUIDs of mobs and item entities by Horizon entity ID.
     pub(super) uuids: HashMap<u32, [i32; 4]>,
@@ -30,6 +31,102 @@ pub struct EntityMemory {
     /// the dragon): the UUID and compound they were loaded with, found again by
     /// type and position (an entity that has moved since loading is saved afresh).
     anon: HashMap<(String, [u64; 3]), (Vec3, Option<[i32; 4]>, Tag)>,
+}
+
+/// Only borrowed native save owners; no Game, renderer, simulation or dimension swap.
+pub(in crate::game) struct NativeEntityMemory<'a> {
+    uuids: &'a mut HashMap<u32, [i32; 4]>,
+    raw: &'a HashMap<u32, Tag>,
+    unknown: &'a HashMap<(i32, i32), Vec<Tag>>,
+    anon: &'a HashMap<(String, [u64; 3]), (Vec3, Option<[i32; 4]>, Tag)>,
+}
+impl<'a> NativeEntityMemory<'a> {
+    pub(in crate::game) fn borrow(memory: &'a mut EntityMemory) -> Self {
+        Self {
+            uuids: &mut memory.uuids,
+            raw: &memory.raw,
+            unknown: &memory.unknown,
+            anon: &memory.anon,
+        }
+    }
+}
+pub(in crate::game) struct NativeEntityView<'a> {
+    pub persist: NativeEntityMemory<'a>,
+    pub player_uuid: Option<[i32; 4]>,
+    pub registry: &'static horizon_world::registry::BlockRegistry,
+    pub mobs: &'a [horizon_client::mobs::Mob],
+    pub dropped: &'a [super::ItemEntity],
+    pub orbs: &'a [super::ExperienceOrb],
+    pub projectiles: &'a [horizon_client::projectiles::Projectile],
+    pub falling: &'a [FallingBlock],
+    pub boats: &'a [super::boats::Boat],
+    pub dragon: Option<&'a super::dragon::Dragon>,
+    pub crystals: &'a [super::dragon::Crystal],
+    pub ominous_spawners: &'a [super::ominous_item_spawner::OminousItemSpawner],
+    pub carts: &'a [super::minecarts::Minecart],
+    pub armor_stands: &'a [horizon_client::entities::ArmorStand],
+    pub item_frames: &'a [horizon_client::entities::ItemFrame],
+    pub cushions: &'a [horizon_client::entities::Cushion],
+    pub paintings: &'a [horizon_client::entities::Painting],
+    pub others: &'a [super::commands::OtherEntity],
+    pub fixed_anon: Option<&'a HashMap<NativeAnonIdentity, [i32; 4]>>,
+}
+
+fn native_state_to_nbt(
+    registry: &horizon_world::registry::BlockRegistry,
+    state: BlockStateId,
+) -> Tag {
+    match registry.state(state) {
+        Some(s) if registry.default_state(&s.name) == Some(state) => {
+            Tag::String(s.name.as_str().into())
+        }
+        Some(s) => s.to_nbt(),
+        None => Tag::String("minecraft:air".into()),
+    }
+}
+fn native_mob_root(mobs: &[horizon_client::mobs::Mob], mut i: usize) -> usize {
+    for _ in 0..8 {
+        let Some(v) = mobs[i].extra.mount else {
+            break;
+        };
+        let Some(j) = mobs.iter().position(|m| m.id == v) else {
+            break;
+        };
+        i = j;
+    }
+    i
+}
+
+/// Exactly the ordinary chunk-extra projection, without an active-level lookup.
+pub(in crate::game) fn native_attach_save_data(
+    chunk: &mut Chunk,
+    world: &horizon_client::world::World,
+    ticks: &horizon_world::level::Ticks,
+    anims: &horizon_client::block_entity_anim::BlockEntityAnims,
+    time: i64,
+) {
+    let pos = ChunkPos::new(chunk.x, chunk.z);
+    let mut extras: ChunkExtras = chunk.saved.as_deref().cloned().unwrap_or_default();
+    if let Some(t) = ticks.blocks.chunk(pos) {
+        extras.block_ticks = t.pack(time);
+    }
+    if let Some(t) = ticks.fluids.chunk(pos) {
+        extras.fluid_ticks = t.pack(time);
+    }
+    extras.last_update = time;
+    for tag in &mut extras.block_entities {
+        let pos = [tag.get("x"), tag.get("y"), tag.get("z")]
+            .map(|v| horizon_client::save::number(v).unwrap_or(0) as i32);
+        if let Some(g) = anims.gateway_servers.get(&pos)
+            && let Some(age) = tag.get_mut("Age")
+        {
+            *age = Tag::Long(g.age);
+        }
+    }
+    if let Some(t) = world.inhabited.get(&(chunk.x, chunk.z)) {
+        extras.root.insert("InhabitedTime".into(), Tag::Long(*t));
+    }
+    chunk.saved = Some(Arc::new(extras));
 }
 
 fn anon_key(kind: &str, p: Vec3) -> (String, [u64; 3]) {
@@ -73,35 +170,13 @@ fn chunk_of(p: Vec3) -> (i32, i32) {
 impl Game<'_> {
     /// Saved ticks and the save time for a chunk about to be written.
     pub(super) fn attach_save_data(&self, chunk: &mut Chunk) {
-        let pos = ChunkPos::new(chunk.x, chunk.z);
-        let time = self.world.game_time;
-        let mut extras: ChunkExtras = chunk.saved.as_deref().cloned().unwrap_or_default();
-        // A chunk the scheduler hasn't registered yet (one loaded and
-        // unloaded again before the next tick) still holds its saved ticks:
-        // `register_chunk_ticks` empties that list once it takes them.
-        if let Some(t) = self.block_ticks.blocks.chunk(pos) {
-            extras.block_ticks = t.pack(time);
-        }
-        if let Some(t) = self.block_ticks.fluids.chunk(pos) {
-            extras.fluid_ticks = t.pack(time);
-        }
-        extras.last_update = time;
-        // TheEndGatewayBlockEntity saves its Age (the server copy's).
-        for tag in &mut extras.block_entities {
-            let pos = [tag.get("x"), tag.get("y"), tag.get("z")]
-                .map(|v| horizon_client::save::number(v).unwrap_or(0) as i32);
-            if let Some(g) = self.be_anims.gateway_servers.get(&pos)
-                && let Some(age) = tag.get_mut("Age")
-            {
-                *age = horizon_world::nbt::Tag::Long(g.age);
-            }
-        }
-        if let Some(t) = self.world.inhabited.get(&(chunk.x, chunk.z)) {
-            extras
-                .root
-                .insert("InhabitedTime".into(), horizon_world::nbt::Tag::Long(*t));
-        }
-        chunk.saved = Some(Arc::new(extras));
+        native_attach_save_data(
+            chunk,
+            &self.world,
+            &self.block_ticks,
+            &self.be_anims,
+            self.world.game_time,
+        );
     }
     /// Register a newly resident chunk with the tick scheduler, with the
     /// block and fluid ticks it was saved with (`LevelChunk.registerTickContainerInLevel`
@@ -439,24 +514,6 @@ impl Game<'_> {
     }
     /// The mobs riding entity `id` under `tag`'s `Passengers`, after the
     /// passengers it kept from loading.
-    fn put_mob_passengers(&mut self, tag: &mut Tag, id: u32) {
-        let riders: Vec<usize> = (0..self.mobs.len())
-            .filter(|&j| self.mobs[j].extra.mount == Some(id) && self.mobs[j].alive())
-            .collect();
-        let riders: Vec<Tag> = riders.into_iter().map(|j| self.mob_tree_nbt(j)).collect();
-        if let Tag::Compound(c) = tag {
-            let mut list = match c.get(&"Passengers".into()) {
-                Some(Tag::List(l)) => l.clone(),
-                _ => Vec::new(),
-            };
-            list.extend(riders);
-            if list.is_empty() {
-                c.remove(&"Passengers".into());
-            } else {
-                c.insert("Passengers".into(), Tag::List(list));
-            }
-        }
-    }
     /// An entity of a type Horizon does not simulate, kept as its compound.
     fn load_other(&mut self, mut tag: Tag, kind: &str) -> Option<u32> {
         strip_finalize(&mut tag);
@@ -487,54 +544,14 @@ impl Game<'_> {
     /// The compound of an entity Horizon does not simulate, with its current
     /// position, rotation and UUID.
     pub(super) fn other_to_nbt(&self, o: &super::commands::OtherEntity, uuid: [i32; 4]) -> Tag {
-        let mut tag = self
-            .persist
-            .raw
-            .get(&o.id)
-            .cloned()
-            .unwrap_or_else(|| Tag::Compound(Default::default()));
-        if let Tag::Compound(c) = &mut tag {
-            c.insert("id".into(), Tag::String(o.kind.as_str().into()));
-            c.insert(
-                "Pos".into(),
-                Tag::List(
-                    [o.position.x, o.position.y, o.position.z]
-                        .map(|v| Tag::Double(v.to_bits()))
-                        .to_vec(),
-                ),
-            );
-            c.insert(
-                "Rotation".into(),
-                Tag::List(vec![
-                    Tag::Float(o.yaw.to_bits()),
-                    Tag::Float(o.pitch.to_bits()),
-                ]),
-            );
-            c.insert("UUID".into(), Tag::IntArray(uuid.to_vec()));
-        }
-        tag
-    }
-    /// The root of a stack of riders (`Entity.getRootVehicle`).
-    fn mob_root(&self, mut i: usize) -> usize {
-        for _ in 0..8 {
-            let Some(v) = self.mobs[i].extra.mount else {
-                break;
-            };
-            let Some(j) = self.mobs.iter().position(|m| m.id == v) else {
-                break;
-            };
-            i = j;
-        }
-        i
+        native_other_to_nbt(&self.persist.raw, o, uuid)
     }
     /// A mob's entity tag with the mobs riding it under `Passengers`.
     pub(super) fn mob_tree_nbt(&mut self, i: usize) -> Tag {
-        let id = self.mobs[i].id;
-        let uuid = self.uuid_for(id);
-        let mut tag = entity_nbt::mob_to_nbt(&self.mobs[i], uuid, self.persist.raw.get(&id));
-        self.write_leash(&mut tag, i);
-        self.put_mob_passengers(&mut tag, id);
-        tag
+        self.native_entity_view().mob_tree_nbt(i)
+    }
+    fn mob_root(&self, i: usize) -> usize {
+        native_mob_root(&self.mobs, i)
     }
     /// Forget an entity that left the world (its UUID and loaded compound).
     pub(super) fn forget_entity(&mut self, id: u32) {
@@ -623,26 +640,170 @@ impl Game<'_> {
             .or_else(|| registry.default_state(&state.name))
     }
     pub(in crate::game) fn state_to_nbt(&self, state: BlockStateId) -> Tag {
-        let registry = self.pack.assets.registry;
-        match registry.state(state) {
-            Some(s) if registry.default_state(&s.name) == Some(state) => {
-                Tag::String(s.name.as_str().into())
-            }
-            Some(s) => s.to_nbt(),
-            None => Tag::String("minecraft:air".into()),
+        native_state_to_nbt(self.pack.assets.registry, state)
+    }
+    pub(in crate::game) fn native_entity_view(&mut self) -> NativeEntityView<'_> {
+        NativeEntityView {
+            persist: NativeEntityMemory::borrow(&mut self.persist),
+            player_uuid: self.level.player_uuid,
+            registry: self.pack.assets.registry,
+            mobs: &self.mobs,
+            dropped: &self.dropped,
+            orbs: &self.orbs,
+            projectiles: &self.creatures.projectiles,
+            falling: &self.falling,
+            boats: &self.boats,
+            dragon: self.dragon.as_ref(),
+            crystals: &self.crystals,
+            ominous_spawners: &self.ominous_spawners,
+            carts: &self.carts,
+            armor_stands: &self.armor_stands,
+            item_frames: &self.item_frames,
+            cushions: &self.cushions,
+            paintings: &self.paintings,
+            others: &self.others,
+            fixed_anon: None,
         }
     }
-    /// The entity NBT of every simulated entity in `keys`, plus the unknown
-    /// entities kept for them. With `remove`, the entities leave the world
-    /// (their chunks unload).
     pub(super) fn entity_chunks(
         &mut self,
         keys: &HashSet<(i32, i32)>,
         remove: bool,
     ) -> Vec<((i32, i32), Vec<Tag>)> {
+        let chunks = self.native_entity_view().entity_chunks(keys);
+        if remove {
+            self.remove_saved_entities(keys);
+        }
+        chunks
+    }
+}
+#[cfg(all(
+    test,
+    feature = "paired-packages",
+    feature = "native-writer-test-control",
+    debug_assertions
+))]
+impl EntityMemory {
+    pub(in crate::game) fn seed_retained_native_raw_fixture(
+        &mut self,
+        id: u32,
+        at: (i32, i32),
+        ordinal: i32,
+    ) {
+        self.raw.insert(
+            id,
+            Tag::compound([(
+                "fixture:opaque",
+                Tag::compound([("ordinal", Tag::Int(ordinal)), ("value", Tag::Long(-73))]),
+            )]),
+        );
+        self.unknown.entry(at).or_default().push(Tag::compound([
+            ("id", Tag::String("minecraft:marker".into())),
+            ("UUID", Tag::IntArray(vec![ordinal, 923, 1, 4])),
+            (
+                "Pos",
+                Tag::List(
+                    [f64::from(at.0 * 16) + 2.5, 72.0, f64::from(at.1 * 16) + 2.5]
+                        .map(|v| Tag::Double(v.to_bits()))
+                        .to_vec(),
+                ),
+            ),
+            (
+                "fixture:unknown",
+                Tag::String("preserve original unknown native owner".into()),
+            ),
+        ]));
+    }
+}
+
+fn native_other_to_nbt(
+    raw: &HashMap<u32, Tag>,
+    o: &super::commands::OtherEntity,
+    uuid: [i32; 4],
+) -> Tag {
+    let mut tag = raw
+        .get(&o.id)
+        .cloned()
+        .unwrap_or_else(|| Tag::Compound(Default::default()));
+    if let Tag::Compound(c) = &mut tag {
+        c.insert("id".into(), Tag::String(o.kind.as_str().into()));
+        c.insert(
+            "Pos".into(),
+            Tag::List(
+                [o.position.x, o.position.y, o.position.z]
+                    .map(|v| Tag::Double(v.to_bits()))
+                    .to_vec(),
+            ),
+        );
+        c.insert(
+            "Rotation".into(),
+            Tag::List(vec![
+                Tag::Float(o.yaw.to_bits()),
+                Tag::Float(o.pitch.to_bits()),
+            ]),
+        );
+        c.insert("UUID".into(), Tag::IntArray(uuid.to_vec()));
+    }
+    tag
+}
+impl NativeEntityView<'_> {
+    fn uuid_for(&mut self, id: u32) -> [i32; 4] {
+        *self.persist.uuids.entry(id).or_insert_with(random_uuid)
+    }
+    fn state_to_nbt(&self, state: BlockStateId) -> Tag {
+        native_state_to_nbt(self.registry, state)
+    }
+    fn other_to_nbt(&self, o: &super::commands::OtherEntity, uuid: [i32; 4]) -> Tag {
+        native_other_to_nbt(self.persist.raw, o, uuid)
+    }
+    fn mob_root(&self, i: usize) -> usize {
+        native_mob_root(self.mobs, i)
+    }
+    fn put_mob_passengers(&mut self, tag: &mut Tag, id: u32) {
+        let riders: Vec<usize> = (0..self.mobs.len())
+            .filter(|&j| self.mobs[j].extra.mount == Some(id) && self.mobs[j].alive())
+            .collect();
+        let riders: Vec<Tag> = riders.into_iter().map(|j| self.mob_tree_nbt(j)).collect();
+        if let Tag::Compound(c) = tag {
+            let mut list = match c.get(&"Passengers".into()) {
+                Some(Tag::List(l)) => l.clone(),
+                _ => Vec::new(),
+            };
+            list.extend(riders);
+            if list.is_empty() {
+                c.remove(&"Passengers".into());
+            } else {
+                c.insert("Passengers".into(), Tag::List(list));
+            }
+        }
+    }
+    fn mob_tree_nbt(&mut self, i: usize) -> Tag {
+        let id = self.mobs[i].id;
+        let uuid = self.uuid_for(id);
+        let mut tag = entity_nbt::mob_to_nbt(&self.mobs[i], uuid, self.persist.raw.get(&id));
+        let holder = self.mobs[i].extra.leash;
+        let pending = self.mobs[i].extra.leash_pending;
+        use horizon_client::mobs::leash::{Holder, Pending};
+        let uuid = match (holder, pending) {
+            (Some(Holder::Player), _) => Some(self.player_uuid.unwrap_or([0, 0, 0, 1])),
+            (Some(Holder::Mob(id)), _) => Some(self.uuid_for(id)),
+            (_, Some(Pending::Uuid(uuid))) => Some(uuid),
+            _ => None,
+        };
+        super::leads::native_write_leash(&mut tag, holder, pending, uuid);
+        self.put_mob_passengers(&mut tag, id);
+        tag
+    }
+    /// The entity NBT of every simulated entity in `keys`, plus the unknown
+    /// entities kept for them. With `remove`, the entities leave the world
+    /// (their chunks unload).
+    pub(in crate::game) fn entity_chunks(
+        &mut self,
+        keys: &HashSet<(i32, i32)>,
+    ) -> Vec<((i32, i32), Vec<Tag>)> {
         let mut out: HashMap<(i32, i32), Vec<Tag>> =
             keys.iter().map(|k| (*k, Vec::new())).collect();
-        let player_uuid = self.level.player_uuid;
+        let player_uuid = self.player_uuid;
         // A rider is saved inside its root vehicle, in the root's chunk; a
         // boat's passengers inside the boat.
         let mobs: Vec<usize> = (0..self.mobs.len())
@@ -674,14 +835,26 @@ impl Game<'_> {
                 .or_default()
                 .push(tag);
         }
-        let anon = |persist: &EntityMemory, kind: &str, at: Vec3| {
+        let fixed_anon = self.fixed_anon;
+        let mut occurrences = HashMap::new();
+        let mut anon = |persist: &NativeEntityMemory<'_>, kind: &str, at: Vec3| {
+            let key = anon_key(kind, at);
+            let ordinal = occurrences.entry(key.clone()).or_insert(0usize);
+            let identity = (key.0, key.1, *ordinal);
+            *ordinal += 1;
+            let generated = || {
+                fixed_anon
+                    .and_then(|ids| ids.get(&identity))
+                    .copied()
+                    .unwrap_or_else(random_uuid)
+            };
             persist
                 .anon
                 .get(&anon_key(kind, at))
-                .map(|(_, uuid, raw)| (uuid.unwrap_or_else(random_uuid), Some(raw.clone())))
-                .unwrap_or_else(|| (random_uuid(), None))
+                .map(|(_, uuid, raw)| (uuid.unwrap_or_else(generated), Some(raw.clone())))
+                .unwrap_or_else(|| (generated(), None))
         };
-        for o in &self.orbs {
+        for o in self.orbs {
             if keys.contains(&chunk_of(o.position)) {
                 let (uuid, raw) = anon(&self.persist, "minecraft:experience_orb", o.position);
                 out.entry(chunk_of(o.position))
@@ -689,7 +862,7 @@ impl Game<'_> {
                     .push(with_raw(entity_nbt::orb_to_nbt(o, uuid), raw.as_ref()));
             }
         }
-        for p in &self.creatures.projectiles {
+        for p in self.projectiles {
             if !keys.contains(&chunk_of(p.position)) {
                 continue;
             }
@@ -710,7 +883,7 @@ impl Game<'_> {
                 out.entry(chunk_of(p.position)).or_default().push(tag);
             }
         }
-        for f in &self.falling {
+        for f in self.falling {
             if keys.contains(&chunk_of(f.position)) {
                 let (uuid, raw) = match &f.saved {
                     Some(saved) => (saved.0, Some(saved.1.clone())),
@@ -763,7 +936,7 @@ impl Game<'_> {
                 .or_default()
                 .push(d.to_nbt(uuid, raw.as_ref()));
         }
-        for c in &self.crystals {
+        for c in self.crystals {
             if keys.contains(&chunk_of(c.position)) {
                 let (uuid, raw) = anon(&self.persist, "minecraft:end_crystal", c.position);
                 out.entry(chunk_of(c.position))
@@ -771,7 +944,7 @@ impl Game<'_> {
                     .push(c.to_nbt(uuid, raw.as_ref()));
             }
         }
-        for s in &self.ominous_spawners {
+        for s in self.ominous_spawners {
             let at = Vec3::new(s.position[0], s.position[1], s.position[2]);
             if keys.contains(&chunk_of(at)) {
                 let tag = entity_nbt::ominous_item_spawner_to_nbt(
@@ -784,7 +957,7 @@ impl Game<'_> {
                 out.entry(chunk_of(at)).or_default().push(tag);
             }
         }
-        for c in &self.carts {
+        for c in self.carts {
             if keys.contains(&chunk_of(c.position)) {
                 let uuid = self
                     .persist
@@ -796,7 +969,7 @@ impl Game<'_> {
                 out.entry(chunk_of(c.position)).or_default().push(tag);
             }
         }
-        for a in &self.armor_stands {
+        for a in self.armor_stands {
             if keys.contains(&chunk_of(a.position)) {
                 let uuid = self
                     .persist
@@ -808,7 +981,7 @@ impl Game<'_> {
                 out.entry(chunk_of(a.position)).or_default().push(tag);
             }
         }
-        for f in &self.item_frames {
+        for f in self.item_frames {
             let (lo, hi) = f.bounds();
             let at = Vec3::new(
                 (lo[0] + hi[0]) / 2.0,
@@ -826,7 +999,7 @@ impl Game<'_> {
                 out.entry(chunk_of(at)).or_default().push(tag);
             }
         }
-        for c in &self.cushions {
+        for c in self.cushions {
             if keys.contains(&chunk_of(c.position)) {
                 let uuid = self
                     .persist
@@ -838,7 +1011,7 @@ impl Game<'_> {
                 out.entry(chunk_of(c.position)).or_default().push(tag);
             }
         }
-        for p in &self.paintings {
+        for p in self.paintings {
             let at = painting_center(p);
             if keys.contains(&chunk_of(at)) {
                 let uuid = self
@@ -851,7 +1024,7 @@ impl Game<'_> {
                 out.entry(chunk_of(at)).or_default().push(tag);
             }
         }
-        for o in &self.others {
+        for o in self.others {
             if keys.contains(&chunk_of(o.position)) {
                 let uuid = self
                     .persist
@@ -869,11 +1042,294 @@ impl Game<'_> {
                 out.entry(*key).or_default().extend(list);
             }
         }
-        if remove {
-            self.remove_saved_entities(keys);
-        }
         out.into_iter().collect()
     }
+}
+#[cfg(feature = "paired-packages")]
+pub(in crate::game) struct NativeEntityCloseIdentity {
+    ids: HashSet<u32>,
+    anon: HashMap<NativeAnonIdentity, [i32; 4]>,
+    memory: EntityMemory,
+}
+#[cfg(feature = "paired-packages")]
+pub(in crate::game) fn native_entity_tag_uuids(tags: &[Tag]) -> Result<HashSet<[i32; 4]>> {
+    let mut used = HashSet::new();
+    let mut work: Vec<_> = tags.iter().collect();
+    while let Some(tag) = work.pop() {
+        match tag.get("UUID") {
+            Some(Tag::IntArray(uuid)) => {
+                used.insert(
+                    uuid.as_slice()
+                        .try_into()
+                        .map_err(|_| "native entity UUID size")?,
+                );
+            }
+            Some(_) => return Err("native entity UUID type".into()),
+            None => {}
+        }
+        if let Some(Tag::List(passengers)) = tag.get("Passengers") {
+            work.extend(passengers);
+        }
+    }
+    Ok(used)
+}
+#[cfg(feature = "paired-packages")]
+impl NativeEntityView<'_> {
+    pub(in crate::game) fn current_close_uuids(&self) -> Result<HashSet<[i32; 4]>> {
+        let mut used: HashSet<_> = self.persist.uuids.values().copied().collect();
+        for (_, uuid, raw) in self.persist.anon.values() {
+            used.extend(*uuid);
+            used.extend(native_entity_tag_uuids(std::slice::from_ref(raw))?);
+        }
+        for raw in self.persist.raw.values() {
+            used.extend(native_entity_tag_uuids(std::slice::from_ref(raw))?);
+        }
+        for raw in self.persist.unknown.values() {
+            used.extend(native_entity_tag_uuids(raw)?);
+        }
+        for falling in self.falling {
+            if let Some(saved) = &falling.saved {
+                used.insert(saved.0);
+                used.extend(native_entity_tag_uuids(std::slice::from_ref(&saved.1))?);
+            }
+        }
+        for spawner in self.ominous_spawners {
+            used.insert(spawner.uuid);
+        }
+        Ok(used)
+    }
+    fn close_ids(&self) -> HashSet<u32> {
+        self.mobs
+            .iter()
+            .map(|e| e.id)
+            .chain(self.dropped.iter().map(|e| e.id))
+            .chain(self.boats.iter().map(|e| e.id))
+            .chain(self.carts.iter().map(|e| e.id))
+            .chain(self.armor_stands.iter().map(|e| e.id))
+            .chain(self.item_frames.iter().map(|e| e.id))
+            .chain(self.cushions.iter().map(|e| e.id))
+            .chain(self.paintings.iter().map(|e| e.id))
+            .chain(self.others.iter().map(|e| e.id))
+            .chain(self.mobs.iter().filter_map(|m| match m.extra.leash {
+                Some(horizon_client::mobs::leash::Holder::Mob(id)) => Some(id),
+                _ => None,
+            }))
+            .collect()
+    }
+    fn close_anon(&self) -> Vec<(String, Vec3)> {
+        self.orbs
+            .iter()
+            .map(|e| ("minecraft:experience_orb".into(), e.position))
+            .chain(
+                self.projectiles
+                    .iter()
+                    .map(|e| (e.kind.id().into(), e.position)),
+            )
+            .chain(
+                self.falling
+                    .iter()
+                    .filter(|e| e.saved.is_none())
+                    .map(|e| ("minecraft:falling_block".into(), e.position)),
+            )
+            .chain(
+                self.dragon
+                    .into_iter()
+                    .map(|e| ("minecraft:ender_dragon".into(), e.position)),
+            )
+            .chain(
+                self.crystals
+                    .iter()
+                    .map(|e| ("minecraft:end_crystal".into(), e.position)),
+            )
+            .collect()
+    }
+    fn close_memory(&self) -> EntityMemory {
+        EntityMemory {
+            uuids: self.persist.uuids.clone(),
+            raw: self.persist.raw.clone(),
+            unknown: self.persist.unknown.clone(),
+            anon: self.persist.anon.clone(),
+        }
+    }
+    fn check_passenger_graph(&self) -> Result<()> {
+        for mob in self.mobs {
+            let mut id = mob.id;
+            let mut seen = HashSet::new();
+            for depth in 0..=128 {
+                if !seen.insert(id) || depth == 128 {
+                    return Err("native close cyclic or overdeep mob passenger ownership".into());
+                }
+                let Some(next) = self
+                    .mobs
+                    .iter()
+                    .find(|m| m.id == id)
+                    .and_then(|m| m.extra.mount)
+                else {
+                    break;
+                };
+                id = next;
+            }
+        }
+        Ok(())
+    }
+    /// Explicit identity stage after old-source validation. UUID entropy is used
+    /// once, never the World's random or simulation state.
+    pub(in crate::game) fn prepare_close_identities(
+        &mut self,
+        used: &mut HashSet<[i32; 4]>,
+    ) -> Result<NativeEntityCloseIdentity> {
+        self.check_passenger_graph()?;
+        let ids = self.close_ids();
+        used.extend(self.current_close_uuids()?);
+        let mut staged = Vec::new();
+        let fresh = |used: &mut HashSet<[i32; 4]>| -> Result<[i32; 4]> {
+            (0..32)
+                .find_map(|_| {
+                    let uuid = random_uuid();
+                    used.insert(uuid).then_some(uuid)
+                })
+                .ok_or_else(|| "native close UUID entropy collision exhaustion".into())
+        };
+        for id in &ids {
+            if !self.persist.uuids.contains_key(id) {
+                staged.push((*id, fresh(used)?));
+            }
+        }
+        let mut anon = HashMap::new();
+        let mut occurrences = HashMap::new();
+        for (kind, position) in self.close_anon() {
+            let key = anon_key(&kind, position);
+            let uuid = match self.persist.anon.get(&key).and_then(|(_, uuid, _)| *uuid) {
+                Some(uuid) => uuid,
+                None => fresh(used)?,
+            };
+            let ordinal = occurrences.entry(key.clone()).or_insert(0usize);
+            anon.insert((key.0, key.1, *ordinal), uuid);
+            *ordinal += 1;
+        }
+        // All fallible staging precedes the first original-memory insert. The
+        // cursor latches a failed preparation, so Retry never draws entropy again.
+        self.persist
+            .uuids
+            .try_reserve(staged.len())
+            .map_err(|_| "native close UUID reservation failed")?;
+        for (id, uuid) in staged {
+            self.persist.uuids.insert(id, uuid);
+        }
+        Ok(NativeEntityCloseIdentity {
+            ids,
+            anon,
+            memory: self.close_memory(),
+        })
+    }
+    /// Full native output, including off-resident owners. Protected producer
+    /// records are checked by final admission; they are never filtered here.
+    pub(in crate::game) fn project_close(
+        &mut self,
+        identity: &NativeEntityCloseIdentity,
+    ) -> Result<Vec<((i32, i32), Vec<Tag>)>> {
+        self.check_passenger_graph()?;
+        let mut memory = self.close_memory();
+        let same_anon = memory.anon.len() == identity.memory.anon.len()
+            && memory.anon.iter().all(|(key, (position, uuid, raw))| {
+                identity
+                    .memory
+                    .anon
+                    .get(key)
+                    .is_some_and(|(old, old_uuid, old_raw)| {
+                        [
+                            position.x.to_bits(),
+                            position.y.to_bits(),
+                            position.z.to_bits(),
+                        ] == [old.x.to_bits(), old.y.to_bits(), old.z.to_bits()]
+                            && uuid == old_uuid
+                            && raw == old_raw
+                    })
+            });
+        let mut occurrences = HashMap::new();
+        let anon_keys: HashSet<_> = self
+            .close_anon()
+            .iter()
+            .map(|(kind, position)| {
+                let key = anon_key(kind, *position);
+                let ordinal = occurrences.entry(key.clone()).or_insert(0usize);
+                let identity = (key.0, key.1, *ordinal);
+                *ordinal += 1;
+                identity
+            })
+            .collect();
+        if self.close_ids() != identity.ids
+            || memory.uuids != identity.memory.uuids
+            || memory.raw != identity.memory.raw
+            || memory.unknown != identity.memory.unknown
+            || !same_anon
+            || anon_keys != identity.anon.keys().cloned().collect()
+        {
+            return Err("native close entity identity or raw ownership changed".into());
+        }
+        let mut keys: HashSet<_> = self.persist.unknown.keys().copied().collect();
+        for (_, position) in self.close_anon() {
+            keys.insert(chunk_of(position));
+        }
+        for position in self
+            .mobs
+            .iter()
+            .map(|e| e.position)
+            .chain(self.dropped.iter().map(|e| e.position))
+            .chain(self.falling.iter().map(|e| e.position))
+            .chain(self.boats.iter().map(|e| e.position))
+            .chain(self.carts.iter().map(|e| e.position))
+            .chain(self.armor_stands.iter().map(|e| e.position))
+            .chain(self.cushions.iter().map(|e| e.position))
+            .chain(self.others.iter().map(|e| e.position))
+            .chain(
+                self.ominous_spawners
+                    .iter()
+                    .map(|e| Vec3::new(e.position[0], e.position[1], e.position[2])),
+            )
+        {
+            keys.insert(chunk_of(position));
+        }
+        for e in self.paintings {
+            keys.insert(chunk_of(painting_center(e)));
+        }
+        for e in self.item_frames {
+            let (lo, hi) = e.bounds();
+            keys.insert(chunk_of(Vec3::new(
+                (lo[0] + hi[0]) / 2.0,
+                (lo[1] + hi[1]) / 2.0,
+                (lo[2] + hi[2]) / 2.0,
+            )));
+        }
+        // Borrow the fixed table only for this native codec call; the original
+        // table remains in the close cursor across all attempts.
+        let mut fixed = NativeEntityView {
+            persist: NativeEntityMemory::borrow(&mut memory),
+            player_uuid: self.player_uuid,
+            registry: self.registry,
+            mobs: self.mobs,
+            dropped: self.dropped,
+            orbs: self.orbs,
+            projectiles: self.projectiles,
+            falling: self.falling,
+            boats: self.boats,
+            dragon: self.dragon,
+            crystals: self.crystals,
+            ominous_spawners: self.ominous_spawners,
+            carts: self.carts,
+            armor_stands: self.armor_stands,
+            item_frames: self.item_frames,
+            cushions: self.cushions,
+            paintings: self.paintings,
+            others: self.others,
+            fixed_anon: Some(&identity.anon),
+        };
+        let mut result = fixed.entity_chunks(&keys);
+        result.sort_by_key(|(at, _)| *at);
+        Ok(result)
+    }
+}
+impl Game<'_> {
     /// Release only the entities selected by the saved coordinate set.
     pub(super) fn remove_saved_entities(&mut self, keys: &HashSet<(i32, i32)>) {
         for key in keys {

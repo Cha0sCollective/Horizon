@@ -68,18 +68,81 @@ use super::{
     functions::{ScheduleMetadataExpected, ScheduleMetadataInput, ScheduleMetadataPost},
     maps::{MapsMetadataEvidence, MapsMetadataExpected, MapsMetadataInput, MapsMetadataPost},
     nether_portal::{ArrivalsMetadataExpected, ArrivalsMetadataInput, ArrivalsMetadataPost},
-    raids::{RaidsMetadataExpected, RaidsMetadataInput, RaidsMetadataPost},
+    raids::{
+        LevelRaidsExpected, LevelRaidsInput, LevelRaidsPost, RaidsMetadataExpected,
+        RaidsMetadataInput, RaidsMetadataPost,
+    },
     scoreboard::{ScoreMetadataExpected, ScoreMetadataInput, ScoreMetadataPost},
     stats::{StatsExpected, StatsInput, StatsWritten},
     trading::{RandomSequencesExpected, RandomSequencesInput, RandomSequencesWritten},
     wandering_trader::{TraderMetadataExpected, TraderMetadataInput, TraderMetadataPost},
 };
 
+enum RaidExpected {
+    Single(RaidsMetadataExpected),
+    Levels(LevelRaidsExpected),
+}
+#[derive(Clone)]
+enum RaidInput {
+    Single(RaidsMetadataInput),
+    Levels(LevelRaidsInput),
+}
+enum RaidPost {
+    Single(RaidsMetadataPost),
+    Levels(LevelRaidsPost),
+}
+struct RaidIo {
+    effect: MetadataEffect,
+    result: Result<RaidPost, String>,
+}
+impl RaidInput {
+    fn write_native(&self) -> RaidIo {
+        match self {
+            Self::Single(input) => {
+                let io = input.write_native();
+                RaidIo {
+                    effect: io.effect,
+                    result: io.result.map(RaidPost::Single),
+                }
+            }
+            Self::Levels(input) => {
+                let io = input.write_native();
+                RaidIo {
+                    effect: io.effect,
+                    result: io.result.map(RaidPost::Levels),
+                }
+            }
+        }
+    }
+    fn apply_to_level(&self, level: &mut horizon_client::save::Level) {
+        if let Self::Levels(input) = self {
+            input.apply_to_level(level);
+        }
+    }
+}
+fn preflight_raid(game: &Game<'_>, expected: &RaidExpected, post: &RaidPost) -> Result<(), String> {
+    match (expected, post) {
+        (RaidExpected::Single(expected), RaidPost::Single(post)) => {
+            game.preflight_retained_raids_metadata(expected, post)
+        }
+        (RaidExpected::Levels(expected), RaidPost::Levels(post)) => {
+            game.preflight_retained_level_raids_metadata(expected, post)
+        }
+        _ => Err("native raid route association changed".into()),
+    }
+}
+fn commit_raid(game: &mut Game<'_>, post: RaidPost) {
+    match post {
+        RaidPost::Single(post) => game.commit_retained_raids_metadata(post),
+        RaidPost::Levels(post) => game.commit_retained_level_raids_metadata(post),
+    }
+}
+
 struct Expected {
     maps: MapsMetadataExpected,
     fight: FightMetadataExpected,
     trader: TraderMetadataExpected,
-    raids: RaidsMetadataExpected,
+    raids: RaidExpected,
     arrivals: ArrivalsMetadataExpected,
     random: RandomSequencesExpected,
     stats: StatsExpected,
@@ -95,7 +158,7 @@ struct Input {
     maps: MapsMetadataInput,
     fight: FightMetadataInput,
     trader: TraderMetadataInput,
-    raids: RaidsMetadataInput,
+    raids: RaidInput,
     arrivals: ArrivalsMetadataInput,
     random: RandomSequencesInput,
     stats: StatsInput,
@@ -110,7 +173,7 @@ struct Written {
     maps: Option<MapsMetadataPost>,
     fight: Option<FightMetadataPost>,
     trader: Option<TraderMetadataPost>,
-    raids: Option<RaidsMetadataPost>,
+    raids: Option<RaidPost>,
     arrivals: Option<ArrivalsMetadataPost>,
     random: Option<RandomSequencesWritten>,
     stats: Option<StatsWritten>,
@@ -275,8 +338,48 @@ pub(super) enum MetadataRetryRefusal {
 /// Exclusive lexical ownership keeps the original Game/session and every family
 /// frozen. No Game pointer/reference is ever sent to the native IO worker.
 pub(super) struct NativeMetadata<'a, 'window> {
-    armed: bool,
     game: &'a mut Game<'window>,
+    state: MetadataState,
+}
+impl<'a, 'window> NativeMetadata<'a, 'window> {
+    pub(super) fn begin(game: &'a mut Game<'window>, deadline: Instant) -> Box<Self> {
+        Box::new(Self {
+            game,
+            state: MetadataState::new(deadline),
+        })
+    }
+    pub(super) fn failures(&self) -> &[MetadataFailure] {
+        self.state.failures()
+    }
+    pub(super) fn sampled_ms(&self) -> i64 {
+        self.state.sampled_ms()
+    }
+    fn effects(&self) -> Effects {
+        self.state.effects()
+    }
+    fn preflight(&self) -> Result<(), String> {
+        self.state.preflight(self.game)
+    }
+    pub(super) fn poll(&mut self) -> MetadataStatus {
+        self.state.poll(self.game)
+    }
+    pub(super) fn retry(&mut self, deadline: Instant) -> Result<(), MetadataRetryRefusal> {
+        self.state.retry(self.game, deadline)
+    }
+    pub(super) fn acknowledge(mut self: Box<Self>) -> Result<MetadataAcknowledged, Box<Self>> {
+        if let Err(error) = self.state.preflight(self.game) {
+            self.state.block(error);
+            return Err(self);
+        }
+        Ok(self.state.commit_preflighted(self.game))
+    }
+}
+
+/// This private state has no Game reference and is never exposed through a
+/// mutable accessor. Both callers keep their original Game exclusively owned.
+struct MetadataState {
+    level_raids: bool,
+    armed: bool,
     batch: Arc<BatchIdentity>,
     tree: RetainedTreeState,
     tree_started: bool,
@@ -304,11 +407,11 @@ pub(super) struct MetadataAcknowledged {
     pub sampled_ms: i64,
     pub failures: Vec<MetadataFailure>,
 }
-impl<'a, 'window> NativeMetadata<'a, 'window> {
-    pub(super) fn begin(game: &'a mut Game<'window>, deadline: Instant) -> Box<Self> {
-        Box::new(Self {
+impl MetadataState {
+    fn new(deadline: Instant) -> Self {
+        Self {
+            level_raids: false,
             armed: true,
-            game,
             batch: Arc::new(BatchIdentity),
             tree: RetainedTreeState::new(),
             tree_started: false,
@@ -325,7 +428,7 @@ impl<'a, 'window> NativeMetadata<'a, 'window> {
             history: Vec::new(),
             #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
             control: None,
-        })
+        }
     }
     pub(super) fn failures(&self) -> &[MetadataFailure] {
         &self.history
@@ -365,29 +468,33 @@ impl<'a, 'window> NativeMetadata<'a, 'window> {
         }
         self.blocked.get_or_insert(detail);
     }
-    fn prepare(&mut self) -> Result<(), String> {
+    fn prepare(&mut self, game: &Game<'_>) -> Result<(), String> {
         // Every value here is a read-only projection, not authority moved from
         // Game. A failed projection leaves the entire original in this guard.
-        let (random, random_input) = self
-            .game
+        let (random, random_input) = game
             .prepare_metadata_random_sequences()
             .map_err(|e| e.to_string())?;
-        let (stats, stats_input) = self.game.prepare_metadata_stats();
-        let (advancements, advancement_input) = self
-            .game
+        let (stats, stats_input) = game.prepare_metadata_stats();
+        let (advancements, advancement_input) = game
             .prepare_metadata_advancements(&self.tree)
             .map_err(|e| e.to_string())?;
-        let (score, score_input) = self.game.prepare_retained_score_metadata(self.sampled_ms)?;
+        let (score, score_input) = game.prepare_retained_score_metadata(self.sampled_ms)?;
         #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
         let score_input = score_input.with_test_control(self.control.clone());
-        let (boss, boss_input) = self.game.prepare_retained_boss_metadata();
-        let (schedule, schedule_input) = self.game.prepare_retained_schedule_metadata();
-        let (clock, clock_input) = self.game.prepare_retained_clock_metadata();
-        let (maps, maps_input) = self.game.prepare_retained_maps_metadata()?;
-        let (fight, fight_input) = self.game.prepare_retained_fight_metadata()?;
-        let (trader, trader_input) = self.game.prepare_retained_trader_metadata();
-        let (raids, raids_input) = self.game.prepare_retained_raids_metadata()?;
-        let (arrivals, arrivals_input) = self.game.prepare_retained_arrivals_metadata();
+        let (boss, boss_input) = game.prepare_retained_boss_metadata();
+        let (schedule, schedule_input) = game.prepare_retained_schedule_metadata();
+        let (clock, clock_input) = game.prepare_retained_clock_metadata();
+        let (maps, maps_input) = game.prepare_retained_maps_metadata()?;
+        let (fight, fight_input) = game.prepare_retained_fight_metadata()?;
+        let (trader, trader_input) = game.prepare_retained_trader_metadata();
+        let (raids, raids_input) = if self.level_raids {
+            let (expected, input) = game.prepare_retained_level_raids_metadata()?;
+            (RaidExpected::Levels(expected), RaidInput::Levels(input))
+        } else {
+            let (expected, input) = game.prepare_retained_raids_metadata()?;
+            (RaidExpected::Single(expected), RaidInput::Single(input))
+        };
+        let (arrivals, arrivals_input) = game.prepare_retained_arrivals_metadata();
         self.expected = Some(Expected {
             maps,
             fight,
@@ -516,27 +623,13 @@ impl<'a, 'window> NativeMetadata<'a, 'window> {
             }
         }
     }
-    pub(super) fn poll(&mut self) -> MetadataStatus {
+    fn poll(&mut self, game: &mut Game<'_>) -> MetadataStatus {
         self.harvest();
         if Instant::now() >= self.deadline && !self.expired {
             self.expired = true;
             self.block("metadata original attempt deadline expired");
         }
-        if !self.tree_started && !self.expired && self.blocked.is_none() {
-            self.tree_started = true;
-            if let Err(error) = self.game.start_metadata_advancement_tree(&mut self.tree) {
-                self.block(error.to_string());
-            }
-        }
-        // Even after a deadline/error, keep harvesting an actual original helper.
-        let tree = if self.tree_started {
-            self.game.poll_metadata_advancement_tree(&mut self.tree)
-        } else {
-            RetainedTreeStatus::Unstarted
-        };
-        if let RetainedTreeStatus::Failed(error) = &tree {
-            self.block(error.clone());
-        }
+        let tree = self.poll_tree(game, !self.expired && self.blocked.is_none());
         if self.input.is_none()
             && self.blocked.is_none()
             && !self.expired
@@ -544,7 +637,7 @@ impl<'a, 'window> NativeMetadata<'a, 'window> {
                 tree,
                 RetainedTreeStatus::Ready | RetainedTreeStatus::Skipped(_)
             )
-            && let Err(error) = self.prepare()
+            && let Err(error) = self.prepare(game)
         {
             self.block(error);
         }
@@ -569,7 +662,29 @@ impl<'a, 'window> NativeMetadata<'a, 'window> {
             MetadataStatus::Pending
         }
     }
-    pub(super) fn retry(&mut self, deadline: Instant) -> Result<(), MetadataRetryRefusal> {
+    fn poll_tree(&mut self, game: &mut Game<'_>, allow_start: bool) -> RetainedTreeStatus {
+        if !self.tree_started && allow_start {
+            self.tree_started = true;
+            if let Err(error) = game.start_metadata_advancement_tree(&mut self.tree) {
+                self.block(error.to_string());
+            }
+        }
+        // Even after a deadline/error, keep harvesting an actual original helper.
+        let tree = if self.tree_started {
+            game.poll_metadata_advancement_tree(&mut self.tree)
+        } else {
+            RetainedTreeStatus::Unstarted
+        };
+        if let RetainedTreeStatus::Failed(error) = &tree {
+            self.block(error.clone());
+        }
+        tree
+    }
+    fn retry(
+        &mut self,
+        game: &mut Game<'_>,
+        deadline: Instant,
+    ) -> Result<(), MetadataRetryRefusal> {
         self.harvest();
         if self.handle.is_some() || self.tree.unresolved() {
             return Err(MetadataRetryRefusal::Busy);
@@ -603,8 +718,7 @@ impl<'a, 'window> NativeMetadata<'a, 'window> {
             });
         }
         if self.input.is_none() && matches!(self.tree.status(), RetainedTreeStatus::Failed(_)) {
-            self.game
-                .retry_metadata_advancement_tree(&mut self.tree)
+            game.retry_metadata_advancement_tree(&mut self.tree)
                 .map_err(|_| MetadataRetryRefusal::OriginalProjectionUnavailable)?;
         }
         self.blocked = None;
@@ -612,7 +726,7 @@ impl<'a, 'window> NativeMetadata<'a, 'window> {
         self.deadline = deadline;
         Ok(())
     }
-    fn preflight(&self) -> Result<(), String> {
+    fn preflight(&self, game: &Game<'_>) -> Result<(), String> {
         if Instant::now() >= self.deadline
             || self.expired
             || self.blocked.is_some()
@@ -633,76 +747,56 @@ impl<'a, 'window> NativeMetadata<'a, 'window> {
             return Err("metadata batch/attempt outcome mismatch".into());
         }
         let written = &outcome.written;
-        self.game
-            .preflight_metadata_random_sequences(&expected.random, written.random.as_ref().unwrap())
+        game.preflight_metadata_random_sequences(
+            &expected.random,
+            written.random.as_ref().unwrap(),
+        )
+        .map_err(|e| e.to_string())?;
+        game.preflight_metadata_stats(&expected.stats, written.stats.as_ref().unwrap())
             .map_err(|e| e.to_string())?;
-        self.game
-            .preflight_metadata_stats(&expected.stats, written.stats.as_ref().unwrap())
-            .map_err(|e| e.to_string())?;
-        self.game
-            .preflight_metadata_advancements(
-                &expected.advancements,
-                written.advancements.as_ref().unwrap(),
-            )
-            .map_err(|e| e.to_string())?;
-        self.game
-            .preflight_retained_score_metadata(&expected.score, written.score.as_ref().unwrap())?;
-        self.game
-            .preflight_retained_boss_metadata(&expected.boss, written.boss.as_ref().unwrap())?;
-        self.game.preflight_retained_schedule_metadata(
+        game.preflight_metadata_advancements(
+            &expected.advancements,
+            written.advancements.as_ref().unwrap(),
+        )
+        .map_err(|e| e.to_string())?;
+        game.preflight_retained_score_metadata(&expected.score, written.score.as_ref().unwrap())?;
+        game.preflight_retained_boss_metadata(&expected.boss, written.boss.as_ref().unwrap())?;
+        game.preflight_retained_schedule_metadata(
             &expected.schedule,
             written.schedule.as_ref().unwrap(),
         )?;
-        self.game
-            .preflight_retained_clock_metadata(&expected.clock, written.clock.as_ref().unwrap())?;
-        self.game
-            .preflight_retained_maps_metadata(&expected.maps, written.maps.as_ref().unwrap())?;
-        self.game
-            .preflight_retained_fight_metadata(&expected.fight, written.fight.as_ref().unwrap())?;
-        self.game.preflight_retained_trader_metadata(
+        game.preflight_retained_clock_metadata(&expected.clock, written.clock.as_ref().unwrap())?;
+        game.preflight_retained_maps_metadata(&expected.maps, written.maps.as_ref().unwrap())?;
+        game.preflight_retained_fight_metadata(&expected.fight, written.fight.as_ref().unwrap())?;
+        game.preflight_retained_trader_metadata(
             &expected.trader,
             written.trader.as_ref().unwrap(),
         )?;
-        self.game
-            .preflight_retained_raids_metadata(&expected.raids, written.raids.as_ref().unwrap())?;
-        self.game.preflight_retained_arrivals_metadata(
+        preflight_raid(game, &expected.raids, written.raids.as_ref().unwrap())?;
+        game.preflight_retained_arrivals_metadata(
             &expected.arrivals,
             written.arrivals.as_ref().unwrap(),
         )?;
         Ok(())
     }
-    pub(super) fn acknowledge(mut self: Box<Self>) -> Result<MetadataAcknowledged, Box<Self>> {
-        if let Err(error) = self.preflight() {
-            self.block(error);
-            return Err(self);
-        }
+    fn commit_preflighted(&mut self, game: &mut Game<'_>) -> MetadataAcknowledged {
         let expected = self.expected.as_ref().unwrap();
         let written = &mut self.outcome.as_mut().unwrap().written;
         // ALL preflights succeeded before ANY live marker can change.
-        self.game.commit_metadata_random_sequences(&expected.random);
-        self.game.commit_metadata_stats(&expected.stats);
-        self.game
-            .commit_metadata_advancements(&expected.advancements);
-        self.game
-            .commit_retained_score_metadata(written.score.take().unwrap());
-        self.game
-            .commit_retained_boss_metadata(written.boss.take().unwrap());
-        self.game
-            .commit_retained_schedule_metadata(written.schedule.take().unwrap());
-        self.game
-            .commit_retained_clock_metadata(written.clock.take().unwrap());
-        self.game
-            .commit_retained_maps_metadata(written.maps.take().unwrap());
-        self.game
-            .commit_retained_fight_metadata(written.fight.take().unwrap());
-        self.game
-            .commit_retained_trader_metadata(written.trader.take().unwrap());
-        self.game
-            .commit_retained_raids_metadata(written.raids.take().unwrap());
-        self.game
-            .commit_retained_arrivals_metadata(written.arrivals.take().unwrap());
+        game.commit_metadata_random_sequences(&expected.random);
+        game.commit_metadata_stats(&expected.stats);
+        game.commit_metadata_advancements(&expected.advancements);
+        game.commit_retained_score_metadata(written.score.take().unwrap());
+        game.commit_retained_boss_metadata(written.boss.take().unwrap());
+        game.commit_retained_schedule_metadata(written.schedule.take().unwrap());
+        game.commit_retained_clock_metadata(written.clock.take().unwrap());
+        game.commit_retained_maps_metadata(written.maps.take().unwrap());
+        game.commit_retained_fight_metadata(written.fight.take().unwrap());
+        game.commit_retained_trader_metadata(written.trader.take().unwrap());
+        commit_raid(game, written.raids.take().unwrap());
+        game.commit_retained_arrivals_metadata(written.arrivals.take().unwrap());
         self.armed = false;
-        Ok(MetadataAcknowledged {
+        MetadataAcknowledged {
             maps: self
                 .outcome
                 .as_ref()
@@ -711,10 +805,10 @@ impl<'a, 'window> NativeMetadata<'a, 'window> {
             effects: self.effects(),
             sampled_ms: self.sampled_ms,
             failures: std::mem::take(&mut self.history),
-        })
+        }
     }
 }
-impl Drop for NativeMetadata<'_, '_> {
+impl Drop for MetadataState {
     fn drop(&mut self) {
         if self.armed {
             use std::io::Write;
@@ -724,6 +818,1179 @@ impl Drop for NativeMetadata<'_, '_> {
             );
             std::process::abort();
         }
+    }
+}
+
+use super::levels::session_checkpoint::{
+    CoherentImageAttempt, CoherentImageBuildInput, CoherentImageContext, CoherentImageReadInput,
+    CoherentImageReadPost, CoherentImageWritten, NativeWorldReadContext, NativeWorldReadInput,
+    NativeWorldReadPost,
+};
+use super::levels::{NativeLevelsStatus, RetainedNativeLevels, RetainedNativePayloads};
+use horizon_client::save::{
+    NativeWriterClosed, NativeWriterDurable, NativeWriterFinal, NativeWriterFinalInput,
+    NativeWriterFinalSubmitted, NativeWriterStaged, NativeWriterStagedStatus,
+};
+
+/// A dormant native completion profile. Neither profile implies transport closure.
+pub(super) enum CloseProfile {
+    NativeWorld,
+    CoherentSession { archive: std::path::PathBuf },
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ClosePhase {
+    Resources,
+    Producers,
+    Historical,
+    ReadPreflight,
+    Prepare,
+    NativeIo,
+    FinalWriters,
+    Image,
+    Preflight,
+    NativeReady,
+}
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum CloseStatus {
+    Pending(ClosePhase),
+    Blocked(String),
+    NativeReady,
+}
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum CloseRetryRefusal {
+    Busy,
+    NotBlocked,
+    Deadline,
+    Refused(String),
+}
+
+/// Fixed values only: callers cannot obtain Game/LAN owners through inspection.
+#[derive(Clone, Debug)]
+pub(super) struct CloseImageObservation {
+    pub epoch: u64,
+    pub pending: std::path::PathBuf,
+    pub published: std::path::PathBuf,
+    pub phase: super::levels::session_checkpoint::CoherentImagePhase,
+    pub publication: super::levels::session_checkpoint::Publication,
+}
+impl CloseImageObservation {
+    fn capture(attempt: &CoherentImageAttempt) -> Self {
+        Self {
+            epoch: attempt.epoch(),
+            pending: attempt.pending().to_owned(),
+            published: attempt.published().to_owned(),
+            phase: attempt.phase(),
+            publication: attempt.publication(),
+        }
+    }
+}
+#[derive(Clone, Debug)]
+pub(super) struct CloseObservation {
+    pub phase: ClosePhase,
+    pub dimension: super::Dim,
+    pub participants: usize,
+    pub levels: usize,
+    pub identity_preparations: usize,
+    pub failed_attempts: usize,
+    pub read_refusals: Vec<(super::Dim, String)>,
+    pub image: Option<(u64, std::path::PathBuf)>,
+    pub image_attempt: Option<CloseImageObservation>,
+    pub prior_images: Vec<CloseImageObservation>,
+}
+/// Native completion retains all outer owners for a later bounded composition.
+/// Its unresolved Drop deliberately retains CloseOwner's invariant backstop.
+pub(super) struct NativeReady<'window> {
+    owner: Box<CloseOwner<'window>>,
+}
+pub(super) struct NativeDisposed {
+    _native_only: (),
+}
+fn dormant_async_owners_absent(game: &Game<'_>, allow_constructor_lan: bool) -> bool {
+    (allow_constructor_lan || game.lan.is_none())
+        && game.remote.is_none()
+        && game.integrated.is_none()
+        && game.serving.is_none()
+        && game.friends.is_none()
+        && game.control.is_none()
+        && game.world_loader.is_none()
+        && game.rest_loader.is_none()
+        && game.retained_prepare_loader.is_none()
+        && game.retained_preparation.is_none()
+        && game.retained_entry_owner.is_none()
+        && game.pending_entry.is_none()
+        && game.pending_save.is_none()
+        && game.adv.pending_tree.is_none()
+        && game.lod.is_none()
+        && game.window.is_none()
+        && game.renderer.is_none()
+}
+impl NativeReady<'_> {
+    pub(super) fn observe(&self) -> CloseObservation {
+        self.owner.observe()
+    }
+    pub(super) fn try_dispose_dormant(mut self) -> Result<NativeDisposed, (Self, String)> {
+        if !self.owner.native_ready_proven()
+            || !dormant_async_owners_absent(self.owner.game.as_ref().unwrap(), false)
+        {
+            return Err((
+                self,
+                "remaining original asynchronous or transport owners require composition".into(),
+            ));
+        }
+        self.owner.armed = false;
+        // Metadata has already been acknowledged and every native actual handle
+        // is terminal; remaining native file/resource owners have no writer.
+        drop(self.owner.game.take());
+        Ok(NativeDisposed { _native_only: () })
+    }
+}
+
+struct CloseWriter {
+    save: Arc<horizon_client::save::SaveDir>,
+    controller: Option<NativeWriterStaged>,
+    historical: Option<NativeWriterDurable>,
+    capability: Option<Arc<NativeWriterFinal>>,
+    input: Option<NativeWriterFinalInput>,
+    submitted: Option<NativeWriterFinalSubmitted>,
+    sealed: bool,
+}
+#[derive(Clone)]
+struct FinalWriterJob {
+    capability: Arc<NativeWriterFinal>,
+    input: NativeWriterFinalInput,
+}
+struct NativeCloseInput {
+    metadata: Arc<Input>,
+    level: super::NativeLevelInput,
+    writers: Vec<FinalWriterJob>,
+    // The ordinary coherent checkpoint persists this actual loaded projection
+    // even when clean; it does not acknowledge a fabricated dirty marker.
+    session_raids: Option<(std::path::PathBuf, horizon_world::nbt::Tag)>,
+}
+struct NativeCloseWritten {
+    metadata: Option<Outcome>,
+    level: Option<super::NativeLevelPost>,
+    submitted: Vec<NativeWriterFinalSubmitted>,
+    error: Option<String>,
+    level_effects: [horizon_client::save::NativeLevelWriteEffect; 6],
+}
+enum CloseIoJob {
+    NativeMetadata {
+        input: Arc<NativeCloseInput>,
+        batch: Arc<BatchIdentity>,
+        attempt: Arc<AttemptIdentity>,
+        #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+        control: Option<MetadataTestControl>,
+    },
+    CoherentRead(CoherentImageReadInput),
+    NativeRead(NativeWorldReadInput),
+    CoherentImage {
+        input: CoherentImageBuildInput,
+        attempt: Arc<CoherentImageAttempt>,
+    },
+}
+enum CloseIoResult {
+    NativeMetadata(NativeCloseWritten),
+    CoherentRead(Result<CoherentImageReadPost, String>),
+    NativeRead(Result<NativeWorldReadPost, String>),
+    CoherentImage(Result<CoherentImageWritten, String>),
+}
+impl CloseIoJob {
+    fn run(self) -> CloseIoResult {
+        match self {
+            Self::NativeRead(input) => {
+                CloseIoResult::NativeRead(input.run().map_err(|e| e.to_string()))
+            }
+            Self::CoherentRead(input) => {
+                CloseIoResult::CoherentRead(input.run().map_err(|e| e.to_string()))
+            }
+            Self::CoherentImage { input, attempt } => CloseIoResult::CoherentImage(
+                input
+                    .build_verify_publish(&attempt)
+                    .map_err(|e| e.to_string()),
+            ),
+            Self::NativeMetadata {
+                input,
+                batch,
+                attempt,
+                #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+                control,
+            } => {
+                let mut out = NativeCloseWritten {
+                    metadata: None,
+                    level: None,
+                    submitted: Vec::new(),
+                    error: None,
+                    level_effects: [horizon_client::save::NativeLevelWriteEffect::Unattempted; 6],
+                };
+                // Capture unknown fields and every native conditional decision
+                // before core Clock or any other final metadata mutation.
+                let operation = (|| -> Result<(), String> {
+                    input.level.capture_native()?;
+                    for writer in &input.writers {
+                        out.submitted.push(
+                            writer
+                                .capability
+                                .submit_native(&writer.input)
+                                .map_err(|e| e.to_string())?,
+                        );
+                    }
+                    let metadata = write_metadata(Request {
+                        batch,
+                        attempt,
+                        input: input.metadata.clone(),
+                        #[cfg(all(
+                            test,
+                            feature = "native-writer-test-control",
+                            debug_assertions
+                        ))]
+                        control,
+                    });
+                    let success = metadata.success();
+                    let error = metadata.error.clone();
+                    out.metadata = Some(metadata);
+                    if !success {
+                        return Err(
+                            error.unwrap_or_else(|| "native metadata outcome incomplete".into())
+                        );
+                    }
+                    if let Some((path, tag)) = &input.session_raids {
+                        horizon_client::save::write_dat(path, tag.clone())
+                            .map_err(|e| e.to_string())?;
+                    }
+                    let level = input.level.write_native();
+                    out.level_effects = level.native_effects;
+                    out.level = Some(level.result?);
+                    Ok(())
+                })();
+                out.error = operation.err();
+                CloseIoResult::NativeMetadata(out)
+            }
+        }
+    }
+}
+struct CloseIoAttempt {
+    number: u64,
+}
+struct CloseIoReturn {
+    attempt: Arc<CloseIoAttempt>,
+    result: CloseIoResult,
+}
+
+/// The original Box is never exposed mutably while closing or blocked. Private
+/// state holds no reference into it, so moving the owner creates no self-reference.
+pub(super) struct CloseOwner<'window> {
+    armed: bool,
+    game: Option<Box<Game<'window>>>,
+    profile: CloseProfile,
+    phase: ClosePhase,
+    deadline: Instant,
+    blocked: Option<String>,
+    failures: Vec<String>,
+    metadata: MetadataState,
+    metadata_ack: Option<MetadataAcknowledged>,
+    levels: Option<RetainedNativeLevels>,
+    payloads: Option<RetainedNativePayloads>,
+    writers: Vec<CloseWriter>,
+    closed: Vec<NativeWriterClosed>,
+    level_expected: Option<super::NativeLevelExpected>,
+    native_input: Option<Arc<NativeCloseInput>>,
+    native_written: Option<NativeCloseWritten>,
+    failed_native_attempts: Vec<NativeCloseWritten>,
+    io_uncertainties: Vec<(u64, ClosePhase)>,
+    image_context: Option<Arc<CoherentImageContext>>,
+    image_read: Option<CoherentImageReadPost>,
+    native_read_context: Option<Arc<NativeWorldReadContext>>,
+    native_read: Option<NativeWorldReadPost>,
+    image_input: Option<CoherentImageBuildInput>,
+    image_attempt: Option<Arc<CoherentImageAttempt>>,
+    old_image_attempts: Vec<Arc<CoherentImageAttempt>>,
+    image_written: Option<CoherentImageWritten>,
+    next_image_epoch: u64,
+    io_handle: Option<JoinHandle<Option<CloseIoReturn>>>,
+    io_attempt: Option<Arc<CloseIoAttempt>>,
+    io_number: u64,
+    identity_preparations: usize,
+    #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+    image_control: Option<super::levels::session_checkpoint::CoherentImageTestControl>,
+    #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+    read_control: Option<super::levels::session_checkpoint::CoherentImageTestControl>,
+}
+impl<'window> CloseOwner<'window> {
+    pub(super) fn begin(
+        game: Box<Game<'window>>,
+        profile: CloseProfile,
+        deadline: Instant,
+    ) -> Box<Self> {
+        let mut metadata = MetadataState::new(deadline);
+        metadata.level_raids = true;
+        Box::new(Self {
+            armed: true,
+            game: Some(game),
+            profile,
+            phase: ClosePhase::Resources,
+            deadline,
+            blocked: None,
+            failures: Vec::new(),
+            metadata,
+            metadata_ack: None,
+            levels: None,
+            payloads: None,
+            writers: Vec::new(),
+            closed: Vec::new(),
+            level_expected: None,
+            native_input: None,
+            native_written: None,
+            failed_native_attempts: Vec::new(),
+            io_uncertainties: Vec::new(),
+            image_context: None,
+            image_read: None,
+            native_read_context: None,
+            native_read: None,
+            image_input: None,
+            image_attempt: None,
+            old_image_attempts: Vec::new(),
+            image_written: None,
+            next_image_epoch: 0,
+            io_handle: None,
+            io_attempt: None,
+            io_number: 0,
+            identity_preparations: 0,
+            #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+            image_control: None,
+            #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+            read_control: None,
+        })
+    }
+    pub(super) fn failures(&self) -> &[String] {
+        &self.failures
+    }
+    #[cfg(all(
+        test,
+        feature = "native-writer-test-control",
+        debug_assertions,
+        target_os = "linux"
+    ))]
+    fn foreign_native_read_context_refuses_for_test(&self) -> Result<bool, String> {
+        let game = self.game.as_ref().unwrap();
+        let levels = self.levels.as_ref().ok_or("native levels absent")?;
+        let post = self
+            .native_read
+            .as_ref()
+            .ok_or("actual native read outcome absent")?;
+        let foreign = game
+            .prepare_native_world_read_context(levels)
+            .map_err(|e| e.to_string())?;
+        Ok(game
+            .preflight_native_world_read(&foreign, levels, post)
+            .is_err())
+    }
+    pub(super) fn identity_preparations(&self) -> usize {
+        self.identity_preparations
+    }
+    pub(super) fn observe(&self) -> CloseObservation {
+        let game = self.game.as_ref().unwrap();
+        CloseObservation {
+            phase: self.phase,
+            dimension: game.dim,
+            participants: game.lan.as_ref().map_or(0, |host| host.hub.guests.len()),
+            levels: self.writers.len(),
+            identity_preparations: self.identity_preparations,
+            failed_attempts: self.failed_native_attempts.len() + self.io_uncertainties.len(),
+            read_refusals: self
+                .levels
+                .as_ref()
+                .map_or_else(Vec::new, |levels| levels.read_refusals().to_vec()),
+            image: self
+                .image_written
+                .as_ref()
+                .map(|written| (written.receipt().epoch, written.receipt().root.clone())),
+            image_attempt: self
+                .image_attempt
+                .as_deref()
+                .map(CloseImageObservation::capture),
+            prior_images: self
+                .old_image_attempts
+                .iter()
+                .map(|attempt| CloseImageObservation::capture(attempt))
+                .collect(),
+        }
+    }
+    fn native_ready_proven(&self) -> bool {
+        self.phase == ClosePhase::NativeReady
+            && self.blocked.is_none()
+            && self.io_handle.is_none()
+            && !self.metadata.armed
+            && self.metadata_ack.is_some()
+            && !self.metadata.tree.unresolved()
+            && self
+                .levels
+                .as_ref()
+                .is_some_and(|levels| levels.acknowledged())
+            && self
+                .writers
+                .iter()
+                .all(|writer| writer.controller.is_none())
+            && self.closed.len() == self.writers.len()
+    }
+    pub(super) fn try_native_ready(self: Box<Self>) -> Result<NativeReady<'window>, Box<Self>> {
+        if !self.native_ready_proven() {
+            return Err(self);
+        }
+        Ok(NativeReady { owner: self })
+    }
+    fn block(&mut self, error: impl Into<String>) {
+        let error = error.into();
+        if !self.failures.contains(&error) {
+            self.failures.push(error.clone());
+        }
+        self.blocked.get_or_insert(error);
+    }
+    fn dispatch(&mut self, job: CloseIoJob) -> Result<(), String> {
+        if self.io_handle.is_some() {
+            return Err("close IO still busy".into());
+        }
+        #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+        if self
+            .metadata
+            .control
+            .as_ref()
+            .is_some_and(MetadataTestControl::refuse_spawn)
+        {
+            return Err("controlled close IO spawn refusal".into());
+        }
+        let number = self
+            .io_number
+            .checked_add(1)
+            .ok_or("close IO attempt exhausted")?;
+        self.io_number = number;
+        let attempt = Arc::new(CloseIoAttempt { number });
+        let (send, receive) = std::sync::mpsc::sync_channel::<(Arc<CloseIoAttempt>, CloseIoJob)>(1);
+        let handle = std::thread::Builder::new()
+            .name("Retained native close IO".into())
+            .spawn(move || {
+                receive.recv().ok().map(|(attempt, job)| CloseIoReturn {
+                    attempt,
+                    result: job.run(),
+                })
+            })
+            .map_err(|e| format!("close IO spawn: {e}"))?;
+        // Register the actual handle before the worker receives any owned input.
+        self.io_handle = Some(handle);
+        self.io_attempt = Some(attempt.clone());
+        #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+        if self
+            .metadata
+            .control
+            .as_ref()
+            .is_some_and(MetadataTestControl::disconnect_dispatch)
+        {
+            drop(send);
+            drop(job);
+            return Err("controlled close IO dispatch disconnect".into());
+        }
+        send.try_send((attempt, job))
+            .map_err(|_| "close IO dispatch disconnected".into())
+    }
+    fn harvest(&mut self) {
+        if !self.io_handle.as_ref().is_some_and(|h| h.is_finished()) {
+            return;
+        }
+        match self.io_handle.take().unwrap().join() {
+            Ok(Some(returned)) => {
+                if !self
+                    .io_attempt
+                    .as_ref()
+                    .is_some_and(|a| Arc::ptr_eq(a, &returned.attempt))
+                {
+                    self.block("close IO returned a foreign actual attempt");
+                    return;
+                }
+                match returned.result {
+                    CloseIoResult::NativeRead(result) => match result {
+                        Ok(read) => {
+                            self.native_read = Some(read);
+                            self.phase = ClosePhase::Prepare;
+                        }
+                        Err(error) => self.block(error),
+                    },
+                    CloseIoResult::CoherentRead(result) => match result {
+                        Ok(read) => {
+                            self.next_image_epoch = read.next_epoch();
+                            self.image_read = Some(read);
+                            self.phase = ClosePhase::Prepare;
+                        }
+                        Err(e) => self.block(e),
+                    },
+                    CloseIoResult::NativeMetadata(written) => {
+                        let error = written.error.clone();
+                        self.native_written = Some(written);
+                        if let Some(e) = error {
+                            self.block(e);
+                        } else {
+                            self.phase = ClosePhase::FinalWriters;
+                        }
+                    }
+                    CloseIoResult::CoherentImage(result) => match result {
+                        Ok(written) => {
+                            self.image_written = Some(written);
+                            self.phase = ClosePhase::Preflight;
+                        }
+                        Err(e) => self.block(e),
+                    },
+                }
+            }
+            Ok(None) => {
+                self.io_uncertainties
+                    .push((self.io_attempt.as_ref().unwrap().number, self.phase));
+                self.block("close IO exited without dispatched outcome; file effects unknown");
+            }
+            Err(_) => {
+                self.io_uncertainties
+                    .push((self.io_attempt.as_ref().unwrap().number, self.phase));
+                self.block(
+                    "close IO panicked; native effects unknown and publication remains unproven",
+                );
+            }
+        }
+    }
+    pub(super) fn poll(&mut self) -> CloseStatus {
+        self.harvest();
+        if self.phase == ClosePhase::NativeReady {
+            return CloseStatus::NativeReady;
+        }
+        // Reap genuine original helpers even after an earlier refusal/deadline.
+        // These operations cannot acknowledge Game markers or dispatch final IO.
+        if self.metadata.tree_started {
+            self.metadata.poll_tree(self.game.as_mut().unwrap(), false);
+        }
+        let mut writer_errors = Vec::new();
+        for writer in &mut self.writers {
+            if let Some(controller) = &mut writer.controller
+                && let NativeWriterStagedStatus::Blocked(error) = controller.poll()
+            {
+                writer_errors.push(error);
+            }
+        }
+        for error in writer_errors {
+            self.block(error);
+        }
+        if Instant::now() >= self.deadline {
+            self.block("coherent native close absolute deadline expired");
+        }
+        // Actual outstanding work is harvested even when blocked. Never dispatch
+        // a new operation or silently renew an expired attempt here.
+        if let Some(error) = &self.blocked {
+            return CloseStatus::Blocked(error.clone());
+        }
+        if self.io_handle.is_none() {
+            match self.advance() {
+                Ok(Some(job)) => {
+                    if let Err(error) = self.dispatch(job) {
+                        self.block(error);
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => self.block(error),
+            }
+        }
+        match &self.blocked {
+            Some(error) => CloseStatus::Blocked(error.clone()),
+            None if self.phase == ClosePhase::NativeReady => CloseStatus::NativeReady,
+            None => CloseStatus::Pending(self.phase),
+        }
+    }
+    fn advance(&mut self) -> Result<Option<CloseIoJob>, String> {
+        let game = self.game.as_mut().ok_or("original close Game absent")?;
+        match self.phase {
+            ClosePhase::Resources => {
+                if matches!(self.profile, CloseProfile::CoherentSession { .. })
+                    && !self.metadata.tree_started
+                    && game.adv.tree.list.is_empty()
+                    && game.adv.pending_tree.is_none()
+                {
+                    game.prefetch_advancement_tree();
+                    if game.adv.pending_tree.is_none() {
+                        return Err("native advancement resource helper failed to start".into());
+                    }
+                }
+                match self.metadata.poll_tree(game, true) {
+                    RetainedTreeStatus::Ready | RetainedTreeStatus::Skipped(_) => {
+                        if let Some(error) = &self.metadata.blocked {
+                            return Err(error.clone());
+                        }
+                        self.levels = Some(game.begin_retained_native_levels(self.deadline)?);
+                        self.phase = ClosePhase::Producers;
+                    }
+                    RetainedTreeStatus::Failed(error) => return Err(error),
+                    _ => {}
+                }
+            }
+            ClosePhase::Producers => {
+                match game.poll_retained_native_levels(self.levels.as_mut().unwrap()) {
+                    NativeLevelsStatus::Pending => {}
+                    NativeLevelsStatus::Blocked(error) => return Err(error),
+                    NativeLevelsStatus::Sealed => {
+                        self.writers = self
+                            .levels
+                            .as_ref()
+                            .unwrap()
+                            .saves()
+                            .into_iter()
+                            .map(|save| CloseWriter {
+                                save,
+                                controller: None,
+                                historical: None,
+                                capability: None,
+                                input: None,
+                                submitted: None,
+                                sealed: false,
+                            })
+                            .collect();
+                        self.phase = ClosePhase::Historical;
+                    }
+                }
+            }
+            ClosePhase::Historical => {
+                for writer in &mut self.writers {
+                    if writer.controller.is_none() {
+                        writer.controller = writer
+                            .save
+                            .begin_staged_writer_close(self.deadline)
+                            .map_err(|e| e.to_string())?;
+                        return Ok(None);
+                    }
+                    if writer.historical.is_none() {
+                        let controller = writer.controller.as_mut().unwrap();
+                        match controller.poll() {
+                            NativeWriterStagedStatus::Durable => {
+                                writer.historical =
+                                    controller.durability().map_err(|e| e.to_string())?
+                            }
+                            NativeWriterStagedStatus::Blocked(error) => return Err(error),
+                            _ => {}
+                        }
+                        return Ok(None);
+                    }
+                }
+                self.phase = ClosePhase::ReadPreflight;
+            }
+            ClosePhase::ReadPreflight => match &self.profile {
+                CloseProfile::CoherentSession { archive } => {
+                    if self.image_context.is_none() {
+                        self.image_context = Some(
+                            game.prepare_coherent_image_context(archive)
+                                .map_err(|e| e.to_string())?,
+                        );
+                    }
+                    let input = self
+                        .image_context
+                        .as_ref()
+                        .unwrap()
+                        .read_preflight_input(self.deadline);
+                    #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+                    let input = match &self.read_control {
+                        Some(control) => input.with_test_control(control.clone()),
+                        None => input,
+                    };
+                    return Ok(Some(CloseIoJob::CoherentRead(input)));
+                }
+                CloseProfile::NativeWorld => {
+                    if self.native_read_context.is_none() {
+                        self.native_read_context = Some(
+                            game.prepare_native_world_read_context(self.levels.as_ref().unwrap())
+                                .map_err(|e| e.to_string())?,
+                        );
+                    }
+                    let input = self
+                        .native_read_context
+                        .as_ref()
+                        .unwrap()
+                        .read_preflight_input(self.deadline);
+                    #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+                    let input = match &self.read_control {
+                        Some(control) => input.with_test_control(control.clone()),
+                        None => input,
+                    };
+                    return Ok(Some(CloseIoJob::NativeRead(input)));
+                }
+            },
+            ClosePhase::Prepare => {
+                if self.payloads.is_none() {
+                    let reserved = match &self.native_read {
+                        Some(read) => read.reserved_uuids(),
+                        None => self
+                            .image_read
+                            .as_ref()
+                            .ok_or("old-source preflight missing")?
+                            .reserved_item_identities()
+                            .into_iter()
+                            .collect(),
+                    };
+                    let prepared = game.prepare_close_identity_fields_avoiding(&reserved)?;
+                    self.identity_preparations += prepared.count();
+                    self.payloads = Some(game.prepare_retained_native_payloads(
+                        self.levels.as_mut().unwrap(),
+                        &reserved,
+                    )?);
+                }
+                if let Some(read) = &self.native_read {
+                    read.preflight_final_payloads(self.payloads.as_ref().unwrap())
+                        .map_err(|e| e.to_string())?;
+                }
+                if self.metadata.input.is_none() {
+                    self.metadata.prepare(game)?;
+                }
+                if self.level_expected.is_none() {
+                    let mut level = game.level.clone();
+                    self.metadata
+                        .input
+                        .as_ref()
+                        .unwrap()
+                        .raids
+                        .apply_to_level(&mut level);
+                    let (expected, input) = game.prepare_retained_level_metadata_from(level)?;
+                    let session_raids =
+                        if matches!(self.profile, CloseProfile::CoherentSession { .. }) {
+                            game.session_checkpoint_raids()
+                                .map_err(|e| e.to_string())?
+                                .map(|tag| (game.raids_path(game.dim), tag))
+                        } else {
+                            None
+                        };
+                    for (writer, payload) in self
+                        .writers
+                        .iter_mut()
+                        .zip(self.payloads.as_ref().unwrap().levels())
+                    {
+                        if !Arc::ptr_eq(&writer.save, payload.save()) {
+                            return Err("fixed native writer/payload order changed".into());
+                        }
+                        writer.input = Some(
+                            NativeWriterFinalInput::new(
+                                &writer.save,
+                                payload.chunks(),
+                                payload.entities(),
+                                payload.forced(),
+                                payload.protected_nonresident(),
+                                game.pack.assets.registry,
+                                game.res.biomes(),
+                            )
+                            .map_err(|e| e.to_string())?,
+                        );
+                    }
+                    self.level_expected = Some(expected);
+                    self.native_input = Some(Arc::new(NativeCloseInput {
+                        metadata: self.metadata.input.as_ref().unwrap().clone(),
+                        level: input,
+                        writers: Vec::new(),
+                        session_raids,
+                    }));
+                }
+                for writer in &mut self.writers {
+                    if writer.capability.is_none() {
+                        writer.capability = writer
+                            .controller
+                            .as_mut()
+                            .unwrap()
+                            .begin_final(writer.historical.as_ref().unwrap())
+                            .map_err(|e| e.to_string())?
+                            .map(Arc::new);
+                        return Ok(None);
+                    }
+                }
+                let native = Arc::get_mut(self.native_input.as_mut().unwrap())
+                    .ok_or("native input escaped before fixed writer binding")?;
+                native.writers = self
+                    .writers
+                    .iter()
+                    .map(|writer| FinalWriterJob {
+                        capability: writer.capability.as_ref().unwrap().clone(),
+                        input: writer.input.as_ref().unwrap().clone(),
+                    })
+                    .collect();
+                if matches!(self.profile, CloseProfile::CoherentSession { .. })
+                    && self.image_input.is_none()
+                {
+                    self.image_input = Some(
+                        game.freeze_coherent_image_input(
+                            self.image_context.as_ref().unwrap(),
+                            self.image_read.as_ref().unwrap(),
+                        )
+                        .map_err(|e| e.to_string())?,
+                    );
+                }
+                self.phase = ClosePhase::NativeIo;
+            }
+            ClosePhase::NativeIo => {
+                let next = self
+                    .metadata
+                    .next_attempt
+                    .checked_add(1)
+                    .ok_or("native metadata attempt exhausted")?;
+                self.metadata.next_attempt = next;
+                let attempt = Arc::new(AttemptIdentity { number: next });
+                self.metadata.attempt = Some(attempt.clone());
+                return Ok(Some(CloseIoJob::NativeMetadata {
+                    input: self.native_input.as_ref().unwrap().clone(),
+                    batch: self.metadata.batch.clone(),
+                    attempt,
+                    #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+                    control: self.metadata.control.clone(),
+                }));
+            }
+            ClosePhase::FinalWriters => {
+                let written = self
+                    .native_written
+                    .as_mut()
+                    .ok_or("native final outcome absent")?;
+                if written.error.is_some()
+                    || written.level.is_none()
+                    || written.submitted.len() != self.writers.len()
+                {
+                    return Err("native final outcome incomplete".into());
+                }
+                for (writer, receipt) in self.writers.iter_mut().zip(&written.submitted) {
+                    if writer.sealed || writer.controller.is_none() {
+                        continue;
+                    }
+                    if writer
+                        .controller
+                        .as_mut()
+                        .unwrap()
+                        .seal_final(receipt)
+                        .map_err(|e| e.to_string())?
+                        .is_some()
+                    {
+                        writer.sealed = true;
+                    }
+                    return Ok(None);
+                }
+                for writer in &mut self.writers {
+                    let Some(controller) = writer.controller.as_mut() else {
+                        continue;
+                    };
+                    match controller.poll() {
+                        NativeWriterStagedStatus::Complete => {
+                            let original = writer.controller.take().unwrap();
+                            match original.finish() {
+                                Ok(closed) => self.closed.push(closed),
+                                Err(original) => writer.controller = Some(original),
+                            }
+                        }
+                        NativeWriterStagedStatus::Blocked(error) => return Err(error),
+                        _ => {}
+                    }
+                    return Ok(None);
+                }
+                match game
+                    .poll_retained_native_writer_ack(self.levels.as_mut().unwrap(), &self.closed)
+                {
+                    NativeLevelsStatus::Pending => {}
+                    NativeLevelsStatus::Blocked(error) => return Err(error),
+                    NativeLevelsStatus::Sealed => {
+                        self.phase = if self.image_input.is_some() {
+                            ClosePhase::Image
+                        } else {
+                            ClosePhase::Preflight
+                        }
+                    }
+                }
+            }
+            ClosePhase::Image => {
+                if self.image_attempt.is_none() {
+                    let epoch = self.next_image_epoch;
+                    self.next_image_epoch = epoch
+                        .checked_add(1)
+                        .ok_or("coherent image epoch exhausted")?;
+                    let input = self.image_input.as_ref().unwrap();
+                    #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+                    let attempt = match &self.image_control {
+                        Some(control) => {
+                            input.attempt_with_test_control(epoch, self.deadline, control.clone())
+                        }
+                        None => input.attempt(epoch, self.deadline),
+                    };
+                    #[cfg(not(all(
+                        test,
+                        feature = "native-writer-test-control",
+                        debug_assertions
+                    )))]
+                    let attempt = input.attempt(epoch, self.deadline);
+                    self.image_attempt = Some(attempt.map_err(|e| e.to_string())?);
+                }
+                return Ok(Some(CloseIoJob::CoherentImage {
+                    input: self.image_input.as_ref().unwrap().clone(),
+                    attempt: self.image_attempt.as_ref().unwrap().clone(),
+                }));
+            }
+            ClosePhase::Preflight => {
+                if let (Some(context), Some(read)) = (&self.native_read_context, &self.native_read)
+                {
+                    game.preflight_native_world_read(context, self.levels.as_ref().unwrap(), read)
+                        .map_err(|e| e.to_string())?;
+                    read.preflight_final_payloads(self.payloads.as_ref().unwrap())
+                        .map_err(|e| e.to_string())?;
+                }
+                game.preflight_retained_native_payloads(
+                    self.levels.as_ref().unwrap(),
+                    self.payloads.as_ref().unwrap(),
+                )?;
+                let written = self
+                    .native_written
+                    .as_ref()
+                    .ok_or("native final outcome absent")?;
+                game.preflight_retained_level_metadata(
+                    self.level_expected.as_ref().unwrap(),
+                    written.level.as_ref().ok_or("native Level result absent")?,
+                )?;
+                // Move the actual same-batch result into the metadata state only
+                // after its worker has finished; no independent IO handle exists.
+                if self.metadata.outcome.is_none() {
+                    self.metadata.outcome = self.native_written.as_mut().unwrap().metadata.take();
+                }
+                self.metadata.preflight(game)?;
+                if let Some(input) = &self.image_input {
+                    game.preflight_coherent_image(
+                        input,
+                        self.image_attempt.as_ref().unwrap(),
+                        self.image_written
+                            .as_ref()
+                            .ok_or("verified coherent image absent")?,
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
+                if !self.levels.as_ref().unwrap().acknowledged() {
+                    return Err("native producer/writer acknowledgements incomplete".into());
+                }
+                if Instant::now() >= self.deadline {
+                    return Err(
+                        "coherent native close deadline expired during aggregate preflight".into(),
+                    );
+                }
+                // No fallible action or projection follows the first marker ack.
+                self.metadata_ack = Some(self.metadata.commit_preflighted(game));
+                game.commit_retained_native_payloads(self.levels.as_mut().unwrap());
+                game.commit_retained_level_metadata(
+                    self.native_written.as_mut().unwrap().level.take().unwrap(),
+                );
+                self.phase = ClosePhase::NativeReady;
+            }
+            ClosePhase::NativeReady => {}
+        }
+        Ok(None)
+    }
+    pub(super) fn retry(&mut self, deadline: Instant) -> Result<(), CloseRetryRefusal> {
+        self.harvest();
+        if self.io_handle.is_some() {
+            return Err(CloseRetryRefusal::Busy);
+        }
+        if self.blocked.is_none() {
+            return Err(CloseRetryRefusal::NotBlocked);
+        }
+        if deadline <= Instant::now() {
+            return Err(CloseRetryRefusal::Deadline);
+        }
+        let game = self.game.as_mut().unwrap();
+        if self.metadata.tree.unresolved() {
+            self.metadata.poll_tree(game, false);
+            if self.metadata.tree.unresolved() {
+                return Err(CloseRetryRefusal::Busy);
+            }
+        }
+        if matches!(self.metadata.tree.status(), RetainedTreeStatus::Failed(_)) {
+            game.retry_metadata_advancement_tree(&mut self.metadata.tree)
+                .map_err(|e| CloseRetryRefusal::Refused(e.to_string()))?;
+        }
+        if self.phase == ClosePhase::Producers {
+            game.retry_retained_native_levels(self.levels.as_mut().unwrap(), deadline)
+                .map_err(CloseRetryRefusal::Refused)?;
+        }
+        for writer in &mut self.writers {
+            if let Some(controller) = &mut writer.controller {
+                match controller.poll() {
+                    NativeWriterStagedStatus::Blocked(_)
+                    | NativeWriterStagedStatus::Durable
+                    | NativeWriterStagedStatus::Submitting => controller
+                        .retry(deadline)
+                        .map_err(|e| CloseRetryRefusal::Refused(e.to_string()))?,
+                    _ => {}
+                }
+            }
+        }
+        if self.phase == ClosePhase::Image {
+            // Every failed/uncertain image keeps its original paths and phase.
+            // New publication attempts use a fresh epoch and the same projection.
+            if let Some(attempt) = self.image_attempt.take() {
+                self.old_image_attempts.push(attempt);
+            }
+        }
+        if self.phase == ClosePhase::NativeIo
+            && let Some(written) = self.native_written.take()
+        {
+            self.failures.push(format!(
+                "retained native attempt {} effects {:?}, Level {:?}: {:?}",
+                self.metadata.next_attempt,
+                written.metadata.as_ref().map(|out| out.effects),
+                written.level_effects,
+                written.error
+            ));
+            self.failed_native_attempts.push(written);
+            // Complete immutable input/capabilities remain in native_input;
+            // no final writer has been sealed on an unsuccessful worker return.
+        }
+        if self.phase == ClosePhase::ReadPreflight && self.image_read.is_some() {
+            self.phase = ClosePhase::Prepare;
+        }
+        self.deadline = deadline;
+        self.metadata.deadline = deadline;
+        self.metadata.expired = false;
+        self.metadata.blocked = None;
+        self.blocked = None;
+        Ok(())
+    }
+}
+impl Drop for CloseOwner<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            use std::io::Write;
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "fatal: unresolved coherent native close owner"
+            );
+            std::process::abort();
+        }
+    }
+}
+
+#[cfg(all(
+    test,
+    feature = "native-writer-test-control",
+    debug_assertions,
+    target_os = "linux"
+))]
+pub(in crate::game) struct TestCloseCustody<'window> {
+    owner: Option<Box<CloseOwner<'window>>>,
+    token: Box<super::levels::session_checkpoint::tests::RetainedCloseFixtureToken>,
+    receivers: Vec<std::sync::mpsc::Receiver<horizon_client::lan::Out>>,
+}
+#[cfg(all(
+    test,
+    feature = "native-writer-test-control",
+    debug_assertions,
+    target_os = "linux"
+))]
+impl<'window> TestCloseCustody<'window> {
+    pub(in crate::game) fn from_constructor(
+        game: Box<Game<'window>>,
+        profile: CloseProfile,
+        deadline: Instant,
+        token: super::levels::session_checkpoint::tests::RetainedCloseFixtureToken,
+        receivers: Vec<std::sync::mpsc::Receiver<horizon_client::lan::Out>>,
+    ) -> Self {
+        assert!(
+            token.matches(&game),
+            "genuine uninterrupted fixture constructor custody"
+        );
+        Self {
+            owner: Some(CloseOwner::begin(game, profile, deadline)),
+            token: Box::new(token),
+            receivers,
+        }
+    }
+    pub(in crate::game) fn poll(&mut self) -> CloseStatus {
+        self.owner.as_mut().unwrap().poll()
+    }
+    pub(in crate::game) fn retry(&mut self, until: Instant) -> Result<(), CloseRetryRefusal> {
+        self.owner.as_mut().unwrap().retry(until)
+    }
+    pub(in crate::game) fn observe(&self) -> CloseObservation {
+        self.owner.as_ref().unwrap().observe()
+    }
+    pub(in crate::game) fn failures(&self) -> &[String] {
+        self.owner.as_ref().unwrap().failures()
+    }
+    pub(in crate::game) fn observe_native(
+        &self,
+    ) -> super::levels::session_checkpoint::tests::RetainedCloseFixtureObservation {
+        self.token
+            .observe(self.owner.as_ref().unwrap().game.as_ref().unwrap())
+    }
+    pub(in crate::game) fn source_root(&self) -> std::path::PathBuf {
+        self.owner
+            .as_ref()
+            .unwrap()
+            .game
+            .as_ref()
+            .unwrap()
+            .world_root
+            .clone()
+    }
+    pub(in crate::game) fn recovery_request(
+        &self,
+        destination: std::path::PathBuf,
+        until: Instant,
+    ) -> super::levels::session_checkpoint::RecoveryRequest {
+        self.token.recovery_request(destination, until)
+    }
+    fn metadata_control(&mut self, control: MetadataTestControl) {
+        self.owner.as_mut().unwrap().metadata.control = Some(control);
+    }
+    fn image_control(
+        &mut self,
+        control: super::levels::session_checkpoint::CoherentImageTestControl,
+    ) {
+        self.owner.as_mut().unwrap().image_control = Some(control);
+    }
+    fn read_control(
+        &mut self,
+        control: super::levels::session_checkpoint::CoherentImageTestControl,
+    ) {
+        self.owner.as_mut().unwrap().read_control = Some(control);
+    }
+    fn io_busy(&self) -> bool {
+        self.owner.as_ref().unwrap().io_handle.is_some()
+    }
+    fn expire_deadline_for_test(&mut self) {
+        let owner = self.owner.as_mut().unwrap();
+        owner.deadline = Instant::now();
+        owner.metadata.deadline = owner.deadline;
+    }
+    pub(in crate::game) fn production_disposal_refused(&mut self) -> Result<bool, String> {
+        let owner = self.owner.take().unwrap();
+        let ready = match owner.try_native_ready() {
+            Ok(ready) => ready,
+            Err(owner) => {
+                self.owner = Some(owner);
+                return Err("native readiness not established".into());
+            }
+        };
+        match ready.try_dispose_dormant() {
+            Err((ready, _)) => {
+                self.owner = Some(ready.owner);
+                Ok(true)
+            }
+            Ok(_) => Ok(false),
+        }
+    }
+    pub(in crate::game) fn try_dispose(mut self) -> Result<NativeDisposed, (Self, String)> {
+        let owner = self.owner.as_ref().unwrap();
+        if !owner.native_ready_proven()
+            || !self.token.matches(owner.game.as_ref().unwrap())
+            || !dormant_async_owners_absent(owner.game.as_ref().unwrap(), true)
+        {
+            return Err((
+                self,
+                "original fixture/native/remaining owner proof incomplete".into(),
+            ));
+        }
+        let mut owner = self.owner.take().unwrap();
+        owner.armed = false;
+        drop(owner.game.take());
+        // The original channel receivers remained in this custody for the whole
+        // populated positive; dispose them only together with the proven host.
+        self.receivers.clear();
+        Ok(NativeDisposed { _native_only: () })
     }
 }
 
@@ -825,3 +2092,13 @@ impl Drop for MetadataTestReceipt {
 #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
 #[path = "paired_close_metadata_tests.rs"]
 mod tests;
+
+#[cfg(all(
+    test,
+    feature = "paired-packages",
+    feature = "native-writer-test-control",
+    debug_assertions,
+    target_os = "linux"
+))]
+#[path = "paired_close_tests.rs"]
+mod close_tests;

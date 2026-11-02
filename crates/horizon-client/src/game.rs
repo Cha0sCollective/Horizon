@@ -1423,6 +1423,412 @@ fn select_creative_tab(
     clicks.skip_release();
 }
 
+/// Only fields authored by `project_sync_level`; unrelated native cache fields
+/// keep their original owners even when the projection was made from a clone.
+fn apply_synced_level_fields(level: &mut Level, projected: Level) {
+    macro_rules! assign {
+        ($($field:ident),+ $(,)?) => { $(level.$field = projected.$field;)+ };
+    }
+    assign!(
+        game_rules,
+        selected_slot,
+        creative,
+        game_mode,
+        difficulty,
+        time,
+        weather,
+        day_time,
+        spawn,
+        respawn_elsewhere,
+        rotation,
+        xp_level,
+        xp_progress,
+        xp_total,
+        position,
+        health,
+        absorption,
+        player_extra,
+        fall_distance,
+        food,
+        saturation,
+        flying,
+        inventory,
+        inventory_components,
+        dimension,
+        ender_items,
+        active_effects,
+    );
+}
+
+#[cfg(feature = "paired-packages")]
+fn native_levels_equal(a: &Level, b: &Level) -> bool {
+    macro_rules! equal {
+        ($($field:ident),+ $(,)?) => { true $(&& a.$field == b.$field)+ };
+    }
+    equal!(
+        name,
+        seed,
+        creative,
+        game_mode,
+        time,
+        day_time,
+        spawn,
+        respawn_elsewhere,
+        position,
+        rotation,
+        health,
+        absorption,
+        food,
+        saturation,
+        inventory,
+        inventory_components,
+        xp_seed,
+        seen_credits,
+        last_death,
+        active_effects,
+        ender_items,
+        xp_level,
+        xp_progress,
+        xp_total,
+        dimension,
+        world_spawn,
+        world_spawn_angle,
+        difficulty,
+        hardcore,
+        difficulty_locked,
+        allow_commands,
+        game_rules,
+        player_uuid,
+        selected_slot,
+        motion,
+        fall_distance,
+        on_ground,
+        food_exhaustion,
+        food_tick_timer,
+        flying,
+        player_extra,
+    ) && a.recipe_book.open == b.recipe_book.open
+        && a.recipe_book.filtering == b.recipe_book.filtering
+        && a.recipe_book.recipes == b.recipe_book.recipes
+        && a.recipe_book.to_be_displayed == b.recipe_book.to_be_displayed
+        && a.weather.clear_time == b.weather.clear_time
+        && a.weather.rain_time == b.weather.rain_time
+        && a.weather.thunder_time == b.weather.thunder_time
+        && a.weather.raining == b.weather.raining
+        && a.weather.thundering == b.weather.thundering
+        && a.weather.rain_level == b.weather.rain_level
+        && a.weather.thunder_level == b.weather.thunder_level
+}
+
+#[cfg(feature = "paired-packages")]
+pub(in crate::game) struct NativeIdentityPreparation {
+    pub(in crate::game) player_uuid_prepared: bool,
+    pub(in crate::game) world_spawn_prepared: bool,
+}
+#[cfg(feature = "paired-packages")]
+impl NativeIdentityPreparation {
+    pub(in crate::game) fn count(&self) -> usize {
+        usize::from(self.player_uuid_prepared) + usize::from(self.world_spawn_prepared)
+    }
+}
+
+#[cfg(feature = "paired-packages")]
+pub(in crate::game) struct NativeLevelExpected {
+    association: Arc<()>,
+    save: Arc<SaveDir>,
+    resources: Arc<Resources>,
+    root: PathBuf,
+    original: Level,
+    projected: Level,
+    prepared_extra: Option<horizon_world::nbt::Tag>,
+    participants: lan::NativeParticipantsExpected,
+    inventory: Vec<Option<ItemStack>>,
+    armor: [Option<ItemStack>; 4],
+    offhand: Option<ItemStack>,
+    ender_items: Vec<Option<ItemStack>>,
+    owner_projected: bool,
+    clock_bits: [u32; 2],
+    clock_paused: bool,
+}
+
+#[cfg(feature = "paired-packages")]
+#[derive(Clone)]
+pub(in crate::game) struct NativeLevelInput {
+    association: Arc<()>,
+    native: horizon_client::save::NativeLevelWriteInput,
+    level: Level,
+    participants: lan::NativeParticipantsInput,
+    owner_projected: bool,
+    local_ender_items: Vec<Option<ItemStack>>,
+}
+
+#[cfg(feature = "paired-packages")]
+pub(in crate::game) struct NativeLevelPost {
+    association: Arc<()>,
+    level: Level,
+    owner_projected: bool,
+    local_ender_items: Vec<Option<ItemStack>>,
+}
+
+#[cfg(feature = "paired-packages")]
+pub(in crate::game) struct NativeLevelIo {
+    pub(in crate::game) native_effects: [horizon_client::save::NativeLevelWriteEffect; 6],
+    pub(in crate::game) result: std::result::Result<NativeLevelPost, String>,
+}
+
+#[cfg(feature = "paired-packages")]
+impl NativeLevelInput {
+    /// Worker-only capture precedes every final metadata mutation. All clones
+    /// retain the library's same complete native plan across failed attempts.
+    pub(in crate::game) fn capture_native(&self) -> std::result::Result<(), String> {
+        self.native.capture_native()
+    }
+
+    pub(in crate::game) fn write_native(&self) -> NativeLevelIo {
+        // Ordinary owner-record failure does not skip the native Level attempt.
+        // Participant records independently attempt advancements then statistics.
+        let participants = self.participants.write_native();
+        let native = self.native.write_native();
+        let result = match (participants, native.result) {
+            (Ok(()), Ok(())) => Ok(NativeLevelPost {
+                association: self.association.clone(),
+                level: self.level.clone(),
+                owner_projected: self.owner_projected,
+                local_ender_items: self.local_ender_items.clone(),
+            }),
+            (Err(participants), Err(level)) => Err(format!(
+                "native participants: {participants}; native Level: {level}"
+            )),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        };
+        NativeLevelIo {
+            native_effects: native.effects,
+            result,
+        }
+    }
+}
+
+#[cfg(feature = "paired-packages")]
+impl Game<'_> {
+    /// Run only after old-source preflight, before capturing native entities or
+    /// metadata expectations. Repeating it never generates a replacement UUID.
+    #[cfg(all(
+        test,
+        feature = "native-writer-test-control",
+        debug_assertions,
+        target_os = "linux"
+    ))]
+    pub(in crate::game) fn prepare_close_identity_fields(
+        &mut self,
+    ) -> std::result::Result<NativeIdentityPreparation, String> {
+        self.prepare_close_identity_fields_avoiding(&std::collections::HashSet::new())
+    }
+
+    pub(in crate::game) fn prepare_close_identity_fields_avoiding(
+        &mut self,
+        reserved: &std::collections::HashSet<[i32; 4]>,
+    ) -> std::result::Result<NativeIdentityPreparation, String> {
+        if self.remote.is_some()
+            || self.integrated.is_some()
+            || self.options.execution_role.is_client()
+            || self.lan_acting.is_some()
+        {
+            return Err(
+                "native close identity preparation requires the authoritative owner".into(),
+            );
+        }
+        let player_uuid_prepared = self.level.player_uuid.is_none();
+        let mut projected = self.level.clone();
+        let mut selected = false;
+        for _ in 0..64 {
+            let uuid = projected.ensure_player_uuid();
+            if !player_uuid_prepared || !reserved.contains(&uuid) {
+                selected = true;
+                break;
+            }
+            projected.player_uuid = None;
+        }
+        if !selected {
+            return Err(
+                "native close player UUID preparation exhausted reserved identities".into(),
+            );
+        }
+        self.project_sync_level(&mut projected);
+        self.project_native_owner_identity(&mut projected);
+        let spawn = projected.spawn.map(|spawn| spawn.map(|v| v.floor() as i32));
+        let world_spawn_prepared = self.level.world_spawn.is_none() && spawn.is_some();
+        // Every permitted native preparation is assigned and reported together.
+        self.level.player_uuid = projected.player_uuid;
+        if self.level.world_spawn.is_none() {
+            self.level.world_spawn = spawn;
+        }
+        Ok(NativeIdentityPreparation {
+            player_uuid_prepared,
+            world_spawn_prepared,
+        })
+    }
+
+    fn project_native_level(
+        &self,
+        level: &mut Level,
+    ) -> std::result::Result<Vec<Option<ItemStack>>, String> {
+        // Preserve the ordinary raid -> warden -> local player -> owner order.
+        if self.sculk.tracker_loaded && !self.no_player_here() {
+            let extra = level
+                .player_extra
+                .get_or_insert_with(|| horizon_world::nbt::Tag::Compound(Default::default()));
+            if let horizon_world::nbt::Tag::Compound(map) = extra {
+                map.insert("warden_spawn_tracker".into(), self.sculk.tracker.to_nbt());
+            }
+        }
+        self.project_sync_level(level);
+        let local_ender_items = level.ender_items.clone();
+        self.project_native_owner(level)?;
+        Ok(local_ender_items)
+    }
+
+    #[cfg(all(
+        test,
+        feature = "native-writer-test-control",
+        debug_assertions,
+        target_os = "linux"
+    ))]
+    pub(in crate::game) fn prepare_retained_level_metadata(
+        &self,
+    ) -> std::result::Result<(NativeLevelExpected, NativeLevelInput), String> {
+        self.prepare_retained_level_metadata_from(self.level.clone())
+    }
+
+    /// `prepared` is an owned original-Level clone with the exact aggregate raid
+    /// extra applied. No other native field may differ before common packing.
+    pub(in crate::game) fn prepare_retained_level_metadata_from(
+        &self,
+        mut prepared: Level,
+    ) -> std::result::Result<(NativeLevelExpected, NativeLevelInput), String> {
+        if self.remote.is_some()
+            || self.integrated.is_some()
+            || self.options.execution_role.is_client()
+            || self.lan_acting.is_some()
+            || self.level.player_uuid.is_none()
+        {
+            return Err("native close Level requires prepared authoritative identity".into());
+        }
+        let prepared_extra = prepared.player_extra.clone();
+        let mut original = self.level.clone();
+        original.player_extra = prepared_extra.clone();
+        if !native_levels_equal(&original, &prepared) {
+            return Err(
+                "native close Level input changed fields outside prepared raid extra".into(),
+            );
+        }
+        let (participants, participant_input) = self.prepare_native_participants()?;
+        let local_ender_items = self.project_native_level(&mut prepared)?;
+        if prepared.world_spawn.is_none() && prepared.spawn.is_some() {
+            return Err("native close world spawn preparation is missing".into());
+        }
+        let association = Arc::new(());
+        let owner_projected = self.lan.as_ref().is_some_and(|host| host.owner.is_some());
+        let native = horizon_client::save::NativeLevelWriteInput::new(
+            self.world_root.clone(),
+            prepared.clone(),
+            horizon_client::save::ClockControls {
+                partial: self.ui.clock.partial,
+                rate: self.ui.clock.rate,
+                paused: self.ui.clock.paused,
+            },
+        );
+        Ok((
+            NativeLevelExpected {
+                association: association.clone(),
+                save: self.save.clone(),
+                resources: self.res.clone(),
+                root: self.world_root.clone(),
+                original: self.level.clone(),
+                projected: prepared.clone(),
+                prepared_extra,
+                participants,
+                inventory: self.inventory.clone(),
+                armor: self.armor.clone(),
+                offhand: self.offhand.clone(),
+                ender_items: self.ender_items.clone(),
+                owner_projected,
+                clock_bits: [
+                    self.ui.clock.partial.to_bits(),
+                    self.ui.clock.rate.to_bits(),
+                ],
+                clock_paused: self.ui.clock.paused,
+            },
+            NativeLevelInput {
+                association,
+                native,
+                level: prepared,
+                participants: participant_input,
+                owner_projected,
+                local_ender_items,
+            },
+        ))
+    }
+
+    pub(in crate::game) fn preflight_retained_level_metadata(
+        &self,
+        expected: &NativeLevelExpected,
+        post: &NativeLevelPost,
+    ) -> std::result::Result<(), String> {
+        if !Arc::ptr_eq(&expected.association, &post.association)
+            || !Arc::ptr_eq(&expected.save, &self.save)
+            || !Arc::ptr_eq(&expected.resources, &self.res)
+            || self.world_root != expected.root
+            || self.remote.is_some()
+            || self.integrated.is_some()
+            || self.options.execution_role.is_client()
+            || self.lan_acting.is_some()
+            || post.owner_projected != expected.owner_projected
+            || [
+                self.ui.clock.partial.to_bits(),
+                self.ui.clock.rate.to_bits(),
+            ] != expected.clock_bits
+            || self.ui.clock.paused != expected.clock_paused
+            || !native_levels_equal(&self.level, &expected.original)
+            || !native_levels_equal(&post.level, &expected.projected)
+            || self.inventory != expected.inventory
+            || self.armor != expected.armor
+            || self.offhand != expected.offhand
+            || self.ender_items != expected.ender_items
+        {
+            return Err("native close Level allocation or original fields changed".into());
+        }
+        self.preflight_native_participants(&expected.participants)?;
+        let mut projected = self.level.clone();
+        projected.player_extra = expected.prepared_extra.clone();
+        let local_ender_items = self.project_native_level(&mut projected)?;
+        if !native_levels_equal(&projected, &expected.projected)
+            || local_ender_items != post.local_ender_items
+        {
+            return Err("native close live player/world projection changed".into());
+        }
+        Ok(())
+    }
+
+    /// Aggregate caller has already preflighted every family and original owner.
+    /// Only native fields actually authored by sync/owner packing are assigned.
+    pub(in crate::game) fn commit_retained_level_metadata(&mut self, post: NativeLevelPost) {
+        if post.owner_projected {
+            self.level.xp_seed = post.level.xp_seed;
+            self.level.on_ground = post.level.on_ground;
+            self.level.seen_credits = post.level.seen_credits;
+            self.level.last_death = post.level.last_death.clone();
+            self.level.recipe_book = post.level.recipe_book.clone();
+            self.level.motion = post.level.motion;
+            self.level.food_exhaustion = post.level.food_exhaustion;
+            self.level.food_tick_timer = post.level.food_tick_timer;
+        }
+        // Sync's ender cache is the local live chest, even when an integrated
+        // owner's player record subsequently replaces Level.ender_items.
+        self.ender_items = post.local_ender_items;
+        apply_synced_level_fields(&mut self.level, post.level);
+    }
+}
+
 struct Game<'a> {
     /// Shared with an integrated server; `collision` and `motion` borrow from it.
     res: Arc<Resources>,
@@ -11375,11 +11781,18 @@ impl Game<'_> {
     }
     /// Copy the live player and world state into the `Level` that gets saved.
     pub(super) fn sync_level(&mut self) {
+        let mut projected = self.level.clone();
+        self.project_sync_level(&mut projected);
+        self.ender_items = projected.ender_items.clone();
+        apply_synced_level_fields(&mut self.level, projected);
+    }
+    /// The ordinary save and retained close use the same native projection.
+    /// This only changes the supplied owned Level; live inventories stay put.
+    fn project_sync_level(&self, level: &mut Level) {
         // Level.write saves the game rules (game_rules.dat) with the rest.
-        self.level.game_rules = self.ui.rules.by_name();
-        self.level.selected_slot = self.selected as i32;
+        level.game_rules = self.ui.rules.by_name();
+        level.selected_slot = self.selected as i32;
         let mode = self.mode_id();
-        let level = &mut self.level;
         level.creative = self.creative;
         level.game_mode = mode;
         // PrimaryLevelData.setDifficulty: /difficulty and the options button change it.
@@ -11455,9 +11868,10 @@ impl Game<'_> {
         if let Some(key) = self.ender_open
             && let Some(BlockEntity::Chest(items)) = self.world.block_entities.get(&key)
         {
-            self.ender_items = items.clone();
+            level.ender_items = items.clone();
+        } else {
+            level.ender_items = self.ender_items.clone();
         }
-        level.ender_items = self.ender_items.clone();
         level.active_effects = self.potions.effects.saved();
     }
     fn save_game(&mut self) -> Result<()> {

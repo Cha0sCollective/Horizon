@@ -1458,16 +1458,30 @@ fn save_guest_records_to(
     let Some(uuid) = record_uuid(owner_uuid, level_uuid, guest.uuid) else {
         return Ok(());
     };
+    save_guest_record_values_to(
+        world,
+        tree,
+        uuid,
+        &guest.advancements,
+        play.map(|play| &play.stats),
+    )
+}
+
+fn save_guest_record_values_to(
+    world: &std::path::Path,
+    tree: &horizon_client::advancements::Tree,
+    uuid: [i32; 4],
+    advancements: &horizon_client::advancements::Progress,
+    stats: Option<&super::stats::Stats>,
+) -> Result<()> {
     let advancement_result = super::advancements::write_progress(
         &super::stats::player_json(world, "advancements", uuid),
-        &guest.advancements,
+        advancements,
         tree,
     );
     // Both independent records are attempted, in the original advancement-then-stats order.
-    let stats_result = match play {
-        Some(play) => play
-            .stats
-            .write(&super::stats::player_json(world, "stats", uuid)),
+    let stats_result = match stats {
+        Some(stats) => stats.write(&super::stats::player_json(world, "stats", uuid)),
         None => Ok(()),
     };
     advancement_result.and(stats_result)
@@ -1481,16 +1495,9 @@ fn store_owner_records_to(
     play: &HashMap<u32, super::lan_actions::GuestPlay>,
     tree: &horizon_client::advancements::Tree,
 ) -> Result<()> {
-    let Some(uuid) = owner_uuid else {
+    let Some(guest) = project_owner_to(level, owner_uuid, guests) else {
         return Ok(());
     };
-    let Some(guest) = guests
-        .iter()
-        .find(|guest| guest.uuid == uuid && guest.placed)
-    else {
-        return Ok(());
-    };
-    playerdata::store(guest, level);
     save_guest_records_to(
         world,
         tree,
@@ -1499,6 +1506,210 @@ fn store_owner_records_to(
         guest,
         play.get(&guest.conn),
     )
+}
+
+/// Native owner packing is pure; ordinary saving and retained close share it.
+fn project_owner_to<'a>(
+    level: &mut horizon_client::save::Level,
+    owner_uuid: Option<u128>,
+    guests: &'a [horizon_client::lan::guest::Guest],
+) -> Option<&'a horizon_client::lan::guest::Guest> {
+    let uuid = owner_uuid?;
+    let guest = guests
+        .iter()
+        .find(|guest| guest.uuid == uuid && guest.placed)?;
+    playerdata::store(guest, level);
+    Some(guest)
+}
+
+#[cfg(feature = "paired-packages")]
+pub(in crate::game) struct NativeParticipantsExpected {
+    roster: Option<ParticipantRoster>,
+    rows: Vec<SessionPlayerRow>,
+    tree: Arc<horizon_client::advancements::Tree>,
+}
+
+#[cfg(feature = "paired-packages")]
+#[derive(Clone)]
+struct NativeParticipantRecord {
+    row: SessionPlayerRow,
+    advancements: horizon_client::advancements::Progress,
+    stats: Arc<super::stats::Stats>,
+}
+
+#[cfg(feature = "paired-packages")]
+#[derive(Clone)]
+pub(in crate::game) struct NativeParticipantsInput {
+    world: std::path::PathBuf,
+    tree: Arc<horizon_client::advancements::Tree>,
+    records: Vec<NativeParticipantRecord>,
+}
+
+#[cfg(feature = "paired-packages")]
+impl NativeParticipantsInput {
+    pub(in crate::game) fn write_native(&self) -> std::result::Result<(), String> {
+        let mut first_error = None;
+        for record in &self.records {
+            // The integrated owner is written by Level::write. External records
+            // use exactly its native player NBT encoder captured on the CPU.
+            let player_result = if record.row.integrated_owner {
+                Ok(())
+            } else {
+                horizon_client::save::write_dat(
+                    &playerdata::path(&self.world, record.row.profile_uuid),
+                    record.row.player.clone(),
+                )
+            };
+            let records_result = save_guest_record_values_to(
+                &self.world,
+                &self.tree,
+                record.row.record_uuid,
+                &record.advancements,
+                Some(&record.stats),
+            );
+            for result in [player_result, records_result] {
+                if let Err(error) = result {
+                    first_error.get_or_insert_with(|| error.to_string());
+                }
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+}
+
+#[cfg(feature = "paired-packages")]
+impl Game<'_> {
+    pub(in crate::game) fn project_native_owner_identity(
+        &self,
+        level: &mut horizon_client::save::Level,
+    ) {
+        if let Some(host) = &self.lan {
+            project_owner_to(
+                level,
+                host.owner.as_ref().map(|owner| owner.uuid),
+                &host.hub.guests,
+            );
+        }
+    }
+
+    pub(in crate::game) fn project_native_owner(
+        &self,
+        level: &mut horizon_client::save::Level,
+    ) -> std::result::Result<(), String> {
+        if let Some(host) = &self.lan
+            && let Some(guest) = project_owner_to(
+                level,
+                host.owner.as_ref().map(|owner| owner.uuid),
+                &host.hub.guests,
+            )
+        {
+            let uuid = level
+                .player_uuid
+                .ok_or("native owner record UUID is missing")?;
+            let actual = session_player_level(guest, uuid).map_err(|error| error.to_string())?;
+            // The retained session projection includes these actual body
+            // fields; ordinary owner saves retain their existing behavior.
+            level.motion = actual.motion;
+            level.food_exhaustion = actual.food_exhaustion;
+            level.food_tick_timer = actual.food_tick_timer;
+            // The participant owns an explicit forced spawn even when it
+            // coincides with world spawn, which Level's fallback would omit.
+            if actual.respawn_elsewhere.is_none()
+                && let Some(block) = actual
+                    .spawn
+                    .map(|spawn| spawn.map(|value| value.floor() as i32))
+                && level.world_spawn == Some(block)
+            {
+                level.respawn_elsewhere = Some(("minecraft:overworld".into(), block, 0.0, true));
+            }
+            if level.player_tag() != actual.player_tag() {
+                return Err("native owner projection differs from its actual session row".into());
+            }
+        }
+        Ok(())
+    }
+
+    pub(in crate::game) fn prepare_native_participants(
+        &self,
+    ) -> std::result::Result<(NativeParticipantsExpected, NativeParticipantsInput), String> {
+        let roster = self
+            .lan
+            .as_ref()
+            .map(|_| self.observe_checkpoint_participants())
+            .transpose()
+            .map_err(|error| format!("native close roster: {error:?}"))?;
+        let rows = match &roster {
+            Some(roster) => self
+                .project_session_participant_rows(roster)
+                .map_err(|error| error.to_string())?,
+            None => Vec::new(),
+        };
+        let mut records = Vec::new();
+        if let Some(host) = &self.lan {
+            for row in &rows {
+                let guest = host
+                    .hub
+                    .guests
+                    .iter()
+                    .find(|guest| guest.conn == row.conn)
+                    .ok_or("native close participant disappeared")?;
+                let play = host
+                    .play
+                    .get(&row.conn)
+                    .ok_or("native close play owner disappeared")?;
+                let mut stats = super::stats::Stats::default();
+                stats.values = play.stats.values.clone();
+                records.push(NativeParticipantRecord {
+                    row: row.clone(),
+                    advancements: guest.advancements.clone(),
+                    stats: Arc::new(stats),
+                });
+            }
+        }
+        Ok((
+            NativeParticipantsExpected {
+                roster,
+                rows,
+                tree: self.adv.tree.clone(),
+            },
+            NativeParticipantsInput {
+                world: self.world_root.clone(),
+                tree: self.adv.tree.clone(),
+                records,
+            },
+        ))
+    }
+
+    pub(in crate::game) fn preflight_native_participants(
+        &self,
+        expected: &NativeParticipantsExpected,
+    ) -> std::result::Result<(), String> {
+        if !Arc::ptr_eq(&expected.tree, &self.adv.tree) {
+            return Err("native close advancement tree owner changed".into());
+        }
+        let rows = match &expected.roster {
+            Some(roster) => self
+                .project_session_participant_rows(roster)
+                .map_err(|error| error.to_string())?,
+            None if self.lan.is_none() => Vec::new(),
+            None => return Err("native close acquired a participant host".into()),
+        };
+        if rows.len() != expected.rows.len()
+            || rows.iter().zip(&expected.rows).any(|(a, b)| {
+                a.conn != b.conn
+                    || a.profile_uuid != b.profile_uuid
+                    || a.record_uuid != b.record_uuid
+                    || a.integrated_owner != b.integrated_owner
+                    || a.dimension != b.dimension
+                    || a.player != b.player
+                    || a.advancements != b.advancements
+                    || a.stats != b.stats
+            })
+        {
+            return Err("native close participant payload changed".into());
+        }
+        Ok(())
+    }
 }
 
 /// A stable UUID for an entity that has none.

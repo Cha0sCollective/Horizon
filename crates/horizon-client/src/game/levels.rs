@@ -130,6 +130,987 @@ impl Levels {
         self.parked.keys().copied().collect()
     }
 }
+#[cfg(feature = "paired-packages")]
+impl Game<'_> {
+    pub(in crate::game) fn retained_level_dimensions(
+        &self,
+    ) -> std::result::Result<Vec<Dim>, String> {
+        if self.levels.parked.contains_key(&self.dim) {
+            return Err("native close duplicate active/parked dimension".into());
+        }
+        Ok([Dim::Overworld, Dim::Nether, Dim::End]
+            .into_iter()
+            .filter(|dim| *dim == self.dim || self.levels.parked.contains_key(dim))
+            .collect())
+    }
+    pub(in crate::game) fn retained_raiding_for_level(&self, dim: Dim) -> Option<&Raiding> {
+        if dim == self.dim {
+            Some(&self.raiding)
+        } else {
+            self.levels.parked.get(&dim).map(|p| &p.raiding)
+        }
+    }
+    pub(in crate::game) fn retained_raiding_for_level_mut(
+        &mut self,
+        dim: Dim,
+    ) -> Option<&mut Raiding> {
+        if dim == self.dim {
+            Some(&mut self.raiding)
+        } else {
+            self.levels.parked.get_mut(&dim).map(|p| &mut p.raiding)
+        }
+    }
+}
+
+#[cfg(feature = "paired-packages")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::game) enum NativeLevelsStatus {
+    Pending,
+    Sealed,
+    Blocked(String),
+}
+#[cfg(feature = "paired-packages")]
+struct RetainedNativeLevel {
+    dimension: Dim,
+    save: Arc<SaveDir>,
+    membership: u64,
+    sealed: Option<horizon_client::streaming::SealedStream>,
+    acknowledged: bool,
+    protected: std::collections::HashSet<(i32, i32)>,
+    identities: Option<persist::NativeEntityCloseIdentity>,
+    modified: Option<std::collections::HashSet<(i32, i32)>>,
+}
+/// Fixed membership and original producer witnesses; never reconstructible from
+/// serialized dimensions, hashes or an observed finished flag.
+#[cfg(feature = "paired-packages")]
+pub(in crate::game) struct RetainedNativeLevels {
+    association: Arc<()>,
+    root: std::path::PathBuf,
+    active: Dim,
+    deadline: Instant,
+    cursor: usize,
+    error: Option<String>,
+    prepared: bool,
+    validation: session_checkpoint::SessionValidationContext,
+    accepted_uuids: std::collections::BTreeSet<[i32; 4]>,
+    initial_reserved: Option<std::collections::HashSet<[i32; 4]>>,
+    identity_reservoir: Option<std::collections::HashSet<[i32; 4]>>,
+    identity_preparation_error: Option<String>,
+    refusals: Vec<(Dim, String)>,
+    levels: Vec<RetainedNativeLevel>,
+}
+#[cfg(feature = "paired-packages")]
+impl RetainedNativeLevels {
+    pub(in crate::game) fn saves(&self) -> Vec<Arc<SaveDir>> {
+        self.levels.iter().map(|level| level.save.clone()).collect()
+    }
+    pub(in crate::game) fn read_refusals(&self) -> &[(Dim, String)] {
+        &self.refusals
+    }
+    pub(in crate::game) fn acknowledged(&self) -> bool {
+        self.levels.iter().all(|level| level.acknowledged)
+    }
+    fn blocked(&mut self, error: impl Into<String>) -> NativeLevelsStatus {
+        let error = error.into();
+        self.error.get_or_insert_with(|| error.clone());
+        NativeLevelsStatus::Blocked(error)
+    }
+}
+#[cfg(feature = "paired-packages")]
+#[derive(Clone)]
+pub(in crate::game) struct RetainedNativePayloads {
+    association: Arc<()>,
+    levels: Vec<RetainedNativeLevelPayload>,
+}
+#[cfg(feature = "paired-packages")]
+#[derive(Clone)]
+pub(in crate::game) struct RetainedNativeLevelPayload {
+    dimension: Dim,
+    save: Arc<SaveDir>,
+    chunks: Vec<Arc<horizon_client::chunk::Chunk>>,
+    entities: Vec<((i32, i32), Vec<horizon_world::nbt::Tag>)>,
+    forced: std::collections::HashSet<(i32, i32)>,
+    protected: std::collections::HashSet<(i32, i32)>,
+    encoded: Vec<horizon_world::nbt::NamedTag>,
+}
+#[cfg(all(
+    test,
+    feature = "paired-packages",
+    feature = "native-writer-test-control",
+    debug_assertions
+))]
+impl Game<'_> {
+    pub(in crate::game) fn seed_retained_native_level_fixture(
+        &mut self,
+        dimension: Dim,
+        at: (i32, i32),
+        ordinal: u32,
+        stack: horizon_client::items::ItemStack,
+    ) -> std::result::Result<(), String> {
+        use horizon_core::geometry::Vec3;
+        let kind = self
+            .res
+            .mob_types()
+            .get("minecraft:cow")
+            .cloned()
+            .ok_or("native fixture cow resource missing")?;
+        let block = self
+            .pack
+            .assets
+            .registry
+            .default_state("minecraft:stone")
+            .ok_or("native fixture stone missing")?;
+        let (world, streaming, memory, dropped, orbs, boats, mobs) = if dimension == self.dim {
+            (
+                &mut self.world,
+                &mut self.streaming,
+                &mut self.persist,
+                &mut self.dropped,
+                &mut self.orbs,
+                &mut self.boats,
+                &mut self.mobs,
+            )
+        } else {
+            let p = self
+                .levels
+                .parked
+                .get_mut(&dimension)
+                .ok_or("native fixture parked level missing")?;
+            (
+                &mut p.world,
+                &mut p.streaming,
+                &mut p.persist,
+                &mut p.dropped,
+                &mut p.orbs,
+                &mut p.boats,
+                &mut p.mobs,
+            )
+        };
+        world.chunks.insert(
+            at,
+            Arc::new(horizon_client::chunk::Chunk::empty(at.0, at.1)),
+        );
+        world
+            .set(at.0 * 16 + 1, 70, at.1 * 16 + 1, block)
+            .map_err(|error| error.to_string())?;
+        let position = Vec3::new(f64::from(at.0 * 16) + 2.5, 71.0, f64::from(at.1 * 16) + 2.5);
+        let id = 700 + ordinal * 10;
+        dropped.push(ItemEntity {
+            id,
+            stack: stack.clone(),
+            position,
+            previous: position,
+            velocity: Vec3::new(0.125, 0.25, -0.125),
+            thrower: Some([1, 2, 3, 4]),
+            target: None,
+            health: 5,
+            fire_ticks: -17,
+            on_ground: false,
+            age: 23,
+            pickup_delay: 37,
+            bob_offset: 0.25,
+            ticks: 11,
+        });
+        memory.seed_retained_native_raw_fixture(id, at, ordinal as i32);
+        let mut boat = boats::Boat::new(id + 1, "oak".into(), position, 15.0).with_chest();
+        boat.items[2] = Some(stack);
+        boats.push(boat);
+        let mut passenger = Mob::new(id + 2, kind.clone(), position, 15.0);
+        passenger.extra.mount = Some(id + 1);
+        passenger.extra.leash = Some(horizon_client::mobs::leash::Holder::Player);
+        mobs.push(passenger);
+        let mut rider = Mob::new(id + 3, kind, position, 30.0);
+        rider.extra.mount = Some(id + 2);
+        rider.extra.leash = Some(horizon_client::mobs::leash::Holder::Mob(id + 2));
+        mobs.push(rider);
+        // Two actual anonymous owners at the same position exercise distinct
+        // frozen UUID occurrences, rather than a kind/position deduplication.
+        for offset in [4, 5] {
+            orbs.push(ExperienceOrb {
+                id: id + offset,
+                position,
+                previous: position,
+                velocity: Vec3::ZERO,
+                value: 7,
+                age: 13,
+                on_ground: false,
+                count: 2,
+                ticks: 17,
+            });
+        }
+        streaming.forced.insert(at);
+        Ok(())
+    }
+    pub(in crate::game) fn seed_retained_saved_falling_fixture(
+        &mut self,
+        dimension: Dim,
+        at: (i32, i32),
+        uuid: [i32; 4],
+    ) -> std::result::Result<horizon_world::nbt::Tag, String> {
+        use horizon_core::{geometry::Vec3, position::BlockPos};
+        use horizon_world::nbt::Tag;
+        let state = self
+            .pack
+            .assets
+            .registry
+            .default_state("minecraft:sand")
+            .ok_or("saved falling fixture sand missing")?;
+        let position = Vec3::new(
+            f64::from(at.0 * 16) + 2.5,
+            73.25,
+            f64::from(at.1 * 16) + 2.5,
+        );
+        let raw = Tag::compound([
+            ("id", Tag::String("minecraft:falling_block".into())),
+            ("UUID", Tag::IntArray(uuid.to_vec())),
+            (
+                "fixture:saved_falling",
+                Tag::compound([
+                    ("opaque", Tag::Long(-731)),
+                    ("dimension", Tag::String(dimension.id().into())),
+                ]),
+            ),
+        ]);
+        let falling = FallingBlock {
+            id: 9900,
+            state,
+            start_pos: BlockPos::new(at.0 * 16 + 2, 74, at.1 * 16 + 2),
+            position,
+            previous: position,
+            velocity: Vec3::new(0.125, -0.25, -0.125),
+            age: 29,
+            no_gravity: false,
+            drop_item: true,
+            fall_distance: 3.5,
+            stuck: Vec3::new(1.0, 1.0, 1.0),
+            damage: horizon_client::falling_block::Damage::default(),
+            saved: Some(Box::new((uuid, raw.clone()))),
+        };
+        if dimension == self.dim {
+            self.falling.push(falling);
+        } else {
+            self.levels
+                .parked
+                .get_mut(&dimension)
+                .ok_or("saved falling fixture parked level missing")?
+                .falling
+                .push(falling);
+        }
+        Ok(raw)
+    }
+}
+#[cfg(feature = "paired-packages")]
+impl RetainedNativePayloads {
+    pub(in crate::game) fn levels(&self) -> &[RetainedNativeLevelPayload] {
+        &self.levels
+    }
+    pub(in crate::game) fn overwritten_entity_rows(&self) -> Vec<(Dim, (i32, i32))> {
+        self.levels
+            .iter()
+            .flat_map(|level| {
+                level
+                    .entities
+                    .iter()
+                    .map(move |(at, _)| (level.dimension, *at))
+            })
+            .collect()
+    }
+    pub(in crate::game) fn entity_uuid_rows(
+        &self,
+    ) -> std::result::Result<Vec<(Dim, (i32, i32), [i32; 4])>, String> {
+        let mut rows = Vec::new();
+        for level in &self.levels {
+            for (at, tags) in &level.entities {
+                for uuid in
+                    persist::native_entity_tag_uuids(tags).map_err(|error| error.to_string())?
+                {
+                    rows.push((level.dimension, *at, uuid));
+                }
+            }
+        }
+        rows.sort_by_key(|(dimension, at, uuid)| (dimension.id(), *at, *uuid));
+        Ok(rows)
+    }
+}
+#[cfg(feature = "paired-packages")]
+impl RetainedNativeLevelPayload {
+    pub(in crate::game) fn dimension(&self) -> Dim {
+        self.dimension
+    }
+    pub(in crate::game) fn save(&self) -> &Arc<SaveDir> {
+        &self.save
+    }
+    pub(in crate::game) fn chunks(&self) -> &[Arc<horizon_client::chunk::Chunk>] {
+        &self.chunks
+    }
+    pub(in crate::game) fn entities(&self) -> &[((i32, i32), Vec<horizon_world::nbt::Tag>)] {
+        &self.entities
+    }
+    pub(in crate::game) fn forced(&self) -> &std::collections::HashSet<(i32, i32)> {
+        &self.forced
+    }
+    pub(in crate::game) fn protected_nonresident(&self) -> &std::collections::HashSet<(i32, i32)> {
+        &self.protected
+    }
+}
+#[cfg(feature = "paired-packages")]
+impl Parked {
+    fn native_entity_view(
+        &mut self,
+        player_uuid: Option<[i32; 4]>,
+        registry: &'static horizon_world::registry::BlockRegistry,
+    ) -> persist::NativeEntityView<'_> {
+        persist::NativeEntityView {
+            persist: persist::NativeEntityMemory::borrow(&mut self.persist),
+            player_uuid,
+            registry,
+            mobs: &self.mobs,
+            dropped: &self.dropped,
+            orbs: &self.orbs,
+            projectiles: &self.projectiles,
+            falling: &self.falling,
+            boats: &self.boats,
+            dragon: self.dragon.as_ref(),
+            crystals: &self.crystals,
+            ominous_spawners: &self.ominous_spawners,
+            carts: &self.carts,
+            armor_stands: &self.armor_stands,
+            item_frames: &self.item_frames,
+            cushions: &self.cushions,
+            paintings: &self.paintings,
+            others: &self.others,
+            fixed_anon: None,
+        }
+    }
+}
+#[cfg(feature = "paired-packages")]
+impl Game<'_> {
+    // Dormant retained factory entry; ordinary level activation remains separate.
+    #[allow(dead_code)]
+    pub(in crate::game) fn add_retained_parked_level(
+        &mut self,
+        construction: super::world_loading::RetainedParkedConstruction,
+    ) -> std::result::Result<(), super::world_loading::RetainedParkedConstruction> {
+        let dimension = construction.dimension();
+        if !construction.matches_game(self)
+            || dimension == self.dim
+            || self.levels.parked.contains_key(&dimension)
+        {
+            return Err(construction);
+        }
+        let parts = construction.into_parts()?;
+        let parked = Parked {
+            world: parts.world,
+            streaming: parts.streaming,
+            locator: parts.locator,
+            save: parts.save,
+            block_ticks: Ticks::new(self.level.seed as i32),
+            tick_chunks: Default::default(),
+            tickets: Default::default(),
+            random_tick_sections: Default::default(),
+            level_events: Vec::new(),
+            falling: Vec::new(),
+            paintings: Vec::new(),
+            item_frames: Vec::new(),
+            armor_stands: Vec::new(),
+            cushions: Vec::new(),
+            others: Vec::new(),
+            boats: Vec::new(),
+            carts: Vec::new(),
+            jukebox_sounds: HashMap::new(),
+            bolts: Vec::new(),
+            crystals: Vec::new(),
+            dragon: None,
+            dragon_fireballs: Vec::new(),
+            breath_clouds: Vec::new(),
+            tridents: Vec::new(),
+            rockets: Vec::new(),
+            ominous_spawners: Vec::new(),
+            tnts: Vec::new(),
+            hoppers: HashMap::new(),
+            mobs: Vec::new(),
+            knot_ids: HashMap::new(),
+            projectiles: Vec::new(),
+            dropped: Vec::new(),
+            orbs: Vec::new(),
+            persist: Default::default(),
+            lectern_pulses: Vec::new(),
+            lid_openers: HashMap::new(),
+            lan_events: Vec::new(),
+            lan_block_events: Vec::new(),
+            lan_entity_events: Vec::new(),
+            lan_critical_hits: Vec::new(),
+            anims: Default::default(),
+            raiding: Default::default(),
+            sculk: Default::default(),
+            creaking: Default::default(),
+            idle: 0,
+        };
+        self.levels.parked.insert(dimension, parked);
+        Ok(())
+    }
+    fn native_level(&self, dimension: Dim) -> Option<(&World, &Streaming, &Arc<SaveDir>)> {
+        if dimension == self.dim {
+            Some((&self.world, &self.streaming, &self.save))
+        } else {
+            self.levels
+                .parked
+                .get(&dimension)
+                .map(|p| (&p.world, &p.streaming, &p.save))
+        }
+    }
+    fn native_level_mut(&mut self, dimension: Dim) -> Option<(&mut World, &mut Streaming)> {
+        if dimension == self.dim {
+            Some((&mut self.world, &mut self.streaming))
+        } else {
+            self.levels
+                .parked
+                .get_mut(&dimension)
+                .map(|p| (&mut p.world, &mut p.streaming))
+        }
+    }
+    fn preflight_native_membership(
+        &self,
+        levels: &RetainedNativeLevels,
+    ) -> std::result::Result<(), String> {
+        if self.world_root != levels.root
+            || self.dim != levels.active
+            || self.retained_level_dimensions()?
+                != levels
+                    .levels
+                    .iter()
+                    .map(|level| level.dimension)
+                    .collect::<Vec<_>>()
+        {
+            return Err(
+                "retained native fixed level membership or original dimension changed".into(),
+            );
+        }
+        for level in &levels.levels {
+            let (world, _, save) = self
+                .native_level(level.dimension)
+                .ok_or("retained native level disappeared")?;
+            if !Arc::ptr_eq(save, &level.save)
+                || world.chunks.membership_revision() != level.membership
+                || save.root
+                    != horizon_client::save::dimension_dir(&self.world_root, level.dimension.id())
+            {
+                return Err(
+                    "retained native World membership or SaveDir allocation changed".into(),
+                );
+            }
+        }
+        Ok(())
+    }
+    pub(in crate::game) fn begin_retained_native_levels(
+        &self,
+        deadline: Instant,
+    ) -> std::result::Result<RetainedNativeLevels, String> {
+        let mut fixed = Vec::new();
+        for dimension in self.retained_level_dimensions()? {
+            let (world, _, save) = self
+                .native_level(dimension)
+                .ok_or("native close level absent")?;
+            fixed.push(RetainedNativeLevel {
+                dimension,
+                save: save.clone(),
+                membership: world.chunks.membership_revision(),
+                sealed: None,
+                acknowledged: false,
+                protected: Default::default(),
+                identities: None,
+                modified: None,
+            });
+        }
+        Ok(RetainedNativeLevels {
+            association: Arc::new(()),
+            root: self.world_root.clone(),
+            active: self.dim,
+            deadline,
+            cursor: 0,
+            error: None,
+            prepared: false,
+            validation: self.capture_native_validation_context(),
+            accepted_uuids: Default::default(),
+            initial_reserved: None,
+            identity_reservoir: None,
+            identity_preparation_error: None,
+            refusals: Vec::new(),
+            levels: fixed,
+        })
+    }
+    pub(in crate::game) fn poll_retained_native_levels(
+        &mut self,
+        levels: &mut RetainedNativeLevels,
+    ) -> NativeLevelsStatus {
+        use horizon_client::streaming::RetainedStreamStatus as S;
+        if let Err(error) = self.preflight_native_membership(levels) {
+            return levels.blocked(error);
+        }
+        if let Some(error) = &levels.error {
+            return NativeLevelsStatus::Blocked(error.clone());
+        }
+        if levels
+            .levels
+            .iter()
+            .all(|level| level.sealed.is_some() || level.acknowledged)
+        {
+            return NativeLevelsStatus::Sealed;
+        }
+        let index = levels.cursor % levels.levels.len();
+        levels.cursor = (index + 1) % levels.levels.len();
+        if levels.levels[index].sealed.is_some() {
+            return NativeLevelsStatus::Pending;
+        }
+        let dimension = levels.levels[index].dimension;
+        let status = {
+            let (world, streaming) = self.native_level_mut(dimension).unwrap();
+            if let Err(error) = streaming.begin_retained_close(Some(world), levels.deadline) {
+                return levels.blocked(error);
+            }
+            streaming.poll_retained_close(Some(world))
+        };
+        match status {
+            S::Pending => NativeLevelsStatus::Pending,
+            S::Blocked(error) => levels.blocked(error),
+            S::Complete => {
+                let (_, streaming) = self.native_level_mut(dimension).unwrap();
+                let Some(sealed) = streaming.take_sealed() else {
+                    return levels.blocked("retained native producer witness missing");
+                };
+                levels.refusals.extend(
+                    sealed
+                        .refused_reads()
+                        .iter()
+                        .cloned()
+                        .map(|error| (dimension, error)),
+                );
+                if sealed.failed_initialization {
+                    levels.refusals.push((
+                        dimension,
+                        "retained native producer initialization failed".into(),
+                    ));
+                }
+                levels.levels[index].sealed = Some(sealed);
+                NativeLevelsStatus::Pending
+            }
+            S::NeedsRefusedRead => {
+                let (_, streaming) = self.native_level_mut(dimension).unwrap();
+                let read = streaming.retained_refused_read().unwrap();
+                let position = read.position();
+                let error = read.error().to_owned();
+                let ticket = read.into_ticket();
+                match streaming.resolve_retained_refused_read(ticket, error) {
+                    Ok(true) => {
+                        levels.levels[index].protected.insert(position);
+                        NativeLevelsStatus::Pending
+                    }
+                    Ok(false) => NativeLevelsStatus::Pending,
+                    Err(error) => levels.blocked(error),
+                }
+            }
+            S::NeedsFinishedColumn => {
+                let (world, streaming, save) = self.native_level(dimension).unwrap();
+                let view = streaming.retained_finished_column().unwrap();
+                let position = (view.chunk().x, view.chunk().z);
+                let read_only = view.evidence().is_some()
+                    && !view.chunk().fresh
+                    && view.origin() == horizon_client::streaming::NativeWorkOrigin::Generate;
+                let mut native_level = self.level.clone();
+                native_level.dimension = dimension.id().into();
+                let result = super::world_loading::validate_retained_column_context(
+                    &levels.validation,
+                    &self.pack,
+                    &self.res,
+                    &self.persist.uuids,
+                    &self.world_root,
+                    Some(&native_level),
+                    Some(world),
+                    self.session_lock.as_ref(),
+                    save,
+                    if dimension == self.dim {
+                        self.native_checkpoint_origin.as_ref()
+                    } else {
+                        None
+                    },
+                    &levels.accepted_uuids,
+                    view.chunk(),
+                    view.evidence(),
+                );
+                let ticket = view.into_ticket();
+                let (_, streaming) = self.native_level_mut(dimension).unwrap();
+                match result {
+                    Ok(None) => NativeLevelsStatus::Pending,
+                    Ok(Some((disposition, identities))) => {
+                        match streaming.resolve_retained_finished_column(ticket, disposition) {
+                            Ok(true) => {
+                                levels.levels[index].protected.insert(position);
+                                levels.accepted_uuids.extend(identities);
+                                NativeLevelsStatus::Pending
+                            }
+                            Ok(false) => NativeLevelsStatus::Pending,
+                            Err(error) => levels.blocked(error),
+                        }
+                    }
+                    Err(error) => {
+                        let error = error.to_string();
+                        if read_only {
+                            match streaming.resolve_retained_refused_read(ticket, error) {
+                                Ok(true) => {
+                                    levels.levels[index].protected.insert(position);
+                                    NativeLevelsStatus::Pending
+                                }
+                                Ok(false) => NativeLevelsStatus::Pending,
+                                Err(error) => levels.blocked(error),
+                            }
+                        } else {
+                            let rejection =
+                                streaming.reject_retained_finished_column(ticket, error.clone());
+                            levels.blocked(rejection.err().unwrap_or(error))
+                        }
+                    }
+                }
+            }
+        }
+    }
+    pub(in crate::game) fn retry_retained_native_levels(
+        &mut self,
+        levels: &mut RetainedNativeLevels,
+        deadline: Instant,
+    ) -> std::result::Result<(), String> {
+        self.preflight_native_membership(levels)?;
+        if deadline <= Instant::now() {
+            return Err("native close retry deadline is not future".into());
+        }
+        for level in &levels.levels {
+            if level.sealed.is_none() && !level.acknowledged {
+                let (world, streaming) = self.native_level_mut(level.dimension).unwrap();
+                streaming.begin_retained_close(Some(world), levels.deadline)?;
+                // Observe the actual retained attempt with its original World;
+                // renew only a real Blocked attempt, never replay callbacks.
+                if matches!(
+                    streaming.poll_retained_close(Some(world)),
+                    horizon_client::streaming::RetainedStreamStatus::Blocked(_)
+                ) {
+                    streaming.retry_retained_close(deadline)?;
+                }
+            }
+        }
+        levels.deadline = deadline;
+        levels.error = None;
+        Ok(())
+    }
+    pub(in crate::game) fn poll_retained_native_writer_ack(
+        &mut self,
+        levels: &mut RetainedNativeLevels,
+        closed: &[horizon_client::save::NativeWriterClosed],
+    ) -> NativeLevelsStatus {
+        use horizon_client::streaming::RetainedStreamStatus as S;
+        if let Err(error) = self.preflight_native_membership(levels) {
+            return levels.blocked(error);
+        }
+        for level in &mut levels.levels {
+            if level.acknowledged {
+                continue;
+            }
+            let Some(writer) = closed
+                .iter()
+                .find(|writer| Arc::ptr_eq(writer.save(), &level.save))
+            else {
+                return NativeLevelsStatus::Pending;
+            };
+            let (_, streaming) = self.native_level_mut(level.dimension).unwrap();
+            match streaming.poll_retained_writer_ack(writer) {
+                S::Pending => return NativeLevelsStatus::Pending,
+                S::Complete => {}
+                S::Blocked(error) => return levels.blocked(error),
+                _ => {
+                    return levels.blocked(
+                        "unsettled native producer payload at final writer acknowledgement",
+                    );
+                }
+            }
+            let Some(sealed) = level.sealed.take() else {
+                return levels
+                    .blocked("native producer witness absent at final writer acknowledgement");
+            };
+            if let Err(sealed) = streaming.finish_retained_close(sealed, writer) {
+                level.sealed = Some(sealed);
+                return levels.blocked("native producer/final writer allocation mismatch");
+            }
+            level.acknowledged = true;
+            return NativeLevelsStatus::Pending;
+        }
+        NativeLevelsStatus::Sealed
+    }
+    fn capture_retained_native_level(
+        &mut self,
+        level: &RetainedNativeLevel,
+    ) -> std::result::Result<RetainedNativeLevelPayload, String> {
+        let identity = level
+            .identities
+            .as_ref()
+            .ok_or("native close entity identity preparation missing")?;
+        let dimension = level.dimension;
+        let (mut chunks, loaded, forced) = {
+            let (world, streaming, _) = self
+                .native_level(dimension)
+                .ok_or("native close level absent during projection")?;
+            let (ticks, anims) = if dimension == self.dim {
+                (&self.block_ticks, &self.be_anims)
+            } else {
+                let parked = self.levels.parked.get(&dimension).unwrap();
+                (&parked.block_ticks, &parked.anims)
+            };
+            let chunks = horizon_client::save::chunks_with_block_entities(
+                world.chunks.values(),
+                &world.block_entities,
+                &world.block_names,
+            )
+            .into_iter()
+            .map(|mut chunk| {
+                persist::native_attach_save_data(
+                    &mut chunk,
+                    world,
+                    ticks,
+                    anims,
+                    self.world.game_time,
+                );
+                Arc::new(chunk)
+            })
+            .collect::<Vec<_>>();
+            (
+                chunks,
+                world.loaded_entities.clone(),
+                streaming.forced.clone(),
+            )
+        };
+        chunks.sort_by_key(|chunk| (chunk.x, chunk.z));
+        let mut entities = if dimension == self.dim {
+            self.native_entity_view().project_close(identity)
+        } else {
+            let player_uuid = self.level.player_uuid;
+            let registry = self.pack.assets.registry;
+            self.levels
+                .parked
+                .get_mut(&dimension)
+                .unwrap()
+                .native_entity_view(player_uuid, registry)
+                .project_close(identity)
+        }
+        .map_err(|error| error.to_string())?;
+        let mut rows: std::collections::BTreeMap<_, _> = entities.drain(..).collect();
+        for chunk in &chunks {
+            rows.entry((chunk.x, chunk.z)).or_insert_with(Vec::new);
+        }
+        // Preserve native arrivals as original raw records. No spawn_loaded_entities,
+        // native ID allocation, simulation or ownership removal occurs here.
+        for (at, tags) in loaded {
+            rows.entry(at).or_insert_with(Vec::new).extend(tags);
+        }
+        entities = rows.into_iter().collect();
+        if chunks
+            .iter()
+            .any(|chunk| level.protected.contains(&(chunk.x, chunk.z)))
+            || entities.iter().any(|(at, _)| level.protected.contains(at))
+        {
+            return Err("native close final resident/entity payload conflicts with protected producer record; original owners retained".into());
+        }
+        let tables = horizon_client::save::SaveTables::new(&self.pack.assets);
+        let shape = horizon_client::save::LevelShape::for_dir(&level.save.root);
+        let encoded = chunks
+            .iter()
+            .map(|chunk| {
+                horizon_client::save::encode_with(
+                    chunk,
+                    self.pack.assets.registry,
+                    self.res.biomes(),
+                    Some(&tables),
+                    shape,
+                )
+            })
+            .collect();
+        Ok(RetainedNativeLevelPayload {
+            dimension,
+            save: level.save.clone(),
+            chunks,
+            entities,
+            forced,
+            protected: level.protected.clone(),
+            encoded,
+        })
+    }
+    pub(in crate::game) fn prepare_retained_native_payloads(
+        &mut self,
+        levels: &mut RetainedNativeLevels,
+        reserved: &std::collections::HashSet<[i32; 4]>,
+    ) -> std::result::Result<RetainedNativePayloads, String> {
+        self.preflight_native_membership(levels)?;
+        if let Some(error) = &levels.identity_preparation_error {
+            return Err(error.clone());
+        }
+        if levels.prepared
+            || levels.error.is_some()
+            || levels.levels.iter().any(|level| level.sealed.is_none())
+        {
+            return Err("native close final projection requires first preparation after actual producer seal".into());
+        }
+        if levels
+            .initial_reserved
+            .as_ref()
+            .is_some_and(|original| original != reserved)
+        {
+            return Err("native close old-source UUID reservoir changed".into());
+        }
+        let result = self.prepare_retained_native_payloads_once(levels, reserved);
+        if let Err(error) = &result {
+            levels.identity_preparation_error = Some(error.clone());
+        }
+        result
+    }
+    fn prepare_retained_native_payloads_once(
+        &mut self,
+        levels: &mut RetainedNativeLevels,
+        reserved: &std::collections::HashSet<[i32; 4]>,
+    ) -> std::result::Result<RetainedNativePayloads, String> {
+        if levels.identity_reservoir.is_none() {
+            let mut used = reserved.clone();
+            used.extend(levels.accepted_uuids.iter().copied());
+            used.extend(self.level.player_uuid);
+            // Inspect every current level BEFORE generating the first UUID, so
+            // new identities cannot collide with later parked or raw owners.
+            for dimension in self.retained_level_dimensions()? {
+                for (_, tags) in &self.native_level(dimension).unwrap().0.loaded_entities {
+                    used.extend(
+                        persist::native_entity_tag_uuids(tags)
+                            .map_err(|error| error.to_string())?,
+                    );
+                }
+                let current = if dimension == self.dim {
+                    self.native_entity_view().current_close_uuids()
+                } else {
+                    let uuid = self.level.player_uuid;
+                    let registry = self.pack.assets.registry;
+                    self.levels
+                        .parked
+                        .get_mut(&dimension)
+                        .unwrap()
+                        .native_entity_view(uuid, registry)
+                        .current_close_uuids()
+                }
+                .map_err(|error| error.to_string())?;
+                used.extend(current);
+            }
+            levels.initial_reserved = Some(reserved.clone());
+            levels.identity_reservoir = Some(used);
+        }
+        let mut payloads = Vec::new();
+        for level in &mut levels.levels {
+            if level.identities.is_none() {
+                let used = levels.identity_reservoir.as_mut().unwrap();
+                let identity = if level.dimension == self.dim {
+                    self.native_entity_view().prepare_close_identities(used)
+                } else {
+                    let uuid = self.level.player_uuid;
+                    let registry = self.pack.assets.registry;
+                    self.levels
+                        .parked
+                        .get_mut(&level.dimension)
+                        .unwrap()
+                        .native_entity_view(uuid, registry)
+                        .prepare_close_identities(used)
+                }
+                .map_err(|error| error.to_string())?;
+                level.identities = Some(identity);
+                level.modified = Some(
+                    self.native_level(level.dimension)
+                        .unwrap()
+                        .0
+                        .modified
+                        .clone(),
+                );
+            }
+            payloads.push(self.capture_retained_native_level(level)?);
+        }
+        let mut uuids = levels.accepted_uuids.clone();
+        for payload in &payloads {
+            for (_, tags) in &payload.entities {
+                let mut work: Vec<_> = tags.iter().collect();
+                while let Some(tag) = work.pop() {
+                    if let Some(horizon_world::nbt::Tag::IntArray(uuid)) = tag.get("UUID") {
+                        let uuid: [i32; 4] = uuid
+                            .as_slice()
+                            .try_into()
+                            .map_err(|_| "native close entity UUID size")?;
+                        if !uuids.insert(uuid) || self.level.player_uuid == Some(uuid) {
+                            return Err("native close duplicate entity or player UUID across original level/producer owners".into());
+                        }
+                    }
+                    if let Some(horizon_world::nbt::Tag::List(passengers)) = tag.get("Passengers") {
+                        work.extend(passengers);
+                    }
+                }
+            }
+        }
+        levels.prepared = true;
+        Ok(RetainedNativePayloads {
+            association: levels.association.clone(),
+            levels: payloads,
+        })
+    }
+    pub(in crate::game) fn preflight_retained_native_payloads(
+        &mut self,
+        levels: &RetainedNativeLevels,
+        payloads: &RetainedNativePayloads,
+    ) -> std::result::Result<(), String> {
+        self.preflight_native_membership(levels)?;
+        if !levels.prepared
+            || !Arc::ptr_eq(&levels.association, &payloads.association)
+            || levels.levels.len() != payloads.levels.len()
+        {
+            return Err("native close original payload association absent or changed".into());
+        }
+        for (level, expected) in levels.levels.iter().zip(&payloads.levels) {
+            if self.native_level(level.dimension).unwrap().0.modified
+                != *level
+                    .modified
+                    .as_ref()
+                    .ok_or("native close original modified set absent")?
+            {
+                return Err("native close original modified marker set changed".into());
+            }
+            let current = self.capture_retained_native_level(level)?;
+            if current.dimension != expected.dimension
+                || !Arc::ptr_eq(&current.save, &expected.save)
+                || current.encoded != expected.encoded
+                || current.entities != expected.entities
+                || current.forced != expected.forced
+                || current.protected != expected.protected
+            {
+                return Err(
+                    "native close original native payload, routes or forced state changed".into(),
+                );
+            }
+        }
+        Ok(())
+    }
+    pub(in crate::game) fn commit_retained_native_payloads(
+        &mut self,
+        levels: &mut RetainedNativeLevels,
+    ) {
+        // Caller has checked EVERY native/Level/participant/metadata/image owner
+        // before entering any infallible marker commit under the same Game guard.
+        for level in &levels.levels {
+            if let Some(modified) = &level.modified
+                && let Some((world, _)) = self.native_level_mut(level.dimension)
+            {
+                for at in modified {
+                    world.modified.remove(at);
+                }
+            }
+        }
+    }
+}
 
 impl Game<'_> {
     /// End every owned trial without swapping levels or changing save results.
