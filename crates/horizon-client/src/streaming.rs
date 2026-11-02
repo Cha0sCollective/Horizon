@@ -5012,8 +5012,9 @@ impl Drop for Streaming {
 
 #[cfg(feature = "paired-packages")]
 pub use retained_remote::{
-    ClosedRemoteStreaming, RemoteCloseStatus, RemoteHandoff, RemoteInput, RemoteObservation,
-    RemoteOutput, RemotePrepareRefusal, RemoteRefusal, RemoteRefusedInput, RetainedRemoteStreaming,
+    ClosedRemoteStreaming, RemoteCloseStatus, RemoteHandoff, RemoteInput, RemoteLightOutcome,
+    RemoteMeshProfile, RemoteObservation, RemoteOutput, RemotePrepareRefusal, RemoteRefusal,
+    RemoteRefusedInput, RetainedRemoteStreaming,
 };
 
 /// A fixed policy in the original pool, not another generator or storage owner.
@@ -5064,6 +5065,25 @@ mod retained_remote {
             Err("remote streaming owns no native storage".into())
         }
     }
+    /// Fixed values selected from the actual Login dimension/obfuscated seed
+    /// and client settings, before any original remote worker starts.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct RemoteMeshProfile {
+        pub sky_light: bool,
+        pub nether_shading: bool,
+        pub obfuscated_biome_seed: i64,
+        pub biome_blend: i32,
+        pub smooth_lighting: bool,
+        pub cutout_leaves: bool,
+    }
+    pub enum RemoteLightOutcome {
+        Missing,
+        Unchanged,
+        Replaced {
+            previous: Arc<Chunk>,
+            sections: Vec<usize>,
+        },
+    }
     #[derive(Clone, Copy)]
     enum Kind {
         Light {
@@ -5080,6 +5100,7 @@ mod retained_remote {
     }
     pub struct RemoteInput {
         context: Arc<WorkerContext>,
+        profile: RemoteMeshProfile,
         region: Box<Region>,
         kind: Kind,
     }
@@ -5118,6 +5139,8 @@ mod retained_remote {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum RemoteRefusal {
         InvalidWorkers,
+        InvalidProfile,
+        InvalidLight,
         InvalidSection,
         MissingColumn,
         NotRunning,
@@ -5125,6 +5148,7 @@ mod retained_remote {
         Busy,
         Full,
         ForeignContext,
+        ForeignProfile,
         Exhausted,
         Attempt,
         Deadline,
@@ -5365,6 +5389,7 @@ mod retained_remote {
         inner: Option<Streaming>,
         mode: Arc<State>,
         workers: usize,
+        profile: Option<RemoteMeshProfile>,
         started: bool,
         spawned: usize,
         joined: usize,
@@ -5424,6 +5449,7 @@ mod retained_remote {
                 inner: Some(inner),
                 mode,
                 workers,
+                profile: None,
                 started: false,
                 spawned: 0,
                 joined: 0,
@@ -5434,16 +5460,26 @@ mod retained_remote {
                 failure: None,
             })
         }
-        pub fn start(&mut self) -> Result<(), RemoteRefusal> {
+        pub fn start(&mut self, profile: RemoteMeshProfile) -> Result<(), RemoteRefusal> {
             if self.mode.sealed() {
                 return Err(RemoteRefusal::Closed);
             }
             if self.started {
                 return Err(RemoteRefusal::State);
             }
+            if !(0..=7).contains(&profile.biome_blend) {
+                return Err(RemoteRefusal::InvalidProfile);
+            }
+            self.profile = Some(profile);
+            let inner = self.inner.as_mut().unwrap();
+            inner.sky_light = profile.sky_light;
+            inner.nether_shading = profile.nether_shading;
+            inner.biome_zoom = BiomeZoom::new(profile.obfuscated_biome_seed);
+            inner.biome_blend = profile.biome_blend;
+            inner.smooth_lighting = profile.smooth_lighting;
+            inner.cutout_leaves = profile.cutout_leaves;
             self.started = true;
             let sender = lock(&self.mode.sender).as_ref().unwrap().clone();
-            let inner = self.inner.as_mut().unwrap();
             let result = Streaming::spawn_pool(
                 inner,
                 Arc::new(Provider),
@@ -5461,6 +5497,24 @@ mod retained_remote {
                 return Err(RemoteRefusal::State);
             }
             Ok(())
+        }
+        pub fn profile(&self) -> Option<RemoteMeshProfile> {
+            self.profile
+        }
+        /// A received resident column with installed server light. This says
+        /// nothing about meshes, rendering, native generation or checked close.
+        pub fn received_ready(&self, world: &World, at: (i32, i32)) -> bool {
+            self.admission().is_ok()
+                && self.inner.as_ref().unwrap().lit.contains(&at)
+                && world
+                    .chunks
+                    .get(&at)
+                    .is_some_and(|chunk| chunk.lit && chunk.light_loaded)
+        }
+        /// Conservative latest-stamp scheduling state. A pending snapshot may
+        /// already be stale; only the original handoff computes `current`.
+        pub fn mesh_pending(&self, section: (i32, i32, i32)) -> bool {
+            self.inner.as_ref().unwrap().meshing.contains_key(&section)
         }
         fn admission(&self) -> Result<(), RemoteRefusal> {
             if self.mode.sealed() {
@@ -5485,6 +5539,9 @@ mod retained_remote {
                 .ok_or(RemoteRefusal::MissingColumn)?;
             Ok(RemoteInput {
                 context: self.mode.context.clone(),
+                profile: self
+                    .profile
+                    .expect("started remote owner has its original profile"),
                 region,
                 kind: Kind::Mesh {
                     x: section.0,
@@ -5510,6 +5567,9 @@ mod retained_remote {
                 .ok_or(RemoteRefusal::MissingColumn)?;
             Ok(RemoteInput {
                 context: self.mode.context.clone(),
+                profile: self
+                    .profile
+                    .expect("started remote owner has its original profile"),
                 region,
                 kind: Kind::Light {
                     x: position.0,
@@ -5523,7 +5583,7 @@ mod retained_remote {
             &mut self,
             world: &mut World,
             chunk: Chunk,
-        ) -> Result<(), (RemoteRefusal, Chunk)> {
+        ) -> Result<Option<Arc<Chunk>>, (RemoteRefusal, Chunk)> {
             if let Err(reason) = self.admission() {
                 return Err((reason, chunk));
             }
@@ -5543,7 +5603,7 @@ mod retained_remote {
             let key = (chunk.x, chunk.z);
             inner.lighting.remove(&key);
             inner.lit.insert(key);
-            world.chunks.insert(key, Arc::new(chunk));
+            let previous = world.chunks.insert(key, Arc::new(chunk));
             for dz in -1..=1 {
                 for dx in -1..=1 {
                     for sy in 0..SECTIONS as i32 {
@@ -5551,7 +5611,77 @@ mod retained_remote {
                     }
                 }
             }
-            Ok(())
+            Ok(previous)
+        }
+        pub fn try_forget_column(
+            &mut self,
+            world: &mut World,
+            at: (i32, i32),
+        ) -> Result<Option<Arc<Chunk>>, RemoteRefusal> {
+            self.admission()?;
+            let inner = self.inner.as_mut().unwrap();
+            let _queue = attempt(&inner.shared.queue).ok_or(RemoteRefusal::Busy)?;
+            let _slots = attempt(&self.mode.slots).ok_or(RemoteRefusal::Busy)?;
+            if self.mode.sealed() {
+                return Err(RemoteRefusal::Closed);
+            }
+            inner.lit.remove(&at);
+            inner.meshed.remove(&at);
+            inner.lighting.remove(&at);
+            inner.light_snapshots.remove(&at);
+            for sy in 0..SECTIONS as i32 {
+                inner.meshing.remove(&(at.0, sy, at.1));
+                inner.waiting.remove(&(at.0, sy, at.1));
+            }
+            world.dirty_sections.take_column(at.0, at.1);
+            world.dirty_light.remove(&at);
+            // Original JobOwners/receipts/snapshots remain in their existing
+            // registry. This transfers only the original resident allocation.
+            Ok(world.chunks.remove(&at))
+        }
+        pub fn try_apply_light(
+            &mut self,
+            world: &mut World,
+            at: (i32, i32),
+            layers: &[horizon_protocol::chunk::SectionLight],
+        ) -> Result<RemoteLightOutcome, RemoteRefusal> {
+            self.admission()?;
+            if layers.len() != SECTIONS
+                || layers.iter().any(|(sky, block)| {
+                    sky.as_ref().is_some_and(|layer| layer.len() != 2048)
+                        || block.as_ref().is_some_and(|layer| layer.len() != 2048)
+                })
+            {
+                return Err(RemoteRefusal::InvalidLight);
+            }
+            let sky = self
+                .profile
+                .expect("started remote owner has its original profile")
+                .sky_light;
+            let inner = self.inner.as_mut().unwrap();
+            let _queue = attempt(&inner.shared.queue).ok_or(RemoteRefusal::Busy)?;
+            let _slots = attempt(&self.mode.slots).ok_or(RemoteRefusal::Busy)?;
+            if self.mode.sealed() {
+                return Err(RemoteRefusal::Closed);
+            }
+            let Some(original) = world.chunks.get(&at) else {
+                return Ok(RemoteLightOutcome::Missing);
+            };
+            if original.sections.len() != SECTIONS {
+                return Err(RemoteRefusal::InvalidLight);
+            }
+            // Work on detached original data. Arc::make_mut inside the real
+            // algorithm can only modify the replacement's section allocations.
+            let mut replacement = (**original).clone();
+            let sections = crate::light::update_light_layers(&mut replacement, layers, sky);
+            if sections.is_empty() {
+                return Ok(RemoteLightOutcome::Unchanged);
+            }
+            let previous = world.chunks.insert(at, Arc::new(replacement)).unwrap();
+            inner.lighting.remove(&at);
+            inner.light_snapshots.remove(&at);
+            Streaming::light_updated(world, at.0, at.1, &sections);
+            Ok(RemoteLightOutcome::Replaced { previous, sections })
         }
         pub fn try_submit(&mut self, input: RemoteInput) -> Result<u64, RemoteRefusedInput> {
             if let Err(reason) = self.admission() {
@@ -5560,6 +5690,12 @@ mod retained_remote {
             if !Arc::ptr_eq(&input.context, &self.mode.context) {
                 return Err(RemoteRefusedInput {
                     reason: RemoteRefusal::ForeignContext,
+                    input,
+                });
+            }
+            if self.profile != Some(input.profile) {
+                return Err(RemoteRefusedInput {
+                    reason: RemoteRefusal::ForeignProfile,
                     input,
                 });
             }
@@ -5707,6 +5843,18 @@ mod retained_remote {
             let output = output(payload.output.take().unwrap());
             payload.receipt.take().unwrap().settle_locked(&mut book);
             slots.retain(|owned| owned.sequence != job.sequence);
+            match input.kind {
+                Kind::Light { x, z, .. } => {
+                    if inner.lighting.get(&(x, z)) == Some(&sequence) {
+                        inner.lighting.remove(&(x, z));
+                    }
+                }
+                Kind::Mesh { x, sy, z, .. } => {
+                    if inner.meshing.get(&(x, sy, z)) == Some(&sequence) {
+                        inner.meshing.remove(&(x, sy, z));
+                    }
+                }
+            }
             drop(payload);
             drop(slots);
             drop(book);
@@ -5996,6 +6144,16 @@ mod retained_remote {
         fn until() -> Instant {
             Instant::now() + Duration::from_secs(15)
         }
+        fn profile() -> RemoteMeshProfile {
+            RemoteMeshProfile {
+                sky_light: true,
+                nether_shading: false,
+                obfuscated_biome_seed: 0,
+                biome_blend: 2,
+                smooth_lighting: true,
+                cutout_leaves: true,
+            }
+        }
         fn fixture() -> (Arc<WorkerContext>, World) {
             let context = super::super::native_work_tests::context();
             let mut world = World::new(
@@ -6080,6 +6238,37 @@ mod retained_remote {
                 }
             }
         }
+        fn insert_received(
+            owner: &mut RetainedRemoteStreaming,
+            world: &mut World,
+            mut incoming: Chunk,
+        ) -> Option<Arc<Chunk>> {
+            let deadline = until();
+            loop {
+                match owner.try_insert_column(world, incoming) {
+                    Ok(previous) => return previous,
+                    Err((RemoteRefusal::Busy, original)) => {
+                        incoming = original;
+                        assert!(Instant::now() < deadline, "received insertion stayed Busy");
+                        thread::yield_now();
+                    }
+                    Err((reason, _)) => panic!("received insertion refused: {reason:?}"),
+                }
+            }
+        }
+        fn take_handoff(owner: &mut RetainedRemoteStreaming, world: &World) -> RemoteHandoff {
+            let deadline = until();
+            loop {
+                if let Some(handoff) = owner.try_take(world) {
+                    return handoff;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "original reconciled remote handoff missing"
+                );
+                thread::yield_now();
+            }
+        }
         fn close(mut owner: RetainedRemoteStreaming) -> ClosedRemoteStreaming {
             owner.begin_close(until());
             let deadline = until();
@@ -6102,13 +6291,46 @@ mod retained_remote {
         fn remote_stream_real_mesh_and_light() {
             let (context, world) = fixture();
             let mut owner = RetainedRemoteStreaming::prepare(context.clone(), 1).unwrap();
-            owner.start().unwrap();
+            let selected = RemoteMeshProfile {
+                sky_light: false,
+                nether_shading: true,
+                obfuscated_biome_seed: 0x1234_5678,
+                biome_blend: 0,
+                smooth_lighting: false,
+                cutout_leaves: false,
+            };
+            owner.start(selected).unwrap();
+            assert_eq!(owner.profile(), Some(selected));
+            assert_eq!(owner.start(profile()), Err(RemoteRefusal::State));
+            assert_eq!(owner.profile(), Some(selected));
+            // Sharing the actual resource allocation does not permit a foreign
+            // profile to bypass the receiver's immutable worker settings.
+            let mut other = RetainedRemoteStreaming::prepare(context.clone(), 1).unwrap();
+            other.start(profile()).unwrap();
+            for mesh in [true, false] {
+                let input = if mesh {
+                    owner.mesh_input(&world, (0, 4, 0)).unwrap()
+                } else {
+                    owner.light_input(&world, (0, 0)).unwrap()
+                };
+                let original = input.region[1][1].as_ref().unwrap().clone();
+                let refused = other.try_submit(input).unwrap_err();
+                assert_eq!(refused.reason, RemoteRefusal::ForeignProfile);
+                assert_eq!(refused.input.profile, selected);
+                assert!(Arc::ptr_eq(&refused.input.context, &context));
+                assert!(Arc::ptr_eq(
+                    &original,
+                    refused.input.region[1][1].as_ref().unwrap()
+                ));
+                assert_eq!(other.try_observe().unwrap().owned, 0);
+            }
+            assert_eq!(close(other).try_observe().unwrap().joined, 1);
             let mesh = owner.mesh_input(&world, (0, 4, 0)).unwrap();
             let light = owner.light_input(&world, (0, 0)).unwrap();
             let sequences = [submit(&mut owner, mesh), submit(&mut owner, light)];
             for (mesh_expected, sequence) in [true, false].into_iter().zip(sequences) {
                 reconcile(&mut owner);
-                let handoff = owner.try_take(&world).expect("original reconciled handoff");
+                let handoff = take_handoff(&mut owner, &world);
                 assert_eq!(handoff.sequence, sequence);
                 assert!(handoff.current && Arc::ptr_eq(&handoff.input.context, &context));
                 match handoff.output.unwrap() {
@@ -6120,6 +6342,23 @@ mod retained_remote {
                         assert!(mesh.solid.iter().all(|v| [1.0, 2.0].contains(&v.pos[0])
                             && [0.0, 1.0].contains(&v.pos[1])
                             && [1.0, 2.0].contains(&v.pos[2])));
+                        let horizontal: Vec<_> = mesh
+                            .solid
+                            .as_chunks::<4>()
+                            .0
+                            .iter()
+                            .filter(|quad| {
+                                quad.iter().all(|v| v.pos[1] == 0.0)
+                                    || quad.iter().all(|v| v.pos[1] == 1.0)
+                            })
+                            .collect();
+                        assert_eq!(horizontal.len(), 2);
+                        assert!(
+                            horizontal.iter().all(|quad| quad
+                                .iter()
+                                .all(|v| v.color & 0x00ff_ffff == 0x00e5_e5e5))
+                        );
+                        assert!(!owner.mesh_pending((0, 4, 0)));
                     }
                     RemoteOutput::Light {
                         position, sections, ..
@@ -6127,9 +6366,10 @@ mod retained_remote {
                         assert!(!mesh_expected);
                         assert_eq!(position, (0, 0));
                         assert_eq!(sections.len(), SECTIONS);
-                        assert_eq!(sections[SECTIONS - 1].get(0), 0xf0);
-                        assert_eq!(sections[4].get(crate::chunk::index(8, 0, 8)), 0xf0);
+                        assert_eq!(sections[SECTIONS - 1].get(0), 0);
+                        assert_eq!(sections[4].get(crate::chunk::index(8, 0, 8)), 0);
                         assert_eq!(sections[4].get(crate::chunk::index(1, 0, 1)), 0);
+                        assert!(!owner.inner.as_ref().unwrap().lighting.contains_key(&(0, 0)));
                     }
                 }
             }
@@ -6138,12 +6378,8 @@ mod retained_remote {
             submit(&mut owner, stale);
             reconcile(&mut owner);
             let mut replacement = world;
-            assert!(
-                owner
-                    .try_insert_column(&mut replacement, Chunk::empty(0, 0))
-                    .is_ok()
-            );
-            assert!(!owner.try_take(&replacement).unwrap().current);
+            assert!(insert_received(&mut owner, &mut replacement, Chunk::empty(0, 0)).is_some());
+            assert!(!take_handoff(&mut owner, &replacement).current);
             // Both real algorithms also retain a stale result when only a
             // neighboring snapshot changes; the center allocation is unchanged.
             for mesh in [true, false] {
@@ -6156,17 +6392,13 @@ mod retained_remote {
                 let sequence = submit(&mut owner, input);
                 reconcile(&mut owner);
                 assert!(
-                    owner
-                        .try_insert_column(&mut replacement, Chunk::empty(1, 0))
-                        .is_ok()
+                    insert_received(&mut owner, &mut replacement, Chunk::empty(1, 0)).is_some()
                 );
                 assert!(Arc::ptr_eq(
                     &center,
                     replacement.chunks.get(&(0, 0)).unwrap()
                 ));
-                let handoff = owner
-                    .try_take(&replacement)
-                    .expect("stale neighbor result remains owned");
+                let handoff = take_handoff(&mut owner, &replacement);
                 assert_eq!(handoff.sequence, sequence);
                 assert!(!handoff.current);
                 assert_eq!(
@@ -6192,21 +6424,40 @@ mod retained_remote {
                 assert!(Arc::ptr_eq(&refused.context, &context));
                 assert_eq!(refused.workers, workers);
             }
-            let owner = RetainedRemoteStreaming::prepare(context.clone(), 2).unwrap();
+            let mut owner = RetainedRemoteStreaming::prepare(context.clone(), 2).unwrap();
             assert!(!owner.try_observe().unwrap().started);
             assert_eq!(owner.try_observe().unwrap().workers, 0);
+            assert_eq!(owner.profile(), None);
+            for blend in [-1, 8] {
+                let invalid = RemoteMeshProfile {
+                    biome_blend: blend,
+                    ..profile()
+                };
+                assert_eq!(owner.start(invalid), Err(RemoteRefusal::InvalidProfile));
+                assert_eq!(owner.profile(), None);
+                assert!(!owner.try_observe().unwrap().started);
+                assert_eq!(owner.try_observe().unwrap().workers, 0);
+            }
             assert!(!close(owner).try_observe().unwrap().started);
             let mut failure = control(Point::BeforeWork, 1);
             Arc::get_mut(&mut failure).unwrap().fail_spawn = Some(1);
             let mut owner = controlled(context.clone(), 2, failure);
-            assert_eq!(owner.start(), Err(RemoteRefusal::State));
+            let selected = RemoteMeshProfile {
+                sky_light: false,
+                obfuscated_biome_seed: 77,
+                ..profile()
+            };
+            assert_eq!(owner.start(selected), Err(RemoteRefusal::State));
+            assert_eq!(owner.profile(), Some(selected));
+            assert_eq!(owner.start(profile()), Err(RemoteRefusal::Closed));
+            assert_eq!(owner.profile(), Some(selected));
             let observation = close(owner).try_observe().unwrap();
             assert_eq!((observation.workers, observation.joined), (1, 1));
             assert!(!observation.failures.is_empty());
             let mut failure = control(Point::BeforeWork, 1);
             Arc::get_mut(&mut failure).unwrap().panic_init = Some(0);
             let mut owner = controlled(context, 1, failure);
-            owner.start().unwrap();
+            owner.start(profile()).unwrap();
             let observation = close(owner).try_observe().unwrap();
             assert_eq!(observation.joined, 1);
             assert!(!observation.failures.is_empty());
@@ -6217,7 +6468,7 @@ mod retained_remote {
             let (context, mut world) = fixture();
             let gate = control(Point::BeforeWork, 3);
             let mut owner = controlled(context, 1, gate.clone());
-            owner.start().unwrap();
+            owner.start(profile()).unwrap();
             let first = owner.mesh_input(&world, (0, 4, 0)).unwrap();
             let first_sequence = submit(&mut owner, first);
             reconcile(&mut owner);
@@ -6258,12 +6509,26 @@ mod retained_remote {
             let refused_column = owner.try_insert_column(&mut world, Chunk::empty(5, 5));
             assert!(matches!(refused_column, Err((RemoteRefusal::Full, _))));
             assert_eq!(world.chunks.membership_revision(), membership);
+            let newest_mesh = owner
+                .inner
+                .as_ref()
+                .unwrap()
+                .meshing
+                .get(&(0, 4, 0))
+                .copied();
+            let first = owner.try_take(&world).expect("explicit first handoff");
+            assert_eq!(first.sequence, first_sequence);
+            assert!(!first.current);
+            assert!(owner.mesh_pending((0, 4, 0)));
             assert_eq!(
                 owner
-                    .try_take(&world)
-                    .expect("explicit first handoff")
-                    .sequence,
-                first_sequence
+                    .inner
+                    .as_ref()
+                    .unwrap()
+                    .meshing
+                    .get(&(0, 4, 0))
+                    .copied(),
+                newest_mesh
             );
             assert_eq!(owner.try_observe().unwrap().owned, 63);
             expected_sequences.push(submit(&mut owner, refused.input));
@@ -6285,6 +6550,246 @@ mod retained_remote {
             assert_eq!(closed.try_observe().unwrap().owned, 0);
         }
         #[test]
+        #[ignore = "owned prepared resources: checked received light/replacement/forget and original allocation custody"]
+        fn remote_stream_received_world_operations() {
+            fn apply_received_light(
+                owner: &mut RetainedRemoteStreaming,
+                world: &mut World,
+                at: (i32, i32),
+                layers: &[horizon_protocol::chunk::SectionLight],
+            ) -> RemoteLightOutcome {
+                let deadline = until();
+                loop {
+                    match owner.try_apply_light(world, at, layers) {
+                        Ok(outcome) => return outcome,
+                        Err(RemoteRefusal::Busy) => {
+                            assert!(Instant::now() < deadline, "received light stayed Busy");
+                            thread::yield_now();
+                        }
+                        Err(reason) => panic!("received light refused: {reason:?}"),
+                    }
+                }
+            }
+            fn forget_received(
+                owner: &mut RetainedRemoteStreaming,
+                world: &mut World,
+                at: (i32, i32),
+            ) -> Option<Arc<Chunk>> {
+                let deadline = until();
+                loop {
+                    match owner.try_forget_column(world, at) {
+                        Ok(previous) => return previous,
+                        Err(RemoteRefusal::Busy) => {
+                            assert!(Instant::now() < deadline, "received forget stayed Busy");
+                            thread::yield_now();
+                        }
+                        Err(reason) => panic!("received forget refused: {reason:?}"),
+                    }
+                }
+            }
+            let (context, mut world) = fixture();
+            let at = (0, 0);
+            let section = (0, 4, 0);
+            {
+                let initial = Arc::make_mut(world.chunks.get_mut(&at).unwrap());
+                initial.lit = true;
+                initial.light_loaded = true;
+            }
+            let gate = control(Point::BeforeWork, 1);
+            let mut owner = controlled(context, 1, gate.clone());
+            let empty: Vec<horizon_protocol::chunk::SectionLight> = vec![(None, None); SECTIONS];
+            let initial = world.chunks.get(&at).unwrap().clone();
+            assert!(matches!(
+                owner.try_forget_column(&mut world, at),
+                Err(RemoteRefusal::NotRunning)
+            ));
+            assert!(matches!(
+                owner.try_apply_light(&mut world, at, &empty),
+                Err(RemoteRefusal::NotRunning)
+            ));
+            assert!(Arc::ptr_eq(&initial, world.chunks.get(&at).unwrap()));
+            assert!(!owner.received_ready(&world, at));
+            owner.start(profile()).unwrap();
+            assert!(
+                !owner.received_ready(&world, at),
+                "residency alone is not received tracking"
+            );
+            let mut retired = Vec::new();
+            for (lit, loaded) in [(false, true), (true, false), (true, true)] {
+                let before = world.chunks.get(&at).unwrap().clone();
+                let mut incoming = (*before).clone();
+                incoming.lit = lit;
+                incoming.light_loaded = loaded;
+                let previous = insert_received(&mut owner, &mut world, incoming)
+                    .expect("received replacement returns original allocation");
+                assert!(Arc::ptr_eq(&before, &previous));
+                assert_eq!(owner.received_ready(&world, at), lit && loaded);
+                retired.push(previous);
+            }
+            world.dirty_sections.clear();
+            let before = world.chunks.get(&at).unwrap().clone();
+            assert!(matches!(
+                apply_received_light(&mut owner, &mut world, (99, 99), &empty),
+                RemoteLightOutcome::Missing
+            ));
+            assert!(matches!(
+                apply_received_light(&mut owner, &mut world, at, &empty),
+                RemoteLightOutcome::Unchanged
+            ));
+            assert!(Arc::ptr_eq(&before, world.chunks.get(&at).unwrap()));
+            assert!(world.dirty_sections.is_empty());
+            let input = owner.mesh_input(&world, section).unwrap();
+            let mesh_sequence = submit(&mut owner, input);
+            entered(&gate); // Original worker holds its actual input payload.
+            assert!(owner.mesh_pending(section));
+            let shared = owner.inner.as_ref().unwrap().shared.clone();
+            let held = lock(&shared.queue);
+            assert!(matches!(
+                owner.try_forget_column(&mut world, at),
+                Err(RemoteRefusal::Busy)
+            ));
+            assert!(matches!(
+                owner.try_apply_light(&mut world, at, &empty),
+                Err(RemoteRefusal::Busy)
+            ));
+            let incoming = Chunk::empty(9, 9);
+            let incoming_section = incoming.sections[0].clone();
+            let incoming = match owner.try_insert_column(&mut world, incoming) {
+                Err((RemoteRefusal::Busy, original)) => original,
+                _ => panic!("busy received insertion did not return its original input"),
+            };
+            assert!(Arc::ptr_eq(&incoming_section, &incoming.sections[0]));
+            drop(held);
+            assert!(Arc::ptr_eq(&before, world.chunks.get(&at).unwrap()));
+            assert!(world.dirty_sections.is_empty() && owner.received_ready(&world, at));
+            assert_eq!(owner.try_observe().unwrap().owned, 1);
+            let too_many = vec![(None, None); SECTIONS + 1];
+            let mut bad_sky = empty.clone();
+            bad_sky[0].0 = Some(vec![0; 2047]);
+            let mut bad_block = empty.clone();
+            bad_block[0].1 = Some(vec![0; 2049]);
+            for invalid in [
+                &empty[..SECTIONS - 1],
+                too_many.as_slice(),
+                bad_sky.as_slice(),
+                bad_block.as_slice(),
+            ] {
+                assert!(matches!(
+                    owner.try_apply_light(&mut world, at, invalid),
+                    Err(RemoteRefusal::InvalidLight)
+                ));
+                assert!(Arc::ptr_eq(&before, world.chunks.get(&at).unwrap()));
+                assert!(world.dirty_sections.is_empty() && owner.mesh_pending(section));
+                assert_eq!(owner.try_observe().unwrap().owned, 1);
+            }
+            let mut layers = empty.clone();
+            layers[4] = (Some(vec![0xaa; 2048]), Some(vec![0x33; 2048]));
+            let (previous, sections) =
+                match apply_received_light(&mut owner, &mut world, at, &layers) {
+                    RemoteLightOutcome::Replaced { previous, sections } => (previous, sections),
+                    _ => panic!("real changed server light did not replace its original column"),
+                };
+            assert_eq!(sections, vec![4]);
+            assert!(Arc::ptr_eq(&before, &previous));
+            assert_eq!(previous.sections[4].light.get(0), 0xf0);
+            assert_eq!(
+                world.chunks.get(&at).unwrap().sections[4].light.get(0),
+                0xa3
+            );
+            assert_eq!(world.dirty_sections.len(), 27);
+            for z in -1..=1 {
+                for x in -1..=1 {
+                    for sy in 3..=5 {
+                        assert!(world.dirty_sections.contains(&(x, sy, z)));
+                    }
+                }
+            }
+            retired.push(previous);
+            assert!(owner.received_ready(&world, at) && owner.mesh_pending(section));
+            let installed = world.chunks.get(&at).unwrap().clone();
+            world.dirty_sections.clear();
+            assert!(matches!(
+                apply_received_light(&mut owner, &mut world, at, &layers),
+                RemoteLightOutcome::Unchanged
+            ));
+            assert!(Arc::ptr_eq(&installed, world.chunks.get(&at).unwrap()));
+            assert!(world.dirty_sections.is_empty());
+            let first_light = owner.light_input(&world, at).unwrap();
+            let first_light_sequence = submit(&mut owner, first_light);
+            let newer_light = owner.light_input(&world, at).unwrap();
+            let newer_light_sequence = submit(&mut owner, newer_light);
+            gate.released.store(true, Ordering::Release);
+            reconcile(&mut owner);
+            let late_mesh = take_handoff(&mut owner, &world);
+            assert_eq!(late_mesh.sequence, mesh_sequence);
+            assert!(
+                !late_mesh.current && matches!(late_mesh.output, Some(RemoteOutput::Mesh { .. }))
+            );
+            assert!(Arc::ptr_eq(
+                &before,
+                late_mesh.input.region[1][1].as_ref().unwrap()
+            ));
+            assert!(!owner.mesh_pending(section));
+            reconcile(&mut owner);
+            let old_light = take_handoff(&mut owner, &world);
+            assert_eq!(old_light.sequence, first_light_sequence);
+            assert!(!old_light.current);
+            assert_eq!(
+                owner.inner.as_ref().unwrap().lighting.get(&at),
+                Some(&newer_light_sequence)
+            );
+            reconcile(&mut owner);
+            let latest_light = take_handoff(&mut owner, &world);
+            assert_eq!(latest_light.sequence, newer_light_sequence);
+            assert!(latest_light.current);
+            assert!(!owner.inner.as_ref().unwrap().lighting.contains_key(&at));
+            let input = owner.mesh_input(&world, section).unwrap();
+            let forget_sequence = submit(&mut owner, input);
+            reconcile(&mut owner);
+            world.dirty_sections.insert(section);
+            world.dirty_light.insert(at);
+            let forgotten = forget_received(&mut owner, &mut world, at).unwrap();
+            assert!(Arc::ptr_eq(&installed, &forgotten));
+            assert!(!owner.received_ready(&world, at) && !owner.mesh_pending(section));
+            assert!(!world.dirty_sections.contains(&section) && !world.dirty_light.contains(&at));
+            assert_eq!(owner.try_observe().unwrap().owned, 1);
+            assert!(insert_received(&mut owner, &mut world, (*forgotten).clone()).is_none());
+            assert!(owner.received_ready(&world, at));
+            assert!(!Arc::ptr_eq(&forgotten, world.chunks.get(&at).unwrap()));
+            let late = take_handoff(&mut owner, &world);
+            assert_eq!(late.sequence, forget_sequence);
+            assert!(!late.current && late.output.is_some());
+            assert!(Arc::ptr_eq(
+                &forgotten,
+                late.input.region[1][1].as_ref().unwrap()
+            ));
+            retired.push(forgotten);
+            let current = world.chunks.get(&at).unwrap().clone();
+            world.dirty_sections.clear();
+            owner.begin_close(until());
+            let incoming = match owner.try_insert_column(&mut world, incoming) {
+                Err((RemoteRefusal::Closed, original)) => original,
+                _ => panic!("closed insertion did not preserve original refused input"),
+            };
+            assert!(Arc::ptr_eq(&incoming_section, &incoming.sections[0]));
+            assert!(matches!(
+                owner.try_apply_light(&mut world, at, &layers),
+                Err(RemoteRefusal::Closed)
+            ));
+            assert!(matches!(
+                owner.try_forget_column(&mut world, at),
+                Err(RemoteRefusal::Closed)
+            ));
+            assert!(Arc::ptr_eq(&current, world.chunks.get(&at).unwrap()));
+            assert!(world.dirty_sections.is_empty() && !owner.received_ready(&world, at));
+            assert_eq!(owner.profile(), Some(profile()));
+            let observation = close(owner).try_observe().unwrap();
+            assert_eq!((observation.owned, observation.joined), (0, 1));
+            assert!(observation.failures.is_empty());
+            drop(incoming);
+            drop(retired);
+        }
+        #[test]
         #[ignore = "owned prepared resources: actual late work and deterministic fence/wake"]
         fn remote_stream_close_late_and_claim_races() {
             let (context, world) = fixture();
@@ -6296,7 +6801,7 @@ mod retained_remote {
             ] {
                 let gate = control(point, 1);
                 let mut owner = controlled(context.clone(), 1, gate.clone());
-                owner.start().unwrap();
+                owner.start(profile()).unwrap();
                 let mut spare = owner.mesh_input(&world, (0, 4, 0)).unwrap();
                 let original = spare.region[1][1].as_ref().unwrap().clone();
                 if point != Point::BeforePark && point != Point::BeforeExit {
@@ -6358,7 +6863,7 @@ mod retained_remote {
                 let mut gate = control(point, 2);
                 Arc::get_mut(&mut gate).unwrap().panic = true;
                 let mut owner = controlled(context.clone(), 1, gate.clone());
-                owner.start().unwrap();
+                owner.start(profile()).unwrap();
                 let mut sequences = Vec::new();
                 for _ in 0..3 {
                     let input = owner.mesh_input(&world, (0, 4, 0)).unwrap();
@@ -6391,7 +6896,7 @@ mod retained_remote {
         fn remote_stream_intrinsic_profile_refusals() {
             let (context, mut world) = fixture();
             let mut owner = RetainedRemoteStreaming::prepare(context, 1).unwrap();
-            owner.start().unwrap();
+            owner.start(profile()).unwrap();
             let inner = owner.inner.as_mut().unwrap();
             inner.remote = false;
             inner.forced.insert((100, 100));
@@ -6429,7 +6934,7 @@ mod retained_remote {
             let (context, world) = fixture();
             let gate = control(Point::BeforeWork, 1);
             let mut owner = controlled(context, 1, gate.clone());
-            owner.start().unwrap();
+            owner.start(profile()).unwrap();
             let input = owner.mesh_input(&world, (0, 4, 0)).unwrap();
             submit(&mut owner, input);
             entered(&gate);
