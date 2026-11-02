@@ -775,6 +775,8 @@ impl Game<'_> {
                     Some(c) => &**c,
                     None => match self
                         .save
+                        .as_ref()
+                        .expect("current Game factory owns storage")
                         .load(x, z, self.pack.assets.registry, self.res.biomes())
                     {
                         Some(c) => {

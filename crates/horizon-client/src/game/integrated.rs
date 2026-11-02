@@ -474,7 +474,11 @@ impl Game<'_> {
         std::thread::sleep(Duration::from_millis(100));
         let save_result = self.save_game();
         self.lan_close(false);
-        let flush_result = self.save.flush();
+        let flush_result = self
+            .save
+            .as_ref()
+            .expect("current Game factory owns storage")
+            .flush();
         match (save_result, flush_result) {
             (Err(error), flush_result) => {
                 if let Err(flush_error) = flush_result {

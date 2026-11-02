@@ -86,9 +86,13 @@ fn seed_current(game: &mut Game<'_>) -> Vec<Tag> {
         .expect_existing_mut()
         .forced
         .insert((index as i32, -(index as i32)));
-    fs::create_dir_all(&game.save.root).unwrap();
+    fs::create_dir_all(&game.save.as_ref().unwrap().root).unwrap();
     fs::write(
-        game.save.root.join("unrelated-owner-sentinel.bin"),
+        game.save
+            .as_ref()
+            .unwrap()
+            .root
+            .join("unrelated-owner-sentinel.bin"),
         [index as u8, 0x83, 0x97],
     )
     .unwrap();
@@ -251,7 +255,7 @@ fn owners(game: &Game<'_>) -> Vec<LevelOwners> {
     let mut out = vec![level_owners(
         game.dim,
         &game.world,
-        &game.save,
+        game.save.as_ref().unwrap(),
         &game.dropped,
         &game.persist,
         game.streaming.expect_existing(),
@@ -364,7 +368,7 @@ fn assert_native_io(error: &(dyn std::error::Error + 'static), obstruction: &Pat
 fn readback(game: &Game<'_>, expected: &[(Dim, Vec<Tag>)]) {
     for (dim, entities) in expected {
         let save = if game.dim == *dim {
-            &game.save
+            game.save.as_ref().unwrap()
         } else {
             &game.levels.parked[dim].save
         };
@@ -553,9 +557,9 @@ fn parked_save_early_ticket_error_restores_owners_in_both_wait_modes_and_repairs
         assert_restored(&game, Dim::Overworld, &before, &players_before);
         // This method saves parked levels only; the original active dimension is untouched.
         readback(&game, &expected[1..]);
-        assert!(!tickets(&game.save.root).exists());
-        assert!(!game.save.root.join("region").exists());
-        assert!(!game.save.root.join("entities").exists());
+        assert!(!tickets(&game.save.as_ref().unwrap().root).exists());
+        assert!(!game.save.as_ref().unwrap().root.join("region").exists());
+        assert!(!game.save.as_ref().unwrap().root.join("entities").exists());
     }
 }
 
@@ -624,7 +628,10 @@ fn parked_save_sticky_entity_error_restores_same_native_writer_on_failure_and_re
         disk(&game.world_root),
         std::slice::from_ref(&parked_save.root),
     );
-    assert!(!game.save.root.join("region").exists() && !game.save.root.join("entities").exists());
+    assert!(
+        !game.save.as_ref().unwrap().root.join("region").exists()
+            && !game.save.as_ref().unwrap().root.join("entities").exists()
+    );
 }
 
 #[test]
@@ -657,7 +664,7 @@ fn parked_save_error_propagates_through_full_caller_before_metadata_publication(
         assert_write_footprint(
             &files_before,
             disk(&game.world_root),
-            &[game.save.root.clone()],
+            &[game.save.as_ref().unwrap().root.clone()],
         );
         let parked = &game.levels.parked[&Dim::Nether];
         assert!(

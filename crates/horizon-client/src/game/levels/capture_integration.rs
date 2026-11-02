@@ -1880,6 +1880,8 @@ impl Game<'_> {
         self.save_game_with(true)
             .map_err(|e| CaptureError::new(Phase::Save, Failure::NativeSave, None, e))?;
         self.save
+            .as_ref()
+            .ok_or_else(|| invalid(Phase::Save, "native storage owner absent"))?
             .flush()
             .map_err(|e| CaptureError::new(Phase::Save, Failure::NativeSave, None, e))?;
         for level in self.levels.parked.values() {

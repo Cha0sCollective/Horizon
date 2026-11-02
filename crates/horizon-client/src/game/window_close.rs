@@ -121,7 +121,9 @@ impl Construction {
         }
     }
     fn matches(&self, game: &Game<'_>) -> bool {
-        Arc::ptr_eq(&self.save, &game.save)
+        game.save
+            .as_ref()
+            .is_some_and(|save| Arc::ptr_eq(&self.save, save))
             && self.root == game.world_root
             && game.session_lock.as_ref().and_then(|s| s.expected_world()) == Some(&self.world)
     }

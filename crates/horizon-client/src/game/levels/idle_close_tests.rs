@@ -83,7 +83,11 @@ fn seed_current(game: &mut Game<'_>) -> Vec<Tag> {
         ]),
     );
     assert!(game.streaming.expect_existing().forced.is_empty());
-    write_dat(&tickets(&game.save.root), ticket_record(game.dim)).unwrap();
+    write_dat(
+        &tickets(&game.save.as_ref().unwrap().root),
+        ticket_record(game.dim),
+    )
+    .unwrap();
     let state = game
         .pack
         .assets
@@ -101,9 +105,13 @@ fn seed_current(game: &mut Game<'_>) -> Vec<Tag> {
             "dimension": game.dim.id(), "instance": record.instance(),
         })
     );
-    fs::create_dir_all(&game.save.root).unwrap();
+    fs::create_dir_all(&game.save.as_ref().unwrap().root).unwrap();
     fs::write(
-        game.save.root.join("unrelated-owner-sentinel.bin"),
+        game.save
+            .as_ref()
+            .unwrap()
+            .root
+            .join("unrelated-owner-sentinel.bin"),
         [index as u8, 0x83, 0x97],
     )
     .unwrap();
@@ -268,7 +276,7 @@ fn owners(game: &Game<'_>) -> Vec<LevelOwners> {
     let mut out = vec![level_owners(
         game.dim,
         &game.world,
-        &game.save,
+        game.save.as_ref().unwrap(),
         &game.dropped,
         &game.persist,
         game.streaming.expect_existing(),

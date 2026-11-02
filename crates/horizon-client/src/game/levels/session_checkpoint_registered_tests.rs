@@ -904,6 +904,8 @@ fn registered_actual_native_writer_refusal_and_retry_keep_original_item() {
     let mut gate = s
         .game
         .save
+        .as_ref()
+        .unwrap()
         .arm_native_writer_test_control(horizon_client::save::NativeWriterTestAction::Block)
         .unwrap();
     let error = s

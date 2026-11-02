@@ -347,6 +347,35 @@ fn cold_native_close_authority_binds_original_and_all_three_gates() {
             .unwrap()
             .authorizes(&first)
     );
+    // Retain the exact original allocation outside Game while checking absence.
+    // These are pure admission queries, not a running no-storage client recipe.
+    let original_save = first.save.take().expect("actual cold storage owner");
+    let save_identity = Arc::downgrade(&original_save);
+    let before_uuid = first.level.player_uuid;
+    assert!(!first.native_close_owner_authorized());
+    assert!(
+        !first
+            .native_close_authority
+            .as_ref()
+            .unwrap()
+            .authorizes(&first)
+    );
+    assert!(first.prepare_close_identity_fields().is_err());
+    assert!(first.prepare_retained_level_metadata().is_err());
+    assert_eq!(first.level.player_uuid, before_uuid);
+    first.save = Some(original_save);
+    assert!(Arc::ptr_eq(
+        &save_identity.upgrade().unwrap(),
+        first.save.as_ref().unwrap()
+    ));
+    assert!(first.native_close_owner_authorized());
+    assert!(
+        first
+            .native_close_authority
+            .as_ref()
+            .unwrap()
+            .authorizes(&first)
+    );
     assert!(
         !first
             .native_close_authority
@@ -373,6 +402,25 @@ fn cold_native_close_authority_binds_original_and_all_three_gates() {
     )
     .unwrap();
     assert!(legacy.native_close_authority.is_none() && legacy.options.execution_role.is_client());
+    // The ordinary server fallback also requires storage; Some keeps its old
+    // role behavior. Do not run native IO or accept mutation in the absent state.
+    let original_role = legacy.options.execution_role;
+    legacy.options.execution_role = execution_role::ExecutionRole::IntegratedServer;
+    assert!(legacy.native_close_owner_authorized());
+    let original_save = legacy.save.take().expect("actual legacy storage owner");
+    let save_identity = Arc::downgrade(&original_save);
+    let before_uuid = legacy.level.player_uuid;
+    assert!(!legacy.native_close_owner_authorized());
+    assert!(legacy.prepare_close_identity_fields().is_err());
+    assert!(legacy.prepare_retained_level_metadata().is_err());
+    assert_eq!(legacy.level.player_uuid, before_uuid);
+    legacy.save = Some(original_save);
+    assert!(Arc::ptr_eq(
+        &save_identity.upgrade().unwrap(),
+        legacy.save.as_ref().unwrap()
+    ));
+    assert!(legacy.native_close_owner_authorized());
+    legacy.options.execution_role = original_role;
     let original_uuid = legacy.level.player_uuid;
     assert!(legacy.prepare_close_identity_fields().is_err());
     assert_eq!(legacy.level.player_uuid, original_uuid);
@@ -398,6 +446,18 @@ fn cold_native_close_authority_binds_original_and_all_three_gates() {
         Ok(post) => post,
         Err(error) => panic!("actual native Level write: {error}"),
     };
+    let original_save = first
+        .save
+        .take()
+        .expect("original restored cold storage owner");
+    let before_uuid = first.level.player_uuid;
+    assert!(
+        first
+            .preflight_retained_level_metadata(&expected, &post)
+            .is_err()
+    );
+    assert_eq!(first.level.player_uuid, before_uuid);
+    first.save = Some(original_save);
     assert!(
         first
             .preflight_retained_level_metadata(&expected, &post)

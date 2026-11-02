@@ -522,10 +522,11 @@ fn update_native(game: &mut Game<'_>) {
         // Match Game's native unload path: retain actual returned columns and
         // attach their current native owners/metadata before releasing them.
         let snapshots = game.with_entities(&unloaded);
-        if let Err(error) =
-            game.save
-                .save_later(&snapshots, game.pack.assets.registry, game.res.biomes())
-        {
+        if let Err(error) = game.save.as_ref().unwrap().save_later(
+            &snapshots,
+            game.pack.assets.registry,
+            game.res.biomes(),
+        ) {
             panic!(
                 "native unloaded snapshot save: {error}; work={:#?}",
                 game.streaming.expect_existing().observe_native_work()
@@ -614,7 +615,7 @@ fn residency(game: &mut Game<'_>, radius: i32, center: (i32, i32)) {
         );
         submit_far_finish(game, (-80, -80), false);
         native_fence(game, until());
-        let path = game.save.root.join("region/r.-3.-3.mca");
+        let path = game.save.as_ref().unwrap().root.join("region/r.-3.-3.mca");
         let bytes = read(&path, FILE_LIMIT).unwrap_or_else(|error| {
             panic!(
                 "actual finished native region: {error}; work={:#?}",
@@ -897,7 +898,7 @@ fn cold_retained_game<'a>(fixture: &'a Fixture, label: &str) -> Game<'a> {
                 let save = prepared.save.clone();
                 let world = prepared.session_lock.expected_world().copied();
                 game.finish_open_world(prepared).unwrap();
-                assert!(Arc::ptr_eq(&save, &game.save));
+                assert!(Arc::ptr_eq(&save, game.save.as_ref().unwrap()));
                 assert_eq!(
                     game.session_lock
                         .as_ref()
@@ -993,7 +994,9 @@ pub(in crate::game) struct RetainedCloseFixtureToken {
 ))]
 impl RetainedCloseFixtureToken {
     pub(in crate::game) fn matches(&self, game: &Game<'_>) -> bool {
-        Arc::ptr_eq(&self.save, &game.save)
+        game.save
+            .as_ref()
+            .is_some_and(|save| Arc::ptr_eq(&self.save, save))
             && self.root == game.world_root
             && game.session_lock.as_ref().and_then(|s| s.expected_world()) == Some(&self.world)
             && game.lan.as_ref().is_some_and(|host| {
@@ -1123,7 +1126,7 @@ pub(in crate::game) fn retained_coherent_close_fixture<'a>(
     // Mint only at uninterrupted final handoff. No Game/Lan/Shared reference or
     // connector-capable handle escapes after this private construction point.
     let token = RetainedCloseFixtureToken {
-        save: game.save.clone(),
+        save: game.save.as_ref().unwrap().clone(),
         shared: game.lan.as_ref().unwrap().hub.lan.shared.clone(),
         world: *game
             .session_lock
@@ -2417,6 +2420,8 @@ fn session_actual_writer_block_timeout_release_retry_and_panic_retains_unpublish
     let mut gate = session
         .game
         .save
+        .as_ref()
+        .unwrap()
         .arm_native_writer_test_control(NativeWriterTestAction::Block)
         .unwrap();
     let stone = session
@@ -2429,7 +2434,13 @@ fn session_actual_writer_block_timeout_release_retry_and_panic_retains_unpublish
     session.game.world.set(3, 120, 2, stone).unwrap();
     session.game.save_game_with(false).unwrap();
     gate.wait_entered(WAIT).unwrap();
-    let before = session.game.save.observe_native_writer_for_test().unwrap();
+    let before = session
+        .game
+        .save
+        .as_ref()
+        .unwrap()
+        .observe_native_writer_for_test()
+        .unwrap();
     assert!(before.outstanding_batches() > 0 && before.pending_records() > 0);
     let error = session
         .game
@@ -2452,6 +2463,8 @@ fn session_actual_writer_block_timeout_release_retry_and_panic_retains_unpublish
     let mut gate = session
         .game
         .save
+        .as_ref()
+        .unwrap()
         .arm_native_writer_test_control(NativeWriterTestAction::Panic)
         .unwrap();
     session.game.world.set(4, 120, 2, stone).unwrap();
@@ -2460,7 +2473,13 @@ fn session_actual_writer_block_timeout_release_retry_and_panic_retains_unpublish
     gate.trigger().unwrap();
     let deadline = until();
     loop {
-        let observed = session.game.save.observe_native_writer_for_test().unwrap();
+        let observed = session
+            .game
+            .save
+            .as_ref()
+            .unwrap()
+            .observe_native_writer_for_test()
+            .unwrap();
         if observed.thread_finished() == Some(true) {
             assert!(observed.outstanding_batches() > 0 && observed.pending_records() > 0);
             assert!(observed.sticky_error().is_none());
@@ -2480,7 +2499,15 @@ fn session_actual_writer_block_timeout_release_retry_and_panic_retains_unpublish
     assert_eq!(error.publication, Publication::NotPublished);
     assert_eq!(tree(&published(&session, 1), &[]).unwrap(), previous);
     assert!(!published(&session, 2).exists());
-    assert!(!session.game.save.writes_finished().unwrap());
+    assert!(
+        !session
+            .game
+            .save
+            .as_ref()
+            .unwrap()
+            .writes_finished()
+            .unwrap()
+    );
     drop(gate);
     // No live Integrated owner may run its flush-on-shutdown path. Native fence
     // settled producers before the writer wait; direct Game/SaveDir Drop joins
@@ -2500,16 +2527,28 @@ fn session_actual_filesystem_writer_error_is_not_published_and_previous_image_su
         .checkpoint_session(&session.archive, 1, until())
         .unwrap();
     let previous = tree(&published(&session, 1), &[]).unwrap();
-    let healthy = session.game.save.observe_native_writer_for_test().unwrap();
+    let healthy = session
+        .game
+        .save
+        .as_ref()
+        .unwrap()
+        .observe_native_writer_for_test()
+        .unwrap();
     assert!(
         healthy.sticky_error().is_none(),
         "initially healthy writer: {healthy:?}"
     );
     assert!(
-        session.game.save.writes_finished().unwrap(),
+        session
+            .game
+            .save
+            .as_ref()
+            .unwrap()
+            .writes_finished()
+            .unwrap(),
         "initial native writer completion: {healthy:?}"
     );
-    let region = session.game.save.root.join("region");
+    let region = session.game.save.as_ref().unwrap().root.join("region");
     // Existing writer files are not corrupted: a fresh destination region for a
     // genuinely generated farther area is blocked by an actual directory.
     let blocked = region.join("r.2.2.mca");
@@ -2536,7 +2575,13 @@ fn session_actual_filesystem_writer_error_is_not_published_and_previous_image_su
                 || after.storage_errors > before.storage_errors),
         "actual far Finish storage outcome; work={work:#?}"
     );
-    let observed = session.game.save.observe_native_writer_for_test().unwrap();
+    let observed = session
+        .game
+        .save
+        .as_ref()
+        .unwrap()
+        .observe_native_writer_for_test()
+        .unwrap();
     retain_log(format_args!(
         "SESSION_FILESYSTEM_CALLBACK accepted_before={} accepted_after={} errors_before={} errors_after={} writer={observed:?}\n",
         before.accepted_storage_handoffs,
@@ -2582,6 +2627,8 @@ fn session_actual_late_finish_storage_handoff_is_closed_before_snapshot_and_retr
     let mut gate = session
         .game
         .save
+        .as_ref()
+        .unwrap()
         .arm_native_writer_test_control(NativeWriterTestAction::Block)
         .unwrap();
     submit_far_finish(&mut session.game, (-112, -112), true);
@@ -2610,6 +2657,8 @@ fn session_actual_late_finish_storage_handoff_is_closed_before_snapshot_and_retr
         session
             .game
             .save
+            .as_ref()
+            .unwrap()
             .observe_native_writer_for_test()
             .unwrap()
             .outstanding_batches()
@@ -2751,7 +2800,14 @@ fn session_actual_native_record_and_player_shape_controls() {
         chunk,
         session.game.pack.assets.registry,
         session.game.res.biomes(),
-        session.game.save.tables.get().map(Arc::as_ref),
+        session
+            .game
+            .save
+            .as_ref()
+            .unwrap()
+            .tables
+            .get()
+            .map(Arc::as_ref),
         LevelShape::OVERWORLD,
     );
     assert!(validate_column(&session.game, &named, at, session.game.world.game_time).is_ok());
@@ -2767,7 +2823,14 @@ fn session_actual_native_record_and_player_shape_controls() {
         &lit_snapshot,
         session.game.pack.assets.registry,
         session.game.res.biomes(),
-        session.game.save.tables.get().map(Arc::as_ref),
+        session
+            .game
+            .save
+            .as_ref()
+            .unwrap()
+            .tables
+            .get()
+            .map(Arc::as_ref),
         LevelShape::OVERWORLD,
     );
     assert_eq!(lit_named.tag.get("isLightOn"), Some(&Tag::Byte(1)));
@@ -2846,7 +2909,14 @@ fn session_actual_native_record_and_player_shape_controls() {
             &restored,
             session.game.pack.assets.registry,
             session.game.res.biomes(),
-            session.game.save.tables.get().map(Arc::as_ref),
+            session
+                .game
+                .save
+                .as_ref()
+                .unwrap()
+                .tables
+                .get()
+                .map(Arc::as_ref),
             LevelShape::OVERWORLD,
         );
         for (before, after) in list(saved.tag.get("sections"))
@@ -2873,7 +2943,14 @@ fn session_actual_native_record_and_player_shape_controls() {
                 chunk,
                 session.game.pack.assets.registry,
                 session.game.res.biomes(),
-                session.game.save.tables.get().map(Arc::as_ref),
+                session
+                    .game
+                    .save
+                    .as_ref()
+                    .unwrap()
+                    .tables
+                    .get()
+                    .map(Arc::as_ref),
                 LevelShape::OVERWORLD,
             );
             let found = list(column.tag.get("sections"))
@@ -3067,7 +3144,7 @@ fn session_actual_native_origin_retirement_and_level_swap_cannot_recreate_eligib
         .unwrap()
         .join("native-origin");
     open_native(&mut game, &root);
-    let save = game.save.clone();
+    let save = game.save.as_ref().unwrap().clone();
     let uuid = *game
         .session_lock
         .as_ref()
@@ -3077,7 +3154,7 @@ fn session_actual_native_origin_retirement_and_level_swap_cannot_recreate_eligib
     assert!(game.world.counter_trial_snapshot().is_none());
     game.retire_counter_trial("world-only-reset-without-counter");
     assert!(game.native_checkpoint_origin.is_none());
-    game.save = save;
+    game.save = Some(save);
     assert_eq!(
         game.session_lock.as_ref().unwrap().expected_world(),
         Some(&uuid)
@@ -3662,7 +3739,13 @@ fn session_actual_corrupt_source_off_resident_header_is_not_hidden_by_native_sav
     let fixture = Fixture::new("session-source-header");
     let _retain = RetainOnPanic::new(&fixture);
     let mut session = session(&fixture, "source-header", 2, true);
-    let path = session.game.save.root.join("region/r.0.0.mca");
+    let path = session
+        .game
+        .save
+        .as_ref()
+        .unwrap()
+        .root
+        .join("region/r.0.0.mca");
     let original = fs::read(&path).unwrap();
     let mut corrupt = original.clone();
     assert_eq!(&corrupt[1023 * 4..1023 * 4 + 4], &[0; 4]);
@@ -3707,7 +3790,16 @@ fn session_actual_region_backups_refuse_capture_and_resealed_complete_images() {
         .unwrap();
     let previous = published(&session, 1);
     let previous_tree = tree(&previous, &[]).unwrap();
-    let native_region = fs::read(session.game.save.root.join("region/r.0.0.mca")).unwrap();
+    let native_region = fs::read(
+        session
+            .game
+            .save
+            .as_ref()
+            .unwrap()
+            .root
+            .join("region/r.0.0.mca"),
+    )
+    .unwrap();
     for (index, bytes) in [
         b"arbitrary unsupported region backup".to_vec(),
         native_region,
@@ -3717,7 +3809,14 @@ fn session_actual_region_backups_refuse_capture_and_resealed_complete_images() {
     {
         let epoch = index as u64 + 2;
         let backup_name = format!("garbage-{index}.mca_old");
-        let working_backup = session.game.save.root.join("region").join(&backup_name);
+        let working_backup = session
+            .game
+            .save
+            .as_ref()
+            .unwrap()
+            .root
+            .join("region")
+            .join(&backup_name);
         fs::write(&working_backup, &bytes).unwrap();
         let error = session
             .game
@@ -5123,7 +5222,13 @@ fn session_items_actual_source_and_resealed_entity_schema_refuse_before_normaliz
     let _retain = RetainOnPanic::new(&fixture);
     let mut s = session_items_delivered(&fixture, "item-records", true, true);
     s.game.checkpoint_session(&s.archive, 2, until()).unwrap();
-    let native = s.game.save.root.join("entities/r.0.0.mca");
+    let native = s
+        .game
+        .save
+        .as_ref()
+        .unwrap()
+        .root
+        .join("entities/r.0.0.mca");
     let bytes = fs::read(&native).unwrap();
     let image = published(&s, 2);
     let inventory = tree(&image, &[]).unwrap();
@@ -5181,6 +5286,8 @@ fn session_items_actual_source_and_resealed_entity_schema_refuse_before_normaliz
     assert!(s.game.world.chunks.contains_key(&(1, 0)));
     s.game
         .save
+        .as_ref()
+        .unwrap()
         .save_entities(vec![((0, 0), vec![stale]), ((1, 0), vec![orphan])])
         .unwrap();
     s.game.checkpoint_session(&s.archive, 3, until()).unwrap();
@@ -5199,7 +5306,7 @@ fn session_items_actual_source_and_resealed_entity_schema_refuse_before_normaliz
         .projection,
         live
     );
-    assert!(s.game.save.load_entities(1, 0).is_empty());
+    assert!(s.game.save.as_ref().unwrap().load_entities(1, 0).is_empty());
     assert_eq!(tree(&image, &[]).unwrap(), inventory);
 }
 
@@ -5210,7 +5317,13 @@ fn session_items_actual_raw_regions_and_off_resident_records_are_never_skipped()
     let _retain = RetainOnPanic::new(&fixture);
     let mut s = session_items_delivered(&fixture, "item-physical", true, false);
     s.game.checkpoint_session(&s.archive, 2, until()).unwrap();
-    let native = s.game.save.root.join("entities/r.0.0.mca");
+    let native = s
+        .game
+        .save
+        .as_ref()
+        .unwrap()
+        .root
+        .join("entities/r.0.0.mca");
     let original = fs::read(&native).unwrap();
     let location = u32::from_be_bytes(original[..4].try_into().unwrap());
     let offset = (location >> 8) as usize * 4096;
@@ -5297,6 +5410,8 @@ fn session_items_actual_raw_regions_and_off_resident_records_are_never_skipped()
         }
         s.game
             .save
+            .as_ref()
+            .unwrap()
             .save_entities(vec![((200, 200), vec![tag])])
             .unwrap();
         session_items_assert_refusal_retains(&mut s, 3);
@@ -5307,7 +5422,12 @@ fn session_items_actual_raw_regions_and_off_resident_records_are_never_skipped()
             .join(format!("items-offresident-image-{malformed}"));
         copy_tree(&image, &copy, &inventory, until()).unwrap();
         fs::copy(
-            s.game.save.root.join("entities/r.6.6.mca"),
+            s.game
+                .save
+                .as_ref()
+                .unwrap()
+                .root
+                .join("entities/r.6.6.mca"),
             copy.join("world/dimensions/minecraft/overworld/entities/r.6.6.mca"),
         )
         .unwrap();
@@ -5325,6 +5445,8 @@ fn session_items_actual_raw_regions_and_off_resident_records_are_never_skipped()
         );
         s.game
             .save
+            .as_ref()
+            .unwrap()
             .save_entities(vec![((200, 200), Vec::new())])
             .unwrap();
     }
@@ -5380,6 +5502,8 @@ fn session_items_actual_writer_deadline_release_and_retry_retain_original_owner(
     let mut gate = s
         .game
         .save
+        .as_ref()
+        .unwrap()
         .arm_native_writer_test_control(NativeWriterTestAction::Block)
         .unwrap();
     let error = s
@@ -5428,7 +5552,13 @@ fn session_items_actual_entity_writer_filesystem_error_retains_drop_and_prior_im
         .collect();
     residency(&mut s.game, 0, far);
     s.game.dropped[0].position = Vec3::new(640.5, 120.5, 640.5);
-    let blocked = s.game.save.root.join("entities/r.1.1.mca");
+    let blocked = s
+        .game
+        .save
+        .as_ref()
+        .unwrap()
+        .root
+        .join("entities/r.1.1.mca");
     assert!(!blocked.exists());
     fs::create_dir_all(blocked.parent().unwrap()).unwrap();
     fs::create_dir(&blocked).unwrap();
@@ -5447,6 +5577,8 @@ fn session_items_actual_entity_writer_filesystem_error_retains_drop_and_prior_im
     assert!(
         s.game
             .save
+            .as_ref()
+            .unwrap()
             .observe_native_writer_for_test()
             .unwrap()
             .sticky_error()

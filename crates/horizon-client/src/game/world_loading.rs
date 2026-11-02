@@ -78,6 +78,9 @@ pub(super) struct NativeCloseAuthority {
 #[cfg(feature = "paired-packages")]
 impl NativeCloseAuthority {
     pub(super) fn authorizes(&self, game: &Game<'_>) -> bool {
+        let Some(game_save) = game.save.as_ref() else {
+            return false;
+        };
         game.options.execution_role.is_client()
             && game.options.test_terrain
             && !game.options.server_thread
@@ -101,7 +104,7 @@ impl NativeCloseAuthority {
             && self
                 .save
                 .upgrade()
-                .is_some_and(|save| Arc::ptr_eq(&save, &game.save))
+                .is_some_and(|save| Arc::ptr_eq(&save, game_save))
             && game
                 .native_checkpoint_origin
                 .as_ref()
@@ -110,7 +113,7 @@ impl NativeCloseAuthority {
                         .upgrade()
                         .is_some_and(|identity| Arc::ptr_eq(&identity, &origin.identity))
                         && origin
-                            .validate(&self.root, self.dimension, &game.save)
+                            .validate(&self.root, self.dimension, game_save)
                             .is_ok()
                 })
     }
@@ -1391,7 +1394,11 @@ impl RetainedParkedConstruction {
         Self {
             owner,
             dimension,
-            parent_save: game.save.clone(),
+            parent_save: game
+                .save
+                .as_ref()
+                .expect("current Game factory owns storage")
+                .clone(),
         }
     }
     pub(in crate::game) fn error(&self) -> Option<&str> {
@@ -1402,7 +1409,10 @@ impl RetainedParkedConstruction {
     }
     pub(in crate::game) fn matches_game(&self, game: &Game<'_>) -> bool {
         self.owner.request.save_root == game.world_root
-            && Arc::ptr_eq(&self.parent_save, &game.save)
+            && game
+                .save
+                .as_ref()
+                .is_some_and(|save| Arc::ptr_eq(&self.parent_save, save))
     }
     pub(in crate::game) fn begin_close(&mut self, deadline: std::time::Instant) {
         self.owner.close_deadline.get_or_insert(deadline);

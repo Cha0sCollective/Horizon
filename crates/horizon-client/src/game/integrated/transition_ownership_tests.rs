@@ -131,7 +131,10 @@ impl Fixture {
         game.dim = Dim::Overworld;
         game.level.dimension = Dim::Overworld.id().into();
         game.level.seed = 17;
-        game.save = Arc::new(SaveDir::new(dimension_dir(&game.world_root, game.dim.id())));
+        game.save = Some(Arc::new(SaveDir::new(dimension_dir(
+            &game.world_root,
+            game.dim.id(),
+        ))));
         game.world = World::new(game.res.facts().air, 17);
         game.world
             .chunks
@@ -276,8 +279,8 @@ fn transition_ownership_entity_io_failure_retains_native_player_and_retry_snapsh
     let uuids = game.persist.uuids.clone();
     let raw = game.persist.raw.clone();
     let progress = game.adv.progress.criteria.clone();
-    fs::create_dir_all(&game.save.root).unwrap();
-    let obstruction = game.save.root.join("entities");
+    fs::create_dir_all(&game.save.as_ref().unwrap().root).unwrap();
+    let obstruction = game.save.as_ref().unwrap().root.join("entities");
     fs::write(&obstruction, b"owned entity-folder obstruction").unwrap();
 
     let error = game.enter_dimension(Dim::Nether).unwrap_err().to_string();
@@ -292,14 +295,17 @@ fn transition_ownership_entity_io_failure_retains_native_player_and_retry_snapsh
     assert_eq!(game.persist.raw, raw);
     assert_same_records(&snapshot(&mut game, (0, 0)), &expected);
     // Disk failure already accepted a pending snapshot. It is not an empty delete.
-    assert_same_records(&game.save.load_entities(0, 0), &expected);
+    assert_same_records(&game.save.as_ref().unwrap().load_entities(0, 0), &expected);
 
     fs::remove_file(obstruction).unwrap();
     // A complete switch retry can stop at its earlier sticky writer barrier.
     // Retry the actual entity producer, without clearing or bypassing that error.
     assert!(game.save_dimension_entities().is_err());
-    assert!(game.save.flush().is_err(), "writer failure remains sticky");
-    let disk = SaveDir::new(game.save.root.clone());
+    assert!(
+        game.save.as_ref().unwrap().flush().is_err(),
+        "writer failure remains sticky"
+    );
+    let disk = SaveDir::new(game.save.as_ref().unwrap().root.clone());
     assert_same_records(&disk.load_entities(0, 0), &expected);
     assert_same_records(&snapshot(&mut game, (0, 0)), &expected);
     assert_eq!(game.persist.uuids, uuids);
@@ -336,7 +342,7 @@ fn transition_ownership_target_failure_retains_then_success_commits() {
     assert_eq!(game.persist.uuids, uuids);
     assert_eq!(game.persist.raw, raw);
     assert_same_records(&snapshot(&mut game, (0, 0)), &expected);
-    let disk = SaveDir::new(game.save.root.clone());
+    let disk = SaveDir::new(game.save.as_ref().unwrap().root.clone());
     assert_same_records(&disk.load_entities(0, 0), &expected);
     assert_eq!(
         game.world.modified,
@@ -378,9 +384,9 @@ fn transition_ownership_chunk_failure_keeps_all_dirty_markers_and_player() {
     let expected = snapshot(&mut game, (0, 0));
     game.world.modified.insert((99, 99));
     let modified = game.world.modified.clone();
-    fs::create_dir_all(&game.save.root).unwrap();
+    fs::create_dir_all(&game.save.as_ref().unwrap().root).unwrap();
     fs::write(
-        game.save.root.join("region"),
+        game.save.as_ref().unwrap().root.join("region"),
         b"owned region-folder obstruction",
     )
     .unwrap();
@@ -448,7 +454,10 @@ fn transition_ownership_cleanup_preserves_outside_keys_and_vehicle_rider_rules()
         "synchronous capture returns exactly resident source coordinates"
     );
     assert_same_records(&snapshot(&mut game, (0, 0)), &selected_expected);
-    assert_same_records(&game.save.load_entities(0, 0), &selected_expected);
+    assert_same_records(
+        &game.save.as_ref().unwrap().load_entities(0, 0),
+        &selected_expected,
+    );
     assert!(
         game.boats.iter().any(|b| b.id == 101),
         "even successful saving is borrowed until target preparation commits"

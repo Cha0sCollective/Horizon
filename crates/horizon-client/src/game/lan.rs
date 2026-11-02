@@ -2740,6 +2740,8 @@ impl Game<'_> {
         );
         encoder.tables = Some(
             self.save
+                .as_ref()
+                .expect("current Game factory owns storage")
                 .tables
                 .get_or_init(|| Arc::new(horizon_client::save::SaveTables::new(&self.pack.assets)))
                 .clone(),

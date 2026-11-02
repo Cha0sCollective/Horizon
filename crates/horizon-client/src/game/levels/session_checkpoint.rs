@@ -2561,7 +2561,9 @@ impl CoherentImageContext {
             "coherent image native resource owners changed",
         )?;
         require(
-            Arc::ptr_eq(&self.save, &game.save),
+            game.save
+                .as_ref()
+                .is_some_and(|save| Arc::ptr_eq(&self.save, save)),
             "coherent image native writer allocation changed",
         )?;
         require(
@@ -3292,7 +3294,11 @@ impl Game<'_> {
         }
         Ok(Arc::new(CoherentImageContext {
             validation,
-            save: self.save.clone(),
+            save: self
+                .save
+                .as_ref()
+                .ok_or_else(|| fail("native storage owner absent"))?
+                .clone(),
             source_root: self.world_root.clone(),
             archive_root: archive_root.to_owned(),
             world,
@@ -3505,7 +3511,13 @@ impl Game<'_> {
             self.native_checkpoint_origin
                 .as_ref()
                 .ok_or_else(|| fail("constructor-issued native origin absent"))?
-                .validate(&self.world_root, self.dim, &self.save),
+                .validate(
+                    &self.world_root,
+                    self.dim,
+                    self.save
+                        .as_ref()
+                        .ok_or_else(|| fail("native storage owner absent"))?,
+                ),
         )?;
         if self.world.has_persistent_guest_counter() {
             let view = checked(self.world.guest_storage_view())?;
@@ -3554,7 +3566,11 @@ impl Game<'_> {
         Ok(world)
     }
     fn session_fence(&mut self, until: Instant) -> SResult<()> {
-        let save = self.save.clone();
+        let save = self
+            .save
+            .as_ref()
+            .ok_or_else(|| fail("native storage owner absent"))?
+            .clone();
         checked(
             self.streaming
                 .expect_existing_mut()
@@ -3615,7 +3631,12 @@ impl Game<'_> {
                 &saved,
                 self.pack.assets.registry,
                 self.res.biomes(),
-                self.save.tables.get().map(Arc::as_ref),
+                self.save
+                    .as_ref()
+                    .ok_or_else(|| fail("native storage owner absent"))?
+                    .tables
+                    .get()
+                    .map(Arc::as_ref),
                 LevelShape::OVERWORLD,
             );
             columns.insert((chunk.x, chunk.z), named);
@@ -3820,11 +3841,12 @@ impl Game<'_> {
             // the current saved clock cannot be lost.
             deadline(until)?;
             let residents = self.with_entities(self.world.chunks.values());
-            checked(self.save.save_later(
-                &residents,
-                self.pack.assets.registry,
-                self.res.biomes(),
-            ))?;
+            checked(
+                self.save
+                    .as_ref()
+                    .ok_or_else(|| fail("native storage owner absent"))?
+                    .save_later(&residents, self.pack.assets.registry, self.res.biomes()),
+            )?;
             self.session_fence(until)?;
             let after = self.session_snapshot()?;
             require(
@@ -3955,7 +3977,12 @@ impl Game<'_> {
                     actual,
                     self.pack.assets.registry,
                     self.res.biomes(),
-                    self.save.tables.get().map(Arc::as_ref),
+                    self.save
+                        .as_ref()
+                        .ok_or_else(|| fail("native storage owner absent"))?
+                        .tables
+                        .get()
+                        .map(Arc::as_ref),
                     LevelShape::OVERWORLD,
                 );
                 require(

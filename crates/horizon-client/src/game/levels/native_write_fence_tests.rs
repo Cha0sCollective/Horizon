@@ -266,7 +266,7 @@ impl Game<'_> {
             .iter()
             .map(|(_, counts)| counts.submitted)
             .collect();
-        let save = self.save.clone();
+        let save = self.save.as_ref().unwrap().clone();
         let mut writer_polls = 0;
         self.streaming
             .expect_existing_mut()

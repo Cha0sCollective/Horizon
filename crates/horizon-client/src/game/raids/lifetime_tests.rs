@@ -29,7 +29,7 @@ fn particle_samples(game: &mut Game<'_>) -> [i64; 4] {
 }
 fn source(game: &mut Game<'_>, dim: Dim) -> i32 {
     if game.dim != dim {
-        let old_save = game.save.clone();
+        let old_save = game.save.as_ref().unwrap().clone();
         game.switch_level(dim, Vec3::new(8.0, 72.0, 8.0)).unwrap();
         old_save.flush().unwrap();
     }
@@ -168,7 +168,7 @@ fn mismatch(game: &mut Game<'_>, from: Dim, to: Dim) -> Boundary {
     let target_bytes = fs::read(&target_path).unwrap();
     let obstruction = source_path.with_file_name("raids.dat_new");
     fs::create_dir(&obstruction).unwrap();
-    let old_save = game.save.clone();
+    let old_save = game.save.as_ref().unwrap().clone();
     game.switch_level(to, Vec3::new(8.0, 72.0, 8.0)).unwrap();
     old_save.flush().unwrap(); // The real departing chunk/entity saves must succeed.
     assert_eq!(game.dim, to);
@@ -542,7 +542,7 @@ fn raid_obstructed_return_to_source_keeps_same_dimension_access() {
         let mut game = fixture.game();
         let boundary = mismatch(&mut game, from, to);
         failed_load(&mut game, &boundary);
-        let old_save = game.save.clone();
+        let old_save = game.save.as_ref().unwrap().clone();
         game.switch_level(from, Vec3::new(8.0, 72.0, 8.0)).unwrap();
         old_save.flush().unwrap();
         assert_eq!(game.dim, from);
@@ -653,7 +653,7 @@ fn raid_initial_and_clean_lazy_replacement_preserve_defaults_and_seed_draw() {
         game.raiding
             .homes
             .insert(2, (13, Arc::new(vec![[1, 2, 3]])));
-        let old_save = game.save.clone();
+        let old_save = game.save.as_ref().unwrap().clone();
         game.switch_level(Dim::Nether, Vec3::new(8.0, 72.0, 8.0))
             .unwrap();
         old_save.flush().unwrap();

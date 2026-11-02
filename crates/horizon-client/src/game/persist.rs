@@ -1447,9 +1447,15 @@ impl Game<'_> {
         let chunks = self.entity_chunks(&keys, false);
         self.prune_entity_memory();
         if wait {
-            self.save.save_entities(chunks)
+            self.save
+                .as_ref()
+                .expect("current Game factory owns storage")
+                .save_entities(chunks)
         } else {
-            self.save.save_entities_later(chunks)
+            self.save
+                .as_ref()
+                .expect("current Game factory owns storage")
+                .save_entities_later(chunks)
         }
     }
     pub(super) fn prune_entity_memory(&mut self) {
@@ -1478,7 +1484,12 @@ impl Game<'_> {
         self.spawn_loaded_entities();
         let keys: HashSet<(i32, i32)> = unloaded.iter().map(|c| (c.x, c.z)).collect();
         let chunks = self.entity_chunks(&keys, true);
-        if let Err(e) = self.save.save_entities_later(chunks) {
+        if let Err(e) = self
+            .save
+            .as_ref()
+            .expect("current Game factory owns storage")
+            .save_entities_later(chunks)
+        {
             log::warn!("Horizon: failed to save entities: {e}");
         }
     }
@@ -1487,7 +1498,10 @@ impl Game<'_> {
         self.spawn_loaded_entities();
         let keys: HashSet<(i32, i32)> = self.world.chunks.keys().copied().collect();
         let chunks = self.entity_chunks(&keys, false);
-        self.save.save_entities(chunks)?;
+        self.save
+            .as_ref()
+            .expect("current Game factory owns storage")
+            .save_entities(chunks)?;
         Ok(keys)
     }
 }

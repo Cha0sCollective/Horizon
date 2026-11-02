@@ -1638,6 +1638,9 @@ impl Game<'_> {
     /// close gates. Its presence fixes that world's admitted mode; changing the
     /// role cannot fall back to the ordinary server rule.
     fn native_close_owner_authorized(&self) -> bool {
+        if self.save.is_none() {
+            return false;
+        }
         match &self.native_close_authority {
             Some(authority) => authority.authorizes(self),
             None => !self.options.execution_role.is_client(),
@@ -1773,7 +1776,11 @@ impl Game<'_> {
         Ok((
             NativeLevelExpected {
                 association: association.clone(),
-                save: self.save.clone(),
+                save: self
+                    .save
+                    .as_ref()
+                    .ok_or("native storage owner absent")?
+                    .clone(),
                 resources: self.res.clone(),
                 root: self.world_root.clone(),
                 original: self.level.clone(),
@@ -1808,7 +1815,10 @@ impl Game<'_> {
         post: &NativeLevelPost,
     ) -> std::result::Result<(), String> {
         if !Arc::ptr_eq(&expected.association, &post.association)
-            || !Arc::ptr_eq(&expected.save, &self.save)
+            || self
+                .save
+                .as_ref()
+                .is_none_or(|save| !Arc::ptr_eq(&expected.save, save))
             || !Arc::ptr_eq(&expected.resources, &self.res)
             || self.world_root != expected.root
             || self.remote.is_some()
@@ -2020,7 +2030,7 @@ struct Game<'a> {
     /// What ends the game with an error; kept as it is, so main can tell a debug crash.
     error: Option<Box<dyn std::error::Error>>,
     message: Option<(String, Instant)>,
-    save: Arc<SaveDir>,
+    save: Option<Arc<SaveDir>>,
     level: Level,
     session_lock: Option<world_loading::host_identity::WorldSession>,
     #[cfg(feature = "paired-packages")]
@@ -9509,7 +9519,7 @@ impl Game<'_> {
         self.retire_counter_trial("world-open");
         self.world = world;
         self.inventory = inventory;
-        self.save = save;
+        self.save = Some(save);
         self.level = level;
         // ServerRecipeBook.loadUntrusted: recipes the manager does not have are dropped.
         let index = &self.res.stations().recipe_index;
@@ -9617,6 +9627,8 @@ impl Game<'_> {
     pub(super) fn switch_level(&mut self, target: Dim, from: Vec3) -> Result<Vec3> {
         // Save the departing dimension's changed chunks.
         self.save
+            .as_ref()
+            .expect("current Game factory owns storage")
             .save_forced_chunks(&self.streaming.expect_existing().forced)?;
         self.streaming
             .expect_existing_mut()
@@ -9624,6 +9636,8 @@ impl Game<'_> {
         let keys: Vec<_> = self.world.modified.iter().copied().collect();
         let chunks = self.with_entities(keys.iter().filter_map(|k| self.world.chunks.get(k)));
         self.save
+            .as_ref()
+            .expect("current Game factory owns storage")
             .save(&chunks, self.pack.assets.registry, self.res.biomes())?;
         for chunk in &chunks {
             self.world.modified.remove(&(chunk.x, chunk.z));
@@ -9661,7 +9675,7 @@ impl Game<'_> {
         self.remove_saved_entities(&departing_entities);
         self.persist = Default::default();
         self.world = world;
-        self.save = save;
+        self.save = Some(save);
         self.dim = target;
         self.level.dimension = target.id().to_owned();
         self.block_ticks = Ticks::new(self.level.seed as i32);
@@ -11964,6 +11978,8 @@ impl Game<'_> {
     /// Save the level in place: its changed chunks, its entities and its raids.
     fn save_level(&mut self, wait: bool) -> Result<()> {
         self.save
+            .as_ref()
+            .expect("current Game factory owns storage")
             .save_forced_chunks(&self.streaming.expect_existing().forced)?;
         self.streaming
             .expect_existing_mut()
@@ -11974,16 +11990,26 @@ impl Game<'_> {
                 .iter()
                 .filter_map(|k| self.world.chunks.get(k)),
         );
-        self.save.save_modified_later(
-            &mut self.world.modified,
-            &chunks,
-            self.pack.assets.registry,
-            self.res.biomes(),
-        )?;
+        self.save
+            .as_ref()
+            .expect("current Game factory owns storage")
+            .save_modified_later(
+                &mut self.world.modified,
+                &chunks,
+                self.pack.assets.registry,
+                self.res.biomes(),
+            )?;
         // Prepare entities while the chunk writer runs, then use one barrier.
         self.save_entities(false)?;
         let raid_result = self.save_raids();
-        let flush_result = if wait { self.save.flush() } else { Ok(()) };
+        let flush_result = if wait {
+            self.save
+                .as_ref()
+                .expect("current Game factory owns storage")
+                .flush()
+        } else {
+            Ok(())
+        };
         // The earlier metadata error wins, but already queued writes still drain.
         raid_result.and(flush_result)
     }
@@ -12948,6 +12974,8 @@ impl Game<'_> {
         if !modified.is_empty()
             && let Err(e) = horizon_client::spans::time("save_chunks", || {
                 self.save
+                    .as_ref()
+                    .expect("current Game factory owns storage")
                     .save_later(&modified, self.pack.assets.registry, self.res.biomes())
             })
         {
@@ -14329,7 +14357,7 @@ impl<'a> Game<'a> {
             ticks: 0,
             error: None,
             message: None,
-            save,
+            save: Some(save),
             level,
             session_lock: None,
             #[cfg(feature = "paired-packages")]

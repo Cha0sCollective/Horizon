@@ -457,7 +457,7 @@ pub(super) fn setup(
     )
     .unwrap();
     game.streaming = crate::game::streaming_owner::GameStreaming::from_existing(streaming);
-    game.save = save;
+    game.save = Some(save);
     game.end.set_locator(locator);
     for guest in &mut game.lan.as_mut().unwrap().hub.guests {
         guest.armor.fill(None);
@@ -1085,7 +1085,7 @@ fn capture_cell_native_save_and_staging_io_faults_keep_previous_epoch() {
         let fixture = Fixture::new("capture-native-fault");
         let (mut game, _body, _receivers, current) = setup(&fixture, false);
         assert_eq!(current, identity);
-        let source_root = game.save.root.clone();
+        let source_root = game.save.as_ref().unwrap().root.clone();
         fs::create_dir_all(&source_root).unwrap();
         if ticket {
             let file = source_root.join("data/minecraft/chunk_tickets.dat");
@@ -1111,7 +1111,7 @@ fn capture_cell_native_save_and_staging_io_faults_keep_previous_epoch() {
             )
             .unwrap();
         }
-        let save = game.save.clone();
+        let save = game.save.as_ref().unwrap().clone();
         let counter = game.world.counter_trial_snapshot();
         let players_before = player_state(&game);
         let before = disk(&game.world_root);
@@ -1129,7 +1129,7 @@ fn capture_cell_native_save_and_staging_io_faults_keep_previous_epoch() {
         assert_eq!(error.code, Failure::NativeSave);
         assert_eq!(error.publication, Publication::NotPublished);
         assert_eq!(game.dim, Dim::Overworld);
-        assert!(Arc::ptr_eq(&save, &game.save));
+        assert!(Arc::ptr_eq(&save, game.save.as_ref().unwrap()));
         assert_eq!(game.world.counter_trial_snapshot(), counter);
         assert_eq!(player_state(&game), players_before);
         if ticket {

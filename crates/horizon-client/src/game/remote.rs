@@ -398,9 +398,9 @@ impl Game<'_> {
         #[cfg(feature = "paired-packages")]
         self.retire_counter_trial("remote-connect");
         self.world = World::new(self.res.facts().air, 0);
-        self.save = Arc::new(SaveDir::new(
+        self.save = Some(Arc::new(SaveDir::new(
             std::env::temp_dir().join("horizon-remote-unused"),
-        ));
+        )));
         self.inventory = vec![None; 36];
         self.armor = [None, None, None, None];
         self.craft_grid = vec![None; 9];

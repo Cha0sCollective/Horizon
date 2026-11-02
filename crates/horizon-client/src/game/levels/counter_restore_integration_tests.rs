@@ -407,7 +407,7 @@ pub(super) fn loaded<'a>(
     )
     .unwrap();
     game.streaming = crate::game::streaming_owner::GameStreaming::from_existing(streaming);
-    game.save = save;
+    game.save = Some(save);
     game.end.set_locator(locator);
     let mut world = World::new(game.res.facts().air, game.level.seed);
     world.game_time = game.level.time;
@@ -417,6 +417,8 @@ pub(super) fn loaded<'a>(
         for x in -1..=1 {
             let chunk = game
                 .save
+                .as_ref()
+                .unwrap()
                 .load(x, z, game.pack.assets.registry, game.res.biomes())
                 .expect("all nine native stored columns");
             assert!(chunk.lit);

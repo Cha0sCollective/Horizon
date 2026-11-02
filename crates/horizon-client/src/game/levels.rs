@@ -551,7 +551,11 @@ impl Game<'_> {
     }
     fn native_level(&self, dimension: Dim) -> Option<(&World, &Streaming, &Arc<SaveDir>)> {
         if dimension == self.dim {
-            Some((&self.world, self.streaming.as_existing().ok()?, &self.save))
+            Some((
+                &self.world,
+                self.streaming.as_existing().ok()?,
+                self.save.as_ref()?,
+            ))
         } else {
             self.levels
                 .parked
@@ -561,6 +565,7 @@ impl Game<'_> {
     }
     fn native_level_mut(&mut self, dimension: Dim) -> Option<(&mut World, &mut Streaming)> {
         if dimension == self.dim {
+            self.save.as_ref()?;
             Some((&mut self.world, self.streaming.as_existing_mut().ok()?))
         } else {
             self.levels
@@ -1189,6 +1194,9 @@ impl Game<'_> {
         // Check the audited current Game factory invariant before changing any
         // provenance or moving any other level owner. This is not remote dispatch.
         self.streaming.expect_existing();
+        self.save
+            .as_ref()
+            .expect("current Game factory owns storage");
         #[cfg(feature = "paired-packages")]
         {
             // Swapping away and back must never revive initial-open provenance.
@@ -1203,7 +1211,12 @@ impl Game<'_> {
         swap(&mut locator, &mut p.locator);
         self.end.set_locator(locator);
         self.share_spawn_conditions();
-        swap(&mut self.save, &mut p.save);
+        swap(
+            self.save
+                .as_mut()
+                .expect("active save was checked before the level swap"),
+            &mut p.save,
+        );
         swap(&mut self.block_ticks, &mut p.block_ticks);
         swap(&mut self.tick_chunks, &mut p.tick_chunks);
         swap(&mut self.tickets, &mut p.tickets);

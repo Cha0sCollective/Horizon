@@ -78,7 +78,7 @@ fn seed_entity(game: &mut Game<'_>) -> Vec<Tag> {
 
 fn assert_disk_world(game: &Game<'_>, expected_entities: &[Tag]) {
     // A new reader cannot satisfy this from Game.save's retained pending values.
-    let disk = SaveDir::new(game.save.root.clone());
+    let disk = SaveDir::new(game.save.as_ref().unwrap().root.clone());
     let chunk = disk
         .load(0, 0, game.pack.assets.registry, game.res.biomes())
         .expect("queued chunk reached disk");
@@ -176,7 +176,7 @@ fn raid_metadata_synchronous_error_still_finishes_queued_chunk_and_entities() {
     assert_eq!(expected_tag(&game), expected);
     assert!(game.raiding.raids.dirty);
     assert_disk_world(&game, &entities);
-    assert!(game.save.writes_finished().unwrap());
+    assert!(game.save.as_ref().unwrap().writes_finished().unwrap());
     assert_eq!(game.dropped.len(), 1);
 
     fs::remove_dir(obstruction).unwrap();
@@ -194,9 +194,9 @@ fn raid_metadata_error_precedes_simultaneous_sticky_entity_writer_failure() {
     let expected = seed_raids(&mut game);
     let entities = seed_entity(&mut game);
     let _raid_obstruction = obstruct_raids(&game);
-    fs::create_dir_all(&game.save.root).unwrap();
+    fs::create_dir_all(&game.save.as_ref().unwrap().root).unwrap();
     fs::write(
-        game.save.root.join("entities"),
+        game.save.as_ref().unwrap().root.join("entities"),
         b"owned entity-folder obstruction",
     )
     .unwrap();
@@ -204,12 +204,12 @@ fn raid_metadata_error_precedes_simultaneous_sticky_entity_writer_failure() {
     assert_raid_error(&game, &error);
     assert!(game.raiding.raids.dirty);
     assert_eq!(expected_tag(&game), expected);
-    let writer_error = game.save.flush().unwrap_err().to_string();
+    let writer_error = game.save.as_ref().unwrap().flush().unwrap_err().to_string();
     assert!(writer_error.contains("entities"), "{writer_error}");
-    assert!(game.save.writes_finished().is_err());
+    assert!(game.save.as_ref().unwrap().writes_finished().is_err());
     // Pending remains readable, but the independent reader proves it is not disk data.
-    assert_eq!(game.save.load_entities(0, 0), entities);
-    let disk = SaveDir::new(game.save.root.clone());
+    assert_eq!(game.save.as_ref().unwrap().load_entities(0, 0), entities);
+    let disk = SaveDir::new(game.save.as_ref().unwrap().root.clone());
     assert!(disk.load_entities(0, 0).is_empty());
     assert!(
         disk.load(0, 0, game.pack.assets.registry, game.res.biomes())

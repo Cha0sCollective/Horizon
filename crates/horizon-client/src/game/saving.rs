@@ -152,11 +152,10 @@ impl Game<'_> {
                     for _ in 0..SNAPSHOTS_PER_FRAME {
                         let Some(&key) = keys.front() else { break };
                         let chunks = self.with_entities(self.world.chunks.get(&key));
-                        self.save.save_later(
-                            &chunks,
-                            self.pack.assets.registry,
-                            self.res.biomes(),
-                        )?;
+                        self.save
+                            .as_ref()
+                            .expect("current Game factory owns storage")
+                            .save_later(&chunks, self.pack.assets.registry, self.res.biomes())?;
                         self.world.modified.remove(&key);
                         keys.pop_front();
                         if started.elapsed() >= SNAPSHOT_BUDGET {
@@ -174,7 +173,10 @@ impl Game<'_> {
                     for _ in 0..SNAPSHOTS_PER_FRAME {
                         let Some(&key) = keys.front() else { break };
                         let chunks = self.entity_chunks(&HashSet::from([key]), false);
-                        self.save.save_entities_later(chunks)?;
+                        self.save
+                            .as_ref()
+                            .expect("current Game factory owns storage")
+                            .save_entities_later(chunks)?;
                         keys.pop_front();
                         if started.elapsed() >= SNAPSHOT_BUDGET {
                             break;
@@ -184,13 +186,19 @@ impl Game<'_> {
                         self.prune_entity_memory();
                         self.save_raids()?;
                         self.save
+                            .as_ref()
+                            .expect("current Game factory owns storage")
                             .save_forced_chunks(&self.streaming.expect_existing().forced)?;
                         self.save_game_metadata()?;
                         save.stage = Stage::Writes;
                     }
                     Ok(false)
                 }
-                Stage::Writes => self.save.writes_finished(),
+                Stage::Writes => self
+                    .save
+                    .as_ref()
+                    .expect("current Game factory owns storage")
+                    .writes_finished(),
             }
         })();
         match result {

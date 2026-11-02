@@ -1301,7 +1301,7 @@ fn loaded_four<'a>(fixture: &'a Fixture, root: &Path) -> (Game<'a>, Vec<mpsc::Re
     )
     .unwrap();
     game.streaming = crate::game::streaming_owner::GameStreaming::from_existing(streaming);
-    game.save = save;
+    game.save = Some(save);
     game.end.set_locator(locator);
     let mut world = World::new(game.res.facts().air, game.level.seed);
     world.game_time = game.level.time;
@@ -1311,6 +1311,8 @@ fn loaded_four<'a>(fixture: &'a Fixture, root: &Path) -> (Game<'a>, Vec<mpsc::Re
         for x in -1..=1 {
             let chunk = game
                 .save
+                .as_ref()
+                .unwrap()
                 .load(x, z, game.pack.assets.registry, game.res.biomes())
                 .expect("all nine native stored columns");
             assert!(chunk.lit);
