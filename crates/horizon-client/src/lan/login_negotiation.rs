@@ -154,6 +154,10 @@ enum AttemptState {
     Server,
     Client,
     Agreed,
+    #[cfg(feature = "paired-packages")]
+    Configuring,
+    #[cfg(feature = "paired-packages")]
+    Configured,
     Closed,
 }
 /// Owns the actual unsplit connection, with no mutable connection escape hatch.
@@ -317,6 +321,439 @@ impl AgreementReceipt {
             return Err(Refusal::Binding);
         }
         Ok((self.session, self.transcript))
+    }
+}
+
+/// Dormant strict-configuration result. This owns the ORIGINAL unsplit scope;
+/// it grants neither player admission nor a Session/Hub publication capability.
+#[cfg(feature = "paired-packages")]
+pub struct ConfiguredEndpoint {
+    scope: NegotiationConnection,
+    role: Endpoint,
+    expectation: Arc<NegotiationExpectation>,
+    profile: login::GameProfile,
+    information: horizon_protocol::packets::configuration::ClientInformation,
+    registries: horizon_protocol::registry::Dynamic,
+    session: [u8; 32],
+    transcript: [u8; 32],
+}
+#[cfg(feature = "paired-packages")]
+impl ConfiguredEndpoint {
+    pub fn is_live(
+        &self,
+        role: Endpoint,
+        expectation: &Arc<NegotiationExpectation>,
+        uuid: u128,
+    ) -> bool {
+        self.role == role
+            && self.profile.uuid == uuid
+            && Arc::ptr_eq(&self.expectation, expectation)
+            && self.scope.state == AttemptState::Configured
+            && self.scope.live.is_open()
+            && Instant::now() < self.scope.deadline
+    }
+    pub fn profile(&self) -> &login::GameProfile {
+        &self.profile
+    }
+    pub fn information(&self) -> &horizon_protocol::packets::configuration::ClientInformation {
+        &self.information
+    }
+    pub fn registries(&self) -> &horizon_protocol::registry::Dynamic {
+        &self.registries
+    }
+    /// Inspectable transcript data is not an admission receipt.
+    pub fn transcript(&self) -> ([u8; 32], [u8; 32]) {
+        (self.session, self.transcript)
+    }
+    pub fn close(&mut self) {
+        self.scope.close();
+    }
+}
+
+/// Expected failure retains the exact closed original scope, not a replacement
+/// connection. Dropping or explicitly closing it uses the existing semantics.
+#[cfg(feature = "paired-packages")]
+pub struct ConfigurationFailure {
+    scope: NegotiationConnection,
+    pub reason: Refusal,
+}
+#[cfg(feature = "paired-packages")]
+impl ConfigurationFailure {
+    pub fn into_scope(self) -> NegotiationConnection {
+        self.scope
+    }
+}
+
+#[cfg(feature = "paired-packages")]
+mod configuration {
+    use super::*;
+    use horizon_protocol::{
+        buf::{Reader, Writer},
+        packets::{Empty, configuration as cfg},
+        registry::Dynamic,
+    };
+    // Covers bounded native frame/decompression/encode/copy overlaps and small
+    // profile/prefix objects. Variable Tag/container/Dynamic storage is charged
+    // separately by capture_for_configuration before any native projection.
+    const BUFFERS: usize =
+        8 * horizon_protocol::frame::MAX_UNCOMPRESSED + 4 * horizon_protocol::frame::MAX_FRAME;
+
+    fn invalid(stage: &'static str) -> Refusal {
+        Refusal::Syntax(stage)
+    }
+    fn valid_name(name: &str) -> bool {
+        !name.is_empty()
+            && name.len() <= 16
+            && name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
+    }
+    fn check_profile(profile: &login::GameProfile) -> Result<()> {
+        if !valid_name(&profile.name)
+            || profile.properties.len() > 16
+            || profile.properties.iter().any(|p| {
+                p.name.len() > 64
+                    || p.value.len() > MAX_PAYLOAD
+                    || p.signature.as_ref().is_some_and(|s| s.len() > 1024)
+            })
+        {
+            return Err(invalid("configuration profile"));
+        }
+        Ok(())
+    }
+    fn information(info: &cfg::ClientInformation) -> Result<()> {
+        if info.language.is_empty()
+            || info.language.len() > 16
+            || !(2..=32).contains(&info.view_distance)
+            || !(0..=2).contains(&info.chat_visibility)
+            || !(0..=1).contains(&info.main_hand)
+            || info.model_customisation & 0x80 != 0
+            || !(0..=2).contains(&info.particle_status)
+        {
+            return Err(invalid("configuration client information"));
+        }
+        Ok(())
+    }
+    fn brand(value: &str) -> cfg::CustomPayload {
+        let mut data = Writer::new();
+        data.string(value);
+        cfg::CustomPayload {
+            channel: "minecraft:brand".into(),
+            data: data.data,
+        }
+    }
+    fn packs(empty: bool) -> cfg::SelectKnownPacks {
+        cfg::SelectKnownPacks {
+            packs: if empty {
+                vec![]
+            } else {
+                vec![cfg::KnownPack {
+                    namespace: super::super::data::CORE_PACK.0.into(),
+                    id: super::super::data::CORE_PACK.1.into(),
+                    version: super::super::data::CORE_PACK.2.into(),
+                }]
+            },
+        }
+    }
+    fn exact(scope: &mut NegotiationConnection, body: &[u8]) -> Result<()> {
+        let mut expected = Reader::new(body);
+        let id = expected
+            .varint()
+            .map_err(|_| invalid("local configuration packet"))?;
+        let (actual_id, actual) = scope.recv()?;
+        if actual_id != id || actual != body[expected.position()..] {
+            return Err(invalid("configuration native body/order"));
+        }
+        Ok(())
+    }
+    fn prefix(scope: &mut NegotiationConnection) -> Result<(i32, Vec<u8>)> {
+        let packet = scope.recv()?;
+        if packet.1.len() > MAX_PAYLOAD {
+            return Err(Refusal::Budget);
+        }
+        Ok(packet)
+    }
+    fn prepare(
+        scope: &NegotiationConnection,
+        receipt: &AgreementReceipt,
+        role: Endpoint,
+        expected: &Arc<NegotiationExpectation>,
+        uuid: u128,
+    ) -> Result<()> {
+        if !receipt.is_live(scope, role, expected, uuid) {
+            return Err(Refusal::Binding);
+        }
+        let snapshot = RegistrySnapshot::capture_for_configuration(
+            &expected.sync,
+            expected.blocks,
+            BUFFERS,
+            32,
+        )
+        .map_err(|_| Refusal::Budget)?;
+        if expected.contract.claims().registries != &snapshot {
+            return Err(Refusal::Binding);
+        }
+        if Instant::now() >= scope.deadline {
+            return Err(Refusal::Budget);
+        }
+        Ok(())
+    }
+
+    impl NegotiationConnection {
+        /// A separate fixed paired route; existing login-only refusal is intact.
+        /// Authentication precedes this call. No ordinary caller selects it yet.
+        #[allow(clippy::result_large_err)] // Refusal keeps the original unsplit scope without another allocation.
+        pub fn configure_server(
+            mut self,
+            receipt: AgreementReceipt,
+            expected: Arc<NegotiationExpectation>,
+            native_profile: login::GameProfile,
+            compression: Option<i32>,
+        ) -> std::result::Result<ConfiguredEndpoint, ConfigurationFailure> {
+            let result = (|| {
+                prepare(
+                    &self,
+                    &receipt,
+                    Endpoint::Server,
+                    &expected,
+                    native_profile.uuid,
+                )?;
+                check_profile(&native_profile)?;
+                if compression.is_some_and(|threshold| threshold < 0)
+                    || (self.connection.is_memory() && compression.is_some())
+                {
+                    return Err(Refusal::Unsupported);
+                }
+                let finished = login::Clientbound::LoginFinished(login::LoginFinished {
+                    profile: native_profile.clone(),
+                    session: native_profile.uuid,
+                })
+                .encode();
+                if finished.len() > MAX_PAYLOAD {
+                    return Err(Refusal::Budget);
+                }
+                let (session, transcript) =
+                    receipt.consume(&self, Endpoint::Server, &expected, native_profile.uuid)?;
+                self.state = AttemptState::Configuring;
+                if let Some(threshold) = compression {
+                    self.send(
+                        &login::Clientbound::Compression(login::Compression { threshold }).encode(),
+                    )?;
+                    self.connection.set_compression(threshold);
+                }
+                self.send(&finished)?;
+                exact(
+                    &mut self,
+                    &login::Serverbound::LoginAcknowledged(Empty).encode(),
+                )?;
+                self.send(&cfg::Clientbound::CustomPayload(brand("vanilla")).encode())?;
+                self.send(
+                    &cfg::Clientbound::UpdateEnabledFeatures(cfg::UpdateEnabledFeatures {
+                        features: expected.sync.features.clone(),
+                    })
+                    .encode(),
+                )?;
+                self.send(&cfg::Clientbound::SelectKnownPacks(packs(false)).encode())?;
+                let (id, payload) = prefix(&mut self)?;
+                let info = match cfg::Serverbound::decode(id, &payload)
+                    .map_err(|_| invalid("configuration client information"))?
+                {
+                    cfg::Serverbound::ClientInformation(info) => info,
+                    _ => return Err(invalid("configuration client information order")),
+                };
+                information(&info)?;
+                exact(
+                    &mut self,
+                    &cfg::Serverbound::CustomPayload(brand("horizon")).encode(),
+                )?;
+                exact(
+                    &mut self,
+                    &cfg::Serverbound::SelectKnownPacks(packs(true)).encode(),
+                )?;
+                self.send(
+                    &cfg::Clientbound::CustomPayload(cfg::CustomPayload {
+                        channel: horizon_protocol::quiet::CHANNEL.into(),
+                        data: vec![],
+                    })
+                    .encode(),
+                )?;
+                let mut dynamic = Dynamic::default();
+                for packet in expected.sync.registry_packets(false) {
+                    let native = cfg::Clientbound::RegistryData(packet);
+                    self.send(&native.encode())?;
+                    let cfg::Clientbound::RegistryData(packet) = native else {
+                        unreachable!()
+                    };
+                    dynamic.add(packet);
+                }
+                self.send(&cfg::Clientbound::UpdateTags(expected.sync.tags.clone()).encode())?;
+                self.send(&cfg::Clientbound::FinishConfiguration(Empty).encode())?;
+                exact(
+                    &mut self,
+                    &cfg::Serverbound::FinishConfiguration(Empty).encode(),
+                )?;
+                Ok((info, dynamic, session, transcript))
+            })();
+            match result {
+                Ok((information, registries, session, transcript))
+                    if self.live.is_open() && Instant::now() < self.deadline =>
+                {
+                    self.state = AttemptState::Configured;
+                    Ok(ConfiguredEndpoint {
+                        scope: self,
+                        role: Endpoint::Server,
+                        expectation: expected,
+                        profile: native_profile,
+                        information,
+                        registries,
+                        session,
+                        transcript,
+                    })
+                }
+                Ok(_) => {
+                    let reason = if self.live.is_open() {
+                        Refusal::Budget
+                    } else {
+                        Refusal::Closed
+                    };
+                    self.close();
+                    Err(ConfigurationFailure {
+                        scope: self,
+                        reason,
+                    })
+                }
+                Err(reason) => {
+                    self.close();
+                    Err(ConfigurationFailure {
+                        scope: self,
+                        reason,
+                    })
+                }
+            }
+        }
+        #[allow(clippy::result_large_err)] // Refusal keeps the original unsplit scope without another allocation.
+        pub fn configure_client(
+            mut self,
+            receipt: AgreementReceipt,
+            expected: Arc<NegotiationExpectation>,
+            uuid: u128,
+            name: &str,
+            info: cfg::ClientInformation,
+        ) -> std::result::Result<ConfiguredEndpoint, ConfigurationFailure> {
+            let result = (|| {
+                prepare(&self, &receipt, Endpoint::Client, &expected, uuid)?;
+                if !valid_name(name) {
+                    return Err(invalid("configuration profile name"));
+                }
+                information(&info)?;
+                let (session, transcript) =
+                    receipt.consume(&self, Endpoint::Client, &expected, uuid)?;
+                self.state = AttemptState::Configuring;
+                let (mut id, mut payload) = prefix(&mut self)?;
+                let mut packet = login::Clientbound::decode(id, &payload)
+                    .map_err(|_| invalid("configuration login profile"))?;
+                if let login::Clientbound::Compression(compression) = packet {
+                    if self.connection.is_memory() || compression.threshold < 0 {
+                        return Err(Refusal::Unsupported);
+                    }
+                    self.connection.set_compression(compression.threshold);
+                    (id, payload) = prefix(&mut self)?;
+                    packet = login::Clientbound::decode(id, &payload)
+                        .map_err(|_| invalid("configuration login profile"))?;
+                }
+                let profile = match packet {
+                    login::Clientbound::LoginFinished(finished)
+                        if finished.profile.uuid == uuid
+                            && finished.profile.name == name
+                            && finished.session == uuid =>
+                    {
+                        finished.profile
+                    }
+                    _ => return Err(invalid("configuration native profile/order")),
+                };
+                check_profile(&profile)?;
+                self.send(&login::Serverbound::LoginAcknowledged(Empty).encode())?;
+                exact(
+                    &mut self,
+                    &cfg::Clientbound::CustomPayload(brand("vanilla")).encode(),
+                )?;
+                exact(
+                    &mut self,
+                    &cfg::Clientbound::UpdateEnabledFeatures(cfg::UpdateEnabledFeatures {
+                        features: expected.sync.features.clone(),
+                    })
+                    .encode(),
+                )?;
+                exact(
+                    &mut self,
+                    &cfg::Clientbound::SelectKnownPacks(packs(false)).encode(),
+                )?;
+                self.send(&cfg::Serverbound::ClientInformation(info.clone()).encode())?;
+                self.send(&cfg::Serverbound::CustomPayload(brand("horizon")).encode())?;
+                self.send(&cfg::Serverbound::SelectKnownPacks(packs(true)).encode())?;
+                exact(
+                    &mut self,
+                    &cfg::Clientbound::CustomPayload(cfg::CustomPayload {
+                        channel: horizon_protocol::quiet::CHANNEL.into(),
+                        data: vec![],
+                    })
+                    .encode(),
+                )?;
+                let mut dynamic = Dynamic::default();
+                for packet in expected.sync.registry_packets(false) {
+                    let native = cfg::Clientbound::RegistryData(packet);
+                    exact(&mut self, &native.encode())?;
+                    let cfg::Clientbound::RegistryData(packet) = native else {
+                        unreachable!()
+                    };
+                    dynamic.add(packet);
+                }
+                exact(
+                    &mut self,
+                    &cfg::Clientbound::UpdateTags(expected.sync.tags.clone()).encode(),
+                )?;
+                exact(
+                    &mut self,
+                    &cfg::Clientbound::FinishConfiguration(Empty).encode(),
+                )?;
+                self.send(&cfg::Serverbound::FinishConfiguration(Empty).encode())?;
+                Ok((profile, dynamic, session, transcript))
+            })();
+            match result {
+                Ok((profile, registries, session, transcript))
+                    if self.live.is_open() && Instant::now() < self.deadline =>
+                {
+                    self.state = AttemptState::Configured;
+                    Ok(ConfiguredEndpoint {
+                        scope: self,
+                        role: Endpoint::Client,
+                        expectation: expected,
+                        profile,
+                        information: info,
+                        registries,
+                        session,
+                        transcript,
+                    })
+                }
+                Ok(_) => {
+                    let reason = if self.live.is_open() {
+                        Refusal::Budget
+                    } else {
+                        Refusal::Closed
+                    };
+                    self.close();
+                    Err(ConfigurationFailure {
+                        scope: self,
+                        reason,
+                    })
+                }
+                Err(reason) => {
+                    self.close();
+                    Err(ConfigurationFailure {
+                        scope: self,
+                        reason,
+                    })
+                }
+            }
+        }
     }
 }
 

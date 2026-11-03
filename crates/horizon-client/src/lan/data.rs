@@ -177,6 +177,126 @@ mod compatibility {
             Value::Array(_) => 9,
         }
     }
+    #[cfg(feature = "paired-packages")]
+    fn multiplied(n: usize, size: usize) -> Result<usize, String> {
+        n.checked_mul(size)
+            .ok_or_else(|| "snapshot counter overflow".into())
+    }
+    // Additional requested storage for the fixed configuration construction
+    // schedule. This is conservative admission accounting, not allocator/RSS
+    // certification. A projection is moved into Dynamic, never cloned into it.
+    #[cfg(feature = "paired-packages")]
+    fn configuration_json_storage(value: &Value) -> Result<usize, String> {
+        let slot = std::mem::size_of::<JavaString>() + std::mem::size_of::<Tag>();
+        match value {
+            Value::String(s) => multiplied(s.encode_utf16().count(), 4),
+            Value::Array(values) => {
+                let mut bytes = multiplied(values.len(), 2 * std::mem::size_of::<Tag>())?;
+                for child in values {
+                    bytes = checked_add(bytes, configuration_json_storage(child)?)?;
+                }
+                Ok(bytes)
+            }
+            Value::Object(values) if !values.is_empty() => {
+                // Cover a sparsely populated root and internal B-tree slots,
+                // edges and the FromIterator temporary vector, without relying
+                // on the allocator returning exactly the logical payload size.
+                let unit = checked_add(slot, 2 * std::mem::size_of::<usize>())?;
+                let mut bytes = checked_add(
+                    multiplied(unit, 16)?,
+                    multiplied(values.len(), multiplied(unit, 8)?)?,
+                )?;
+                for (key, child) in values {
+                    bytes = checked_add(bytes, multiplied(key.encode_utf16().count(), 4)?)?;
+                    bytes = checked_add(bytes, configuration_json_storage(child)?)?;
+                }
+                Ok(bytes)
+            }
+            _ => Ok(0), // Scalars/empty compounds live in their parent slots.
+        }
+    }
+    #[cfg(feature = "paired-packages")]
+    fn configuration_reservation(
+        sync: &SyncData,
+        reserved_bytes: usize,
+        reserved_tables: usize,
+    ) -> Result<(usize, usize), String> {
+        let mut budget = Budget::default();
+        budget.bytes(reserved_bytes)?;
+        budget.table(reserved_tables)?;
+        budget.bytes(4096)?;
+        budget.table(sync.registries.len())?;
+        budget.bytes(multiplied(
+            sync.registries.len(),
+            8 * (std::mem::size_of::<RegistryData>()
+                + std::mem::size_of::<(String, Vec<(String, Option<Tag>)>)>()),
+        )?)?;
+        for (name, entries) in &sync.registries {
+            budget.bytes(multiplied(name.len(), 2)?)?;
+            budget.table(entries.names.len())?;
+            budget.table(entries.json.len())?;
+            if entries.names.len() != entries.json.len() {
+                return Err("snapshot synchronized lengths differ".into());
+            }
+            // The native projection vector and Dynamic's moved-entry vector can
+            // overlap in capacity even though each Tag has only one owner.
+            budget.bytes(multiplied(
+                entries.names.len(),
+                4 * (std::mem::size_of::<RegistryEntry>()
+                    + std::mem::size_of::<(String, Option<Tag>)>()),
+            )?)?;
+            let mut body = checked_add(32, name.len())?;
+            for (name, value) in entries.names.iter().zip(&entries.json) {
+                let measured = measured_json(value)?; // Borrowed depth/node/string validation FIRST.
+                budget.bytes(configuration_json_storage(value)?)?;
+                budget.bytes(multiplied(name.len(), 2)?)?;
+                body = checked_add(body, checked_add(32 + name.len(), measured.bytes)?)?;
+            }
+            if body > horizon_protocol::frame::MAX_UNCOMPRESSED {
+                return Err("configuration registry native body limit".into());
+            }
+        }
+        budget.table(sync.features.len())?;
+        budget.bytes(multiplied(
+            sync.features.len(),
+            2 * std::mem::size_of::<String>(),
+        )?)?;
+        let mut features_body = 32usize;
+        for name in &sync.features {
+            budget.bytes(multiplied(name.len(), 2)?)?;
+            features_body = checked_add(features_body, checked_add(8, name.len())?)?;
+        }
+        budget.table(sync.tags.registries.len())?;
+        budget.bytes(multiplied(
+            sync.tags.registries.len(),
+            2 * std::mem::size_of::<RegistryTags>(),
+        )?)?;
+        let mut tags_body = 32usize;
+        for registry in &sync.tags.registries {
+            budget.bytes(multiplied(registry.registry.len(), 2)?)?;
+            budget.table(registry.tags.len())?;
+            budget.bytes(multiplied(
+                registry.tags.len(),
+                2 * std::mem::size_of::<TagEntry>(),
+            )?)?;
+            tags_body = checked_add(tags_body, checked_add(16, registry.registry.len())?)?;
+            for tag in &registry.tags {
+                budget.bytes(multiplied(tag.name.len(), 2)?)?;
+                budget.table(tag.ids.len())?;
+                budget.bytes(multiplied(tag.ids.len(), 2 * std::mem::size_of::<i32>())?)?;
+                tags_body = checked_add(
+                    tags_body,
+                    checked_add(16 + tag.name.len(), multiplied(tag.ids.len(), 5)?)?,
+                )?;
+            }
+        }
+        if features_body > horizon_protocol::frame::MAX_UNCOMPRESSED
+            || tags_body > horizon_protocol::frame::MAX_UNCOMPRESSED
+        {
+            return Err("configuration features/tags native body limit".into());
+        }
+        Ok((budget.bytes, budget.tables))
+    }
     fn json_measure(
         value: &Value,
         source_depth: usize,
@@ -431,6 +551,19 @@ mod compatibility {
                 );
             }
             Ok(hash.finalize().into())
+        }
+        /// Fixed paired configuration schedule only. Charge native projection,
+        /// moved private Dynamic and simultaneous caller buffers BEFORE capture
+        /// performs its native hashing allocations. Ordinary capture is unchanged.
+        #[cfg(feature = "paired-packages")]
+        pub(crate) fn capture_for_configuration(
+            sync: &SyncData,
+            blocks: &BlockRegistry,
+            reserved_bytes: usize,
+            reserved_tables: usize,
+        ) -> Result<Self, String> {
+            let (bytes, tables) = configuration_reservation(sync, reserved_bytes, reserved_tables)?;
+            Self::capture(sync, blocks, bytes, tables)
         }
         /// Internal data prerequisite only. Reservations account for the private
         /// package/build/schema component in the same aggregate resource policy.
@@ -759,6 +892,34 @@ mod compatibility {
         }
         fn capture(sync: &SyncData, blocks: &BlockRegistry) -> RegistrySnapshot {
             RegistrySnapshot::capture(sync, blocks, 0, 0).unwrap()
+        }
+
+        #[cfg(feature = "paired-packages")]
+        #[test]
+        fn configuration_budget_preserves_snapshot_and_refuses_before_projection() {
+            let b = blocks(1, false);
+            let s = sync();
+            let expected = capture(&s, &b);
+            let buffers = 8 * horizon_protocol::frame::MAX_UNCOMPRESSED
+                + 4 * horizon_protocol::frame::MAX_FRAME;
+            assert_eq!(
+                RegistrySnapshot::capture_for_configuration(&s, &b, buffers, 0).unwrap(),
+                expected
+            );
+            let mut heavy = sync();
+            heavy.registries[0].1.json[0] =
+                Value::Array(vec![serde_json::json!({"v":true}); 40_000]);
+            assert!(measured_json(&heavy.registries[0].1.json[0]).unwrap().bytes < 1 << 20);
+            let before = PROJECTION_CALLS.with(std::cell::Cell::get);
+            assert!(
+                RegistrySnapshot::capture_for_configuration(&heavy, &b, buffers, 0)
+                    .unwrap_err()
+                    .contains("byte limit")
+            );
+            assert_eq!(PROJECTION_CALLS.with(std::cell::Cell::get), before);
+            assert!(RegistrySnapshot::capture_for_configuration(&s, &b, MAX_BYTES - 1, 0).is_err());
+            assert!(RegistrySnapshot::capture_for_configuration(&s, &b, usize::MAX, 0).is_err());
+            assert_eq!(PROJECTION_CALLS.with(std::cell::Cell::get), before);
         }
 
         #[test]
@@ -1153,9 +1314,14 @@ fn walk(dir: &Path, prefix: &str, out: &mut BTreeMap<String, Value>) {
     }
 }
 
+#[cfg(all(test, feature = "paired-packages"))]
+thread_local! { static PROJECTION_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
 /// A JSON value as the NBT that vanilla's NbtOps would produce from the codec
 /// (integers are ints, other numbers doubles, booleans bytes).
 pub fn json_to_nbt(v: &Value) -> Tag {
+    #[cfg(all(test, feature = "paired-packages"))]
+    PROJECTION_CALLS.with(|calls| calls.set(calls.get() + 1));
     match v {
         Value::Null => Tag::compound(Vec::<(&str, Tag)>::new()),
         Value::Bool(b) => Tag::Byte(i8::from(*b)),

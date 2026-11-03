@@ -1231,4 +1231,508 @@ mod tcp {
         );
         assert_eq!(lan.shared.next.load(Ordering::Relaxed), 1);
     }
+
+    struct Agreed {
+        server: NegotiationConnection,
+        server_receipt: AgreementReceipt,
+        client: NegotiationConnection,
+        client_receipt: AgreementReceipt,
+        server_required: RequiredNegotiation,
+        client_required: RequiredNegotiation,
+    }
+    fn agreed(
+        a: &Arc<NegotiationExpectation>,
+        b: &Arc<NegotiationExpectation>,
+        memory: bool,
+        budget: Duration,
+    ) -> Agreed {
+        let (server, client) = if memory {
+            let (a, b) = horizon_protocol::connection::Pipe::pair();
+            (Connection::local(a), Connection::local(b))
+        } else {
+            sockets()
+        };
+        let server_required = RequiredNegotiation::new(a.clone(), budget).unwrap();
+        let client_required = RequiredNegotiation::new(b.clone(), budget).unwrap();
+        let mut server = NegotiationConnection::for_required(
+            server,
+            &server_required,
+            server_required.deadline(),
+        )
+        .unwrap();
+        let mut client = NegotiationConnection::for_required(
+            client,
+            &client_required,
+            client_required.deadline(),
+        )
+        .unwrap();
+        let a = a.clone();
+        let join = std::thread::spawn(move || {
+            let receipt = negotiate_server(&mut server, a, 42).unwrap();
+            (server, receipt)
+        });
+        let client_receipt = negotiate_client(&mut client, b.clone(), 42).unwrap();
+        let (server, server_receipt) = join.join().unwrap();
+        Agreed {
+            server,
+            server_receipt,
+            client,
+            client_receipt,
+            server_required,
+            client_required,
+        }
+    }
+    fn native_profile() -> login::GameProfile {
+        login::GameProfile {
+            uuid: 42,
+            name: "StrictGuest".into(),
+            properties: vec![],
+        }
+    }
+    fn configured(
+        result: std::result::Result<ConfiguredEndpoint, ConfigurationFailure>,
+    ) -> ConfiguredEndpoint {
+        match result {
+            Ok(owner) => owner,
+            Err(failure) => panic!("actual strict completion failed: {:?}", failure.reason),
+        }
+    }
+    fn config_failure(
+        result: std::result::Result<ConfiguredEndpoint, ConfigurationFailure>,
+    ) -> ConfigurationFailure {
+        match result {
+            Ok(_) => panic!("unexpected configured owner"),
+            Err(failure) => failure,
+        }
+    }
+
+    #[test]
+    #[ignore = "pinned actual captures; native full Memory and compressed TCP configuration"]
+    fn strict_configuration_memory_tcp_complete_on_original_scopes() {
+        use horizon_protocol::packets::configuration::ClientInformation;
+        let a = captured();
+        let b = captured();
+        assert!(!Arc::ptr_eq(&a, &b));
+        for memory in [true, false] {
+            let fixture = agreed(&a, &b, memory, Duration::from_secs(15));
+            let server_live = fixture.server.live.clone();
+            let client_live = fixture.client.live.clone();
+            let server_deadline = fixture.server.deadline;
+            let client_deadline = fixture.client.deadline;
+            let server_expected = a.clone();
+            let join = std::thread::spawn(move || {
+                configured(fixture.server.configure_server(
+                    fixture.server_receipt,
+                    server_expected,
+                    native_profile(),
+                    (!memory).then_some(64),
+                ))
+            });
+            let mut client = configured(fixture.client.configure_client(
+                fixture.client_receipt,
+                b.clone(),
+                42,
+                "StrictGuest",
+                ClientInformation::new(2),
+            ));
+            let mut server = join.join().unwrap();
+            assert!(Arc::ptr_eq(&server.scope.live, &server_live));
+            assert!(Arc::ptr_eq(&client.scope.live, &client_live));
+            assert_eq!(server.scope.deadline, server_deadline);
+            assert_eq!(client.scope.deadline, client_deadline);
+            assert!(server.is_live(Endpoint::Server, &a, 42));
+            assert!(client.is_live(Endpoint::Client, &b, 42));
+            assert!(!client.is_live(Endpoint::Server, &b, 42));
+            assert!(!client.is_live(Endpoint::Client, &a, 42));
+            assert!(!client.is_live(Endpoint::Client, &b, 43));
+            assert_eq!(server.profile(), client.profile());
+            assert_eq!(server.information(), client.information());
+            assert_eq!(server.transcript(), client.transcript());
+            assert_eq!(
+                server.registries().registries,
+                client.registries().registries
+            );
+            let mut expected = horizon_protocol::registry::Dynamic::default();
+            for packet in a.sync.registry_packets(false) {
+                expected.add(packet);
+            }
+            assert_eq!(client.registries().registries, expected.registries);
+            assert!(!client.registries().is_empty());
+            assert!(
+                client
+                    .registries()
+                    .registries
+                    .values()
+                    .flatten()
+                    .all(|(_, tag)| tag.is_some())
+            );
+            assert!(
+                client_live.open.load(Ordering::Acquire)
+                    && server_live.open.load(Ordering::Acquire)
+            );
+            if memory {
+                server.close();
+                assert!(!server_live.open.load(Ordering::Acquire));
+                assert!(client_live.open.load(Ordering::Acquire));
+                assert!(
+                    matches!(client.scope.recv(),Err(Refusal::Io(message)) if message == "Connection closed during bounded receive"),
+                    "explicit endpoint close must yield actual EOF, not a deadline"
+                );
+                assert!(!client_live.open.load(Ordering::Acquire));
+            } else {
+                fixture.client_required.close();
+                assert!(!client.is_live(Endpoint::Client, &b, 42));
+                assert!(
+                    client_live.open.load(Ordering::Acquire),
+                    "runtime invalidation is distinct from explicit local close"
+                );
+                assert!(server.is_live(Endpoint::Server, &a, 42));
+                fixture.server_required.close();
+                assert!(!server.is_live(Endpoint::Server, &a, 42));
+                client.close();
+                server.close();
+                assert!(
+                    !client_live.open.load(Ordering::Acquire)
+                        && !server_live.open.load(Ordering::Acquire)
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "pinned actual captures; wrong local role/allocation/profile never configures"]
+    fn strict_configuration_binding_refusals_keep_original_failed_scope() {
+        let a = captured();
+        let b = captured();
+        let substitute = captured();
+        for case in 0..4 {
+            let mut f = agreed(&a, &b, true, Duration::from_secs(10));
+            let live = f.server.live.clone();
+            let deadline = f.server.deadline;
+            let mut native = native_profile();
+            let receipt = if case == 0 {
+                f.client_receipt
+            } else {
+                f.server_receipt
+            };
+            let expected = if case == 1 {
+                substitute.clone()
+            } else {
+                a.clone()
+            };
+            if case == 2 {
+                native.uuid = 43;
+            }
+            if case == 3 {
+                f.server_required.close();
+            }
+            let failure =
+                config_failure(f.server.configure_server(receipt, expected, native, None));
+            assert!(matches!(failure.reason, Refusal::Binding));
+            let failed = failure.into_scope();
+            assert!(Arc::ptr_eq(&failed.live, &live));
+            assert_eq!(failed.deadline, deadline);
+            assert!(matches!(failed.state, AttemptState::Closed));
+            assert!(!live.is_open());
+            f.client.close();
+        }
+        let mut f = agreed(&a, &b, true, Duration::from_secs(10));
+        let mut other = agreed(&a, &b, true, Duration::from_secs(10));
+        let other_live = other.server.live.clone();
+        let failure = config_failure(f.server.configure_server(
+            other.server_receipt,
+            a.clone(),
+            native_profile(),
+            None,
+        ));
+        assert!(matches!(failure.reason, Refusal::Binding));
+        assert!(
+            other_live.is_open(),
+            "wrong-attempt receipt cannot close the other actual scope"
+        );
+        drop(failure);
+        f.client.close();
+        other.client.close();
+        other.server.close();
+        let mut f = agreed(&a, &b, true, Duration::from_secs(10));
+        let failure = config_failure(f.server.configure_server(
+            f.server_receipt,
+            a.clone(),
+            native_profile(),
+            Some(64),
+        ));
+        assert!(matches!(failure.reason, Refusal::Unsupported));
+        drop(failure);
+        f.client.close();
+    }
+
+    fn server_brand() -> horizon_protocol::packets::configuration::CustomPayload {
+        let mut data = horizon_protocol::buf::Writer::new();
+        data.string("vanilla");
+        horizon_protocol::packets::configuration::CustomPayload {
+            channel: "minecraft:brand".into(),
+            data: data.data,
+        }
+    }
+    fn core_packs() -> horizon_protocol::packets::configuration::SelectKnownPacks {
+        use super::super::super::data::CORE_PACK;
+        use horizon_protocol::packets::configuration::{KnownPack, SelectKnownPacks};
+        SelectKnownPacks {
+            packs: vec![KnownPack {
+                namespace: CORE_PACK.0.into(),
+                id: CORE_PACK.1.into(),
+                version: CORE_PACK.2.into(),
+            }],
+        }
+    }
+    fn send_prefix(server: &mut NegotiationConnection, expected: &NegotiationExpectation) {
+        use horizon_protocol::packets::{Empty, configuration as cfg};
+        server
+            .send(
+                &login::Clientbound::LoginFinished(login::LoginFinished {
+                    profile: native_profile(),
+                    session: 42,
+                })
+                .encode(),
+            )
+            .unwrap();
+        let (id, payload) = server.recv().unwrap();
+        assert_eq!(
+            login::Serverbound::decode(id, &payload).unwrap(),
+            login::Serverbound::LoginAcknowledged(Empty)
+        );
+        server
+            .send(&cfg::Clientbound::CustomPayload(server_brand()).encode())
+            .unwrap();
+        server
+            .send(
+                &cfg::Clientbound::UpdateEnabledFeatures(cfg::UpdateEnabledFeatures {
+                    features: expected.sync.features.clone(),
+                })
+                .encode(),
+            )
+            .unwrap();
+        server
+            .send(&cfg::Clientbound::SelectKnownPacks(core_packs()).encode())
+            .unwrap();
+        for next in 0..3 {
+            let (id, payload) = server.recv().unwrap();
+            let packet = cfg::Serverbound::decode(id, &payload).unwrap();
+            assert!(match (next, packet) {
+                (0, cfg::Serverbound::ClientInformation(info)) => info.view_distance == 2,
+                (1, cfg::Serverbound::CustomPayload(p)) => p.channel == "minecraft:brand",
+                (2, cfg::Serverbound::SelectKnownPacks(p)) => p.packs.is_empty(),
+                _ => false,
+            });
+        }
+        server
+            .send(
+                &cfg::Clientbound::CustomPayload(cfg::CustomPayload {
+                    channel: horizon_protocol::quiet::CHANNEL.into(),
+                    data: vec![],
+                })
+                .encode(),
+            )
+            .unwrap();
+    }
+    fn duplicate_nbt_key(
+        packet: &horizon_protocol::packets::configuration::RegistryData,
+    ) -> Vec<u8> {
+        use horizon_protocol::{buf::Reader, packets::configuration as cfg};
+        use horizon_world::nbt::{Compound, Limits, Tag, write_network};
+        let tag = packet.entries[0].data.as_ref().unwrap();
+        let Tag::Compound(values) = tag else {
+            panic!("actual native compound required")
+        };
+        let (key, value) = values.first_key_value().unwrap();
+        let mut one = Compound::new();
+        one.insert(key.clone(), value.clone());
+        let entry = write_network(&Tag::Compound(one), Limits::default()).unwrap();
+        let encoded = write_network(tag, Limits::default()).unwrap();
+        let original = cfg::Clientbound::RegistryData(packet.clone()).encode();
+        let at = original
+            .windows(encoded.len())
+            .position(|part| part == encoded)
+            .unwrap();
+        let mut body = original.clone();
+        body.splice(at + 1..at + 1, entry[1..entry.len() - 1].iter().copied());
+        let decode = |body: &[u8]| {
+            let mut r = Reader::new(body);
+            let id = r.varint().unwrap();
+            cfg::Clientbound::decode(id, &body[r.position()..]).unwrap()
+        };
+        assert_ne!(body, original);
+        assert_eq!(
+            decode(&body),
+            decode(&original),
+            "native decoding normalizes the duplicate; exact wire validation must still refuse it"
+        );
+        body
+    }
+    #[test]
+    #[ignore = "pinned actual captures; strict wire mutations cannot publish a configured owner"]
+    fn strict_configuration_raw_order_nbt_features_tags_and_trailing_refuse() {
+        use horizon_protocol::packets::configuration as cfg;
+        let a = captured();
+        let b = captured();
+        for mutation in [
+            "duplicate",
+            "missing",
+            "order",
+            "absent-nbt",
+            "nbt-duplicate-key",
+            "entry-order",
+            "features",
+            "tags",
+            "trailing",
+            "profile",
+        ] {
+            let f = agreed(&a, &b, true, Duration::from_secs(15));
+            let expected = a.clone();
+            let join = std::thread::spawn(move || {
+                let mut server = f.server;
+                assert!(
+                    f.server_receipt
+                        .is_live(&server, Endpoint::Server, &expected, 42)
+                );
+                if mutation == "profile" {
+                    let mut profile = native_profile();
+                    profile.uuid = 43;
+                    server
+                        .send(
+                            &login::Clientbound::LoginFinished(login::LoginFinished {
+                                profile,
+                                session: 42,
+                            })
+                            .encode(),
+                        )
+                        .unwrap();
+                    return;
+                }
+                if matches!(mutation, "features" | "trailing") {
+                    server
+                        .send(
+                            &login::Clientbound::LoginFinished(login::LoginFinished {
+                                profile: native_profile(),
+                                session: 42,
+                            })
+                            .encode(),
+                        )
+                        .unwrap();
+                    server.recv().unwrap();
+                    server
+                        .send(&cfg::Clientbound::CustomPayload(server_brand()).encode())
+                        .unwrap();
+                    let mut features = expected.sync.features.clone();
+                    if mutation == "features" {
+                        features.push("example:extra".into());
+                    }
+                    let mut body =
+                        cfg::Clientbound::UpdateEnabledFeatures(cfg::UpdateEnabledFeatures {
+                            features,
+                        })
+                        .encode();
+                    if mutation == "trailing" {
+                        body.push(0);
+                    }
+                    server.send(&body).unwrap();
+                    return;
+                }
+                send_prefix(&mut server, &expected);
+                let mut packets = expected.sync.registry_packets(false);
+                assert!(packets.len() > 1);
+                if mutation == "duplicate" {
+                    packets.insert(1, packets[0].clone());
+                }
+                if mutation == "missing" {
+                    packets.remove(0);
+                }
+                if mutation == "order" {
+                    packets.swap(0, 1);
+                }
+                if mutation == "absent-nbt" {
+                    packets[0].entries[0].data = None;
+                }
+                if mutation == "entry-order" {
+                    assert!(packets[0].entries.len() > 1);
+                    packets[0].entries.swap(0, 1);
+                }
+                for (index, packet) in packets.into_iter().enumerate() {
+                    let body = if mutation == "nbt-duplicate-key" && index == 0 {
+                        duplicate_nbt_key(&packet)
+                    } else {
+                        cfg::Clientbound::RegistryData(packet).encode()
+                    };
+                    if server.send(&body).is_err() {
+                        return;
+                    }
+                }
+                let mut tags = expected.sync.tags.clone();
+                if mutation == "tags" {
+                    tags.registries[0].tags[0].ids.push(0);
+                }
+                let _ = server.send(&cfg::Clientbound::UpdateTags(tags).encode());
+            });
+            let failure = config_failure(f.client.configure_client(
+                f.client_receipt,
+                b.clone(),
+                42,
+                "StrictGuest",
+                cfg::ClientInformation::new(2),
+            ));
+            assert!(
+                matches!(failure.reason, Refusal::Syntax(_)),
+                "{mutation}: {:?}",
+                failure.reason
+            );
+            let scope = failure.into_scope();
+            assert!(matches!(scope.state, AttemptState::Closed));
+            join.join().unwrap();
+        }
+    }
+
+    #[test]
+    #[ignore = "pinned actual captures; original negotiation deadline remains active during configuration"]
+    fn strict_configuration_original_deadline_survives_native_login_progress() {
+        use horizon_protocol::packets::{Empty, configuration as cfg};
+        let a = captured();
+        let b = captured();
+        let f = agreed(&a, &b, true, Duration::from_secs(2));
+        let original = f.client.deadline;
+        let join = std::thread::spawn(move || {
+            config_failure(f.client.configure_client(
+                f.client_receipt,
+                b,
+                42,
+                "StrictGuest",
+                cfg::ClientInformation::new(2),
+            ))
+        });
+        let mut server = f.server;
+        server
+            .send(
+                &login::Clientbound::LoginFinished(login::LoginFinished {
+                    profile: native_profile(),
+                    session: 42,
+                })
+                .encode(),
+            )
+            .unwrap();
+        let (id, payload) = server.recv().unwrap();
+        assert_eq!(
+            login::Serverbound::decode(id, &payload).unwrap(),
+            login::Serverbound::LoginAcknowledged(Empty),
+            "actual native configuration progress before withholding brand"
+        );
+        let failure = join.join().unwrap();
+        assert!(
+            matches!(&failure.reason,Refusal::Io(message) if message.contains("deadline")||message.contains("timed")),
+            "{:?}",
+            failure.reason
+        );
+        let failed = failure.into_scope();
+        assert_eq!(failed.deadline, original);
+        assert!(!failed.live.is_open());
+        server.close();
+    }
 }
