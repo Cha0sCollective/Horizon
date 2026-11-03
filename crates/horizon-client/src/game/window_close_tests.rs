@@ -2,6 +2,116 @@
 //! a real display and complete pinned resources; absent inputs are failures.
 use super::*;
 
+pub(super) fn hold_integrated_stage(stage: &str) -> bool {
+    std::env::var("HORIZON_INTEGRATED_WINDOW_GATE")
+        .ok()
+        .as_deref()
+        == Some(stage)
+        && std::env::var_os("HORIZON_RETAINED_CLIENT_ROOT").is_some_and(|root| {
+            !PathBuf::from(root)
+                .join(format!("release-{stage}"))
+                .exists()
+        })
+}
+pub(super) fn refuse_integrated_renderer() -> bool {
+    std::env::var("HORIZON_INTEGRATED_WINDOW_GATE")
+        .ok()
+        .as_deref()
+        == Some("renderer-refusal")
+}
+
+#[test]
+#[ignore = "requires real isolated X11 and pinned resources; actual joint integrated application"]
+fn integrated_client_actual_original_window_child() {
+    let root = PathBuf::from(std::env::var_os("HORIZON_RETAINED_CLIENT_ROOT").expect("fresh root"));
+    let resources = std::env::var("HORIZON_RETAINED_CLIENT_RESOURCES").expect("pinned resources");
+    let parsed = Options::read_from(vec![
+        "--retained-client-integrated".into(),
+        "--retained-client-root".into(),
+        root.to_string_lossy().into_owned(),
+        "--resources".into(),
+        resources,
+        "--width".into(),
+        "640".into(),
+        "--height".into(),
+        "360".into(),
+        "--timeout-seconds".into(),
+        "110".into(),
+    ])
+    .unwrap()
+    .unwrap();
+    let result = run_remote(
+        parsed.options,
+        parsed.retained_remote.expect("actual integrated launch"),
+    );
+    eprintln!("INTEGRATED_WINDOW_RESULT={result:?}");
+    let case = std::env::var("HORIZON_RETAINED_CLIENT_CASE").expect("fixed actual window case");
+    match case.as_str() {
+        "renderer-refusal" => assert_eq!(
+            result.unwrap_err().to_string(),
+            "controlled integrated frontend renderer refusal"
+        ),
+        "cancel-prepare" => result.unwrap(),
+        "integrated-play" | "integrated-retry" | "cancel-offer" => {
+            if let Err(error) = result {
+                let error = error.to_string();
+                let native_stats = case == "integrated-retry"
+                    && error.contains(
+                        &root
+                            .join("server/world/players/stats")
+                            .display()
+                            .to_string(),
+                    );
+                assert!(
+                    native_stats
+                        || error.contains("Receive(")
+                        || error.contains("outcome: Eof")
+                        || error.contains("Transport endpoint is not connected (os error 107)"),
+                    "unexpected original diagnostic: {error}"
+                );
+            }
+            let world = root.join("server/world");
+            let saved = horizon_client::save::Level::read(&world)
+                .expect("actual native owner/world readback");
+            let uuid = saved.player_uuid.expect("native owner record");
+            assert_ne!(
+                uuid,
+                horizon_client::lan::playerdata::uuid_ints(horizon_protocol::crypto::offline_uuid(
+                    "IntegratedOwner"
+                ))
+            );
+            assert!(
+                !horizon_client::lan::playerdata::path(
+                    &world,
+                    horizon_protocol::crypto::offline_uuid("IntegratedOwner")
+                )
+                .exists()
+            );
+            eprintln!(
+                "INTEGRATED_NATIVE_READBACK={}",
+                serde_json::json!({"uuid":uuid,"position":saved.position,"rotation":saved.rotation,"time":saved.time,"dimension":saved.dimension})
+            );
+        }
+        _ => panic!("unsupported integrated window case"),
+    }
+}
+
+#[test]
+fn integrated_launch_is_exclusive_and_inert() {
+    let root = fresh_root("integrated-parse");
+    let mut args = vec![
+        "--retained-client-integrated".into(),
+        "--retained-client-root".into(),
+        root.to_string_lossy().into_owned(),
+    ];
+    let launch = RemoteLaunch::parse(&args).unwrap().unwrap();
+    assert!(matches!(launch.destination, RemoteDestination::Integrated));
+    assert!(!root.exists());
+    args.extend(["--retained-client-window".into(), "127.0.0.1:25565".into()]);
+    assert!(RemoteLaunch::parse(&args).is_err());
+    assert!(!root.exists());
+}
+
 #[test]
 fn retained_client_launch_rejects_unsupported_entry_before_acquisition() {
     let root = fresh_root("remote-refusal");

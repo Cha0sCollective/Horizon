@@ -17,7 +17,11 @@ use horizon_client::{
 use horizon_protocol::{connection::Pipe, packets::play::Serverbound};
 use std::{
     collections::{HashMap, VecDeque},
-    sync::{Mutex, mpsc},
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     thread::JoinHandle,
 };
 
@@ -371,23 +375,24 @@ impl Game<'_> {
 }
 
 #[derive(Clone, Debug)]
-struct View {
+pub(super) struct View {
     phase: &'static str,
-    attempt: u64,
-    ready: bool,
+    pub(super) attempt: u64,
+    pub(super) ready: bool,
     port: u16,
     ticks: u64,
     world_time: i64,
     guests: usize,
     installed: usize,
     pending_events: usize,
-    original_error: Option<String>,
-    blocked: Option<String>,
+    pub(super) original_error: Option<String>,
+    pub(super) blocked: Option<String>,
     worker_joined: bool,
     players: Vec<serde_json::Value>,
     transport: Option<RetainedHubCloseView>,
     owner_record: Option<[i32; 4]>,
     owner_saved: bool,
+    paused: bool,
     #[cfg(test)]
     consume_refusal_checked: bool,
 }
@@ -410,17 +415,18 @@ impl Default for View {
             transport: None,
             owner_record: None,
             owner_saved: false,
+            paused: false,
             #[cfg(test)]
             consume_refusal_checked: false,
         }
     }
 }
 impl View {
-    fn json(&self) -> serde_json::Value {
+    pub(super) fn json(&self) -> serde_json::Value {
         serde_json::json!({"phase":self.phase,"attempt":self.attempt,"ready":self.ready,"port":self.port,
         "ticks":self.ticks,"world_time":self.world_time,"guests":self.guests,"installed":self.installed,
         "pending_events":self.pending_events,"original_error":self.original_error,"blocked":self.blocked,
-        "owner_record":self.owner_record,"owner_saved":self.owner_saved,
+        "owner_record":self.owner_record,"owner_saved":self.owner_saved,"paused":self.paused,
         "worker_joined":self.worker_joined,"players":self.players,
         "transport":self.transport.as_ref().map(|view|serde_json::json!({
             "phase":format!("{:?}",view.phase),"attempt":view.attempt,"failure":view.failure,
@@ -493,13 +499,86 @@ impl Input {
         Ok(self)
     }
 }
-struct Supervisor {
+pub(super) struct Supervisor {
     thread: Option<JoinHandle<std::result::Result<(), String>>>,
     commands: mpsc::Sender<Command>,
     view: Arc<Mutex<View>>,
     _inert: Arc<Mutex<Option<Input>>>,
+    paused: Arc<AtomicBool>,
+}
+pub(super) struct IntegratedStartRefusal {
+    _input: Box<Input>,
+    pub(super) reason: String,
 }
 impl Supervisor {
+    pub(super) fn prepare_integrated(
+        mut options: Options,
+        mut settings: Settings,
+        root: PathBuf,
+        name: &str,
+    ) -> std::result::Result<Self, Box<IntegratedStartRefusal>> {
+        let launch = Launch {
+            root,
+            args: Vec::new(),
+        };
+        launch.configure(&mut options);
+        options.control = None;
+        // The remote frontend keeps its native settings; only this fixed
+        // server profile uses the existing bounded backend distances.
+        settings.render_distance = 2;
+        settings.simulation_distance = 2;
+        let input = Input {
+            options,
+            settings,
+            launch,
+            owner: None,
+            #[cfg(test)]
+            test: tests::Startup::default(),
+        };
+        let refusal = |input, reason| {
+            Box::new(IntegratedStartRefusal {
+                _input: Box::new(input),
+                reason,
+            })
+        };
+        if !input.launch.root.is_absolute()
+            || input
+                .launch
+                .root
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(refusal(
+                input,
+                "integrated server requires a fresh absolute application child".into(),
+            ));
+        }
+        if let Err(error) = std::fs::create_dir(&input.launch.root) {
+            return Err(refusal(input, error.to_string()));
+        }
+        let input = input
+            .with_integrated_owner(name)
+            .map_err(|(input, reason)| refusal(input, reason))?;
+        Self::prepare(input).map_err(|(input, reason)| refusal(input, reason))
+    }
+    pub(super) fn offer(
+        &self,
+    ) -> std::result::Result<mpsc::Receiver<std::result::Result<Pipe, String>>, String> {
+        let (send, receive) = mpsc::channel();
+        self.commands
+            .send(Command::Offer(send))
+            .map_err(|_| "original server no longer accepts Memory offers".to_string())?;
+        Ok(receive)
+    }
+    pub(super) fn request_close(&self) {
+        let _ = self.commands.send(Command::Close);
+    }
+    pub(super) fn retry(&self, attempt: u64) -> bool {
+        self.commands.send(Command::Retry(attempt)).is_ok()
+    }
+    pub(super) fn set_paused(&self, paused: bool) {
+        self.paused.store(paused, Ordering::SeqCst);
+    }
     /// The handle is registered before the worker can acquire native owners.
     #[allow(clippy::result_large_err)] // Refusal returns the exact original inert inputs.
     fn prepare(input: Input) -> std::result::Result<Self, (Input, String)> {
@@ -507,6 +586,8 @@ impl Supervisor {
         let worker_input = inert.clone();
         let view = Arc::new(Mutex::new(View::default()));
         let worker_view = view.clone();
+        let paused = Arc::new(AtomicBool::new(false));
+        let worker_paused = paused.clone();
         let (commands, receive) = mpsc::channel();
         let (release, acquire) = mpsc::sync_channel(0);
         let handle = std::thread::Builder::new()
@@ -520,7 +601,7 @@ impl Supervisor {
                     .unwrap_or_else(|e| e.into_inner())
                     .take()
                     .expect("original inert input");
-                worker(input, receive, worker_view)
+                worker(input, receive, worker_view, worker_paused)
             });
         match handle {
             Err(error) => Err((
@@ -537,6 +618,7 @@ impl Supervisor {
                     commands,
                     view,
                     _inert: inert,
+                    paused,
                 };
                 // A refused latch is an original finished worker result, joined
                 // by the same supervisor; no acquisition has taken place.
@@ -545,13 +627,13 @@ impl Supervisor {
             }
         }
     }
-    fn snapshot(&self) -> View {
+    pub(super) fn snapshot(&self) -> View {
         self.view.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
-    fn finished(&self) -> bool {
+    pub(super) fn finished(&self) -> bool {
         self.thread.as_ref().is_some_and(JoinHandle::is_finished)
     }
-    fn join(&mut self) -> Option<std::result::Result<(), String>> {
+    pub(super) fn join(&mut self) -> Option<std::result::Result<(), String>> {
         if !self.finished() {
             return None;
         }
@@ -650,6 +732,7 @@ fn worker(
     input: Input,
     commands: mpsc::Receiver<Command>,
     view: Arc<Mutex<View>>,
+    paused: Arc<AtomicBool>,
 ) -> std::result::Result<(), String> {
     let Input {
         options,
@@ -825,7 +908,7 @@ fn worker(
             Err(error)
         }
     };
-    run_game(game, commands, &view, startup.err())
+    run_game(game, commands, &view, startup.err(), &paused)
 }
 
 fn close_cold<T>(
@@ -901,6 +984,7 @@ fn run_game<'a>(
     commands: mpsc::Receiver<Command>,
     shared: &Mutex<View>,
     startup_error: Option<String>,
+    paused: &AtomicBool,
 ) -> std::result::Result<(), String> {
     let mut phase = Some(Phase::Running(game));
     let mut view = View::default();
@@ -953,6 +1037,7 @@ fn run_game<'a>(
         let mut next = None;
         match phase.as_mut().unwrap() {
             Phase::Running(game) => {
+                let pause = paused.load(Ordering::SeqCst);
                 view.phase = if settled { "Running" } else { "Settling" };
                 if !close {
                     let result = if !settled {
@@ -988,7 +1073,7 @@ fn run_game<'a>(
                         }
                     } else if Instant::now() >= next_tick {
                         next_tick = Instant::now() + Duration::from_millis(50);
-                        game.tick_server_timed(false)
+                        game.tick_server_timed(pause)
                     } else {
                         Ok(())
                     };
@@ -1000,6 +1085,7 @@ fn run_game<'a>(
                     }
                 }
                 view.ready = settled && listen_started && !close;
+                view.paused = pause;
                 view.ticks = game.ticks;
                 view.world_time = game.world.game_time;
                 view.guests = game.lan.as_ref().map_or(0, |h| h.hub.guests.len());

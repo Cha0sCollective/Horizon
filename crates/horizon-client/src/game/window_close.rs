@@ -16,9 +16,14 @@ use world_loading::{
 
 const CLOSE_WAIT: Duration = Duration::from_secs(10);
 
+enum RemoteDestination {
+    Address(String),
+    Integrated,
+}
+
 pub(super) struct RemoteLaunch {
     root: PathBuf,
-    address: String,
+    destination: RemoteDestination,
     args: Vec<String>,
 }
 impl RemoteLaunch {
@@ -40,12 +45,15 @@ impl RemoteLaunch {
                 return Err(format!("retained client refuses {name}").into());
             }
         }
-        let (mut root, mut address) = (None, None);
+        let (mut root, mut address, mut integrated) = (None, None, false);
         let mut ordinary = Vec::new();
         let mut input = args.iter();
         while let Some(arg) = input.next() {
             match arg.as_str() {
-                "--retained-client-window" if address.is_none() => {
+                "--retained-client-integrated" if address.is_none() && !integrated => {
+                    integrated = true
+                }
+                "--retained-client-window" if address.is_none() && !integrated => {
                     address = Some(
                         input
                             .next()
@@ -87,7 +95,11 @@ impl RemoteLaunch {
         ordinary.push("--test-terrain".into());
         Ok(Some(Self {
             root,
-            address: address.ok_or("missing retained client address")?,
+            destination: if integrated {
+                RemoteDestination::Integrated
+            } else {
+                RemoteDestination::Address(address.ok_or("missing retained client address")?)
+            },
             args: ordinary,
         }))
     }
@@ -259,6 +271,14 @@ struct ColdState {
     ui: ColdUi,
     entry: RetainedEntryIdentity,
 }
+struct IntegratedPreparing<'a> {
+    res: &'a Arc<Resources>,
+    prepared: Option<RemotePreparation>,
+    ui: ColdUi,
+    server_root: PathBuf,
+    refusal: Option<Box<retained_server::IntegratedStartRefusal>>,
+    targets: Vec<horizon_client::net::RetainedTarget>,
+}
 enum Phase<'a> {
     Running(Box<Game<'a>>),
     RemoteRunning(Box<Game<'a>>),
@@ -267,13 +287,24 @@ enum Phase<'a> {
     Closing(Box<CloseOwner<'a>>),
     Ready(NativeReady<'a>),
     Cold(Box<ColdState>),
+    IntegratedPreparing(Box<IntegratedPreparing<'a>>),
     Done,
 }
 
 pub(super) fn run_remote(options: Options, launch: RemoteLaunch) -> Result<()> {
     horizon_threads::catch_retained_stop_signals();
     let settings = Settings::load(&std::env::current_dir()?.join("options.txt"));
+    let integrated = matches!(launch.destination, RemoteDestination::Integrated);
     preflight(&options, &settings)?;
+    if integrated
+        && (cfg!(feature = "audio")
+            || settings.render_distance != 2
+            || settings.simulation_distance != 5)
+    {
+        return Err(
+            "retained integrated view requires audio disabled, render distance two and client simulation distance five".into(),
+        );
+    }
     if cfg!(feature = "controllers") {
         return Err("retained client excludes controller acquisition".into());
     }
@@ -313,18 +344,46 @@ pub(super) fn run_remote(options: Options, launch: RemoteLaunch) -> Result<()> {
         .control
         .clone()
         .ok_or("retained client control path")?;
-    let game = Game::new_retained_remote(
-        &resources,
-        loaded.pack,
-        gui,
-        options,
-        settings,
-        cpu,
-        launch.address,
-        "RetainedGuest".into(),
-    )?;
+    let phase = match launch.destination {
+        RemoteDestination::Address(address) => {
+            Phase::RemoteRunning(Box::new(Game::new_retained_remote(
+                &resources,
+                loaded.pack,
+                gui,
+                options,
+                settings,
+                cpu,
+                address,
+                "RetainedGuest".into(),
+            )?))
+        }
+        RemoteDestination::Integrated => {
+            Phase::IntegratedPreparing(Box::new(IntegratedPreparing {
+                res: &resources,
+                prepared: Some(RemotePreparation::new(
+                    options,
+                    settings,
+                    cpu,
+                    "IntegratedOwner".into(),
+                )?),
+                ui: ColdUi {
+                    pack: loaded.pack,
+                    gui,
+                    renderer: None,
+                    window: None,
+                },
+                server_root: launch.root.join("server"),
+                refusal: None,
+                targets: Vec::new(),
+            }))
+        }
+    };
     let mut application = Application {
-        phase: Phase::RemoteRunning(Box::new(game)),
+        phase,
+        server: None,
+        server_result: None,
+        server_offer: None,
+        client_attempt: 0,
         construction: None,
         control: Some(RetainedControl::prepare_window(&control_path)),
         closed_control: None,
@@ -355,7 +414,7 @@ pub(super) fn run_remote(options: Options, launch: RemoteLaunch) -> Result<()> {
         ))]
         test: None,
     };
-    if let Err(error) = application.control.as_mut().unwrap().start() {
+    if !integrated && let Err(error) = application.control.as_mut().unwrap().start() {
         application.fail(error);
     }
     if let Phase::RemoteRunning(game) = &mut application.phase
@@ -369,6 +428,19 @@ pub(super) fn run_remote(options: Options, launch: RemoteLaunch) -> Result<()> {
         std::process::abort();
     }
     outcome?;
+    if integrated {
+        eprintln!(
+            "INTEGRATED_APPLICATION_JOINED={} SERVER_RESULT={:?}",
+            application.server_done(),
+            application.server_result
+        );
+        if let Some(server) = &application.server {
+            eprintln!(
+                "INTEGRATED_APPLICATION_SERVER_FINAL={}",
+                server.snapshot().json()
+            );
+        }
+    }
     if let Some(error) = application.original_error.take() {
         return Err(error.into());
     }
@@ -377,6 +449,12 @@ pub(super) fn run_remote(options: Options, launch: RemoteLaunch) -> Result<()> {
 
 struct Application<'a> {
     phase: Phase<'a>,
+    server: Option<retained_server::Supervisor>,
+    server_result: Option<std::result::Result<(), String>>,
+    server_offer: Option<
+        std::sync::mpsc::Receiver<std::result::Result<horizon_protocol::connection::Pipe, String>>,
+    >,
+    client_attempt: u64,
     construction: Option<Construction>,
     control: Option<RetainedControl>,
     closed_control: Option<ClosedControl>,
@@ -469,6 +547,10 @@ pub(super) fn run(options: Options, launch: Launch) -> Result<()> {
         RetainedControl::prepare_window(options.control.as_ref().expect("profile control path"));
     let mut application = Application {
         phase: Phase::Done,
+        server: None,
+        server_result: None,
+        server_offer: None,
+        client_attempt: 0,
         construction: None,
         control: Some(control),
         closed_control: None,
@@ -729,6 +811,156 @@ pub(super) fn request_redraw(game: &Game<'_>, title: &str) {
 }
 
 impl Application<'_> {
+    fn server_done(&self) -> bool {
+        self.server.is_none() || self.server_result.is_some()
+    }
+    fn frontend_done(&self) -> bool {
+        matches!(self.phase, Phase::Ready(_) | Phase::RemoteReady(_))
+            || matches!(&self.phase, Phase::Cold(cold) if cold.closed.is_some())
+            || (self.attempt > 0 && matches!(self.phase, Phase::IntegratedPreparing(_)))
+    }
+    fn poll_integrated(&mut self) {
+        let mut failure = None;
+        #[cfg(test)]
+        let hold_prepare = tests::hold_integrated_stage("prepare");
+        #[cfg(not(test))]
+        let hold_prepare = false;
+        if self.attempt == 0
+            && self.server.is_none()
+            && self.view().usable
+            && !hold_prepare
+            && let Phase::IntegratedPreparing(seed) = &mut self.phase
+            && seed.refusal.is_none()
+        {
+            let prepared = seed.prepared.as_ref().unwrap();
+            match retained_server::Supervisor::prepare_integrated(
+                prepared.options.clone(),
+                prepared.settings.clone(),
+                seed.server_root.clone(),
+                &prepared.name,
+            ) {
+                Ok(server) => self.server = Some(server),
+                Err(refusal) => {
+                    failure = Some(refusal.reason.clone());
+                    seed.refusal = Some(refusal);
+                }
+            }
+        }
+        if let Some(server) = &self.server {
+            let state = server.snapshot();
+            if let Some(error) = state.original_error {
+                failure.get_or_insert(error);
+            }
+            if self.attempt == 0
+                && state.ready
+                && self.server_offer.is_none()
+                && matches!(self.phase, Phase::IntegratedPreparing(_))
+            {
+                match server.offer() {
+                    Ok(receive) => self.server_offer = Some(receive),
+                    Err(error) => {
+                        failure.get_or_insert(error);
+                    }
+                }
+            }
+            if let Phase::RemoteRunning(game) = &self.phase {
+                server.set_paused(game.screen == Screen::Paused);
+            }
+        }
+        #[cfg(test)]
+        let hold_offer = self.attempt == 0 && tests::hold_integrated_stage("offer");
+        #[cfg(not(test))]
+        let hold_offer = false;
+        let offered = self
+            .server_offer
+            .as_ref()
+            .filter(|_| !hold_offer)
+            .and_then(|receive| match receive.try_recv() {
+                Ok(value) => Some(value),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    Some(Err("original integrated Offer channel closed".into()))
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+            });
+        if let Some(offered) = offered {
+            self.server_offer.take();
+            self.status_presented = false;
+            let phase = std::mem::replace(&mut self.phase, Phase::Done);
+            self.phase = match phase {
+                Phase::IntegratedPreparing(mut seed) => match offered {
+                    Ok(pipe) if self.attempt == 0 && failure.is_none() => {
+                        match seed.prepared.take().unwrap().attach(
+                            horizon_client::net::RetainedTarget::Memory(pipe),
+                            "Integrated world".into(),
+                            RemoteFrontend::Integrated,
+                        ) {
+                            Ok(attached) => {
+                                assert!(seed.targets.is_empty());
+                                let mut game =
+                                    attached.into_game(seed.res, seed.ui.pack, seed.ui.gui);
+                                game.window = seed.ui.window;
+                                game.renderer = seed.ui.renderer;
+                                game.world_renderer_ready = game.renderer.is_some();
+                                game.focused = game
+                                    .window
+                                    .as_ref()
+                                    .is_some_and(|window| window.has_focus());
+                                if let Err(error) = game.start_retained_remote() {
+                                    failure.get_or_insert(error.to_string());
+                                }
+                                Phase::RemoteRunning(Box::new(game))
+                            }
+                            Err((prepared, target, error)) => {
+                                seed.prepared = Some(prepared);
+                                if let horizon_client::net::RetainedTarget::Memory(pipe) = &target {
+                                    pipe.shutdown();
+                                }
+                                seed.targets.push(target);
+                                failure.get_or_insert(error);
+                                Phase::IntegratedPreparing(seed)
+                            }
+                        }
+                    }
+                    Ok(pipe) => {
+                        pipe.shutdown();
+                        seed.targets
+                            .push(horizon_client::net::RetainedTarget::Memory(pipe));
+                        #[cfg(test)]
+                        eprintln!("INTEGRATED_CANCELLED_ACTUAL_MEMORY_OFFER=true");
+                        Phase::IntegratedPreparing(seed)
+                    }
+                    Err(error) => {
+                        failure.get_or_insert(error);
+                        Phase::IntegratedPreparing(seed)
+                    }
+                },
+                other => {
+                    // An Offer is requested only in preparing and that phase
+                    // stays owned until its actual response is consumed.
+                    self.phase = other;
+                    eprintln!("fatal: integrated Offer lost its original preparing owner");
+                    std::process::abort();
+                }
+            };
+        }
+        if self.server_result.is_none()
+            && let Some(server) = &mut self.server
+            && server.finished()
+        {
+            let result = server.join().expect("original finished supervisor join");
+            if let Err(error) = &result {
+                failure.get_or_insert(error.clone());
+            }
+            self.server_result = Some(result);
+            self.status_presented = false;
+        }
+        if let Some(error) = failure
+            && self.original_error.as_ref() != Some(&error)
+            && self.late_error.as_ref() != Some(&error)
+        {
+            self.fail(error);
+        }
+    }
     fn view(&self) -> Presentation {
         match &self.phase {
             Phase::Running(game)
@@ -743,6 +975,17 @@ impl Application<'_> {
                 usable: cold.ui.window.as_ref().is_some_and(|w| {
                     w.is_visible() != Some(false) && w.is_minimized() != Some(true)
                 }) && cold
+                    .ui
+                    .renderer
+                    .as_ref()
+                    .is_some_and(Renderer::has_inline_occlusion_provenance),
+            },
+            Phase::IntegratedPreparing(seed) => Presentation {
+                id: seed.ui.window.as_ref().map(|w| w.id()),
+                focused: seed.ui.window.as_ref().is_some_and(|w| w.has_focus()),
+                usable: seed.ui.window.as_ref().is_some_and(|w| {
+                    w.is_visible() != Some(false) && w.is_minimized() != Some(true)
+                }) && seed
                     .ui
                     .renderer
                     .as_ref()
@@ -776,6 +1019,7 @@ impl Application<'_> {
                 Phase::Closing(_) => "closing native world",
                 Phase::Ready(_) => "world closed; Q quits",
                 Phase::Cold(_) => "closing original failed preparation",
+                Phase::IntegratedPreparing(_) => "integrated frontend preparing",
                 Phase::Done => "complete",
             }
         }
@@ -783,7 +1027,7 @@ impl Application<'_> {
     fn status_text(&self) -> String {
         if let Phase::RemoteRunning(game) = &self.phase {
             return format!(
-                "remote running | chunks={} sections={} frames={} | player={:?} | yaw={:.2} pitch={:.2} | Esc leaves",
+                "remote running | chunks={} sections={} frames={} | player={:?} | yaw={:.2} pitch={:.2} | {}",
                 game.world.chunks.len(),
                 game.renderer.as_ref().map_or(0, |r| r.drawn_sections),
                 game.frames,
@@ -791,9 +1035,26 @@ impl Application<'_> {
                     .as_ref()
                     .map(|p| [p.position.x, p.position.y, p.position.z]),
                 game.yaw,
-                game.pitch
+                game.pitch,
+                if game.remote_frontend == RemoteFrontend::Integrated {
+                    "Esc pauses/resumes"
+                } else {
+                    "Esc leaves"
+                }
             );
         }
+        let server = self
+            .server
+            .as_ref()
+            .map(|server| {
+                format!(
+                    "\nServer {} {:?}",
+                    server.snapshot().attempt,
+                    server.snapshot().blocked
+                )
+            })
+            .unwrap_or_default();
+        let detail = format!("{}{server}", brief(&self.visible_detail()));
         format!(
             "{}\nAttempt {}{}\n{}\n{}",
             self.stage(),
@@ -804,13 +1065,16 @@ impl Application<'_> {
             } else {
                 "R: Retry / restore status; Q: quit; Esc: close world"
             },
-            brief(&self.visible_detail())
+            detail
         )
     }
     fn visible_detail(&self) -> String {
         if matches!(
             self.phase,
-            Phase::RemoteRunning(_) | Phase::RemoteClosing(_) | Phase::RemoteReady(_)
+            Phase::RemoteRunning(_)
+                | Phase::RemoteClosing(_)
+                | Phase::RemoteReady(_)
+                | Phase::IntegratedPreparing(_)
         ) && let Some(error) = &self.original_error
         {
             return format!("{error}; {}", self.detail);
@@ -835,6 +1099,9 @@ impl Application<'_> {
             return;
         }
         self.attempt = 1;
+        if let Some(server) = &self.server {
+            server.request_close();
+        }
         self.status_presented = false;
         let now = Instant::now();
         if let Some(lod) = &mut self.lod {
@@ -843,6 +1110,7 @@ impl Application<'_> {
         let phase = std::mem::replace(&mut self.phase, Phase::Done);
         self.phase = match phase {
             Phase::RemoteRunning(mut game) => {
+                self.client_attempt = 1;
                 if let Some(error) = game.retained_remote_failure() {
                     self.original_error.get_or_insert(error);
                 }
@@ -877,6 +1145,10 @@ impl Application<'_> {
             return false;
         };
         let now = Instant::now();
+        let server_accepted = self.server.as_ref().is_some_and(|server| {
+            let state = server.snapshot();
+            state.blocked.is_some() && server.retry(state.attempt)
+        });
         let accepted = if let Some(control) = self
             .control
             .as_mut()
@@ -888,7 +1160,15 @@ impl Application<'_> {
         } else {
             match &mut self.phase {
                 Phase::RemoteClosing(game) => {
-                    game.retry_retained_remote_close(expected, now + CLOSE_WAIT)
+                    let accepted =
+                        game.retry_retained_remote_close(self.client_attempt, now + CLOSE_WAIT);
+                    if accepted {
+                        self.client_attempt = self
+                            .client_attempt
+                            .checked_add(1)
+                            .expect("validated client Retry counter");
+                    }
+                    accepted
                 }
                 Phase::Closing(owner) => owner.retry(now + CLOSE_WAIT).is_ok(),
                 Phase::Cold(cold) => cold
@@ -898,6 +1178,7 @@ impl Application<'_> {
                 _ => false,
             }
         };
+        let accepted = accepted || server_accepted;
         if accepted {
             self.attempt = next;
             self.blocked = false;
@@ -929,14 +1210,25 @@ impl Application<'_> {
             match request.command() {
                 WindowCommand::Status | WindowCommand::CloseStatus => {
                     let stage = self.stage();
-                    let visible = self.visible_detail();
-                    let detail = brief(&visible);
+                    let visible = if let Some(server) = &self.server {
+                        let state = server.snapshot().json();
+                        serde_json::json!({"server_phase":state["phase"],"server_attempt":state["attempt"],"time":state["world_time"],"paused":state["paused"],"record":state["owner_record"],"joined":state["worker_joined"],"blocked":state["blocked"],"offer_pending":self.server_offer.is_some(),"error":self.original_error.as_ref().map(|error| error.chars().take(80).collect::<String>())}).to_string()
+                    } else {
+                        self.visible_detail()
+                    };
+                    let detail = if self.server.is_some() {
+                        visible.as_str()
+                    } else {
+                        brief(&visible)
+                    };
                     let _ = request.reply(WindowReply::Status {
                         phase: if self.blocked { "blocked" } else { "active" },
                         stage,
                         attempt: self.attempt,
                         detail,
-                        world_closed: matches!(self.phase, Phase::Ready(_)),
+                        world_closed: self.frontend_done()
+                            && self.server_done()
+                            && self.server_offer.is_none(),
                         control_sealed: false,
                     });
                 }
@@ -998,7 +1290,7 @@ impl Application<'_> {
         match &mut self.phase {
             Phase::RemoteClosing(game) => {
                 let status = game.poll_retained_remote_close();
-                if status.attempt != self.attempt {
+                if status.attempt != self.client_attempt {
                     self.blocked = true;
                     self.detail = "original remote parent attempt mismatch; owners retained".into();
                     return;
@@ -1063,8 +1355,14 @@ impl Application<'_> {
             }
             _ => {}
         }
-        let world_closed = matches!(self.phase, Phase::Ready(_) | Phase::RemoteReady(_))
-            || matches!(&self.phase, Phase::Cold(c) if c.closed.is_some());
+        if let Some(server) = &self.server
+            && let Some(error) = server.snapshot().blocked
+        {
+            self.blocked = true;
+            self.detail = format!("integrated native server: {error}");
+        }
+        let world_closed =
+            self.frontend_done() && self.server_done() && self.server_offer.is_none();
         if !world_closed || !self.quit || !self.unclaimed_columns.is_empty() {
             return;
         }
@@ -1076,8 +1374,28 @@ impl Application<'_> {
                 .control
                 .as_ref()
                 .is_some_and(|control| control.observation().admission_sealed);
-        if !sealed && (!self.status_presented || self.surface_occluded || !self.view().usable) {
+        let unstarted_presentation_failure = matches!(self.phase, Phase::IntegratedPreparing(_))
+            && self.server.is_none()
+            && !self.view().usable
+            && self.original_error.is_some();
+        if unstarted_presentation_failure {
+            self.exit_acknowledged = true;
+        }
+        if !sealed
+            && !unstarted_presentation_failure
+            && (!self.status_presented || self.surface_occluded || !self.view().usable)
+        {
             return;
+        }
+        #[cfg(test)]
+        if self.control.is_some() && !sealed {
+            eprintln!(
+                "WINDOW_JOINT_CONTROL_SEAL server_done={} offer_pending={} status_presented={} unpublished_failure={}",
+                self.server_done(),
+                self.server_offer.is_some(),
+                self.status_presented,
+                unstarted_presentation_failure
+            );
         }
         if let Some(control) = &mut self.control {
             control.begin_close(Instant::now() + CLOSE_WAIT);
@@ -1099,8 +1417,10 @@ impl Application<'_> {
             if observation.native_quiescent {
                 match self.control.take().unwrap().try_closed() {
                     Ok(closed) => {
-                        self.terminal_failure |= (matches!(self.phase, Phase::RemoteReady(_))
-                            && self.original_error.is_some())
+                        self.terminal_failure |= (matches!(
+                            self.phase,
+                            Phase::RemoteReady(_) | Phase::IntegratedPreparing(_)
+                        ) && self.original_error.is_some())
                             || !matches!(
                                 observation.endpoint,
                                 RetainedEndpointState::Released
@@ -1146,11 +1466,21 @@ impl Application<'_> {
         }
     }
     fn complete(&mut self, event_loop: &ActiveEventLoop) {
+        if !self.server_done() || self.server_offer.is_some() {
+            return;
+        }
         if self.closed_control.is_none() || (self.terminal_failure && !self.exit_acknowledged) {
             return;
         }
         let phase = std::mem::replace(&mut self.phase, Phase::Done);
         match phase {
+            Phase::IntegratedPreparing(seed)
+                if self.server_done() && self.server_offer.is_none() =>
+            {
+                drop(seed);
+                drop(self.closed_control.take());
+                event_loop.exit();
+            }
             Phase::RemoteReady(game) => {
                 // All three original actor owners are now closed and retained
                 // in this same Game. No storage/world completion is fabricated.
@@ -1229,6 +1559,9 @@ impl Application<'_> {
             Phase::Closing(owner) => owner.draw_window_status(&stage),
             Phase::Ready(ready) => ready.draw_window_status(&stage),
             Phase::Cold(cold) => draw_hud(cold.ui.renderer.as_mut(), &cold.ui.gui, &stage),
+            Phase::IntegratedPreparing(seed) => {
+                draw_hud(seed.ui.renderer.as_mut(), &seed.ui.gui, &stage)
+            }
             Phase::Done => Ok(false),
         };
         #[cfg(all(
@@ -1335,6 +1668,7 @@ impl ApplicationHandler for Application<'_> {
             Phase::RemoteRunning(game) | Phase::RemoteClosing(game) | Phase::RemoteReady(game) => {
                 game.options.window_size
             }
+            Phase::IntegratedPreparing(seed) => seed.prepared.as_ref().unwrap().options.window_size,
             _ => [960, 540],
         };
         let attributes = Window::default_attributes()
@@ -1376,10 +1710,29 @@ impl ApplicationHandler for Application<'_> {
                 )
                 .map(|renderer| cold.ui.renderer = Some(renderer))
             }
+            Phase::IntegratedPreparing(seed) => {
+                seed.ui.window = Some(window.clone());
+                #[cfg(test)]
+                if tests::refuse_integrated_renderer() {
+                    return self.fail("controlled integrated frontend renderer refusal");
+                }
+                renderer(
+                    window,
+                    &seed.ui.pack,
+                    &seed.ui.gui,
+                    horizon_client::graphics::GraphicsApi::default(),
+                )
+                .map(|renderer| seed.ui.renderer = Some(renderer))
+            }
             Phase::Done => Ok(()),
         };
         if let Err(error) = result {
             self.fail(error.to_string());
+        } else if matches!(self.phase, Phase::IntegratedPreparing(_))
+            && let Some(control) = &mut self.control
+            && let Err(error) = control.start()
+        {
+            self.fail(error);
         }
     }
     fn window_event(&mut self, _event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
@@ -1473,6 +1826,11 @@ impl ApplicationHandler for Application<'_> {
                             renderer.resize(size.width, size.height);
                         }
                     }
+                    Phase::IntegratedPreparing(seed) => {
+                        if let Some(renderer) = &mut seed.ui.renderer {
+                            renderer.resize(size.width, size.height);
+                        }
+                    }
                     Phase::Done => {}
                 }
             }
@@ -1487,6 +1845,7 @@ impl ApplicationHandler for Application<'_> {
         }
     }
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.poll_integrated();
         if horizon_threads::stop_requests() > 0 {
             self.begin_close(true);
         }
@@ -1535,6 +1894,12 @@ impl ApplicationHandler for Application<'_> {
             Phase::Ready(ready) => ready.redraw_window(&title),
             Phase::Cold(cold) => {
                 if let Some(window) = &cold.ui.window {
+                    window.set_title(&title);
+                    window.request_redraw();
+                }
+            }
+            Phase::IntegratedPreparing(seed) => {
+                if let Some(window) = &seed.ui.window {
                     window.set_title(&title);
                     window.request_redraw();
                 }

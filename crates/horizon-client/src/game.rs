@@ -2080,6 +2080,8 @@ struct Game<'a> {
     #[cfg(feature = "paired-packages")]
     native_close_authority: Option<world_loading::NativeCloseAuthority>,
     #[cfg(feature = "paired-packages")]
+    remote_frontend: RemoteFrontend,
+    #[cfg(feature = "paired-packages")]
     retained_server: Option<retained_server::ServerGameState>,
     audio: Audio,
     music: horizon_client::music::MusicManager,
@@ -14239,13 +14241,143 @@ enum InitialGameWorld {
     Legacy,
     #[cfg(feature = "paired-packages")]
     RetainedRemote {
-        address: String,
+        session: horizon_client::net::RetainedSession,
+        label: String,
         name: String,
         builtin: horizon_protocol::registry::Builtin,
         language: Arc<horizon_protocol::text::Language>,
+        kind: RemoteFrontend,
     },
     #[cfg(feature = "paired-packages")]
     Retained(Box<world_loading::ColdPreparedWorld>),
+}
+
+#[cfg(feature = "paired-packages")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RemoteFrontend {
+    External,
+    Integrated,
+}
+
+#[cfg(feature = "paired-packages")]
+struct RemotePreparation {
+    options: Options,
+    settings: Settings,
+    cpu: GameCpuResources,
+    builtin: horizon_protocol::registry::Builtin,
+    language: Arc<horizon_protocol::text::Language>,
+    name: String,
+}
+#[cfg(feature = "paired-packages")]
+struct RemoteAttachment {
+    prepared: RemotePreparation,
+    session: horizon_client::net::RetainedSession,
+    label: String,
+    kind: RemoteFrontend,
+}
+#[cfg(feature = "paired-packages")]
+impl RemotePreparation {
+    fn new(
+        options: Options,
+        settings: Settings,
+        cpu: GameCpuResources,
+        name: String,
+    ) -> Result<Self> {
+        if cfg!(feature = "controllers")
+            || settings.horizon.lod_distance != 0
+            || !settings.mods.enabled.is_empty()
+            || !settings.resource_packs.is_empty()
+            || !options.dev_mods.is_empty()
+            || options.mod_packages.has_pairs()
+            || options.server_thread
+            || options.server.is_some()
+            || options.dedicated.is_some()
+            || name.is_empty()
+            || name.len() > 16
+            || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        {
+            return Err(
+                "retained client requires fixed unmodified inputs and a valid offline name".into(),
+            );
+        }
+        let builtin = horizon_protocol::registry::Builtin::find(&options.resources)
+            .and_then(|p| horizon_protocol::registry::Builtin::load(&p).ok())
+            .ok_or("retained client requires complete registries")?;
+        let language = Arc::new(horizon_client::net::load_language(&options.resources));
+        Ok(Self {
+            options,
+            settings,
+            cpu,
+            builtin,
+            language,
+            name,
+        })
+    }
+    #[allow(clippy::result_large_err)] // Refusal preserves all original inert frontend inputs and target.
+    fn attach(
+        self,
+        target: horizon_client::net::RetainedTarget,
+        label: String,
+        kind: RemoteFrontend,
+    ) -> std::result::Result<RemoteAttachment, (Self, horizon_client::net::RetainedTarget, String)>
+    {
+        let settings = horizon_client::net::RetainedSettings::offline(
+            self.name.clone(),
+            self.settings.render_distance.clamp(2, 32) as i8,
+            self.language.clone(),
+        );
+        match horizon_client::net::RetainedSession::new_offline(target, settings) {
+            Ok(session) => Ok(RemoteAttachment {
+                prepared: self,
+                session,
+                label,
+                kind,
+            }),
+            Err(refusal) => Err((self, refusal.target, refusal.reason)),
+        }
+    }
+}
+#[cfg(feature = "paired-packages")]
+impl RemoteAttachment {
+    fn into_game<'a>(
+        self,
+        res: &'a Arc<Resources>,
+        pack: PackResources,
+        gui: UiResources,
+    ) -> Game<'a> {
+        let RemotePreparation {
+            options,
+            settings,
+            cpu,
+            builtin,
+            language,
+            name,
+        } = self.prepared;
+        let audio = Audio::silent(&options.resources);
+        // CPU and Session validation are complete before the original target is
+        // adopted. This branch has no remaining ordinary fallible operation.
+        Game::new_with_world(
+            res,
+            pack,
+            gui,
+            options,
+            settings,
+            audio,
+            Some(cpu),
+            InitialGameWorld::RetainedRemote {
+                session: self.session,
+                label: self.label,
+                name,
+                builtin,
+                language,
+                kind: self.kind,
+            },
+        )
+        .unwrap_or_else(|error| {
+            eprintln!("fatal: prevalidated remote Game construction: {error}");
+            std::process::abort();
+        })
+    }
 }
 
 impl<'a> Game<'a> {
@@ -14315,17 +14447,25 @@ impl<'a> Game<'a> {
                 }
             }
         }
-        let turn = |k| f32::from(u8::from(self.keys.contains(&k)));
-        self.yaw += (turn(KeyCode::ArrowRight) - turn(KeyCode::ArrowLeft))
-            * 90.0
-            * elapsed.as_secs_f32().min(0.1);
-        self.pitch = (self.pitch
-            + (turn(KeyCode::ArrowDown) - turn(KeyCode::ArrowUp))
+        let paused =
+            self.remote_frontend == RemoteFrontend::Integrated && self.screen == Screen::Paused;
+        if !paused {
+            let turn = |k| f32::from(u8::from(self.keys.contains(&k)));
+            self.yaw += (turn(KeyCode::ArrowRight) - turn(KeyCode::ArrowLeft))
                 * 90.0
-                * elapsed.as_secs_f32().min(0.1))
-        .clamp(-90.0, 90.0);
-        self.apply_mouse_look();
-        for _ in 0..self.clock.advance(elapsed) {
+                * elapsed.as_secs_f32().min(0.1);
+            self.pitch = (self.pitch
+                + (turn(KeyCode::ArrowDown) - turn(KeyCode::ArrowUp))
+                    * 90.0
+                    * elapsed.as_secs_f32().min(0.1))
+            .clamp(-90.0, 90.0);
+            self.apply_mouse_look();
+        }
+        for _ in 0..if paused {
+            0
+        } else {
+            self.clock.advance(elapsed)
+        } {
             self.tick_remote()?;
             if let Some(error) = self.retained_remote_failure() {
                 return Err(error.into());
@@ -14339,7 +14479,7 @@ impl<'a> Game<'a> {
         if let Some(error) = self.retained_remote_failure() {
             return Err(error.into());
         }
-        self.clock.end_frame(false);
+        self.clock.end_frame(paused);
         if presented {
             self.frames += 1;
             if self.player.is_some() {
@@ -14372,6 +14512,25 @@ impl<'a> Game<'a> {
             } => {
                 if let PhysicalKey::Code(key) = event.physical_key {
                     if key == KeyCode::Escape && event.state == ElementState::Pressed {
+                        if self.remote_frontend == RemoteFrontend::Integrated {
+                            if event.repeat {
+                                return Ok(());
+                            }
+                            self.screen = if self.screen == Screen::Paused {
+                                Screen::Playing
+                            } else {
+                                Screen::Paused
+                            };
+                            self.pause_menu = false;
+                            self.keys.clear();
+                            self.physical_keys.clear();
+                            self.left = false;
+                            self.right = false;
+                            self.clock.reset();
+                            self.previous = Instant::now();
+                            self.capture(self.screen == Screen::Playing);
+                            return Ok(());
+                        }
                         self.retained_remote_request_leave();
                         return Ok(());
                     }
@@ -14400,7 +14559,9 @@ impl<'a> Game<'a> {
                     }
                 }
             }
-            WindowEvent::MouseInput { state, button, .. } if self.focused => {
+            WindowEvent::MouseInput { state, button, .. }
+                if self.focused && self.screen == Screen::Playing =>
+            {
                 if !self.captured && state == ElementState::Pressed {
                     self.capture(true);
                 } else if self.screen == Screen::Playing {
@@ -14438,41 +14599,17 @@ impl<'a> Game<'a> {
         address: String,
         name: String,
     ) -> Result<Self> {
-        if cfg!(feature = "controllers")
-            || settings.horizon.lod_distance != 0
-            || !settings.mods.enabled.is_empty()
-            || !settings.resource_packs.is_empty()
-            || !options.dev_mods.is_empty()
-            || options.mod_packages.has_pairs()
-            || options.server_thread
-            || options.server.is_some()
-            || options.dedicated.is_some()
-        {
-            return Err(
-                "retained client requires fixed no-LOD, no-controller, unmodified remote inputs"
-                    .into(),
-            );
+        let prepared = RemotePreparation::new(options, settings, prepared, name)?;
+        match prepared.attach(
+            horizon_client::net::RetainedTarget::Address(address.clone()),
+            address,
+            RemoteFrontend::External,
+        ) {
+            Ok(attached) => Ok(attached.into_game(res, pack, gui)),
+            // This wrapper creates only a plain address target; Memory attachment
+            // is handled by the application with target-preserving refusal.
+            Err((_prepared, _address, reason)) => Err(reason.into()),
         }
-        let builtin = horizon_protocol::registry::Builtin::find(&options.resources)
-            .and_then(|p| horizon_protocol::registry::Builtin::load(&p).ok())
-            .ok_or("retained client requires complete registries")?;
-        let language = Arc::new(horizon_client::net::load_language(&options.resources));
-        let audio = Audio::silent(&options.resources);
-        Self::new_with_world(
-            res,
-            pack,
-            gui,
-            options,
-            settings,
-            audio,
-            Some(prepared),
-            InitialGameWorld::RetainedRemote {
-                address,
-                name,
-                builtin,
-                language,
-            },
-        )
     }
     /// A game with no world open, over the loaded resources: the window's,
     /// or an integrated server's on its own thread.
@@ -14512,6 +14649,11 @@ impl<'a> Game<'a> {
         let registry = pack.assets.registry;
         #[cfg(feature = "paired-packages")]
         let preloaded_cpu = prepared.is_some();
+        #[cfg(feature = "paired-packages")]
+        assert!(
+            !matches!(&initial, InitialGameWorld::RetainedRemote { .. }) || preloaded_cpu,
+            "an attached original remote Session requires preloaded CPU inputs"
+        );
         // Finish fallible CPU loading before a retained Session can exist.
         let prepared = prepared
             .map(Ok)
@@ -14544,23 +14686,14 @@ impl<'a> Game<'a> {
             }
             #[cfg(feature = "paired-packages")]
             InitialGameWorld::RetainedRemote {
-                address,
+                session,
+                label,
                 name,
                 builtin,
                 language,
+                kind,
             } => {
                 let view = settings.render_distance.clamp(2, 32) as i8;
-                // The last ordinary fallible operation. Refusal owns only its
-                // original target; no worker/decoder/stream owner yet exists.
-                let session = horizon_client::net::RetainedSession::new_offline(
-                    horizon_client::net::RetainedTarget::Address(address.clone()),
-                    horizon_client::net::RetainedSettings::offline(
-                        name.clone(),
-                        view,
-                        language.clone(),
-                    ),
-                )
-                .map_err(|r| r.reason)?;
                 // Literal one is validated by the fixed prepare contract;
                 // construction is inert and cannot acquire a native worker.
                 let stream = horizon_client::streaming::RetainedRemoteStreaming::prepare(
@@ -14568,16 +14701,19 @@ impl<'a> Game<'a> {
                     1,
                 )
                 .unwrap_or_else(|_| unreachable!("fixed one-worker remote preparation"));
-                remote_initial = Some(remote::Remote::fresh(
-                    retained_remote::RemoteIo::Retained(Box::new(
-                        retained_remote::RetainedIo::new(session, address, name),
-                    )),
-                    builtin,
-                    language,
-                    view,
-                    settings.render_distance,
-                    settings.chat_visibility as i32,
-                    perspective::player_type(&root),
+                remote_initial = Some((
+                    remote::Remote::fresh(
+                        retained_remote::RemoteIo::Retained(Box::new(
+                            retained_remote::RetainedIo::new(session, label, name),
+                        )),
+                        builtin,
+                        language,
+                        view,
+                        settings.render_distance,
+                        settings.chat_visibility as i32,
+                        perspective::player_type(&root),
+                    ),
+                    kind,
                 ));
                 (
                     World::new(res.facts().air, 0),
@@ -14752,6 +14888,8 @@ impl<'a> Game<'a> {
             native_close_authority: None,
             #[cfg(feature = "paired-packages")]
             retained_server: None,
+            #[cfg(feature = "paired-packages")]
+            remote_frontend: RemoteFrontend::External,
             audio,
             music: {
                 // The manager starts with the saved option (MusicManager's constructor).
@@ -15026,8 +15164,9 @@ impl<'a> Game<'a> {
                 game.block_ticks = Ticks::new(game.level.seed as i32);
                 game.dim = Dim::Overworld;
             }
-            if let Some(remote) = remote_initial {
+            if let Some((remote, kind)) = remote_initial {
                 game.remote = Some(remote);
+                game.remote_frontend = kind;
                 game.screen = Screen::Playing;
                 game.title = None;
                 game.clock = FixedStep::client();

@@ -192,6 +192,10 @@ impl Game<'_> {
     /// `Minecraft.hasSingleplayerServer`: a world of this window's own, run
     /// in the frame or on its server thread.
     pub(super) fn has_singleplayer_server(&self) -> bool {
+        #[cfg(feature = "paired-packages")]
+        if self.remote_frontend == super::RemoteFrontend::Integrated && self.is_retained_remote() {
+            return true;
+        }
         self.remote.is_none() || self.integrated.is_some()
     }
     /// `IntegratedServer.isPublished`: the world is open to the network.
