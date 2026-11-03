@@ -27,6 +27,12 @@ mod tests;
 
 const CLOSE_WAIT: Duration = Duration::from_secs(10);
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum ServerProfile {
+    Dedicated,
+    Integrated { owner: u128, record: [i32; 4] },
+}
+
 pub(super) struct Launch {
     root: PathBuf,
     args: Vec<String>,
@@ -117,6 +123,7 @@ struct NativeInstallation {
     uuid: u128,
 }
 pub(super) struct ServerGameState {
+    profile: ServerProfile,
     construction: Arc<()>,
     identity: Option<RetainedHubIdentity>,
     hub_refusal: Option<Box<RetainedHubRefusal>>,
@@ -132,8 +139,9 @@ pub(super) struct ServerGameState {
     pub(super) consume_refusal_checked: bool,
 }
 impl ServerGameState {
-    pub(super) fn from_cold() -> Self {
+    pub(super) fn from_cold(profile: ServerProfile) -> Self {
         Self {
+            profile,
             construction: Arc::new(()),
             identity: None,
             hub_refusal: None,
@@ -176,6 +184,12 @@ impl ServerGameState {
         self.frozen = true;
     }
     pub(super) fn check_hub(&mut self, hub: &Hub) {
+        if let ServerProfile::Integrated { owner, .. } = self.profile
+            && hub.guests.iter().any(|guest| guest.uuid != owner)
+        {
+            self.fail("integrated Memory connection has a different owner profile".into());
+            return;
+        }
         if !self
             .identity
             .as_ref()
@@ -238,10 +252,43 @@ impl ServerGameState {
             .values()
             .any(|admission| !admission.installed())
     }
+    pub(super) fn integrated_owner(&self) -> Option<(u128, [i32; 4])> {
+        match self.profile {
+            ServerProfile::Integrated { owner, record } => Some((owner, record)),
+            ServerProfile::Dedicated => None,
+        }
+    }
+    pub(super) fn profile(&self) -> ServerProfile {
+        self.profile
+    }
     pub(super) fn authorizes_close(&self, game: &Game<'_>) -> bool {
+        let profile_matches = match self.profile {
+            ServerProfile::Dedicated => {
+                game.options.execution_role == execution_role::ExecutionRole::DedicatedServer
+                    && game
+                        .lan
+                        .as_ref()
+                        .is_none_or(|host| host.owner.is_none() && !host.hub.config.integrated)
+            }
+            ServerProfile::Integrated { owner, record } => {
+                game.options.execution_role == execution_role::ExecutionRole::IntegratedServer
+                    && game.options.dedicated.as_ref().is_some_and(Vec::is_empty)
+                    && game.level.player_uuid == Some(record)
+                    && game.lan.as_ref().is_none_or(|host| {
+                        host.owner.as_ref().is_some_and(|saved| {
+                            saved.uuid == owner
+                                && saved
+                                    .saved
+                                    .as_ref()
+                                    .is_none_or(|level| level.player_uuid == Some(record))
+                        }) && host.hub.singleplayer_owner == Some(owner)
+                            && host.hub.config.integrated
+                    })
+            }
+        };
         self.frozen
             && !self.incomplete()
-            && game.options.execution_role == execution_role::ExecutionRole::DedicatedServer
+            && profile_matches
             && game.settings.render_distance == 2
             && game.settings.simulation_distance == 2
             && game.settings.horizon.lod_distance == 0
@@ -339,6 +386,8 @@ struct View {
     worker_joined: bool,
     players: Vec<serde_json::Value>,
     transport: Option<RetainedHubCloseView>,
+    owner_record: Option<[i32; 4]>,
+    owner_saved: bool,
     #[cfg(test)]
     consume_refusal_checked: bool,
 }
@@ -359,6 +408,8 @@ impl Default for View {
             worker_joined: false,
             players: Vec::new(),
             transport: None,
+            owner_record: None,
+            owner_saved: false,
             #[cfg(test)]
             consume_refusal_checked: false,
         }
@@ -369,6 +420,7 @@ impl View {
         serde_json::json!({"phase":self.phase,"attempt":self.attempt,"ready":self.ready,"port":self.port,
         "ticks":self.ticks,"world_time":self.world_time,"guests":self.guests,"installed":self.installed,
         "pending_events":self.pending_events,"original_error":self.original_error,"blocked":self.blocked,
+        "owner_record":self.owner_record,"owner_saved":self.owner_saved,
         "worker_joined":self.worker_joined,"players":self.players,
         "transport":self.transport.as_ref().map(|view|serde_json::json!({
             "phase":format!("{:?}",view.phase),"attempt":view.attempt,"failure":view.failure,
@@ -419,8 +471,27 @@ struct Input {
     options: Options,
     settings: Settings,
     launch: Launch,
+    owner: Option<u128>,
     #[cfg(test)]
     test: tests::Startup,
+}
+impl Input {
+    #[cfg_attr(not(test), allow(dead_code))] // Joint window attachment follows this native owner adapter.
+    #[allow(clippy::result_large_err)] // Refusal preserves the complete inert launch input.
+    fn with_integrated_owner(mut self, name: &str) -> std::result::Result<Self, (Self, String)> {
+        if name.is_empty()
+            || name.len() > 16
+            || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        {
+            return Err((self, "invalid integrated offline player name".into()));
+        }
+        self.owner = Some(horizon_protocol::crypto::offline_uuid(name));
+        self.options.execution_role = execution_role::ExecutionRole::IntegratedServer;
+        // Match the ordinary integrated factory's native no-local-player marker.
+        self.options.dedicated = Some(Vec::new());
+        self.options.player_name = Some(name.into());
+        Ok(self)
+    }
 }
 struct Supervisor {
     thread: Option<JoinHandle<std::result::Result<(), String>>>,
@@ -584,6 +655,7 @@ fn worker(
         options,
         settings,
         launch,
+        owner,
         #[cfg(test)]
         test,
     } = input;
@@ -616,7 +688,13 @@ fn worker(
         return Err("retained server advancement resource input missing".into());
     }
     let resources = loaded.resources;
-    let inputs = hub_inputs(&resources, &loaded.pack, &root).map_err(|e| e.to_string())?;
+    let mut inputs = hub_inputs(&resources, &loaded.pack, &root).map_err(|e| e.to_string())?;
+    if owner.is_some() {
+        inputs.config.integrated = true;
+        inputs.config.max_players = 1;
+        inputs.offline.bind = None;
+        inputs.offline.max_players = 1;
+    }
     let mut stop_before_acquisition = horizon_threads::stop_requests() > 0;
     for command in commands.try_iter().take(16) {
         match command {
@@ -653,6 +731,7 @@ fn worker(
         &options,
         &settings,
         &entry,
+        owner,
     );
     #[cfg(test)]
     let cold = if test.fail_after_streaming {
@@ -672,6 +751,7 @@ fn worker(
             &options,
             &settings,
             &entry,
+            owner,
         )
     };
     let prepared = match cold.into_prepared(&entry) {
@@ -718,7 +798,9 @@ fn worker(
     #[cfg(test)]
     let fixture_error = {
         game.retained_server.as_mut().unwrap().test = test.clone();
-        test.install_staged_inputs(&game.world_root).err()
+        test.install_staged_inputs(&game.world_root)
+            .and_then(|_| test.install_owner_inputs(&mut game))
+            .err()
     };
     #[cfg(not(test))]
     let fixture_error: Option<String> = None;
@@ -811,7 +893,7 @@ fn player_observations(game: &Game<'_>) -> Vec<serde_json::Value> {
         "items":g.inventory.iter().flatten().map(|s|u64::from(s.count)).sum::<u64>(),
         "creative_reach_modifiers":g.motion.as_ref().map_or(0,|body|body.attributes.instances().flat_map(|(_,_,value)|value.modifiers())
             .filter(|modifier|matches!(modifier.id(),"minecraft:creative_mode_block_range"|"minecraft:creative_mode_entity_range")).count()),
-        "book_open":g.recipe_book.open[0],"book_filtering":g.recipe_book.filtering[0]})).collect()).unwrap_or_default()
+        "book_open":g.recipe_book.open[0],"book_filtering":g.recipe_book.filtering[0],"position":g.position})).collect()).unwrap_or_default()
 }
 
 fn run_game<'a>(
@@ -883,6 +965,18 @@ fn run_game<'a>(
                             Ok(false) => Err("original native server spawn did not settle".into()),
                             Err(error) => Err(error),
                         }
+                    } else if !listen_started
+                        && game
+                            .retained_server
+                            .as_ref()
+                            .unwrap()
+                            .integrated_owner()
+                            .is_some()
+                    {
+                        // Memory-only integrated profile never calls listen:
+                        // an absent bind address would otherwise mean wildcard.
+                        listen_started = true;
+                        Ok(())
                     } else if !listen_started {
                         match game.lan.as_mut().unwrap().hub.retained_listen() {
                             Ok(port) => {
@@ -910,6 +1004,17 @@ fn run_game<'a>(
                 view.world_time = game.world.game_time;
                 view.guests = game.lan.as_ref().map_or(0, |h| h.hub.guests.len());
                 view.installed = game.retained_server.as_ref().unwrap().installations.len();
+                view.owner_record = game
+                    .retained_server
+                    .as_ref()
+                    .unwrap()
+                    .integrated_owner()
+                    .map(|(_, record)| record);
+                view.owner_saved = game
+                    .lan
+                    .as_ref()
+                    .and_then(|host| host.owner.as_ref())
+                    .is_some_and(|owner| owner.saved.is_some());
                 view.pending_events = game.retained_server.as_ref().unwrap().pending.len();
                 view.transport = game
                     .lan
@@ -1173,6 +1278,7 @@ fn run_configured(
         options,
         settings,
         launch,
+        owner: None,
         #[cfg(test)]
         test,
     }) {

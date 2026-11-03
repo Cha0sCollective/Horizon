@@ -36,6 +36,7 @@ static SYNC: Mutex<Option<std::result::Result<Arc<SyncData>, String>>> = Mutex::
 #[cfg(feature = "paired-packages")]
 pub(super) struct NativeAdmission {
     pub(super) uuid: u128,
+    record_uuid: Option<[i32; 4]>,
     tag: Option<Option<horizon_world::nbt::Tag>>,
     stats: Option<Option<serde_json::Value>>,
     advancements: Option<Option<serde_json::Value>>,
@@ -52,6 +53,7 @@ impl NativeAdmission {
     pub(super) fn new(uuid: u128) -> Self {
         Self {
             uuid,
+            record_uuid: None,
             tag: None,
             stats: None,
             advancements: None,
@@ -84,6 +86,7 @@ impl NativeAdmission {
         }
     }
     fn read_inputs(&mut self, root: &std::path::Path) -> Result<()> {
+        self.bind_record(playerdata::uuid_ints(self.uuid))?;
         let path = playerdata::path(root, self.uuid);
         if self.tag.is_none() {
             match horizon_client::save::read_dat_checked(&path) {
@@ -95,7 +98,38 @@ impl NativeAdmission {
                 }
             }
         }
-        let uuid = playerdata::uuid_ints(self.uuid);
+        self.read_mapped_json(root, playerdata::uuid_ints(self.uuid))
+    }
+    fn bind_record(&mut self, record: [i32; 4]) -> Result<()> {
+        if self.record_uuid.is_some_and(|old| old != record) {
+            return Err("native player storage mapping changed during admission".into());
+        }
+        self.record_uuid = Some(record);
+        Ok(())
+    }
+    fn read_owner_inputs(
+        &mut self,
+        root: &std::path::Path,
+        level: &horizon_client::save::Level,
+        spawn: Option<[f64; 3]>,
+    ) -> Result<()> {
+        let record = level
+            .player_uuid
+            .ok_or("integrated native player UUID missing")?;
+        self.bind_record(record)?;
+        if self.tag.is_none() {
+            // Supply native spawn before encoding a pristine owner's snapshot;
+            // retain every other actual saved field and cache the result.
+            let mut source = level.clone();
+            if source.position.is_none() {
+                source.position =
+                    Some(spawn.ok_or("pristine integrated owner needs native spawn")?);
+            }
+            self.tag = Some(Some(source.player_tag()));
+        }
+        self.read_mapped_json(root, record)
+    }
+    fn read_mapped_json(&mut self, root: &std::path::Path, uuid: [i32; 4]) -> Result<()> {
         if self.stats.is_none() {
             self.stats = Some(self.read_json(&super::stats::player_json(root, "stats", uuid))?);
         }
@@ -255,6 +289,19 @@ impl Game<'_> {
             states: Default::default(),
         });
         self.audio.capture = Some(Vec::new());
+        if let Some((owner, record)) = self.retained_server.as_ref().unwrap().integrated_owner() {
+            if self.level.player_uuid != Some(record) {
+                return Err("integrated native record identity differs".into());
+            }
+            let commands = self.allow_commands();
+            let host = self.lan.as_mut().unwrap();
+            host.hub.singleplayer_owner = Some(owner);
+            host.hub.ops.insert(owner, if commands { 4 } else { 0 });
+            host.owner = Some(Owner {
+                uuid: owner,
+                saved: Some(Box::new(self.level.clone())),
+            });
+        }
         Ok(())
     }
 
@@ -311,13 +358,36 @@ impl Game<'_> {
         if host.hub.guest(conn).map(|g| g.uuid) != Some(admission.uuid) {
             return Err("native admission profile changed".into());
         }
-        admission.read_inputs(&self.world_root)?;
+        let integrated = self.retained_server.as_ref().unwrap().integrated_owner();
+        let record = if let Some((owner, record)) = integrated {
+            let saved = host
+                .owner
+                .as_ref()
+                .ok_or("integrated owner storage missing")?;
+            if admission.uuid != owner
+                || saved.uuid != owner
+                || self.level.player_uuid != Some(record)
+            {
+                return Err("integrated player/profile storage mapping differs".into());
+            }
+            let source = saved
+                .saved
+                .as_ref()
+                .ok_or("integrated saved owner already consumed")?;
+            let native_spawn = (admission.tag.is_none() && source.position.is_none())
+                .then(|| self.server_player_spawn(spawn));
+            admission.read_owner_inputs(&self.world_root, source, native_spawn)?;
+            record
+        } else {
+            admission.read_inputs(&self.world_root)?;
+            playerdata::uuid_ints(admission.uuid)
+        };
         let tag = admission.tag.as_ref().unwrap();
         let mut level = horizon_client::save::Level {
             health: 20.0,
             food: 20,
             saturation: 5.0,
-            player_uuid: Some(playerdata::uuid_ints(admission.uuid)),
+            player_uuid: Some(record),
             ..Default::default()
         };
         if let Some(tag) = tag {
@@ -330,7 +400,7 @@ impl Game<'_> {
             level.game_mode = host.hub.config.default_game_mode;
             level.creative = level.game_mode == 1;
         }
-        if level.player_uuid != Some(playerdata::uuid_ints(admission.uuid))
+        if level.player_uuid != Some(record)
             || level.dimension != "minecraft:overworld"
             || !level.active_effects.is_empty()
             || level.selected_slot < 0
@@ -410,6 +480,14 @@ impl Game<'_> {
         g.advancements = progress;
         g.advancements_loaded = true;
         host.play.entry(conn).or_default().stats = stats;
+        if integrated.is_some() {
+            host.owner
+                .as_mut()
+                .unwrap()
+                .saved
+                .take()
+                .expect("original native saved owner");
+        }
         admission.installed = true;
         self.retained_server
             .as_mut()
@@ -814,8 +892,22 @@ impl Game<'_> {
         let host = self.checkpoint_participant_host()?;
         let server = self.retained_server.as_ref().ok_or(E::NotAuthoritative)?;
         let identity = server.hub_identity().ok_or(E::NotAuthoritative)?;
+        let integrated = server.integrated_owner();
+        let owner_matches = match integrated {
+            Some((owner, record)) => {
+                host.owner.as_ref().is_some_and(|saved| {
+                    saved.uuid == owner
+                        && saved
+                            .saved
+                            .as_ref()
+                            .is_none_or(|level| level.player_uuid == Some(record))
+                }) && self.level.player_uuid == Some(record)
+                    && host.hub.singleplayer_owner == Some(owner)
+            }
+            None => host.owner.is_none(),
+        };
         if !identity.matches(&host.hub)
-            || host.owner.is_some()
+            || !owner_matches
             || self.player.is_some()
             || self.lan_acting.is_some()
             || !self.server_trips.is_empty()
@@ -875,8 +967,16 @@ impl Game<'_> {
                 uuid: guest.uuid,
                 dimension: guest.dimension.clone(),
                 sender_identity: guest.sender.pending.clone(),
-                storage: ParticipantStorage::External {
-                    record_uuid: playerdata::uuid_ints(guest.uuid),
+                storage: match integrated {
+                    Some((owner, record)) if owner == guest.uuid => {
+                        ParticipantStorage::IntegratedOwner {
+                            record_uuid: record,
+                        }
+                    }
+                    Some(_) => return Err(E::OwnerMismatch),
+                    None => ParticipantStorage::External {
+                        record_uuid: playerdata::uuid_ints(guest.uuid),
+                    },
                 },
             });
         }
@@ -887,9 +987,15 @@ impl Game<'_> {
         {
             return Err(E::UnsupportedServerState);
         }
+        let owner_uuid = integrated.and_then(|(owner, _)| {
+            identities
+                .iter()
+                .any(|row| row.uuid == owner)
+                .then_some(owner)
+        });
         let roster = ParticipantRoster {
             host_identity: ParticipantHostIdentity::Retained(identity.clone()),
-            owner_uuid: None,
+            owner_uuid,
             level_player_uuid: self.level.player_uuid,
             identities,
         };
@@ -909,6 +1015,8 @@ impl Game<'_> {
             .map_err(|e| format!("retained native population: {e:?}"))?;
         let host = self.lan.as_ref().ok_or("retained native host missing")?;
         if !expected.host_identity.matches(host)
+            || current.owner_uuid != expected.owner_uuid
+            || current.level_player_uuid != expected.level_player_uuid
             || current.identities.len() != expected.identities.len()
             || current
                 .identities
@@ -2331,6 +2439,47 @@ impl Game<'_> {
         &self,
         level: &mut horizon_client::save::Level,
     ) -> std::result::Result<(), String> {
+        if let Some((owner, record)) = self
+            .retained_server
+            .as_ref()
+            .and_then(|server| server.integrated_owner())
+        {
+            let host = self.lan.as_ref().ok_or("integrated native host missing")?;
+            let storage = host
+                .owner
+                .as_ref()
+                .ok_or("integrated native owner missing")?;
+            if storage.uuid != owner || level.player_uuid != Some(record) {
+                return Err("integrated native owner projection identity differs".into());
+            }
+            let actual = if let Some(saved) = &storage.saved {
+                (**saved).clone()
+            } else {
+                let guest = host
+                    .hub
+                    .guests
+                    .iter()
+                    .find(|guest| guest.uuid == owner)
+                    .ok_or("installed integrated native owner missing")?;
+                if !self
+                    .retained_server
+                    .as_ref()
+                    .unwrap()
+                    .native_installed(guest.conn, owner)
+                {
+                    return Err("integrated native body has no installation".into());
+                }
+                pack_player_level(guest, record, PlayerBodyProjection::RetainedNative)
+                    .map_err(|error| error.to_string())?
+            };
+            let tag = actual.player_tag();
+            level.read_player(&tag);
+            level.player_extra = Some(tag.clone());
+            if level.player_tag() != tag {
+                return Err("integrated native player projection changed saved fields".into());
+            }
+            return Ok(());
+        }
         if let Some(host) = &self.lan
             && let Some(guest) = project_owner_to(
                 level,

@@ -21,6 +21,9 @@ use std::{
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
+const OWNER_STATS_JSON: &str = "{\"stats\":{\"minecraft:custom\":{\"minecraft:jump\":7}}}";
+const OWNER_ADVANCEMENTS_JSON: &str = "{\"DataVersion\":5023,\"test:owner_keep\":{\"criteria\":{\"test:keep\":\"2026-01-01 00:00:00 +0000\"},\"done\":false}}";
+
 #[derive(Default)]
 pub(super) struct Gate {
     entered: AtomicBool,
@@ -49,8 +52,47 @@ pub(in crate::game) struct Startup {
     first_poll: Option<Arc<Gate>>,
     frozen: Option<Arc<Gate>>,
     final_reply: Option<Arc<Gate>>,
+    integrated: bool,
+    owner_items: u32,
+    owner_bad_stats: bool,
+    pristine_owner: bool,
 }
 impl Startup {
+    pub(super) fn install_owner_inputs(
+        &self,
+        game: &mut Game<'_>,
+    ) -> std::result::Result<(), String> {
+        let Some((_, record)) = game.retained_server.as_ref().unwrap().integrated_owner() else {
+            return Ok(());
+        };
+        game.level.inventory = vec![(0, "minecraft:cobblestone".into(), self.owner_items, 0)];
+        if self.owner_items == 0 {
+            game.level.inventory.clear();
+        }
+        game.level.ender_items = vec![None; 27];
+        game.level.ender_items[0] = Some(ItemStack::new("minecraft:stone", 2));
+        game.level.position = (!self.pristine_owner).then_some([8.5, 80.0, 8.5]);
+        game.level.rotation = [21.0, 0.0];
+        game.level.xp_level = 7;
+        game.level.creative = true;
+        game.level.game_mode = 1;
+        for (family, json) in [
+            (
+                "stats",
+                if self.owner_bad_stats {
+                    "not valid JSON"
+                } else {
+                    OWNER_STATS_JSON
+                },
+            ),
+            ("advancements", OWNER_ADVANCEMENTS_JSON),
+        ] {
+            let path = crate::game::stats::player_json(&game.world_root, family, record);
+            fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
+            fs::write(path, json).map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
     pub(in crate::game) fn hold_first_poll(&self) -> bool {
         self.first_poll.as_ref().is_some_and(|gate| gate.held())
     }
@@ -197,15 +239,22 @@ impl Fixture {
         };
         settings.horizon.lod_distance = 0;
         settings.controller.enabled = false;
-        (
-            base,
-            Input {
-                options,
-                settings,
-                launch,
-                test,
-            },
-        )
+        let integrated = test.integrated;
+        let input = Input {
+            options,
+            settings,
+            launch,
+            owner: None,
+            test,
+        };
+        let input = if integrated {
+            input
+                .with_integrated_owner("IntegratedOwner")
+                .unwrap_or_else(|(_, reason)| panic!("{reason}"))
+        } else {
+            input
+        };
+        (base, input)
     }
     fn start(label: &str, test: Startup, profiles: &[(&str, u32)], corrupt_stats: bool) -> Self {
         let (base, input) = Self::inputs(label, test, profiles, corrupt_stats);
@@ -248,9 +297,11 @@ impl Fixture {
             "actual server not ready: {:?}",
             self.supervisor.snapshot()
         );
-        assert!(
-            self.supervisor.snapshot().port > 0,
-            "actual loopback listener required"
+        let view = self.supervisor.snapshot();
+        assert_eq!(
+            view.port == 0,
+            view.owner_record.is_some(),
+            "only the integrated profile is Memory-only"
         );
     }
     fn connect(&mut self, tcp: bool, name: &str) {
@@ -333,19 +384,19 @@ impl Drop for Fixture {
             // A test assertion never detaches the original Game. Repair only
             // this fixture's known IO/read faults, then exact Retry and close.
             let mut repaired = false;
-            for name in [
+            let mut records = [
                 "ServerMemory",
                 "ServerTcp",
                 "PartialPlayer",
                 "UntouchedPlayer",
                 "WriterPlayer",
-            ] {
-                let uuid = offline_uuid(name);
-                let path = crate::game::stats::player_json(
-                    &self.root.join("world"),
-                    "stats",
-                    horizon_client::lan::playerdata::uuid_ints(uuid),
-                );
+            ]
+            .map(|name| horizon_client::lan::playerdata::uuid_ints(offline_uuid(name)))
+            .to_vec();
+            records.extend(self.supervisor.snapshot().owner_record);
+            for record in records {
+                let path =
+                    crate::game::stats::player_json(&self.root.join("world"), "stats", record);
                 if path.is_dir() {
                     repaired |=
                         fs::rename(&path, path.with_extension("json.blocker-preserved")).is_ok();
@@ -553,6 +604,361 @@ impl Drop for Application {
 }
 fn count(level: &Level) -> u32 {
     level.inventory.iter().map(|(_, _, count, _)| *count).sum()
+}
+fn integrated_fixture(label: &str, mut test: Startup) -> Fixture {
+    test.integrated = true;
+    test.owner_items = 3;
+    let mut fixture = Fixture::start(label, test, &[], false);
+    fixture.ready();
+    assert!(fixture.supervisor.snapshot().owner_saved);
+    fixture
+}
+fn drive_integrated_owner(fixture: &mut Fixture) -> f64 {
+    fixture.connect(false, "IntegratedOwner");
+    let (mut login, mut terrain, mut moved) = (false, false, false);
+    let mut expected_x = None;
+    assert!(
+        fixture.until(|f| {
+            let client = &mut f.clients[0];
+            for event in client.poll_events(128) {
+                match event {
+                    Event::Packet(packet) => match *packet {
+                        C::Login(_) => login = true,
+                        C::PlayerPosition(p) => {
+                            // TestTerrain's bounded surface is near y=68; an
+                            // encoded empty Level's [0,0,0] is never valid feet.
+                            assert!(
+                                (40.0..100.0).contains(&p.position[1]),
+                                "invalid native TestTerrain spawn: {:?}",
+                                p.position
+                            );
+                            send(
+                                client,
+                                S::AcceptTeleportation(play::AcceptTeleportation {
+                                    id: p.teleport,
+                                    x: p.position[0],
+                                    y: p.position[1],
+                                    z: p.position[2],
+                                    yaw: p.yaw,
+                                    pitch: p.pitch,
+                                }),
+                            );
+                            send(client, S::PlayerLoaded(Empty {}));
+                            if !moved {
+                                expected_x = Some(p.position[0] + 0.125);
+                                send(
+                                    client,
+                                    S::RecipeBookChangeSettings(RecipeBookChangeSettings {
+                                        book_type: 0,
+                                        open: true,
+                                        filtering: true,
+                                    }),
+                                );
+                                send(
+                                    client,
+                                    S::MovePlayerPosRot(play::MovePlayerPosRot {
+                                        x: p.position[0] + 0.125,
+                                        y: p.position[1],
+                                        z: p.position[2],
+                                        yaw: 32.0,
+                                        pitch: 0.0,
+                                        flags: 0,
+                                    }),
+                                );
+                                moved = true;
+                            }
+                        }
+                        C::LevelChunkWithLight(p) => {
+                            assert!(login && !p.chunk.buffer.is_empty());
+                            terrain = true;
+                        }
+                        C::ChunkBatchFinished(_) => send(
+                            client,
+                            S::ChunkBatchReceived(play::ChunkBatchReceived {
+                                chunks_per_tick: 9.0,
+                            }),
+                        ),
+                        C::KeepAlive(p) => send(client, S::KeepAlive(p)),
+                        _ => {}
+                    },
+                    Event::DecodeError(error) => panic!("native integrated decode: {error}"),
+                    Event::Disconnected { reason, .. } => {
+                        panic!("unexpected integrated disconnect: {reason}")
+                    }
+                    _ => {}
+                }
+            }
+            let view = f.supervisor.snapshot();
+            login
+                && terrain
+                && moved
+                && view.installed == 1
+                && !view.owner_saved
+                && view.world_time > 0
+                && view.players.len() == 1
+                && view.players[0]["loaded"] == true
+                && view.players[0]["position"][0].as_f64() == expected_x
+                && view.players[0]["yaw"] == 32.0
+                && view.players[0]["items"] == 3
+                && view.players[0]["book_open"] == true
+                && view.players[0]["creative_reach_modifiers"] == 2
+        }),
+        "integrated play incomplete: {:?}",
+        fixture.supervisor.snapshot()
+    );
+    expected_x.unwrap()
+}
+fn assert_integrated_completion(fixture: &Fixture, result: &std::result::Result<(), String>) {
+    let view = fixture.supervisor.snapshot();
+    assert!(view.worker_joined);
+    assert_eq!(view.phase, "NativeDisposed");
+    let transport = view.transport.as_ref().unwrap();
+    assert!(transport.transport.quiescent);
+    assert!(transport.transport.attempts.iter().all(|attempt| {
+        attempt
+            .outbound
+            .as_ref()
+            .is_none_or(|out| out.failure.is_none())
+    }));
+    assert!(transport.transport.terminals.iter().all(|terminal| {
+        matches!(terminal.outcome, RetainedOutcome::Returned | RetainedOutcome::Closed)
+            || (terminal.actor == horizon_client::lan::RetainedActor::Outer
+                && matches!(terminal.outcome, RetainedOutcome::Eof | RetainedOutcome::Receive(_)))
+            || (terminal.actor == horizon_client::lan::RetainedActor::Shutdown
+                && matches!(&terminal.outcome, RetainedOutcome::Io(detail) if detail == "Transport endpoint is not connected (os error 107)"))
+    }));
+    if let Err(error) = result {
+        assert_eq!(Some(error.clone()), transport_failure(transport));
+    } else {
+        assert!(transport_failure(transport).is_none());
+    }
+}
+fn assert_integrated_saved(fixture: &Fixture, yaw: f32, expected_x: Option<f64>) {
+    let world = fixture.root.join("world");
+    let level = Level::read(&world).expect("native integrated world/player readback");
+    let record = fixture.supervisor.snapshot().owner_record.unwrap();
+    assert_eq!(level.player_uuid, Some(record));
+    assert_ne!(
+        record,
+        horizon_client::lan::playerdata::uuid_ints(offline_uuid("IntegratedOwner"))
+    );
+    assert_eq!(count(&level), 3);
+    assert_eq!(
+        level
+            .ender_items
+            .iter()
+            .flatten()
+            .map(|s| s.count)
+            .sum::<u32>(),
+        2
+    );
+    assert_eq!(level.xp_level, 7);
+    assert_eq!(level.rotation[0], yaw);
+    if let Some(x) = expected_x {
+        assert_eq!(level.position.unwrap()[0], x);
+    }
+    assert_eq!(level.time, fixture.supervisor.snapshot().world_time);
+    assert_eq!(level.dimension, "minecraft:overworld");
+    assert!(
+        !horizon_client::lan::playerdata::path(&world, offline_uuid("IntegratedOwner")).exists()
+    );
+    for family in ["stats", "advancements"] {
+        assert!(
+            !crate::game::stats::player_json(
+                &world,
+                family,
+                horizon_client::lan::playerdata::uuid_ints(offline_uuid("IntegratedOwner"))
+            )
+            .exists()
+        );
+    }
+}
+fn assert_pending_owner_json(fixture: &Fixture) {
+    let record = fixture.supervisor.snapshot().owner_record.unwrap();
+    for (family, expected) in [
+        ("stats", OWNER_STATS_JSON),
+        ("advancements", OWNER_ADVANCEMENTS_JSON),
+    ] {
+        assert_eq!(
+            fs::read_to_string(crate::game::stats::player_json(
+                &fixture.root.join("world"),
+                family,
+                record
+            ))
+            .unwrap(),
+            expected
+        );
+    }
+}
+
+#[test]
+#[ignore = "pinned resources; genuine integrated native owner Memory play/save mapping"]
+fn integrated_owner_memory_play_and_native_close() {
+    let mut fixture = integrated_fixture("integrated-play", Startup::default());
+    let x = drive_integrated_owner(&mut fixture);
+    let result = fixture.finish();
+    assert_integrated_completion(&fixture, &result);
+    assert_integrated_saved(&fixture, 32.0, Some(x));
+    let record = fixture.supervisor.snapshot().owner_record.unwrap();
+    for family in ["stats", "advancements"] {
+        assert!(
+            crate::game::stats::player_json(&fixture.root.join("world"), family, record).is_file()
+        );
+    }
+}
+
+#[test]
+#[ignore = "pinned resources; pristine no-position owner takes actual native spawn retaining player fields"]
+fn integrated_owner_pristine_uses_native_spawn() {
+    let mut fixture = integrated_fixture(
+        "integrated-pristine",
+        Startup {
+            pristine_owner: true,
+            ..Default::default()
+        },
+    );
+    let x = drive_integrated_owner(&mut fixture);
+    let result = fixture.finish();
+    assert_integrated_completion(&fixture, &result);
+    assert_integrated_saved(&fixture, 32.0, Some(x));
+}
+
+#[test]
+#[ignore = "pinned resources; pending integrated native owner survives no-player close"]
+fn integrated_owner_pending_close_preserves_native_player() {
+    let mut fixture = integrated_fixture("integrated-pending", Startup::default());
+    let result = fixture.finish();
+    assert_integrated_completion(&fixture, &result);
+    assert!(result.is_ok());
+    assert_integrated_saved(&fixture, 21.0, Some(8.5));
+    assert_pending_owner_json(&fixture);
+}
+
+#[test]
+#[ignore = "pinned resources; untouched integrated owner Joined retains saved player"]
+fn integrated_owner_untouched_join_preserves_native_player() {
+    let mut fixture = integrated_fixture(
+        "integrated-untouched",
+        Startup {
+            stop_on_untouched_join: true,
+            ..Default::default()
+        },
+    );
+    fixture.connect(false, "IntegratedOwner");
+    assert!(fixture.until(|f| f.supervisor.finished()));
+    let result = fixture.finish();
+    assert!(result.unwrap_err().contains("controlled untouched"));
+    let view = fixture.supervisor.snapshot();
+    assert!(
+        view.worker_joined && view.owner_saved && view.installed == 0 && view.pending_events > 0
+    );
+    assert_integrated_saved(&fixture, 21.0, Some(8.5));
+    assert_pending_owner_json(&fixture);
+}
+
+#[test]
+#[ignore = "pinned resources; wrong integrated profile never becomes incomplete admission"]
+fn integrated_owner_wrong_profile_closes_without_installation() {
+    let mut fixture = integrated_fixture("integrated-wrong-profile", Startup::default());
+    fixture.connect(false, "WrongOwner");
+    assert!(fixture.until(|f| f.supervisor.finished()));
+    assert!(
+        fixture
+            .finish()
+            .unwrap_err()
+            .contains("different owner profile")
+    );
+    let view = fixture.supervisor.snapshot();
+    assert!(view.worker_joined && view.installed == 0 && view.owner_saved);
+    assert_integrated_saved(&fixture, 21.0, Some(8.5));
+    assert_pending_owner_json(&fixture);
+    assert!(
+        !horizon_client::lan::playerdata::path(
+            &fixture.root.join("world"),
+            offline_uuid("WrongOwner")
+        )
+        .exists()
+    );
+}
+
+#[test]
+#[ignore = "pinned resources; actual mapped JSON failure and unplaced owner close-only Retry"]
+fn integrated_owner_partial_read_retries_mapped_record() {
+    let mut fixture = integrated_fixture(
+        "integrated-read",
+        Startup {
+            owner_bad_stats: true,
+            ..Default::default()
+        },
+    );
+    fixture.connect(false, "IntegratedOwner");
+    assert!(fixture.until(|f| f.supervisor.snapshot().blocked.is_some()));
+    let before = fixture.supervisor.snapshot();
+    assert!(before.owner_saved && before.installed == 0);
+    let stats = crate::game::stats::player_json(
+        &fixture.root.join("world"),
+        "stats",
+        before.owner_record.unwrap(),
+    );
+    assert!(
+        before
+            .original_error
+            .as_ref()
+            .unwrap()
+            .contains(&stats.display().to_string())
+    );
+    fs::write(&stats, "{}").unwrap();
+    fixture
+        .supervisor
+        .commands
+        .send(Command::Retry(before.attempt))
+        .unwrap();
+    assert!(fixture.until(|f| f.supervisor.finished()));
+    assert_eq!(
+        fixture.finish().unwrap_err(),
+        before.original_error.unwrap()
+    );
+    assert_integrated_saved(&fixture, 21.0, Some(8.5));
+    assert!(fixture.supervisor.snapshot().worker_joined);
+}
+
+#[test]
+#[ignore = "pinned resources; actual native mapped stats write failure preserves owner through Retry"]
+fn integrated_owner_native_write_retries_mapped_record() {
+    let mut fixture = integrated_fixture("integrated-write", Startup::default());
+    let x = drive_integrated_owner(&mut fixture);
+    let stats = crate::game::stats::player_json(
+        &fixture.root.join("world"),
+        "stats",
+        fixture.supervisor.snapshot().owner_record.unwrap(),
+    );
+    if stats.exists() {
+        fs::rename(&stats, stats.with_extension("json.before-io-fault")).unwrap();
+    }
+    fs::create_dir_all(&stats).unwrap();
+    fixture.supervisor.commands.send(Command::Close).unwrap();
+    assert!(fixture.until(|f| f.supervisor.snapshot().blocked.is_some()));
+    let before = fixture.supervisor.snapshot();
+    assert!(
+        before
+            .blocked
+            .as_ref()
+            .unwrap()
+            .contains(&stats.display().to_string()),
+        "{:?}",
+        before.blocked
+    );
+    fs::rename(&stats, stats.with_extension("json.blocker-preserved")).unwrap();
+    fixture
+        .supervisor
+        .commands
+        .send(Command::Retry(before.attempt))
+        .unwrap();
+    assert!(fixture.until(|f| f.supervisor.finished()));
+    let original_result = fixture.finish();
+    assert_integrated_completion(&fixture, &original_result);
+    assert_integrated_saved(&fixture, 32.0, Some(x));
+    assert!(stats.is_file());
 }
 fn send(client: &RetainedSession, packet: S) {
     assert!(matches!(

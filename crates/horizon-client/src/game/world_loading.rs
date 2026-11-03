@@ -73,6 +73,7 @@ pub(super) struct NativeCloseAuthority {
     root: PathBuf,
     dimension: Dim,
     level_dimension: String,
+    native_player_uuid: Option<[i32; 4]>,
     origin: std::sync::Weak<()>,
 }
 #[cfg(feature = "paired-packages")]
@@ -80,12 +81,27 @@ pub(super) struct NativeCloseAuthority {
 enum ColdProfile {
     InFrameClient,
     HeadlessServer,
+    IntegratedServer { owner: u128 },
 }
 
 #[cfg(feature = "paired-packages")]
 impl NativeCloseAuthority {
     pub(super) fn is_server(&self) -> bool {
-        self.profile == ColdProfile::HeadlessServer
+        self.profile != ColdProfile::InFrameClient
+    }
+    pub(super) fn server_profile(&self) -> Option<super::retained_server::ServerProfile> {
+        match self.profile {
+            ColdProfile::InFrameClient => None,
+            ColdProfile::HeadlessServer => Some(super::retained_server::ServerProfile::Dedicated),
+            ColdProfile::IntegratedServer { owner } => {
+                Some(super::retained_server::ServerProfile::Integrated {
+                    owner,
+                    record: self
+                        .native_player_uuid
+                        .expect("cold integrated owner has a native record"),
+                })
+            }
+        }
     }
     pub(super) fn authorizes(&self, game: &Game<'_>) -> bool {
         let Some(game_save) = game.save.as_ref() else {
@@ -97,16 +113,22 @@ impl NativeCloseAuthority {
                     && game.retained_server.is_none()
                     && game.lan.is_none()
             }
-            ColdProfile::HeadlessServer => game
-                .retained_server
-                .as_ref()
-                .is_some_and(|server| server.authorizes_close(game)),
+            ColdProfile::HeadlessServer | ColdProfile::IntegratedServer { .. } => {
+                game.retained_server.as_ref().is_some_and(|server| {
+                    Some(server.profile()) == self.server_profile() && server.authorizes_close(game)
+                })
+            }
         };
         profile
             && game.options.test_terrain
             && !game.options.server_thread
             && game.options.server.is_none()
-            && game.options.dedicated.is_none()
+            && match self.profile {
+                ColdProfile::IntegratedServer { .. } => {
+                    game.options.dedicated.as_ref().is_some_and(Vec::is_empty)
+                }
+                _ => game.options.dedicated.is_none(),
+            }
             && game.options.dimension.is_none()
             && game.remote.is_none()
             && game.integrated.is_none()
@@ -636,6 +658,7 @@ impl ColdPreparation {
         options: &Options,
         settings: &Settings,
         entry: &RetainedEntryIdentity,
+        owner: Option<u128>,
     ) -> Self {
         Self::prepare_profile(
             request,
@@ -644,7 +667,9 @@ impl ColdPreparation {
             options,
             settings,
             entry,
-            ColdProfile::HeadlessServer,
+            owner.map_or(ColdProfile::HeadlessServer, |owner| {
+                ColdProfile::IntegratedServer { owner }
+            }),
             #[cfg(test)]
             None,
         )
@@ -712,10 +737,23 @@ impl ColdPreparation {
             || options.dimension.is_some()
             || !match profile {
                 ColdProfile::InFrameClient => options.execution_role.is_client(),
-                ColdProfile::HeadlessServer => {
-                    options.execution_role == super::execution_role::ExecutionRole::DedicatedServer
-                        && options.server.is_none()
-                        && options.dedicated.is_none()
+                ColdProfile::HeadlessServer | ColdProfile::IntegratedServer { .. } => {
+                    (match profile {
+                        ColdProfile::HeadlessServer => {
+                            options.execution_role
+                                == super::execution_role::ExecutionRole::DedicatedServer
+                                && options.dedicated.is_none()
+                        }
+                        ColdProfile::IntegratedServer { owner } => {
+                            options.execution_role
+                                == super::execution_role::ExecutionRole::IntegratedServer
+                                && options.dedicated.as_ref().is_some_and(Vec::is_empty)
+                                && options.player_name.as_ref().is_some_and(|name| {
+                                    horizon_protocol::crypto::offline_uuid(name) == owner
+                                })
+                        }
+                        ColdProfile::InFrameClient => false,
+                    }) && options.server.is_none()
                         && options.dev_mods.is_empty()
                         && options.mod_packages.catalog().is_none()
                         && settings.mods.enabled.is_empty()
@@ -732,6 +770,7 @@ impl ColdPreparation {
             Err(match profile {
                 ColdProfile::InFrameClient => "cold retained preparation requires a new identified in-frame native TestTerrain world",
                 ColdProfile::HeadlessServer => "cold retained preparation requires its exact new identified headless native TestTerrain profile",
+                ColdProfile::IntegratedServer { .. } => "cold retained preparation requires its exact new identified integrated native owner profile",
             }.into())
         } else {
             owner.prepare(res, pack, options, settings)
@@ -765,10 +804,13 @@ impl ColdPreparation {
                         // before issuing authority, preserving exact equality
                         // across native metadata commit. Client recipes retain
                         // their existing representation and gates.
-                        if profile == ColdProfile::HeadlessServer
+                        if profile != ColdProfile::InFrameClient
                             && prepared.level.dimension.is_empty()
                         {
                             prepared.level.dimension = Dim::Overworld.id().into();
+                        }
+                        if matches!(profile, ColdProfile::IntegratedServer { .. }) {
+                            prepared.level.ensure_player_uuid();
                         }
                         // The complete original cold transfer and exact entry
                         // checks precede issuance. No other constructor issues
@@ -780,6 +822,7 @@ impl ColdPreparation {
                             root: prepared.save_root.clone(),
                             dimension: Dim::from_id(&prepared.level.dimension),
                             level_dimension: prepared.level.dimension.clone(),
+                            native_player_uuid: prepared.level.player_uuid,
                             origin: Arc::downgrade(
                                 &prepared.native_checkpoint_origin.as_ref().unwrap().identity,
                             ),

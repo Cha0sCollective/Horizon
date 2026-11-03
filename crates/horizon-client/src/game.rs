@@ -15018,8 +15018,9 @@ impl<'a> Game<'a> {
                 game.rand_sequences = random;
                 game.end.set_locator(locator);
                 game.native_checkpoint_origin = origin;
-                if authority.is_server() {
-                    game.retained_server = Some(retained_server::ServerGameState::from_cold());
+                if let Some(profile) = authority.server_profile() {
+                    game.retained_server =
+                        Some(retained_server::ServerGameState::from_cold(profile));
                 }
                 game.native_close_authority = Some(authority);
                 game.block_ticks = Ticks::new(game.level.seed as i32);
