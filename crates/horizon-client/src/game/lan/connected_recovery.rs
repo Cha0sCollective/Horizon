@@ -128,6 +128,8 @@ impl OwnedRecovery<'_> {
             let status = host
                 .hub
                 .lan
+                .legacy()
+                .expect("owned staged legacy transport")
                 .staged_status()
                 .expect("owned staged transport");
             (
@@ -210,7 +212,13 @@ impl OwnedRecovery<'_> {
     }
     fn begin_refusal(&mut self, detail: String) {
         self.state = State::Refusing(detail);
-        let _ = self.host().hub.lan.close_staged();
+        let _ = self
+            .host()
+            .hub
+            .lan
+            .legacy()
+            .expect("legacy host factory")
+            .close_staged();
     }
     fn close_attempt(
         &mut self,
@@ -257,7 +265,14 @@ impl OwnedRecovery<'_> {
                 .checkpoint_session(archive, epoch, Instant::now() + timeout)
         });
         match result {
-            Ok(receipt) => match self.host().hub.lan.close_staged_if_live() {
+            Ok(receipt) => match self
+                .host()
+                .hub
+                .lan
+                .legacy()
+                .expect("legacy host factory")
+                .close_staged_if_live()
+            {
                 Ok(()) => self.state = State::Closing(receipt),
                 Err(error) => {
                     self.state = State::CleanupBlocked(format!(
@@ -429,8 +444,20 @@ pub(in crate::game) fn recover_connected<'a>(
         last_refusal: None,
     };
     let pipes = (|| -> Result<[Pipe; 2]> {
-        let first = owned.host().hub.lan.connect_local_staged()?;
-        let second = owned.host().hub.lan.connect_local_staged()?;
+        let first = owned
+            .host()
+            .hub
+            .lan
+            .legacy()
+            .expect("legacy host factory")
+            .connect_local_staged()?;
+        let second = owned
+            .host()
+            .hub
+            .lan
+            .legacy()
+            .expect("legacy host factory")
+            .connect_local_staged()?;
         Ok([first, second])
     })();
     let mut offers = match pipes {
@@ -488,8 +515,22 @@ pub(in crate::game) fn recover_connected<'a>(
         }
         if matches!(owned.state, State::Refusing(_) | State::Closing(_)) {
             let until = *cleanup_deadline.get_or_insert_with(|| Instant::now() + timeout);
-            if owned.host().hub.lan.staged_finished() {
-                match owned.host().hub.lan.join_staged_finished() {
+            if owned
+                .host()
+                .hub
+                .lan
+                .legacy()
+                .expect("legacy host factory")
+                .staged_finished()
+            {
+                match owned
+                    .host()
+                    .hub
+                    .lan
+                    .legacy()
+                    .expect("legacy host factory")
+                    .join_staged_finished()
+                {
                     Ok(()) => {
                         let result = match owned.state.clone() {
                             State::Closing(receipt) => {

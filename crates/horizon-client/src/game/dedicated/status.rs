@@ -80,7 +80,7 @@ impl Game<'_> {
                     })
                 })
                 .collect();
-            (players, h.hub.lan.shared.max_players())
+            (players, h.hub.lan.max_players())
         });
         json!({
             "tps": state.tps(),

@@ -285,7 +285,7 @@ fn recipe_settings_packets_update_only_the_players_book_and_survive_save() {
         return;
     };
     let mut s = server(&resources);
-    let port = s.hub.lan.port;
+    let port = s.hub.lan.port();
     let _bot = run(&mut s, move || connect(port, "RecipeSettings", true));
     let deadline = Instant::now() + Duration::from_secs(5);
     while s.hub.guests.is_empty() {
@@ -354,7 +354,7 @@ fn sprint_commands_survive_keyboard_input_changes() {
         return;
     };
     let mut s = server(&resources);
-    let port = s.hub.lan.port;
+    let port = s.hub.lan.port();
     let _bot = run(&mut s, move || connect(port, "Sprinter", true));
     let deadline = Instant::now() + Duration::from_secs(5);
     while s.hub.guests.is_empty() {
@@ -413,7 +413,7 @@ fn status_and_join() {
         return;
     };
     let mut s = server(&resources);
-    let port = s.hub.lan.port;
+    let port = s.hub.lan.port();
     // Server list ping.
     let json = run(&mut s, move || {
         let mut c = Connection::connect("127.0.0.1", port, Duration::from_secs(5))
@@ -547,7 +547,7 @@ fn guests_see_each_other_and_the_world_entities() {
         return;
     };
     let mut s = server(&resources);
-    let port = s.hub.lan.port;
+    let port = s.hub.lan.port();
     let zombie = EntityState {
         id: 500,
         uuid: 9,

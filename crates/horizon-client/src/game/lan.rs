@@ -315,7 +315,13 @@ impl Game<'_> {
             });
         }
         let roster = ParticipantRoster {
-            host_identity: host.hub.lan.shared.clone(),
+            host_identity: host
+                .hub
+                .lan
+                .legacy()
+                .expect("legacy host factory")
+                .shared
+                .clone(),
             owner_uuid,
             level_player_uuid: self.level.player_uuid,
             identities,
@@ -2761,7 +2767,7 @@ impl Game<'_> {
         let host_entity = self.next_entity as i32;
         let mut hub = Hub::new(lan, sync, encoder, config);
         hub.flat_world = self.world_flat;
-        let port = hub.lan.port;
+        let port = hub.lan.port();
         self.world.block_log = Some(Vec::new());
         self.world.light_log = Some(Default::default());
         let host = LanHost {

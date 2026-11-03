@@ -1746,6 +1746,38 @@ mod retained {
         announcement: Option<discovery::RetainedPinger>,
     }
     impl RetainedLan {
+        pub(in crate::lan) fn max_players(&self) -> usize {
+            self.registry.shared.max_players()
+        }
+        pub(in crate::lan) fn online(&self) -> usize {
+            self.registry.shared.online()
+        }
+        pub(in crate::lan) fn motd(&self) -> String {
+            self.registry.shared.motd()
+        }
+        pub(in crate::lan) fn validate_joined(&self, joined: &Joined) -> bool {
+            let inner = self.registry.inner();
+            !inner.closing
+                && joined.uuid == horizon_protocol::crypto::offline_uuid(&joined.name)
+                && inner.attempts.iter().any(|attempt| {
+                    attempt.conn == joined.conn
+                        && attempt.uuid == Some(joined.uuid)
+                        && !attempt.released
+                        && attempt
+                            .outbound
+                            .as_ref()
+                            .is_some_and(|outbound| joined.sender.retained_matches(outbound))
+                })
+        }
+        pub(in crate::lan) fn harvest(&self) {
+            self.registry.harvest();
+        }
+        pub(in crate::lan) fn fence(&self) {
+            self.registry.request_close();
+            if let Some(pinger) = &self.announcement {
+                pinger.request_stop();
+            }
+        }
         /// This constructor acquires no listener, thread, online service or POST.
         pub fn new(sync: Arc<data::SyncData>, config: RetainedOfflineConfig) -> io::Result<Self> {
             if config.max_players == 0

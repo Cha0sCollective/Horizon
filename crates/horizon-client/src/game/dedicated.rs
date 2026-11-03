@@ -933,10 +933,7 @@ impl Game<'_> {
                             .collect()
                     })
                     .unwrap_or_default();
-                let max = self
-                    .lan
-                    .as_ref()
-                    .map_or(0, |h| h.hub.lan.shared.max_players());
+                let max = self.lan.as_ref().map_or(0, |h| h.hub.lan.max_players());
                 let names: Vec<String> = if rest.first() == Some(&"uuids") {
                     guests
                         .iter()

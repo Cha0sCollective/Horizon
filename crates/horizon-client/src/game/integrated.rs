@@ -398,7 +398,11 @@ impl Game<'_> {
                 uuid: owner,
                 saved: Some(saved),
             });
-            host.hub.lan.connect_local()?
+            host.hub
+                .lan
+                .legacy()
+                .expect("legacy host factory")
+                .connect_local()?
         };
         self.serving = Some(Serving {
             flags: flags.clone(),
@@ -684,7 +688,13 @@ impl Game<'_> {
         };
         match pending {
             Publish::Open(listener, settings) => {
-                if let Err(e) = host.hub.lan.listen_on(listener, true) {
+                if let Err(e) = host
+                    .hub
+                    .lan
+                    .legacy_mut()
+                    .expect("legacy host factory")
+                    .listen_on(listener, true)
+                {
                     log::error!("Horizon: Open to LAN: {e}");
                 }
                 host.settings = settings;
@@ -694,7 +704,11 @@ impl Game<'_> {
                 host.hub.resend_commands();
             }
             Publish::Close => {
-                host.hub.lan.stop_listening();
+                host.hub
+                    .lan
+                    .legacy_mut()
+                    .expect("legacy host factory")
+                    .stop_listening();
                 log::info!(
                     "Unpublishing integrated server (was on port {})",
                     host.settings.port

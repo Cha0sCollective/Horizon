@@ -35,6 +35,10 @@ use std::sync::{Arc, atomic::Ordering};
 
 /// GameEvent types (ClientboundGameEventPacket).
 pub mod chat;
+mod retained;
+pub use retained::HubTransport;
+#[cfg(feature = "paired-packages")]
+pub use retained::{ClosedHub, RetainedHubCloseView, RetainedHubPhase, RetainedHubRefusal};
 
 pub mod game_event {
     pub const START_RAINING: u8 = 1;
@@ -201,7 +205,7 @@ struct StagedHub {
 }
 
 pub struct Hub {
-    pub lan: Lan,
+    pub lan: HubTransport,
     pub config: HubConfig,
     pub encoder: ChunkEncoder,
     pub guests: Vec<Guest>,
@@ -383,6 +387,14 @@ impl Default for LevelSync {
 
 impl Hub {
     pub fn new(lan: Lan, sync: Arc<SyncData>, encoder: ChunkEncoder, config: HubConfig) -> Self {
+        Self::with_transport(HubTransport::new_legacy(lan), sync, encoder, config)
+    }
+    fn with_transport(
+        lan: HubTransport,
+        sync: Arc<SyncData>,
+        encoder: ChunkEncoder,
+        config: HubConfig,
+    ) -> Self {
         let chat_type = sync
             .id("minecraft:chat_type", "minecraft:chat")
             .unwrap_or(0);
@@ -605,7 +617,7 @@ impl Hub {
                 "with",
                 Tag::List(vec![
                     Tag::Int(players.len() as i32),
-                    Tag::Int(self.lan.shared.max_players() as i32),
+                    Tag::Int(self.lan.max_players() as i32),
                     names,
                 ]),
             ),
@@ -726,6 +738,9 @@ impl Hub {
 
     /// PlayerList.placeNewPlayer for a guest whose saved state is loaded.
     pub fn place_new_player(&mut self, conn: u32, ctx: &mut TickCtx) {
+        if !self.retained_turn_open() {
+            return;
+        }
         let Some(i) = self.guests.iter().position(|g| g.conn == conn) else {
             return;
         };
@@ -746,7 +761,7 @@ impl Hub {
             limited_crafting: false,
             spawn: self.spawn_info(i),
             // MinecraftServer.usesAuthentication, enforceSecureProfile.
-            online_mode: self.lan.shared.config.online.is_some(),
+            online_mode: self.lan.online_mode(),
             enforces_secure_chat: self.enforces_secure_chat(),
         }));
         g.send(&C::ChangeDifficulty(play::ChangeDifficulty {
@@ -792,8 +807,8 @@ impl Hub {
         self.teleport(i, None);
         let g = &self.guests[i];
         g.send(&C::ServerData(play::ServerData {
-            motd: literal(&self.lan.shared.motd()),
-            icon: self.lan.shared.config.favicon.clone(),
+            motd: literal(&self.lan.motd()),
+            icon: self.lan.favicon(),
         }));
         // The player list: everyone already here, then the newcomer to all.
         let mut entries = Vec::new();
@@ -1174,9 +1189,13 @@ impl Hub {
     /// level ticks: joins (into the level in place), leaves, and each guest's
     /// packets queued for its own level's pass.
     pub fn poll(&mut self, ctx: &mut TickCtx) -> Vec<HostEvent> {
+        #[cfg(feature = "paired-packages")]
+        if self.lan.is_retained() {
+            return self.poll_retained(ctx, 16);
+        }
         self.ticks += 1;
         let mut events = Vec::new();
-        for event in self.lan.poll() {
+        for event in self.lan.legacy_mut().expect("ordinary transport").poll() {
             match event {
                 NetEvent::Joined(j) => {
                     let conn = self.admit(*j, ctx);
@@ -1218,6 +1237,8 @@ impl Hub {
     pub fn begin_staged_recovery(&mut self) -> Result<(), &'static str> {
         let status = self
             .lan
+            .legacy()
+            .ok_or("not a staged legacy transport")?
             .staged_status()
             .map_err(|_| "not a staged transport")?;
         if self.staged.is_some()
@@ -1250,9 +1271,19 @@ impl Hub {
         }
         let status = self
             .lan
+            .legacy()
+            .ok_or("not a staged legacy transport")?
             .staged_status()
             .map_err(|_| "staged transport failure")?;
-        if self.lan.staged_failure().is_some() || status.terminal_count != 0 || status.closed {
+        if self
+            .lan
+            .legacy()
+            .ok_or("not a staged legacy transport")?
+            .staged_failure()
+            .is_some()
+            || status.terminal_count != 0
+            || status.closed
+        {
             return Err("staged transport terminated");
         }
         if self.ticks != 0
@@ -1304,6 +1335,8 @@ impl Hub {
         self.check_staged_recovery()?;
         let events = self
             .lan
+            .legacy()
+            .ok_or("not a staged legacy transport")?
             .poll_staged(16)
             .map_err(|_| "staged transport failure")?;
         let mut joined = Vec::with_capacity(2);
@@ -1315,7 +1348,11 @@ impl Hub {
                     let stage = self.staged.as_ref().ok_or("staged recovery not begun")?;
                     if stage.placed
                         || stage.peers.len() >= 2
-                        || !self.lan.validate_staged_join(&j)
+                        || !self
+                            .lan
+                            .legacy()
+                            .ok_or("not a staged legacy transport")?
+                            .validate_staged_join(&j)
                         || j.info.view_distance != 2
                         || stage
                             .peers
@@ -1409,6 +1446,8 @@ impl Hub {
         }
         let status = self
             .lan
+            .legacy()
+            .ok_or("not a staged legacy transport")?
             .staged_status()
             .map_err(|_| "staged transport failure")?;
         if status.queued_events != 0 || status.queued_bytes != 0 || status.pending_outbound != 0 {
@@ -1663,6 +1702,8 @@ impl Hub {
         self.check_staged_recovery()?;
         let status = self
             .lan
+            .legacy()
+            .ok_or("not a staged legacy transport")?
             .staged_status()
             .map_err(|_| "staged transport failure")?;
         let stage = self.staged.as_ref().ok_or("staged recovery not begun")?;
@@ -1696,10 +1737,16 @@ impl Hub {
     /// map and the connections of the players in it): their packets, then
     /// the chunks, block changes, containers and entities they see.
     pub fn tick_level(&mut self, ctx: &mut TickCtx) -> Vec<HostEvent> {
+        if !self.retained_turn_open() {
+            return Vec::new();
+        }
         let mut events = Vec::new();
         for i in 0..self.guests.len() {
             if self.here(&self.guests[i]) {
                 self.process_inbox(i, ctx, &mut events);
+                if !self.retained_turn_open() {
+                    return events;
+                }
             }
         }
         if !self.guests.iter().any(|g| self.here(g)) {
@@ -1727,9 +1774,21 @@ impl Hub {
             ctx.world.light_log = Some(Default::default());
         }
         self.sync_world(ctx);
+        if !self.retained_turn_open() {
+            return events;
+        }
         crate::spans::time("lan_chunks", || self.update_chunks(ctx));
+        if !self.retained_turn_open() {
+            return events;
+        }
         self.broadcast_light_changes(ctx.world);
+        if !self.retained_turn_open() {
+            return events;
+        }
         self.broadcast_block_changes(ctx.world);
+        if !self.retained_turn_open() {
+            return events;
+        }
         // ServerGamePacketListenerImpl.tick: the actions handled since the last tick are
         // acknowledged after the block changes they made were sent, so a client's predicted
         // blocks settle on the server's states.
@@ -1740,11 +1799,23 @@ impl Hub {
             }
         }
         self.sync_containers(ctx.world);
+        if !self.retained_turn_open() {
+            return events;
+        }
         self.track_entities(ctx);
+        if !self.retained_turn_open() {
+            return events;
+        }
         for i in 0..self.guests.len() {
             if self.here(&self.guests[i]) {
                 self.sync_player_state(i);
+                if !self.retained_turn_open() {
+                    return events;
+                }
                 self.sync_effects(i);
+                if !self.retained_turn_open() {
+                    return events;
+                }
             }
         }
         events
@@ -1752,6 +1823,9 @@ impl Hub {
 
     /// After every level: `PlayerList.tick`.
     pub fn end_tick(&mut self) {
+        if !self.retained_turn_open() {
+            return;
+        }
         let latencies: Vec<_> = self
             .guests
             .iter()
@@ -1920,7 +1994,11 @@ impl Hub {
                 (i, taken, bodies)
             })
             .collect();
-        self.encoder.warm(&columns);
+        // The ordinary warm cache owns a process-global detached worker pool.
+        // Retained transport uses the identical synchronous encoder instead.
+        if !self.lan.is_retained() {
+            self.encoder.warm(&columns);
+        }
         let mut bodies: Vec<Vec<u8>> = columns
             .iter()
             .map(|c| self.encoder.body_in(c, world))
@@ -2628,11 +2706,15 @@ impl Hub {
         let g = &mut self.guests[i];
         g.first_good = g.position;
         g.known_moves = g.received_moves;
-        let mut budget = 400;
+        let mut budget = if self.lan.is_retained() { 16 } else { 400 };
         while budget > 0 {
+            if !self.finish_retained_input() {
+                break;
+            }
             let Some(packet) = self.guests[i].inbox.pop_front() else {
                 break;
             };
+            let packet = self.retained_input(packet);
             budget -= 1;
             let conn = self.guests[i].conn;
             // ServerPlayer.resetLastActionTime: every handler of a player's
@@ -2769,6 +2851,7 @@ impl Hub {
                 other => events.push(HostEvent::Packet(conn, Box::new(other))),
             }
         }
+        self.finish_retained_input();
     }
 
     /// ServerGamePacketListenerImpl.handleMovePlayer.

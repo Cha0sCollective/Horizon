@@ -363,8 +363,18 @@ pub(in crate::game) fn source(fixture: &Fixture, scratch: &Scratch) -> Source {
         host.hub.singleplayer_owner = Some(owner_uuid);
         host.hub.ops.insert(owner_uuid, 4);
         (
-            host.hub.lan.connect_local().unwrap(),
-            host.hub.lan.connect_local().unwrap(),
+            host.hub
+                .lan
+                .legacy()
+                .expect("legacy host factory")
+                .connect_local()
+                .unwrap(),
+            host.hub
+                .lan
+                .legacy()
+                .expect("legacy host factory")
+                .connect_local()
+                .unwrap(),
         )
     };
     let mut clients = [
@@ -467,7 +477,18 @@ pub(in crate::game) fn source(fixture: &Fixture, scratch: &Scratch) -> Source {
         disconnect(client);
     }
     let deadline = Instant::now() + WAIT;
-    while game.lan.as_ref().unwrap().hub.lan.shared.online() != 0 {
+    while game
+        .lan
+        .as_ref()
+        .unwrap()
+        .hub
+        .lan
+        .legacy()
+        .expect("legacy host factory")
+        .shared
+        .online()
+        != 0
+    {
         if Instant::now() >= deadline {
             panic!("source transport did not finish after receipt");
         }

@@ -88,12 +88,16 @@ impl ChatMessage {
 impl Hub {
     /// MinecraftServer.enforceSecureProfile.
     pub fn enforces_secure_chat(&self) -> bool {
-        self.lan.shared.config.enforces_secure_chat()
+        self.lan.enforces_secure_chat()
     }
 
     /// Component.getString in the server's language, for the log.
     pub(crate) fn english(&self, tag: &Tag) -> String {
-        match &self.lan.shared.config.log {
+        match self
+            .lan
+            .legacy()
+            .and_then(|lan| lan.shared.config.log.as_ref())
+        {
             Some(log) => horizon_protocol::text::plain(tag, &log.lang),
             None => horizon_protocol::text::plain(tag, &Default::default()),
         }
@@ -251,7 +255,10 @@ impl Hub {
             );
             return;
         }
-        let secure = self.lan.shared.config.secure_chat.clone();
+        let secure = self
+            .lan
+            .legacy()
+            .and_then(|lan| lan.shared.config.secure_chat.clone());
         let keys = secure.as_deref().map_or(&[][..], |s| s.keys());
         if keys.is_empty() {
             events.push(HostEvent::Warn(format!(

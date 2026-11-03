@@ -1000,10 +1000,34 @@ impl RetainedCloseFixtureToken {
             && self.root == game.world_root
             && game.session_lock.as_ref().and_then(|s| s.expected_world()) == Some(&self.world)
             && game.lan.as_ref().is_some_and(|host| {
-                Arc::ptr_eq(&self.shared, &host.hub.lan.shared)
-                    && !host.hub.lan.shared.config.listen
-                    && !host.hub.lan.shared.config.announce
-                    && host.hub.lan.shared.config.online.is_none()
+                Arc::ptr_eq(
+                    &self.shared,
+                    &host.hub.lan.legacy().expect("legacy host factory").shared,
+                ) && !host
+                    .hub
+                    .lan
+                    .legacy()
+                    .expect("legacy host factory")
+                    .shared
+                    .config
+                    .listen
+                    && !host
+                        .hub
+                        .lan
+                        .legacy()
+                        .expect("legacy host factory")
+                        .shared
+                        .config
+                        .announce
+                    && host
+                        .hub
+                        .lan
+                        .legacy()
+                        .expect("legacy host factory")
+                        .shared
+                        .config
+                        .online
+                        .is_none()
             })
     }
     pub(in crate::game) fn observe(&self, game: &Game<'_>) -> RetainedCloseFixtureObservation {
@@ -1127,7 +1151,16 @@ pub(in crate::game) fn retained_coherent_close_fixture<'a>(
     // connector-capable handle escapes after this private construction point.
     let token = RetainedCloseFixtureToken {
         save: game.save.as_ref().unwrap().clone(),
-        shared: game.lan.as_ref().unwrap().hub.lan.shared.clone(),
+        shared: game
+            .lan
+            .as_ref()
+            .unwrap()
+            .hub
+            .lan
+            .legacy()
+            .expect("legacy host factory")
+            .shared
+            .clone(),
         world: *game
             .session_lock
             .as_ref()

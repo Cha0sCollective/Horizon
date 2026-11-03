@@ -245,6 +245,12 @@ pub struct PlayerSender {
     retained: Option<Arc<RetainedOutbound>>,
 }
 impl PlayerSender {
+    #[cfg(feature = "paired-packages")]
+    pub(super) fn retained_matches(&self, outbound: &Arc<RetainedOutbound>) -> bool {
+        self.retained
+            .as_ref()
+            .is_some_and(|owner| Arc::ptr_eq(owner, outbound))
+    }
     pub fn new(tx: Sender<Out>, pending: Arc<AtomicUsize>) -> Self {
         Self {
             tx,
@@ -463,6 +469,13 @@ struct RetainedQueue {
     disconnecting: bool,
     close_after: Option<Arc<[u8]>>,
     failure: Option<RetainedOutcome>,
+    // These are the original, unadmitted vectors, never wire work to retry.
+    refused: Vec<RetainedRefusedBatch>,
+}
+#[cfg(feature = "paired-packages")]
+struct RetainedRefusedBatch {
+    reason: &'static str,
+    bodies: Vec<Vec<u8>>,
 }
 /// Counts describe retained bodies and successful native writes, not delivery.
 #[cfg(feature = "paired-packages")]
@@ -475,6 +488,10 @@ pub struct RetainedOutboundStatus {
     pub written_bodies: usize,
     pub failed_bodies: usize,
     pub sealed: bool,
+    pub refused_bodies: usize,
+    pub refused_bytes: usize,
+    pub failure: Option<RetainedOutcome>,
+    pub first_refusal: Option<&'static str>,
 }
 #[cfg(feature = "paired-packages")]
 impl RetainedOutbound {
@@ -503,6 +520,10 @@ impl RetainedOutbound {
             written_bodies: q.written,
             failed_bodies: q.failed,
             sealed: q.sealed || q.disconnecting || self.close_latch.load(Ordering::Acquire),
+            refused_bodies: q.refused.iter().map(|r| r.bodies.len()).sum(),
+            refused_bytes: q.refused.iter().flat_map(|r| &r.bodies).map(Vec::len).sum(),
+            failure: q.failure.clone(),
+            first_refusal: q.refused.first().map(|r| r.reason),
         }
     }
     fn enqueue(&self, bodies: Vec<Vec<u8>>, held: bool) {
@@ -516,13 +537,30 @@ impl RetainedOutbound {
         // This load is the enqueue admission point shared with the registry's
         // permanent close latch, including the gap before individual seals.
         if self.close_latch.load(Ordering::Acquire) || q.sealed || q.disconnecting {
+            let reason = if self.close_latch.load(Ordering::Acquire) {
+                "closing"
+            } else if q.disconnecting {
+                "disconnecting"
+            } else {
+                "sealed"
+            };
+            q.refused.push(RetainedRefusedBatch { reason, bodies });
+            q.failure.get_or_insert_with(|| {
+                RetainedOutcome::Protocol(
+                    "outbound admission refused after close/seal/disconnect".into(),
+                )
+            });
             return;
         }
         let Some(next) = bytes
             .and_then(|n| self.pending.load(Ordering::Acquire).checked_add(n))
             .filter(|n| *n <= MAX_PENDING)
         else {
-            q.failure = Some(RetainedOutcome::Protocol(
+            q.refused.push(RetainedRefusedBatch {
+                reason: "capacity",
+                bodies,
+            });
+            q.failure.get_or_insert(RetainedOutcome::Protocol(
                 "outbound queue limit exceeded".into(),
             ));
             q.sealed = true;
@@ -585,7 +623,7 @@ impl RetainedOutbound {
     fn failed(&self, failure: RetainedOutcome) {
         let mut q = self.inner();
         q.failed += usize::from(q.active.is_some());
-        q.failure = Some(failure);
+        q.failure.get_or_insert(failure);
         q.sealed = true;
         self.ready.notify_all();
     }
@@ -1610,6 +1648,47 @@ pub(super) fn retained_test_read_progress(conn: u32) -> (usize, usize) {
     retained_controls::reads(conn)
 }
 
+#[cfg(all(
+    test,
+    feature = "paired-packages",
+    feature = "native-writer-test-control",
+    debug_assertions
+))]
+pub(in crate::lan) fn retained_test_pause_writer(conn: u32) {
+    retained_controls::set(retained_controls::Control {
+        conn,
+        pause_writer: true,
+        ..Default::default()
+    });
+}
+#[cfg(all(
+    test,
+    feature = "paired-packages",
+    feature = "native-writer-test-control",
+    debug_assertions
+))]
+pub(in crate::lan) fn retained_test_writer_entered() -> bool {
+    retained_controls::counts().0 != 0
+}
+#[cfg(all(
+    test,
+    feature = "paired-packages",
+    feature = "native-writer-test-control",
+    debug_assertions
+))]
+pub(in crate::lan) fn retained_test_outbound_limit() -> usize {
+    MAX_PENDING
+}
+#[cfg(all(
+    test,
+    feature = "paired-packages",
+    feature = "native-writer-test-control",
+    debug_assertions
+))]
+pub(in crate::lan) fn retained_test_release_writer() {
+    retained_controls::release();
+}
+
 struct Parts {
     uuid: u128,
     name: String,
@@ -2444,6 +2523,53 @@ mod tests {
 mod retained_transport_tests {
     use super::super::{ClosedLan, RetainedActor, RetainedLan, RetainedOfflineConfig};
     use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn retained_refused_outbound_keeps_original_vectors_and_first_failure() {
+        for mode in ["closing", "sealed", "disconnecting", "capacity"] {
+            let latch = Arc::new(AtomicBool::new(false));
+            let queue = RetainedOutbound::new(latch.clone());
+            let sender = queue.sender();
+            match mode {
+                "closing" => latch.store(true, Ordering::Release),
+                "sealed" => queue.seal(),
+                "disconnecting" => {
+                    sender.disconnect(horizon_world::nbt::Tag::String("stop".into()))
+                }
+                _ => {}
+            }
+            let body = vec![
+                0xa7;
+                if mode == "capacity" {
+                    MAX_PENDING + 1
+                } else {
+                    7
+                }
+            ];
+            let pointer = body.as_ptr();
+            let capacity = body.capacity();
+            sender.send(body);
+            let first = queue.snapshot();
+            let failure = first.failure.clone().expect("refusal is visible");
+            let stored = queue.inner();
+            assert_eq!(stored.refused.len(), 1);
+            assert_eq!(stored.refused[0].reason, mode);
+            assert_eq!(stored.refused[0].bodies[0].as_ptr(), pointer);
+            assert_eq!(stored.refused[0].bodies[0].capacity(), capacity);
+            assert!(stored.refused[0].bodies[0].iter().all(|b| *b == 0xa7));
+            drop(stored);
+            queue.failed(RetainedOutcome::Io("later native failure".into()));
+            sender.send(vec![0xb2, 0x19]);
+            let later = queue.snapshot();
+            assert_eq!(later.failure, Some(failure));
+            assert_eq!(later.first_refusal, Some(mode));
+            assert_eq!(later.refused_bodies, 2);
+            assert_eq!(later.refused_bytes, first.refused_bytes + 2);
+            assert_eq!(queue.inner().refused[0].bodies[0].as_ptr(), pointer);
+            assert_eq!(queue.inner().refused[1].bodies[0], [0xb2, 0x19]);
+        }
+    }
 
     struct Fixture(Option<RetainedLan>);
     impl Fixture {
