@@ -53,6 +53,8 @@ pub const MAX_PLAYERS: usize = 8;
 pub enum NetEvent {
     /// A client finished configuration and enters the play state.
     Joined(Box<Joined>),
+    #[cfg(feature = "paired-packages")]
+    PairedJoined(Box<PairedJoined>),
     Packet(u32, Box<play::Serverbound>),
     /// The connection ended (reason for the log).
     Left(u32, String),
@@ -72,6 +74,18 @@ pub struct Joined {
     /// Smoothed keep-alive round trip in milliseconds.
     pub latency: Arc<AtomicI32>,
     pub address: SocketAddr,
+}
+/// Private construction binds metadata to a real registered retained attempt.
+#[cfg(feature = "paired-packages")]
+pub struct PairedJoined {
+    joined: Option<Box<Joined>>,
+    envelope: login_negotiation::ConfiguredEnvelope,
+}
+#[cfg(feature = "paired-packages")]
+impl PairedJoined {
+    pub(in crate::lan) fn joined(&self) -> Option<&Joined> {
+        self.joined.as_deref()
+    }
 }
 
 /// Experimental offline memory fixture policy; not general network admission.
@@ -1189,7 +1203,7 @@ pub(super) fn retained_test_sync() -> Arc<data::SyncData> {
 #[cfg(feature = "paired-packages")]
 mod retained {
     use super::*;
-    use horizon_protocol::connection::{Connection, ConnectionShutdown, Pipe};
+    use horizon_protocol::connection::{Connection, ConnectionShutdown, Counters, Pipe};
     use std::collections::VecDeque;
     use std::time::Instant;
 
@@ -1312,6 +1326,12 @@ mod retained {
         outbound: Option<Arc<conn::RetainedOutbound>>,
         uuid: Option<u128>,
         released: bool,
+        counters: Arc<Counters>,
+        configured: Option<login_negotiation::ConfiguredOwner>,
+        failed_scope: Option<login_negotiation::NegotiationConnection>,
+        failed_endpoint: Option<login_negotiation::ConfiguredEndpoint>,
+        failed_connection: Option<Connection>,
+        pending_configured: Option<login_negotiation::ConfiguredEnvelope>,
     }
     #[derive(Default)]
     struct RegistryInner {
@@ -1331,6 +1351,7 @@ mod retained {
         fail_outer_spawn: bool,
         fail_listener_spawn: bool,
         panic_listener: bool,
+        paired_publication: Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
         #[cfg(all(
             feature = "native-writer-test-control",
             debug_assertions,
@@ -1348,6 +1369,7 @@ mod retained {
         inner: Mutex<RegistryInner>,
         shared: Arc<Shared>,
         closing_latch: Arc<AtomicBool>,
+        required: Option<login_negotiation::RequiredNegotiation>,
     }
 
     /// Explicit per-attempt codec context; never installed in ordinary Shared.
@@ -1357,6 +1379,143 @@ mod retained {
         conn: u32,
     }
     impl RetainedContext {
+        #[cfg(test)]
+        pub(super) fn publication_gate(&self) {
+            let gate = self.registry.inner().controls.paired_publication.take();
+            if let Some((reached, release)) = gate {
+                reached.wait();
+                release.wait();
+            }
+        }
+        pub(super) fn required(&self) -> Option<login_negotiation::RequiredNegotiation> {
+            self.registry.required.clone()
+        }
+        pub(super) fn retain_scope(&self, scope: login_negotiation::NegotiationConnection) {
+            self.registry
+                .inner()
+                .attempts
+                .iter_mut()
+                .find(|a| a.conn == self.conn)
+                .expect("registered scope")
+                .failed_scope = Some(scope);
+        }
+        pub(super) fn transfer_configured(
+            &self,
+            endpoint: login_negotiation::ConfiguredEndpoint,
+        ) -> Result<Connection, String> {
+            let mut inner = self.registry.inner();
+            let closing = inner.closing;
+            let attempt = inner
+                .attempts
+                .iter_mut()
+                .find(|a| a.conn == self.conn)
+                .expect("registered original attempt");
+            let required = self
+                .registry
+                .required
+                .as_ref()
+                .expect("explicit paired policy");
+            let uuid = endpoint.profile().uuid;
+            let transfer = match endpoint.transfer(
+                login_negotiation::Endpoint::Server,
+                required,
+                &attempt.counters,
+                uuid,
+            ) {
+                Ok(transfer) => transfer,
+                Err((mut endpoint, reason)) => {
+                    endpoint.close();
+                    attempt.failed_endpoint = Some(endpoint);
+                    return Err(reason.to_string());
+                }
+            };
+            if closing {
+                transfer.owner.invalidate();
+            }
+            attempt.configured = Some(transfer.owner);
+            attempt.pending_configured = Some(transfer.envelope);
+            Ok(transfer.connection)
+        }
+        pub(super) fn admit_paired(
+            &self,
+            uuid: u128,
+            name: &str,
+        ) -> Option<horizon_world::nbt::Tag> {
+            let mut inner = self.registry.inner();
+            let index = inner
+                .attempts
+                .iter()
+                .position(|a| a.conn == self.conn)
+                .expect("registered attempt");
+            let attempt = &inner.attempts[index];
+            let required = self.registry.required.as_ref().expect("paired policy");
+            if inner.closing
+                || !attempt.pending_configured.as_ref().is_some_and(|envelope| {
+                    attempt.configured.as_ref().is_some_and(|configured| {
+                        configured.validates(
+                            envelope,
+                            login_negotiation::Endpoint::Server,
+                            required,
+                            &attempt.counters,
+                            uuid,
+                        )
+                    })
+                })
+            {
+                return Some(translatable("multiplayer.disconnect.server_shutdown", &[]));
+            }
+            self.admit_locked(&mut inner, index, uuid, name)
+        }
+        pub(super) fn retain_connection(&self, connection: Connection) {
+            connection.writer.shutdown();
+            self.registry
+                .inner()
+                .attempts
+                .iter_mut()
+                .find(|a| a.conn == self.conn)
+                .expect("registered connection")
+                .failed_connection = Some(connection);
+        }
+        pub(super) fn publish_paired(&self, joined: Joined) -> bool {
+            let mut inner = self.registry.inner();
+            let envelope = inner
+                .attempts
+                .iter_mut()
+                .find(|a| a.conn == self.conn)
+                .expect("registered paired attempt")
+                .pending_configured
+                .take()
+                .expect("original pending envelope");
+            let valid = !inner.closing
+                && inner
+                    .attempts
+                    .iter()
+                    .find(|a| a.conn == self.conn)
+                    .is_some_and(|attempt| {
+                        attempt.uuid == Some(joined.uuid)
+                            && !attempt.released
+                            && attempt
+                                .outbound
+                                .as_ref()
+                                .is_some_and(|outbound| joined.sender.retained_matches(outbound))
+                            && attempt.configured.as_ref().is_some_and(|configured| {
+                                configured.validates(
+                                    &envelope,
+                                    login_negotiation::Endpoint::Server,
+                                    self.registry.required.as_ref().expect("paired policy"),
+                                    &attempt.counters,
+                                    joined.uuid,
+                                )
+                            })
+                    });
+            inner
+                .events
+                .push_back(NetEvent::PairedJoined(Box::new(PairedJoined {
+                    joined: Some(Box::new(joined)),
+                    envelope,
+                })));
+            valid
+        }
         pub(super) fn conn(&self) -> u32 {
             self.conn
         }
@@ -1379,6 +1538,15 @@ mod retained {
             let Some(index) = inner.attempts.iter().position(|a| a.conn == self.conn) else {
                 return Some(translatable("multiplayer.disconnect.duplicate_login", &[]));
             };
+            self.admit_locked(&mut inner, index, uuid, name)
+        }
+        fn admit_locked(
+            &self,
+            inner: &mut RegistryInner,
+            index: usize,
+            uuid: u128,
+            name: &str,
+        ) -> Option<horizon_world::nbt::Tag> {
             if inner.attempts[index].uuid.is_some()
                 || inner
                     .attempts
@@ -1392,12 +1560,13 @@ mod retained {
                 .iter()
                 .filter(|a| a.uuid.is_some() && !a.released)
                 .count()
-                >= shared.max_players()
+                >= self.registry.shared.max_players()
             {
                 return Some(translatable("multiplayer.disconnect.server_full", &[]));
             }
             inner.attempts[index].uuid = Some(uuid);
-            shared
+            self.registry
+                .shared
                 .online
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1464,6 +1633,9 @@ mod retained {
                 let Some(attempt) = inner.attempts.iter().find(|a| a.conn == self.conn) else {
                     return;
                 };
+                if let Some(configured) = &attempt.configured {
+                    configured.invalidate();
+                }
                 (attempt.shutdown.clone(), attempt.outbound.clone())
             };
             if let Some(outbound) = outbound {
@@ -1537,6 +1709,12 @@ mod retained {
                 outbound: None,
                 uuid: None,
                 released: false,
+                counters: connection.reader.counters.clone(),
+                configured: None,
+                failed_scope: None,
+                failed_endpoint: None,
+                failed_connection: None,
+                pending_configured: None,
             });
             if !accepted {
                 inner.terminals.push(RetainedTerminal {
@@ -1631,6 +1809,14 @@ mod retained {
             let owners: Vec<_> = {
                 let mut inner = self.inner();
                 inner.closing = true;
+                if let Some(required) = &self.required {
+                    required.close();
+                }
+                for attempt in &inner.attempts {
+                    if let Some(configured) = &attempt.configured {
+                        configured.invalidate();
+                    }
+                }
                 // Queue admission reads this same permanent latch while holding
                 // its own queue lock. No producer starting after this store can
                 // enter the gap before the individual queues are sealed below.
@@ -1746,6 +1932,22 @@ mod retained {
         announcement: Option<discovery::RetainedPinger>,
     }
     impl RetainedLan {
+        #[cfg(test)]
+        pub(in crate::lan) fn retained_test_paired_publication(
+            &self,
+            reached: Arc<std::sync::Barrier>,
+            release: Arc<std::sync::Barrier>,
+        ) {
+            self.registry.inner().controls.paired_publication = Some((reached, release));
+        }
+        #[cfg(test)]
+        pub(in crate::lan) fn retained_test_configured_custody(&self) -> bool {
+            self.registry.inner().attempts.iter().any(|a| {
+                a.pending_configured.is_some()
+                    || a.failed_scope.is_some()
+                    || a.failed_endpoint.is_some()
+            })
+        }
         pub(in crate::lan) fn max_players(&self) -> usize {
             self.registry.shared.max_players()
         }
@@ -1757,7 +1959,8 @@ mod retained {
         }
         pub(in crate::lan) fn validate_joined(&self, joined: &Joined) -> bool {
             let inner = self.registry.inner();
-            !inner.closing
+            self.registry.required.is_none()
+                && !inner.closing
                 && joined.uuid == horizon_protocol::crypto::offline_uuid(&joined.name)
                 && inner.attempts.iter().any(|attempt| {
                     attempt.conn == joined.conn
@@ -1768,6 +1971,67 @@ mod retained {
                             .as_ref()
                             .is_some_and(|outbound| joined.sender.retained_matches(outbound))
                 })
+        }
+        pub(in crate::lan) fn validate_paired(&self, paired: &PairedJoined) -> bool {
+            let inner = self.registry.inner();
+            self.valid_paired_locked(&inner, paired)
+        }
+        fn valid_paired_locked(&self, inner: &RegistryInner, paired: &PairedJoined) -> bool {
+            let Some(required) = self.registry.required.as_ref() else {
+                return false;
+            };
+            let Some(joined) = paired.joined() else {
+                return false;
+            };
+            !inner.closing
+                && joined.uuid == horizon_protocol::crypto::offline_uuid(&joined.name)
+                && inner.attempts.iter().any(|attempt| {
+                    attempt.conn == joined.conn
+                        && attempt.uuid == Some(joined.uuid)
+                        && !attempt.released
+                        && attempt
+                            .outbound
+                            .as_ref()
+                            .is_some_and(|outbound| joined.sender.retained_matches(outbound))
+                        && attempt.configured.as_ref().is_some_and(|configured| {
+                            configured.validates(
+                                &paired.envelope,
+                                login_negotiation::Endpoint::Server,
+                                required,
+                                &attempt.counters,
+                                joined.uuid,
+                            )
+                        })
+                })
+        }
+        pub(in crate::lan) fn consume_paired(
+            &self,
+            paired: &mut PairedJoined,
+        ) -> Result<(Box<Joined>, login_negotiation::ConfiguredAdmission), login_negotiation::Refusal>
+        {
+            let inner = self.registry.inner();
+            if !self.valid_paired_locked(&inner, paired) {
+                return Err(login_negotiation::Refusal::Binding);
+            }
+            let joined = paired.joined().expect("validated original joined");
+            let attempt = inner
+                .attempts
+                .iter()
+                .find(|a| a.conn == joined.conn)
+                .expect("validated attempt");
+            let uuid = joined.uuid;
+            let admission = attempt
+                .configured
+                .as_ref()
+                .expect("validated owner")
+                .consume(
+                    &mut paired.envelope,
+                    login_negotiation::Endpoint::Server,
+                    self.registry.required.as_ref().expect("paired policy"),
+                    &attempt.counters,
+                    uuid,
+                )?;
+            Ok((paired.joined.take().expect("one-use joined"), admission))
         }
         pub(in crate::lan) fn harvest(&self) {
             self.registry.harvest();
@@ -1780,6 +2044,26 @@ mod retained {
         }
         /// This constructor acquires no listener, thread, online service or POST.
         pub fn new(sync: Arc<data::SyncData>, config: RetainedOfflineConfig) -> io::Result<Self> {
+            Self::construct(sync, config, None)
+        }
+        pub fn new_paired(
+            sync: Arc<data::SyncData>,
+            config: RetainedOfflineConfig,
+            required: login_negotiation::RequiredNegotiation,
+        ) -> io::Result<Self> {
+            if !required.expectation.retains_sync(&sync) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "paired retained sync owner differs",
+                ));
+            }
+            Self::construct(sync, config, Some(required))
+        }
+        fn construct(
+            sync: Arc<data::SyncData>,
+            config: RetainedOfflineConfig,
+            required: Option<login_negotiation::RequiredNegotiation>,
+        ) -> io::Result<Self> {
             if config.max_players == 0
                 || config.max_players > 1024
                 || config.motd.len() > 32_767
@@ -1819,6 +2103,7 @@ mod retained {
                     inner: Mutex::new(RegistryInner::default()),
                     shared,
                     closing_latch: Arc::new(AtomicBool::new(false)),
+                    required,
                 }),
                 deadline: None,
                 announcement: None,

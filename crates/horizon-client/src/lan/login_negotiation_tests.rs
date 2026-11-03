@@ -1,6 +1,45 @@
 use super::super::data::RegistrySnapshot;
 use super::*;
 
+#[cfg(feature = "paired-packages")]
+pub(super) fn capture_actual(sync: Arc<SyncData>) -> Arc<NegotiationExpectation> {
+    use std::{io::Read, path::PathBuf};
+    let resources =
+        PathBuf::from(std::env::var_os("HORIZON_TEST_RESOURCES").expect("pinned resources"));
+    let pair =
+        PathBuf::from(std::env::var_os("HORIZON_COUNTER_PAIR_FIXTURE").expect("pinned pair"));
+    let prepared = Arc::new(horizon_mods::paired::PreparedBundle::read_folder(&pair).unwrap());
+    let blocks = Box::leak(Box::new(
+        BlockRegistry::from_facts_json(std::fs::File::open(resources.join("facts.json")).unwrap())
+            .unwrap(),
+    ));
+    let projections = RegistrySnapshot::capture(&sync, blocks, 0, 0).unwrap();
+    let mut executable = std::fs::File::open(std::env::current_exe().unwrap()).unwrap();
+    let mut hash = Sha256::new();
+    let mut chunk = [0; 65536];
+    loop {
+        let n = executable.read(&mut chunk).unwrap();
+        if n == 0 {
+            break;
+        }
+        hash.update(&chunk[..n]);
+    }
+    let machines = prepared.content().machine_types().types();
+    assert_eq!(machines.len(), 1);
+    let contract = WireContract::from_claims(super::super::peer_contract::WireClaims {
+        protocol: horizon_protocol::PROTOCOL_VERSION,
+        game: horizon_protocol::GAME_VERSION,
+        build: hash.finalize().into(),
+        package_id: &prepared.bundle().content_owner().id,
+        package: *prepared.identity(),
+        machine_id: machines[0].id(),
+        schema: machines[0].save_schema(),
+        registries: &projections,
+    })
+    .unwrap();
+    NegotiationExpectation::from_retained(sync, blocks, prepared, contract).unwrap()
+}
+
 fn wire() -> WireContract {
     use super::super::peer_contract::WireClaims;
     WireContract::from_claims(WireClaims {
@@ -217,52 +256,15 @@ fn invalid_scope_deadline_closes_the_owned_connection() {
 mod tcp {
     use super::*;
     use std::{
-        io::Read,
         net::{TcpListener, TcpStream},
         path::PathBuf,
         sync::mpsc::channel,
     };
 
     fn captured() -> Arc<NegotiationExpectation> {
-        let resources = PathBuf::from(
-            std::env::var_os("HORIZON_TEST_RESOURCES").expect("pinned resources required"),
-        );
-        let pair = PathBuf::from(
-            std::env::var_os("HORIZON_COUNTER_PAIR_FIXTURE").expect("prebuilt Rust pair required"),
-        );
-        let prepared = Arc::new(horizon_mods::paired::PreparedBundle::read_folder(&pair).unwrap());
-        let sync = Arc::new(SyncData::load(&resources).unwrap());
-        let blocks = Box::leak(Box::new(
-            BlockRegistry::from_facts_json(
-                std::fs::File::open(resources.join("facts.json")).unwrap(),
-            )
-            .unwrap(),
-        ));
-        let projections = RegistrySnapshot::capture(&sync, blocks, 0, 0).unwrap();
-        let mut executable = std::fs::File::open(std::env::current_exe().unwrap()).unwrap();
-        let mut hash = Sha256::new();
-        let mut chunk = [0; 65536];
-        loop {
-            let n = executable.read(&mut chunk).unwrap();
-            if n == 0 {
-                break;
-            }
-            hash.update(&chunk[..n]);
-        }
-        let machines = prepared.content().machine_types().types();
-        assert_eq!(machines.len(), 1);
-        let contract = WireContract::from_claims(super::super::super::peer_contract::WireClaims {
-            protocol: horizon_protocol::PROTOCOL_VERSION,
-            game: horizon_protocol::GAME_VERSION,
-            build: hash.finalize().into(),
-            package_id: &prepared.bundle().content_owner().id,
-            package: *prepared.identity(),
-            machine_id: machines[0].id(),
-            schema: machines[0].save_schema(),
-            registries: &projections,
-        })
-        .unwrap();
-        NegotiationExpectation::from_retained(sync, blocks, prepared, contract).unwrap()
+        let resources =
+            PathBuf::from(std::env::var_os("HORIZON_TEST_RESOURCES").expect("pinned resources"));
+        capture_actual(Arc::new(SyncData::load(&resources).unwrap()))
     }
     fn sockets() -> (Connection, Connection) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -351,6 +353,8 @@ mod tcp {
         assert_eq!(
             server
                 .connection
+                .as_ref()
+                .unwrap()
                 .reader
                 .counters
                 .sent
@@ -360,6 +364,8 @@ mod tcp {
         assert_eq!(
             server
                 .connection
+                .as_ref()
+                .unwrap()
                 .reader
                 .counters
                 .received
@@ -369,6 +375,8 @@ mod tcp {
         assert_eq!(
             client
                 .connection
+                .as_ref()
+                .unwrap()
                 .reader
                 .counters
                 .sent
@@ -378,6 +386,8 @@ mod tcp {
         assert_eq!(
             client
                 .connection
+                .as_ref()
+                .unwrap()
                 .reader
                 .counters
                 .received
@@ -393,6 +403,8 @@ mod tcp {
         assert_eq!(
             server
                 .connection
+                .as_ref()
+                .unwrap()
                 .reader
                 .counters
                 .sent
@@ -402,6 +414,8 @@ mod tcp {
         assert_eq!(
             client
                 .connection
+                .as_ref()
+                .unwrap()
                 .reader
                 .counters
                 .received
@@ -755,7 +769,7 @@ mod tcp {
         let pending = prepare_client_confirmation(&mut c, expected.clone(), 42, first).unwrap();
         // This is the actual client socket, after native phase3 verification.
         // The production final-write helper must fail rather than mint receipt.
-        c.connection.writer.shutdown();
+        c.connection.as_ref().unwrap().writer.shutdown();
         let outcome = finish_client_confirmation(&mut c, pending).err().unwrap();
         let terminal = server.join().unwrap();
         assert!(matches!(outcome, Refusal::Io(_)));
@@ -1396,6 +1410,226 @@ mod tcp {
                         && !server_live.open.load(Ordering::Acquire)
                 );
             }
+        }
+    }
+
+    fn handoff_pair(
+        a: &Arc<NegotiationExpectation>,
+        b: &Arc<NegotiationExpectation>,
+        memory: bool,
+        budget: Duration,
+    ) -> (
+        ConfiguredTransfer,
+        ConfiguredTransfer,
+        RequiredNegotiation,
+        RequiredNegotiation,
+    ) {
+        let fixture = agreed(a, b, memory, budget);
+        let sr = fixture.server_required.clone();
+        let cr = fixture.client_required.clone();
+        let sc = fixture
+            .server
+            .connection
+            .as_ref()
+            .unwrap()
+            .reader
+            .counters
+            .clone();
+        let cc = fixture
+            .client
+            .connection
+            .as_ref()
+            .unwrap()
+            .reader
+            .counters
+            .clone();
+        let expected = a.clone();
+        let join = std::thread::spawn(move || {
+            configured(fixture.server.configure_server(
+                fixture.server_receipt,
+                expected,
+                native_profile(),
+                (!memory).then_some(64),
+            ))
+        });
+        let mut client = configured(fixture.client.configure_client(
+            fixture.client_receipt,
+            b.clone(),
+            42,
+            "StrictGuest",
+            horizon_protocol::packets::configuration::ClientInformation::new(2),
+        ));
+        let server = join.join().unwrap();
+        // Refusals retain the exact live scope and allow its genuine later use.
+        for case in 0..4 {
+            let wrong_runtime = RequiredNegotiation::new(b.clone(), budget).unwrap();
+            let (role, required, counters, uuid) = match case {
+                0 => (Endpoint::Server, &cr, &cc, 42),
+                1 => (Endpoint::Client, &wrong_runtime, &cc, 42),
+                2 => (Endpoint::Client, &cr, &sc, 42),
+                _ => (Endpoint::Client, &cr, &cc, 43),
+            };
+            client = match client.transfer(role, required, counters, uuid) {
+                Err((original, Refusal::Binding)) => original,
+                _ => panic!("wrong binding transferred actual connection"),
+            };
+            assert!(Arc::ptr_eq(
+                &client.scope.connection.as_ref().unwrap().reader.counters,
+                &cc
+            ));
+            assert!(client.is_live(Endpoint::Client, b, 42));
+            assert!(server.is_live(Endpoint::Server, a, 42));
+        }
+        let server = server
+            .transfer(Endpoint::Server, &sr, &sc, 42)
+            .unwrap_or_else(|_| panic!("genuine server transfer"));
+        let client = client
+            .transfer(Endpoint::Client, &cr, &cc, 42)
+            .unwrap_or_else(|_| panic!("genuine client transfer"));
+        assert!(Arc::ptr_eq(&server.connection.reader.counters, &sc));
+        assert!(Arc::ptr_eq(&client.connection.reader.counters, &cc));
+        (server, client, sr, cr)
+    }
+
+    #[test]
+    #[ignore = "pinned captures; actual configured transfer and original counters"]
+    fn configured_transfer_one_use_counter_runtime_and_deadline() {
+        let a = captured();
+        let b = captured();
+        for memory in [true, false] {
+            let (mut server, mut client, sr, cr) =
+                handoff_pair(&a, &b, memory, Duration::from_secs(3));
+            let sc = server.connection.reader.counters.clone();
+            let cc = client.connection.reader.counters.clone();
+            assert!(
+                server
+                    .owner
+                    .consume(&mut client.envelope, Endpoint::Client, &cr, &cc, 42)
+                    .is_err()
+            );
+            assert!(
+                client
+                    .owner
+                    .validates(&client.envelope, Endpoint::Client, &cr, &cc, 42)
+            );
+            let sa = server
+                .owner
+                .consume(&mut server.envelope, Endpoint::Server, &sr, &sc, 42)
+                .unwrap();
+            let ca = client
+                .owner
+                .consume(&mut client.envelope, Endpoint::Client, &cr, &cc, 42)
+                .unwrap();
+            assert!(
+                client
+                    .owner
+                    .consume(&mut client.envelope, Endpoint::Client, &cr, &cc, 42)
+                    .is_err()
+            );
+            assert!(ca.is_live() && sa.is_live());
+            assert_eq!(ca.transcript(), sa.transcript());
+            // Cross the original absolute deadline after establishment, then
+            // exchange real traffic through both moved original transports.
+            std::thread::sleep(
+                client
+                    .owner
+                    .life
+                    .deadline
+                    .saturating_duration_since(Instant::now())
+                    + Duration::from_millis(20),
+            );
+            assert!(client.owner.established() && server.owner.established());
+            client.connection.send(&[17, 9]).unwrap();
+            assert_eq!(
+                server
+                    .connection
+                    .recv_until(Instant::now() + Duration::from_secs(1))
+                    .unwrap(),
+                (17, vec![9])
+            );
+            server.connection.send(&[18, 10]).unwrap();
+            assert_eq!(
+                client
+                    .connection
+                    .recv_until(Instant::now() + Duration::from_secs(1))
+                    .unwrap(),
+                (18, vec![10])
+            );
+            client.owner.invalidate();
+            assert!(!ca.is_live() && sa.is_live());
+            sr.close();
+            assert!(!sa.is_live());
+        }
+        let (mut server, mut client, sr, cr) = handoff_pair(&a, &b, true, Duration::from_secs(2));
+        let cc = client.connection.reader.counters.clone();
+        std::thread::sleep(
+            client
+                .owner
+                .life
+                .deadline
+                .saturating_duration_since(Instant::now())
+                + Duration::from_millis(20),
+        );
+        assert!(
+            client
+                .owner
+                .consume(&mut client.envelope, Endpoint::Client, &cr, &cc, 42)
+                .is_err()
+        );
+        assert!(
+            client.envelope.payload.is_some(),
+            "expired original payload retained"
+        );
+        let sc = server.connection.reader.counters.clone();
+        assert!(
+            server
+                .owner
+                .consume(&mut server.envelope, Endpoint::Server, &sr, &sc, 42)
+                .is_err()
+        );
+        assert!(server.envelope.payload.is_some());
+    }
+
+    #[test]
+    #[ignore = "pinned capture; actual failed acquisition retained"]
+    fn configured_retained_acquisition_refusal_keeps_original_scope() {
+        let expected = captured();
+        for closed in [false, true] {
+            let (pipe, peer) = horizon_protocol::connection::Pipe::pair();
+            let connection = Connection::local(pipe);
+            let counters = connection.reader.counters.clone();
+            let required =
+                RequiredNegotiation::new(expected.clone(), Duration::from_secs(1)).unwrap();
+            if closed {
+                required.close();
+            }
+            let deadline = if closed {
+                required.deadline()
+            } else {
+                Instant::now()
+            };
+            let (scope, reason) =
+                NegotiationConnection::for_retained(connection, &required, deadline)
+                    .err()
+                    .expect("actual refusal");
+            assert_eq!(
+                reason,
+                if closed {
+                    Refusal::Closed
+                } else {
+                    Refusal::Budget
+                }
+            );
+            assert!(Arc::ptr_eq(
+                &scope.connection.as_ref().unwrap().reader.counters,
+                &counters
+            ));
+            assert!(!scope.live.open.load(Ordering::Acquire));
+            let mut peer = Connection::local(peer);
+            assert!(
+                peer.send(&[1]).is_err(),
+                "original endpoint was actually closed"
+            );
         }
     }
 

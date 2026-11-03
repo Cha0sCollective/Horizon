@@ -1302,6 +1302,69 @@ fn serve_login(
     };
     // verifyLoginAndFinishConnectionSetup: PlayerList.canPlayerLogin, then
     // duplicates and a full server.
+    #[cfg(feature = "paired-packages")]
+    if let Some(owner) = retained
+        && let Some(required) = owner.required()
+    {
+        use super::login_negotiation::{NegotiationConnection, negotiate_server};
+        let mut scope = match NegotiationConnection::for_retained(c, &required, required.deadline())
+        {
+            Ok(scope) => scope,
+            Err((scope, reason)) => {
+                owner.retain_scope(scope);
+                return Err(reason.to_string());
+            }
+        };
+        let receipt = match negotiate_server(&mut scope, required.expectation.clone(), uuid) {
+            Ok(receipt) => receipt,
+            Err(reason) => {
+                owner.retain_scope(scope);
+                return Err(reason.to_string());
+            }
+        };
+        let compression = if shared.config.compression_threshold >= 0 && !scope.is_memory() {
+            Some(shared.config.compression_threshold)
+        } else {
+            None
+        };
+        let endpoint = match scope.configure_server(
+            receipt,
+            required.expectation.clone(),
+            login::GameProfile {
+                uuid,
+                name: hello.name.clone(),
+                properties,
+            },
+            compression,
+        ) {
+            Ok(endpoint) => endpoint,
+            Err(failure) => {
+                let reason = failure.reason.to_string();
+                owner.retain_scope(failure.into_scope());
+                return Err(reason);
+            }
+        };
+        let profile = endpoint.profile().clone();
+        let info = endpoint.information().clone();
+        let mut connection = owner.transfer_configured(endpoint)?;
+        if let Some(reason) = owner.admit_paired(uuid, &hello.name) {
+            let result = send_modern(
+                &mut connection,
+                &play::Clientbound::Disconnect(cfg::Disconnect { reason }).encode(),
+                retained,
+            );
+            owner.retain_connection(connection);
+            return result;
+        }
+        let parts = Parts {
+            uuid,
+            name: profile.name,
+            properties: profile.properties,
+            info,
+            brand: "horizon".into(),
+        };
+        return play_retained_inner(connection, parts, address, owner.clone(), true);
+    }
     if let Some(required) = &shared.required_negotiation {
         use super::login_negotiation::{NegotiationConnection, negotiate_server};
         let mut scope = NegotiationConnection::for_required(c, required, required.deadline())
@@ -1369,6 +1432,16 @@ fn play_retained(
     address: std::net::SocketAddr,
     owner: RetainedContext,
 ) -> Result<(), String> {
+    play_retained_inner(c, parts, address, owner, false)
+}
+#[cfg(feature = "paired-packages")]
+fn play_retained_inner(
+    c: Connection,
+    parts: Parts,
+    address: std::net::SocketAddr,
+    owner: RetainedContext,
+    paired: bool,
+) -> Result<(), String> {
     let outbound = RetainedOutbound::new(owner.close_latch());
     if !owner.attach_outbound(outbound.clone()) {
         return Err("retained connection closed".into());
@@ -1428,7 +1501,16 @@ fn play_retained(
         latency,
         address,
     };
-    if !owner.emit(NetEvent::Joined(Box::new(joined))) {
+    #[cfg(test)]
+    if paired {
+        owner.publication_gate();
+    }
+    let published = if paired {
+        owner.publish_paired(joined)
+    } else {
+        owner.emit(NetEvent::Joined(Box::new(joined)))
+    };
+    if !published {
         return Err("retained queue closed".into());
     }
     #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
@@ -1665,6 +1747,20 @@ pub(in crate::lan) fn retained_test_pause_writer(conn: u32) {
     retained_controls::set(retained_controls::Control {
         conn,
         pause_writer: true,
+        ..Default::default()
+    });
+}
+#[cfg(all(
+    test,
+    feature = "paired-packages",
+    feature = "native-writer-test-control",
+    debug_assertions
+))]
+pub(in crate::lan) fn retained_test_writer_fault(conn: u32, panic: bool) {
+    retained_controls::set(retained_controls::Control {
+        conn,
+        panic_writer: panic,
+        spawn_failure: !panic,
         ..Default::default()
     });
 }

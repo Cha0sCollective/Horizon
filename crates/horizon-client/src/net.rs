@@ -48,6 +48,8 @@ pub enum Event {
         uuid: u128,
         name: String,
     },
+    #[cfg(feature = "paired-packages")]
+    PairedJoined(crate::lan::login_negotiation::ConfiguredEnvelope),
     Packet(Box<play::Clientbound>),
     /// A packet that failed to decode (skipped, like vanilla's skippable packets).
     DecodeError(String),
@@ -1069,6 +1071,10 @@ mod retained_client {
         terminals: Vec<RetainedTerminal>,
         cookies: HashMap<String, Vec<u8>>,
         transfer: Option<RetainedTransfer>,
+        configured: Option<crate::lan::login_negotiation::ConfiguredOwner>,
+        failed_scope: Option<crate::lan::login_negotiation::NegotiationConnection>,
+        failed_endpoint: Option<crate::lan::login_negotiation::ConfiguredEndpoint>,
+        pending_configured: Option<crate::lan::login_negotiation::ConfiguredEnvelope>,
         #[cfg(test)]
         controls: Controls,
     }
@@ -1077,6 +1083,7 @@ mod retained_client {
         ready: Condvar,
         settings: RetainedSettings,
         transferred: bool,
+        required: Option<crate::lan::login_negotiation::RequiredNegotiation>,
     }
     impl Controller {
         fn lock(&self) -> std::sync::MutexGuard<'_, State> {
@@ -1091,6 +1098,12 @@ mod retained_client {
             let cap = {
                 let mut s = self.lock();
                 s.stopped = true;
+                if let Some(configured) = &s.configured {
+                    configured.invalidate();
+                }
+                if let Some(required) = &self.required {
+                    required.close();
+                }
                 s.interrupt.clone()
             };
             self.ready.notify_all();
@@ -1107,6 +1120,13 @@ mod retained_client {
         }
         fn terminal(&self, actor: RetainedActor, outcome: RetainedOutcome) {
             let mut s = self.lock();
+            s.stopped = true;
+            if let Some(configured) = &s.configured {
+                configured.invalidate();
+            }
+            if let Some(required) = &self.required {
+                required.close();
+            }
             if actor == RetainedActor::Writer
                 && outcome == RetainedOutcome::Panic
                 && let Some(body) = s.active.clone()
@@ -1244,19 +1264,28 @@ mod retained_client {
             target: RetainedTarget,
             settings: RetainedSettings,
         ) -> Result<Self, RetainedValidation> {
-            Self::construct(target, settings, None)
+            Self::construct(target, settings, None, None)
         }
         pub fn new_offline_transferred(
             target: RetainedTarget,
             settings: RetainedSettings,
             cookies: RetainedCookies,
         ) -> Result<Self, RetainedValidation> {
-            Self::construct(target, settings, Some(cookies))
+            Self::construct(target, settings, Some(cookies), None)
+        }
+        /// Explicit dormant route. It does not enable ordinary paired startup.
+        pub fn new_offline_paired(
+            target: RetainedTarget,
+            settings: RetainedSettings,
+            required: crate::lan::login_negotiation::RequiredNegotiation,
+        ) -> Result<Self, RetainedValidation> {
+            Self::construct(target, settings, None, Some(required))
         }
         fn construct(
             target: RetainedTarget,
             settings: RetainedSettings,
             cookies: Option<RetainedCookies>,
+            required: Option<crate::lan::login_negotiation::RequiredNegotiation>,
         ) -> Result<Self, RetainedValidation> {
             let valid_target = match &target {
                 RetainedTarget::Address(a) => !a.starts_with(FRIEND) && parse_address(a).is_some(),
@@ -1328,12 +1357,17 @@ mod retained_client {
                         terminals: vec![],
                         cookies: cookies.unwrap_or_default().0,
                         transfer: None,
+                        configured: None,
+                        failed_scope: None,
+                        failed_endpoint: None,
+                        pending_configured: None,
                         #[cfg(test)]
                         controls: Controls::default(),
                     }),
                     ready: Condvar::new(),
                     settings,
                     transferred,
+                    required,
                 }),
                 resolved: false,
             })
@@ -1395,10 +1429,74 @@ mod retained_client {
             let take = max.min(s.events.len());
             s.events.drain(..take).collect()
         }
+        #[cfg(test)]
+        pub(crate) fn retained_test_paired_gate(&self, publication: bool) {
+            self.owner.lock().controls.gate = Some(if publication {
+                Gate::PairedPublication
+            } else {
+                Gate::PairedConfiguration
+            });
+        }
+        #[cfg(test)]
+        pub(crate) fn retained_test_gate_reached(&self) -> bool {
+            self.owner.lock().controls.reached
+        }
+        #[cfg(test)]
+        pub(crate) fn retained_test_gate_release(&self) {
+            self.owner.lock().controls.release = true;
+            self.owner.ready.notify_all();
+        }
+        #[cfg(test)]
+        pub(crate) fn retained_test_writer_fault(&self, panic: bool) {
+            let mut s = self.owner.lock();
+            if panic {
+                s.controls.writer_panic = true;
+            } else {
+                s.controls.writer_spawn_failure = true;
+            }
+        }
+        #[cfg(test)]
+        pub(crate) fn retained_test_configured_custody(&self) -> bool {
+            let s = self.owner.lock();
+            s.pending_configured.is_some()
+                || s.failed_scope.is_some()
+                || s.failed_endpoint.is_some()
+                || s.events.iter().any(|e| matches!(e, Event::PairedJoined(_)))
+        }
+        /// Wrong owner, expired and replayed envelopes remain untouched.
+        pub fn consume_paired(
+            &self,
+            envelope: &mut crate::lan::login_negotiation::ConfiguredEnvelope,
+        ) -> Result<
+            crate::lan::login_negotiation::ConfiguredAdmission,
+            crate::lan::login_negotiation::Refusal,
+        > {
+            use crate::lan::login_negotiation::{Endpoint, Refusal};
+            let s = self.owner.lock();
+            if s.stopped
+                || !s.reader_registered
+                || !s.writer_registered
+                || s.phase != RetainedPhase::Play
+            {
+                return Err(Refusal::Closed);
+            }
+            let required = self.owner.required.as_ref().ok_or(Refusal::Binding)?;
+            s.configured.as_ref().ok_or(Refusal::Binding)?.consume(
+                envelope,
+                Endpoint::Client,
+                required,
+                s.counters.as_ref().ok_or(Refusal::Binding)?,
+                offline_uuid(&self.owner.settings.name),
+            )
+        }
         pub fn send(&self, packet: play::Serverbound) -> SendAdmission {
             let mut s = self.owner.lock();
             let body = packet.encode();
-            if !s.stopped && s.phase != RetainedPhase::Play {
+            if !s.stopped
+                && (s.phase != RetainedPhase::Play
+                    || (self.owner.required.is_some()
+                        && !s.configured.as_ref().is_some_and(|c| c.established())))
+            {
                 return SendAdmission::Refused {
                     reason: SendRefusal::Phase,
                     body,
@@ -1697,6 +1795,9 @@ mod retained_client {
             })
             .encode(),
         )?;
+        if let Some(required) = &owner.required {
+            return paired_run(owner, c, required);
+        }
         let receive = |e: horizon_protocol::Error| RetainedOutcome::Receive(e.to_string());
         let profile = loop {
             let (id, body) = c.recv().map_err(receive)?;
@@ -1762,6 +1863,101 @@ mod retained_client {
             uuid: profile.uuid,
             name: profile.name,
         });
+        retained_play(owner, reader)
+    }
+    fn paired_run(
+        owner: &Arc<Controller>,
+        c: Connection,
+        required: &crate::lan::login_negotiation::RequiredNegotiation,
+    ) -> Result<RetainedOutcome, RetainedOutcome> {
+        use crate::lan::login_negotiation::{Endpoint, NegotiationConnection, negotiate_client};
+        let fail = |reason: crate::lan::login_negotiation::Refusal| {
+            RetainedOutcome::Refused(reason.to_string())
+        };
+        let mut scope = match NegotiationConnection::for_retained(c, required, required.deadline())
+        {
+            Ok(scope) => scope,
+            Err((scope, reason)) => {
+                owner.lock().failed_scope = Some(scope);
+                return Err(fail(reason));
+            }
+        };
+        #[cfg(test)]
+        test_gate(owner, Gate::PairedConfiguration);
+        let uuid = offline_uuid(&owner.settings.name);
+        let receipt = match negotiate_client(&mut scope, required.expectation.clone(), uuid) {
+            Ok(receipt) => receipt,
+            Err(reason) => {
+                owner.lock().failed_scope = Some(scope);
+                return Err(fail(reason));
+            }
+        };
+        let configured = match scope.configure_client(
+            receipt,
+            required.expectation.clone(),
+            uuid,
+            &owner.settings.name,
+            cfg::ClientInformation::new(owner.settings.view_distance),
+        ) {
+            Ok(configured) => configured,
+            Err(failure) => {
+                let reason = failure.reason.clone();
+                owner.lock().failed_scope = Some(failure.into_scope());
+                return Err(fail(reason));
+            }
+        };
+        let counters = owner
+            .lock()
+            .counters
+            .clone()
+            .expect("registered original counters");
+        let transfer = match configured.transfer(Endpoint::Client, required, &counters, uuid) {
+            Ok(transfer) => transfer,
+            Err((mut endpoint, reason)) => {
+                endpoint.close();
+                owner.lock().failed_endpoint = Some(endpoint);
+                return Err(fail(reason));
+            }
+        };
+        let (reader, writer) = transfer.connection.split();
+        {
+            let mut s = owner.lock();
+            if s.stopped {
+                transfer.owner.invalidate();
+            }
+            s.configured = Some(transfer.owner);
+            s.pending_configured = Some(transfer.envelope);
+            s.events.push_back(Event::Brand("vanilla".into()));
+            s.events.push_back(Event::QuietCommands);
+        }
+        start_writer(owner, writer)?;
+        #[cfg(test)]
+        test_gate(owner, Gate::PairedPublication);
+        {
+            let mut s = owner.lock();
+            let envelope = s
+                .pending_configured
+                .take()
+                .expect("original pending envelope");
+            let live = !s.stopped
+                && s.configured.as_ref().is_some_and(|configured| {
+                    configured.validates(&envelope, Endpoint::Client, required, &counters, uuid)
+                });
+            // Keep even a refused original envelope; it never becomes generic Joined.
+            s.events.push_back(Event::PairedJoined(envelope));
+            if !live {
+                return Err(RetainedOutcome::Closed);
+            }
+            s.phase = RetainedPhase::Play;
+        }
+        retained_play(owner, reader)
+    }
+    fn retained_play(
+        owner: &Arc<Controller>,
+        mut reader: ConnReader,
+    ) -> Result<RetainedOutcome, RetainedOutcome> {
+        let settings = &owner.settings;
+        let receive = |e: horizon_protocol::Error| RetainedOutcome::Receive(e.to_string());
         loop {
             #[cfg(test)]
             if owner.lock().controls.reader_panic {
@@ -1783,6 +1979,11 @@ mod retained_client {
                 play::Clientbound::ResourcePackPush(p) => owner.event(Event::PackPush(p)),
                 play::Clientbound::ResourcePackPop(p) => owner.event(Event::PackPop(p.id)),
                 play::Clientbound::StartConfiguration(_) => {
+                    if owner.required.is_some() {
+                        return Err(RetainedOutcome::Refused(
+                            "paired reconfiguration is not enabled".into(),
+                        ));
+                    }
                     let ack = owner.automatic(
                         play::Serverbound::ConfigurationAcknowledged(Empty).encode(),
                         Some(RetainedPhase::Configuration),
@@ -1807,7 +2008,14 @@ mod retained_client {
                     owner.lock().cookies.insert(p.key, p.payload);
                 }
                 play::Clientbound::ServerLinks(p) => owner.event(Event::ServerLinks(p.links)),
-                play::Clientbound::Transfer(p) => return Ok(owner.transfer(p)),
+                play::Clientbound::Transfer(p) => {
+                    if owner.required.is_some() {
+                        return Err(RetainedOutcome::Refused(
+                            "paired transfer is not enabled".into(),
+                        ));
+                    }
+                    return Ok(owner.transfer(p));
+                }
                 play::Clientbound::Disconnect(d) => {
                     return Ok(RetainedOutcome::ServerDisconnect(plain(
                         &d.reason,
@@ -2007,6 +2215,8 @@ mod retained_client {
         BeforeRegister,
         AfterRegister,
         WriterActive,
+        PairedConfiguration,
+        PairedPublication,
     }
     #[cfg(test)]
     #[derive(Default)]

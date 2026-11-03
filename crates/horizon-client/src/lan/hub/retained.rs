@@ -193,6 +193,7 @@ struct OriginalConnection {
     conn: u32,
     uuid: u128,
     sender: super::super::PlayerSender,
+    configured: Option<super::super::login_negotiation::ConfiguredAdmission>,
 }
 /// Identity of one actual constructor-issued Hub, not a close or storage receipt.
 #[cfg(feature = "paired-packages")]
@@ -202,6 +203,13 @@ pub struct RetainedHubIdentity {
 }
 #[cfg(feature = "paired-packages")]
 impl RetainedHubIdentity {
+    /// A generic retained Guest identity alone does not establish configuration.
+    pub fn matches_configured_guest(&self, hub: &Hub, conn: u32, uuid: u128) -> bool {
+        self.matches_guest(hub, conn, uuid)
+            && matches!(&hub.lan.kind, Transport::Retained(owner)
+            if owner.connections.iter().any(|original| original.conn == conn && original.uuid == uuid
+                && original.configured.as_ref().is_some_and(|admission| admission.is_live())))
+    }
     pub fn matches(&self, hub: &Hub) -> bool {
         matches!(&hub.lan.kind, Transport::Retained(owner) if Arc::ptr_eq(&self.original, &owner.identity))
     }
@@ -256,6 +264,11 @@ pub struct RetainedHubRefusal {
     pub reason: String,
 }
 #[cfg(feature = "paired-packages")]
+pub struct RetainedPairedHubRefusal {
+    pub inputs: Box<RetainedHubRefusal>,
+    pub required: super::super::login_negotiation::RequiredNegotiation,
+}
+#[cfg(feature = "paired-packages")]
 pub struct ClosedHub {
     hub: Hub,
 }
@@ -283,6 +296,25 @@ impl Hub {
         config: HubConfig,
         offline: RetainedOfflineConfig,
     ) -> Result<Self, Box<RetainedHubRefusal>> {
+        Self::construct_retained(sync, encoder, config, offline, None)
+    }
+    pub fn new_retained_paired(
+        sync: Arc<SyncData>,
+        encoder: ChunkEncoder,
+        config: HubConfig,
+        offline: RetainedOfflineConfig,
+        required: super::super::login_negotiation::RequiredNegotiation,
+    ) -> Result<Self, Box<RetainedPairedHubRefusal>> {
+        Self::construct_retained(sync, encoder, config, offline, Some(required.clone()))
+            .map_err(|inputs| Box::new(RetainedPairedHubRefusal { inputs, required }))
+    }
+    fn construct_retained(
+        sync: Arc<SyncData>,
+        encoder: ChunkEncoder,
+        config: HubConfig,
+        offline: RetainedOfflineConfig,
+        required: Option<super::super::login_negotiation::RequiredNegotiation>,
+    ) -> Result<Self, Box<RetainedHubRefusal>> {
         let valid = config.max_players == offline.max_players
             && (2..=32).contains(&config.view_distance)
             && (2..=32).contains(&config.simulation_distance)
@@ -291,7 +323,13 @@ impl Hub {
                 .id("minecraft:dimension_type", &config.dimension)
                 .is_some();
         let lan = if valid {
-            RetainedLan::new(sync.clone(), offline.clone()).map_err(|e| e.to_string())
+            match &required {
+                Some(required) => {
+                    RetainedLan::new_paired(sync.clone(), offline.clone(), required.clone())
+                }
+                None => RetainedLan::new(sync.clone(), offline.clone()),
+            }
+            .map_err(|e| e.to_string())
         } else {
             Err("invalid retained Hub configuration".into())
         };
@@ -404,6 +442,22 @@ impl Hub {
                 break;
             };
             let refusal = match event {
+                NetEvent::PairedJoined(paired)
+                    if !owner
+                        .lan
+                        .as_ref()
+                        .expect("original transport")
+                        .validate_paired(paired)
+                        || paired.joined().is_none_or(|joined| {
+                            self.guests
+                                .iter()
+                                .any(|g| g.conn == joined.conn || g.uuid == joined.uuid)
+                        })
+                        || *ctx.next_entity >= i32::MAX as u32
+                        || !ctx.spawn.iter().all(|n| n.is_finite()) =>
+                {
+                    Some("retained configured identity/capacity refused".to_owned())
+                }
                 NetEvent::Joined(joined)
                     if !owner
                         .lan
@@ -437,7 +491,35 @@ impl Hub {
                     conn: joined.conn,
                     uuid: joined.uuid,
                     sender: joined.sender.clone(),
+                    configured: None,
                 });
+            }
+            if let Some(NetEvent::PairedJoined(paired)) = owner.pending.front_mut() {
+                let consumed = owner
+                    .lan
+                    .as_ref()
+                    .expect("original transport")
+                    .consume_paired(paired);
+                let (joined, configured) = match consumed {
+                    Ok(consumed) => consumed,
+                    Err(reason) => {
+                        owner.fail(format!("retained configured consumption refused: {reason}"));
+                        break;
+                    }
+                };
+                owner.connections.push(OriginalConnection {
+                    conn: joined.conn,
+                    uuid: joined.uuid,
+                    sender: joined.sender.clone(),
+                    configured: Some(configured),
+                });
+                owner
+                    .pending
+                    .pop_front()
+                    .expect("consumed original event tombstone");
+                let conn = self.admit(*joined, ctx);
+                output.push(HostEvent::Joined(conn));
+                continue;
             }
             let event = owner.pending.pop_front().expect("front retained");
             match event {
@@ -453,6 +535,7 @@ impl Hub {
                 NetEvent::Left(_, _) | NetEvent::Duplicate(_) => {
                     unreachable!("terminal retained above")
                 }
+                NetEvent::PairedJoined(_) => unreachable!("consumed above"),
             }
         }
         self.retained_turn_open();

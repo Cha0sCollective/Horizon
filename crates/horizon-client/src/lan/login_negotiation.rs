@@ -5,6 +5,8 @@ use super::{
     data::SyncData,
     peer_contract::{ContractMismatch, WireContract},
 };
+#[cfg(feature = "paired-packages")]
+use horizon_protocol::connection::{ConnectionShutdown, Counters};
 use horizon_protocol::{connection::Connection, crypto::random_bytes, packets::login};
 use horizon_world::registry::BlockRegistry;
 use sha2::{Digest, Sha256};
@@ -158,12 +160,14 @@ enum AttemptState {
     Configuring,
     #[cfg(feature = "paired-packages")]
     Configured,
+    #[cfg(feature = "paired-packages")]
+    Transferred,
     Closed,
 }
 /// Owns the actual unsplit connection, with no mutable connection escape hatch.
 /// Terminal I/O, explicit close and scope destruction invalidate queued receipts.
 pub struct NegotiationConnection {
-    connection: Connection,
+    connection: Option<Connection>,
     live: Arc<Live>,
     deadline: Instant,
     state: AttemptState,
@@ -176,7 +180,7 @@ impl NegotiationConnection {
             return Err(Refusal::Budget);
         }
         Ok(Self {
-            connection,
+            connection: Some(connection),
             live: Arc::new(Live {
                 open: AtomicBool::new(true),
                 runtime_open: None,
@@ -201,6 +205,46 @@ impl NegotiationConnection {
         });
         Ok(scope)
     }
+    /// Retained actors keep the actual failed acquisition, even on invalid budget
+    /// or a runtime that closed before registration completed.
+    #[cfg(feature = "paired-packages")]
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn for_retained(
+        connection: Connection,
+        required: &RequiredNegotiation,
+        deadline: Instant,
+    ) -> std::result::Result<Self, (Self, Refusal)> {
+        let mut scope = Self {
+            connection: Some(connection),
+            live: Arc::new(Live {
+                open: AtomicBool::new(true),
+                runtime_open: Some(required.runtime_open.clone()),
+            }),
+            deadline,
+            state: AttemptState::Fresh,
+        };
+        let left = deadline.saturating_duration_since(Instant::now());
+        let reason = if left.is_zero() || left > MAX_BUDGET {
+            Some(Refusal::Budget)
+        } else if !scope.live.is_open() {
+            Some(Refusal::Closed)
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            scope.close();
+            Err((scope, reason))
+        } else {
+            Ok(scope)
+        }
+    }
+    #[cfg(feature = "paired-packages")]
+    pub(crate) fn is_memory(&self) -> bool {
+        self.connection
+            .as_ref()
+            .expect("original unsplit scope")
+            .is_memory()
+    }
     fn io<T>(&mut self, result: horizon_protocol::Result<T>) -> Result<T> {
         match result {
             Ok(value) if self.live.is_open() => Ok(value),
@@ -219,7 +263,11 @@ impl NegotiationConnection {
             self.close();
             return Err(Refusal::Closed);
         }
-        let result = self.connection.recv_until(self.deadline);
+        let result = self
+            .connection
+            .as_mut()
+            .expect("unsplit scope")
+            .recv_until(self.deadline);
         self.io(result)
     }
     fn send(&mut self, bytes: &[u8]) -> Result<()> {
@@ -227,13 +275,19 @@ impl NegotiationConnection {
             self.close();
             return Err(Refusal::Closed);
         }
-        let result = self.connection.send_until(self.deadline, bytes);
+        let result = self
+            .connection
+            .as_mut()
+            .expect("unsplit scope")
+            .send_until(self.deadline, bytes);
         self.io(result)
     }
     pub fn close(&mut self) {
         self.state = AttemptState::Closed;
         self.live.open.store(false, Ordering::Release);
-        self.connection.writer.shutdown();
+        if let Some(connection) = &self.connection {
+            connection.writer.shutdown();
+        }
     }
     fn refused<T>(&mut self, result: Result<T>) -> Result<T> {
         if result.is_err() {
@@ -279,6 +333,10 @@ impl NegotiationConnection {
 }
 impl Drop for NegotiationConnection {
     fn drop(&mut self) {
+        #[cfg(feature = "paired-packages")]
+        if self.state == AttemptState::Transferred {
+            return;
+        }
         self.close();
     }
 }
@@ -367,6 +425,199 @@ impl ConfiguredEndpoint {
     }
     pub fn close(&mut self) {
         self.scope.close();
+    }
+
+    /// Only an actual registered retained actor can request this crate-private
+    /// transfer. The caller must install the owner before publishing the envelope.
+    #[allow(clippy::result_large_err)]
+    pub(crate) fn transfer(
+        mut self,
+        role: Endpoint,
+        required: &RequiredNegotiation,
+        counters: &Arc<Counters>,
+        uuid: u128,
+    ) -> std::result::Result<ConfiguredTransfer, (Self, Refusal)> {
+        if !self.is_live(role, &required.expectation, uuid)
+            || !self
+                .scope
+                .live
+                .runtime_open
+                .as_ref()
+                .is_some_and(|runtime| Arc::ptr_eq(runtime, &required.runtime_open))
+            || !self
+                .scope
+                .connection
+                .as_ref()
+                .is_some_and(|connection| Arc::ptr_eq(&connection.reader.counters, counters))
+        {
+            return Err((self, Refusal::Binding));
+        }
+        let connection = self
+            .scope
+            .connection
+            .take()
+            .expect("checked original scope");
+        self.scope.state = AttemptState::Transferred;
+        let life = Arc::new(ConfiguredLife {
+            live: self.scope.live.clone(),
+            expectation: self.expectation,
+            runtime: required.runtime_open.clone(),
+            counters: counters.clone(),
+            role,
+            uuid,
+            deadline: self.scope.deadline,
+            consumed: AtomicBool::new(false),
+        });
+        let owner = ConfiguredOwner {
+            life: life.clone(),
+            shutdown: connection.shutdown_handle(),
+        };
+        let envelope = ConfiguredEnvelope {
+            life,
+            payload: Some(ConfiguredMetadata {
+                profile: self.profile,
+                information: self.information,
+                registries: Arc::new(self.registries),
+                session: self.session,
+                transcript: self.transcript,
+            }),
+        };
+        Ok(ConfiguredTransfer {
+            connection,
+            owner,
+            envelope,
+        })
+    }
+}
+
+#[cfg(feature = "paired-packages")]
+struct ConfiguredLife {
+    live: Arc<Live>,
+    expectation: Arc<NegotiationExpectation>,
+    runtime: Arc<AtomicBool>,
+    counters: Arc<Counters>,
+    role: Endpoint,
+    uuid: u128,
+    deadline: Instant,
+    consumed: AtomicBool,
+}
+#[cfg(feature = "paired-packages")]
+impl ConfiguredLife {
+    fn pending(
+        &self,
+        role: Endpoint,
+        required: &RequiredNegotiation,
+        counters: &Arc<Counters>,
+        uuid: u128,
+    ) -> bool {
+        self.role == role
+            && self.uuid == uuid
+            && Arc::ptr_eq(&self.expectation, &required.expectation)
+            && Arc::ptr_eq(&self.runtime, &required.runtime_open)
+            && Arc::ptr_eq(&self.counters, counters)
+            && self.live.is_open()
+            && Instant::now() < self.deadline
+            && !self.consumed.load(Ordering::Acquire)
+    }
+}
+#[cfg(feature = "paired-packages")]
+pub(crate) struct ConfiguredTransfer {
+    pub connection: Connection,
+    pub owner: ConfiguredOwner,
+    pub envelope: ConfiguredEnvelope,
+}
+/// Opaque queued metadata; only its original Session/Hub can consume it.
+#[cfg(feature = "paired-packages")]
+pub struct ConfiguredEnvelope {
+    life: Arc<ConfiguredLife>,
+    payload: Option<ConfiguredMetadata>,
+}
+#[cfg(feature = "paired-packages")]
+pub(crate) struct ConfiguredOwner {
+    life: Arc<ConfiguredLife>,
+    shutdown: ConnectionShutdown,
+}
+#[cfg(feature = "paired-packages")]
+impl ConfiguredOwner {
+    pub(crate) fn invalidate(&self) {
+        self.life.live.open.store(false, Ordering::Release);
+    }
+    pub(crate) fn validates(
+        &self,
+        envelope: &ConfiguredEnvelope,
+        role: Endpoint,
+        required: &RequiredNegotiation,
+        counters: &Arc<Counters>,
+        uuid: u128,
+    ) -> bool {
+        Arc::ptr_eq(&self.life, &envelope.life)
+            && envelope.payload.is_some()
+            && self.life.pending(role, required, counters, uuid)
+    }
+    pub(crate) fn consume(
+        &self,
+        envelope: &mut ConfiguredEnvelope,
+        role: Endpoint,
+        required: &RequiredNegotiation,
+        counters: &Arc<Counters>,
+        uuid: u128,
+    ) -> Result<ConfiguredAdmission> {
+        if !self.validates(envelope, role, required, counters, uuid)
+            || self
+                .life
+                .consumed
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return Err(Refusal::Binding);
+        }
+        Ok(ConfiguredAdmission {
+            life: self.life.clone(),
+            metadata: envelope.payload.take().expect("validated one-use metadata"),
+        })
+    }
+    pub(crate) fn established(&self) -> bool {
+        self.life.consumed.load(Ordering::Acquire) && self.life.live.is_open()
+    }
+}
+#[cfg(feature = "paired-packages")]
+impl Drop for ConfiguredOwner {
+    fn drop(&mut self) {
+        self.invalidate();
+        let _ = self.shutdown.shutdown();
+    }
+}
+#[cfg(feature = "paired-packages")]
+struct ConfiguredMetadata {
+    profile: login::GameProfile,
+    information: horizon_protocol::packets::configuration::ClientInformation,
+    registries: Arc<horizon_protocol::registry::Dynamic>,
+    session: [u8; 32],
+    transcript: [u8; 32],
+}
+/// Successful actual-owner consumption. Live/runtime still govern play; the
+/// configuration deadline no longer governs this established admission.
+#[cfg(feature = "paired-packages")]
+pub struct ConfiguredAdmission {
+    life: Arc<ConfiguredLife>,
+    metadata: ConfiguredMetadata,
+}
+#[cfg(feature = "paired-packages")]
+impl ConfiguredAdmission {
+    pub fn is_live(&self) -> bool {
+        self.life.live.is_open()
+    }
+    pub fn profile(&self) -> &login::GameProfile {
+        &self.metadata.profile
+    }
+    pub fn information(&self) -> &horizon_protocol::packets::configuration::ClientInformation {
+        &self.metadata.information
+    }
+    pub fn registries(&self) -> &Arc<horizon_protocol::registry::Dynamic> {
+        &self.metadata.registries
+    }
+    pub fn transcript(&self) -> ([u8; 32], [u8; 32]) {
+        (self.metadata.session, self.metadata.transcript)
     }
 }
 
@@ -518,7 +769,8 @@ mod configuration {
                 )?;
                 check_profile(&native_profile)?;
                 if compression.is_some_and(|threshold| threshold < 0)
-                    || (self.connection.is_memory() && compression.is_some())
+                    || (self.connection.as_ref().expect("unsplit scope").is_memory()
+                        && compression.is_some())
                 {
                     return Err(Refusal::Unsupported);
                 }
@@ -537,7 +789,10 @@ mod configuration {
                     self.send(
                         &login::Clientbound::Compression(login::Compression { threshold }).encode(),
                     )?;
-                    self.connection.set_compression(threshold);
+                    self.connection
+                        .as_mut()
+                        .expect("unsplit scope")
+                        .set_compression(threshold);
                 }
                 self.send(&finished)?;
                 exact(
@@ -651,10 +906,15 @@ mod configuration {
                 let mut packet = login::Clientbound::decode(id, &payload)
                     .map_err(|_| invalid("configuration login profile"))?;
                 if let login::Clientbound::Compression(compression) = packet {
-                    if self.connection.is_memory() || compression.threshold < 0 {
+                    if self.connection.as_ref().expect("unsplit scope").is_memory()
+                        || compression.threshold < 0
+                    {
                         return Err(Refusal::Unsupported);
                     }
-                    self.connection.set_compression(compression.threshold);
+                    self.connection
+                        .as_mut()
+                        .expect("unsplit scope")
+                        .set_compression(compression.threshold);
                     (id, payload) = prefix(&mut self)?;
                     packet = login::Clientbound::decode(id, &payload)
                         .map_err(|_| invalid("configuration login profile"))?;
@@ -1125,3 +1385,8 @@ pub fn negotiate_client(
 #[cfg(test)]
 #[path = "login_negotiation_tests.rs"]
 mod tests;
+
+#[cfg(all(test, feature = "paired-packages"))]
+pub(crate) fn retained_test_expectation(sync: Arc<SyncData>) -> Arc<NegotiationExpectation> {
+    tests::capture_actual(sync)
+}

@@ -40,6 +40,7 @@ pub use retained::HubTransport;
 #[cfg(feature = "paired-packages")]
 pub use retained::{
     ClosedHub, RetainedHubCloseView, RetainedHubIdentity, RetainedHubPhase, RetainedHubRefusal,
+    RetainedPairedHubRefusal,
 };
 
 pub mod game_event {
@@ -259,6 +260,8 @@ pub struct Hub {
     mod_commands: (serde_json::Value, Option<u64>),
     #[cfg(feature = "paired-packages")]
     staged: Option<StagedHub>,
+    #[cfg(feature = "paired-packages")]
+    refused_paired: Vec<super::PairedJoined>,
 }
 
 fn string(s: &str) -> Tag {
@@ -439,6 +442,8 @@ impl Hub {
             teams: Vec::new(),
             #[cfg(feature = "paired-packages")]
             staged: None,
+            #[cfg(feature = "paired-packages")]
+            refused_paired: Vec::new(),
         }
     }
 
@@ -1203,6 +1208,11 @@ impl Hub {
                     let conn = self.admit(*j, ctx);
                     events.push(HostEvent::Joined(conn));
                 }
+                #[cfg(feature = "paired-packages")]
+                NetEvent::PairedJoined(paired) => {
+                    self.refused_paired.push(*paired);
+                    break;
+                }
                 NetEvent::Left(conn, reason) => {
                     if let Some(i) = self.guests.iter().position(|g| g.conn == conn) {
                         let g = self.remove_guest(i, &reason);
@@ -1346,6 +1356,10 @@ impl Hub {
             // A terminal arriving while data was dequeued wins before dispatch.
             self.check_staged_recovery()?;
             match event {
+                NetEvent::PairedJoined(paired) => {
+                    self.refused_paired.push(*paired);
+                    return Err("staged recovery refuses paired configured admission");
+                }
                 NetEvent::Joined(j) => {
                     let stage = self.staged.as_ref().ok_or("staged recovery not begun")?;
                     if stage.placed

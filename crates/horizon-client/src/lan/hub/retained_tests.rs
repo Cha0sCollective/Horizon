@@ -64,6 +64,9 @@ impl Fixture {
         let (sync, encoder, config, offline) = construction();
         let hub = Hub::new_retained(sync, encoder, config, offline)
             .unwrap_or_else(|e| panic!("{}", e.reason));
+        Self::from_hub(hub)
+    }
+    fn from_hub(hub: Hub) -> Self {
         let mut world = World::new(BlockStateId(0), 0);
         for cz in -4..=4 {
             for cx in -4..=4 {
@@ -205,6 +208,538 @@ impl Drop for Fixture {
         if self.hub.is_some() {
             self.close();
         }
+    }
+}
+
+type Expectation = super::super::super::login_negotiation::NegotiationExpectation;
+fn paired_fixture(compression: bool) -> (Fixture, Arc<Expectation>) {
+    paired_fixture_budget(compression, Duration::from_secs(12))
+}
+fn paired_fixture_budget(compression: bool, budget: Duration) -> (Fixture, Arc<Expectation>) {
+    let (sync, encoder, config, mut offline) = construction();
+    offline.compression_threshold = if compression { 64 } else { -1 };
+    let expected = super::super::super::login_negotiation::retained_test_expectation(sync.clone());
+    let required =
+        super::super::super::login_negotiation::RequiredNegotiation::new(expected.clone(), budget)
+            .unwrap();
+    let hub = Hub::new_retained_paired(sync, encoder, config, offline, required)
+        .unwrap_or_else(|e| panic!("{}", e.inputs.reason));
+    (Fixture::from_hub(hub), expected)
+}
+fn paired_connect(
+    f: &mut Fixture,
+    expected: &Arc<Expectation>,
+    tcp: bool,
+    name: &str,
+    budget: Duration,
+) -> RetainedSession {
+    let target = if tcp {
+        let port = match &f.hub().lan.kind {
+            Transport::Retained(owner) => owner.port,
+            _ => unreachable!(),
+        };
+        let port = if port == 0 {
+            f.hub().retained_listen().unwrap()
+        } else {
+            port
+        };
+        RetainedTarget::Address(format!("127.0.0.1:{port}"))
+    } else {
+        RetainedTarget::Memory(f.hub().retained_connect_local().unwrap())
+    };
+    let required =
+        super::super::super::login_negotiation::RequiredNegotiation::new(expected.clone(), budget)
+            .unwrap();
+    RetainedSession::new_offline_paired(
+        target,
+        RetainedSettings::offline(name.into(), 2, Arc::default()),
+        required,
+    )
+    .unwrap_or_else(|e| panic!("{}", e.reason))
+}
+fn original_lan(f: &Fixture) -> &RetainedLan {
+    match &f.hub.as_ref().unwrap().lan.kind {
+        Transport::Retained(owner) => owner.lan.as_ref().unwrap(),
+        _ => unreachable!(),
+    }
+}
+fn take_paired(
+    f: &mut Fixture,
+    index: usize,
+) -> super::super::super::login_negotiation::ConfiguredEnvelope {
+    let mut envelope = None;
+    assert!(
+        f.until(|f| {
+            for event in f.clients[index].poll_events(64) {
+                match event {
+                    Event::PairedJoined(original) => {
+                        assert!(envelope.is_none());
+                        envelope = Some(original);
+                    }
+                    Event::Joined { .. } => panic!("paired actor published generic authority"),
+                    Event::Disconnected { reason, .. } => {
+                        panic!("premature paired disconnect: {reason}")
+                    }
+                    _ => {}
+                }
+            }
+            envelope.is_some()
+        }),
+        "actual paired client publication"
+    );
+    envelope.unwrap()
+}
+fn take_server_paired(f: &mut Fixture) -> Box<super::super::super::PairedJoined> {
+    let mut paired = None;
+    assert!(f.until(|f| {
+        for event in original_lan(f).poll_events(16) {
+            match event {
+                NetEvent::PairedJoined(original) => {
+                    if paired.is_none() {
+                        paired = Some(original);
+                    } else if let Transport::Retained(owner) = &mut f.hub().lan.kind {
+                        owner.pending.push_back(NetEvent::PairedJoined(original));
+                    }
+                }
+                _ => panic!("unexpected event before paired admission"),
+            }
+        }
+        paired.is_some()
+    }));
+    paired.unwrap()
+}
+
+#[test]
+#[ignore = "pinned pair/resources; actual Memory and compressed TCP Session/Hub actors"]
+fn paired_retained_actual_two_clients_consume_and_native_play() {
+    use horizon_protocol::packets::Empty;
+    for tcp in [false, true] {
+        let (mut f, expected) = paired_fixture_budget(tcp, Duration::from_secs(6));
+        let (mut other, _) = paired_fixture(false);
+        let mut ordinary = Fixture::new();
+        for name in ["ConfiguredOne", "ConfiguredTwo"] {
+            let mut client = paired_connect(&mut f, &expected, tcp, name, Duration::from_secs(6));
+            client.start().unwrap();
+            f.clients.push(client);
+        }
+        let mut e0 = take_paired(&mut f, 0);
+        let mut e1 = take_paired(&mut f, 1);
+        assert!(
+            f.hub().guests.is_empty(),
+            "native actors cannot create a Guest"
+        );
+        assert!(matches!(
+            f.clients[0].send(S::PlayerLoaded(Empty)),
+            SendAdmission::Refused { .. }
+        ));
+        assert!(
+            f.clients[1].consume_paired(&mut e0).is_err(),
+            "wrong actual Session refuses"
+        );
+        let a0 = f.clients[0].consume_paired(&mut e0).unwrap();
+        let a1 = f.clients[1].consume_paired(&mut e1).unwrap();
+        assert!(
+            f.clients[0].consume_paired(&mut e0).is_err(),
+            "one-use client consume"
+        );
+        assert!(a0.is_live() && a1.is_live());
+        assert_eq!(a0.registries().registries, a1.registries().registries);
+        // Test the actual first server envelope against a foreign real registry.
+        let mut server = take_server_paired(&mut f);
+        assert!(!original_lan(&other).validate_paired(&server));
+        assert!(original_lan(&other).consume_paired(&mut server).is_err());
+        assert!(!original_lan(&ordinary).validate_paired(&server));
+        assert!(original_lan(&ordinary).consume_paired(&mut server).is_err());
+        if let Transport::Retained(owner) = &mut ordinary.hub().lan.kind {
+            owner.pending.push_back(NetEvent::PairedJoined(server));
+        }
+        ordinary.turn(false, false);
+        assert!(ordinary.hub().guests.is_empty());
+        assert_eq!(
+            ordinary.hub().retained_close_view().unwrap().phase,
+            RetainedHubPhase::Frozen
+        );
+        let server = match &mut ordinary.hub().lan.kind {
+            Transport::Retained(owner) => {
+                assert!(
+                    matches!(owner.pending.front(), Some(NetEvent::PairedJoined(_))),
+                    "ordinary refusal retains original at queue head"
+                );
+                match owner.pending.pop_front().unwrap() {
+                    NetEvent::PairedJoined(server) => server,
+                    _ => unreachable!(),
+                }
+            }
+            _ => unreachable!(),
+        };
+        assert!(
+            original_lan(&f).validate_paired(&server),
+            "foreign refusal keeps original envelope intact"
+        );
+        if let Transport::Retained(owner) = &mut f.hub().lan.kind {
+            owner.pending.push_front(NetEvent::PairedJoined(server));
+        }
+        other.close();
+        assert!(f.until(|f| {
+            f.turn(true, false);
+            f.hub().guests.len() == 2
+        }));
+        let mut native_login = [false; 2];
+        assert!(
+            f.until(|f| {
+                for (index, client) in f.clients.iter().enumerate() {
+                    for event in client.poll_events(64) {
+                        match event {
+                            Event::Packet(packet) if matches!(*packet, C::Login(_)) => {
+                                native_login[index] = true;
+                            }
+                            Event::Joined { .. } => panic!("generic authority in paired play"),
+                            Event::Disconnected { reason, .. } => {
+                                panic!("native play disconnected: {reason}")
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                native_login.iter().all(|received| *received)
+            }),
+            "actual native play Login on both moved connections"
+        );
+        let identity = f.hub().retained_identity().unwrap();
+        for guest in &f.hub.as_ref().unwrap().guests {
+            assert!(identity.matches_configured_guest(
+                f.hub.as_ref().unwrap(),
+                guest.conn,
+                guest.uuid
+            ));
+        }
+        // The client budget has expired; established actors must still carry
+        // actual play packets, without renewing configuration authority.
+        std::thread::sleep(Duration::from_secs(6));
+        assert!(a0.is_live() && a1.is_live());
+        for guest in &f.hub.as_ref().unwrap().guests {
+            assert!(identity.matches_configured_guest(
+                f.hub.as_ref().unwrap(),
+                guest.conn,
+                guest.uuid
+            ));
+        }
+        for client in &f.clients {
+            assert!(matches!(
+                client.send(S::PlayerLoaded(Empty)),
+                SendAdmission::Admitted { .. }
+            ));
+        }
+        assert!(f.until(|f| {
+            f.turn(false, false);
+            f.hub()
+                .guests
+                .iter()
+                .all(|g| g.inbox.iter().any(|p| matches!(p, S::PlayerLoaded(_))))
+        }));
+        let closed = f.close();
+        assert!(!a0.is_live() && !a1.is_live());
+        assert_eq!(
+            closed.hub.guests.len(),
+            2,
+            "checked close retains admitted participants"
+        );
+        assert!(
+            closed
+                .hub
+                .retained_close_view()
+                .unwrap()
+                .transport
+                .attempts
+                .iter()
+                .all(|a| !a.outer_pending && !a.writer_pending && a.released)
+        );
+        ordinary.close();
+    }
+}
+
+#[test]
+#[ignore = "pinned pair/resources; actual expiry and close races"]
+fn paired_retained_pending_expiry_and_original_close_refuse() {
+    for publication in [false, true] {
+        let (mut f, expected) = paired_fixture(false);
+        let mut client = paired_connect(
+            &mut f,
+            &expected,
+            false,
+            "ClosePending",
+            Duration::from_secs(5),
+        );
+        client.retained_test_paired_gate(publication);
+        client.start().unwrap();
+        f.clients.push(client);
+        assert!(f.until(|f| f.clients[0].retained_test_gate_reached()));
+        f.clients[0].begin_close(Instant::now() + Duration::from_secs(5));
+        f.clients[0].retained_test_gate_release();
+        assert!(f.until(|f| f.clients[0].poll_close() == RetainedClose::Quiescent));
+        assert!(f.clients[0].retained_test_configured_custody());
+        for event in f.clients[0].poll_events(64) {
+            if let Event::PairedJoined(mut envelope) = event {
+                assert!(f.clients[0].consume_paired(&mut envelope).is_err());
+            }
+        }
+        assert!(f.hub().guests.is_empty());
+        f.close();
+    }
+    for close in [false, true] {
+        let (mut f, expected) = paired_fixture_budget(
+            false,
+            if close {
+                Duration::from_secs(12)
+            } else {
+                Duration::from_secs(2)
+            },
+        );
+        let mut client = paired_connect(
+            &mut f,
+            &expected,
+            false,
+            "QueuedPending",
+            Duration::from_secs(2),
+        );
+        client.start().unwrap();
+        f.clients.push(client);
+        let mut envelope = take_paired(&mut f, 0);
+        let mut server = take_server_paired(&mut f);
+        if close {
+            original_lan(&f).fence();
+            assert!(f.until(|f| !f.clients[0].observe().terminals.is_empty()));
+        } else {
+            std::thread::sleep(Duration::from_secs(2));
+        }
+        assert!(f.clients[0].consume_paired(&mut envelope).is_err());
+        assert!(original_lan(&f).consume_paired(&mut server).is_err());
+        assert!(
+            server.joined().is_some(),
+            "refusal retains original native metadata"
+        );
+        assert!(f.hub().guests.is_empty());
+        f.close();
+    }
+    // A real paired attempt's metadata cannot be downgraded to generic Joined,
+    // even with the correct original conn/UUID/sender and retained reservation.
+    let (mut f, expected) = paired_fixture(false);
+    let mut client = paired_connect(
+        &mut f,
+        &expected,
+        false,
+        "GenericDowngrade",
+        Duration::from_secs(6),
+    );
+    client.start().unwrap();
+    f.clients.push(client);
+    let _client_envelope = take_paired(&mut f, 0);
+    let mut server = take_server_paired(&mut f);
+    let joined = server
+        .joined
+        .take()
+        .expect("actual configured native metadata");
+    let conn = joined.conn;
+    if let Transport::Retained(owner) = &mut f.hub().lan.kind {
+        owner.pending.push_back(NetEvent::Joined(joined));
+    }
+    f.turn(false, false);
+    assert!(f.hub().guests.is_empty());
+    assert_eq!(
+        f.hub().retained_close_view().unwrap().phase,
+        RetainedHubPhase::Frozen
+    );
+    if let Transport::Retained(owner) = &f.hub().lan.kind {
+        assert!(
+            matches!(owner.pending.front(), Some(NetEvent::Joined(joined)) if joined.conn == conn)
+        );
+    }
+    f.close();
+}
+
+#[test]
+#[ignore = "pinned pair/resources; native writer failure and actual duplicate profiles"]
+fn paired_retained_writer_failures_and_duplicate_custody() {
+    use horizon_protocol::packets::Empty;
+    for panic in [false, true] {
+        let (mut f, expected) = paired_fixture(false);
+        let mut client = paired_connect(
+            &mut f,
+            &expected,
+            false,
+            "WriterFailure",
+            Duration::from_secs(5),
+        );
+        client.retained_test_writer_fault(panic);
+        client.start().unwrap();
+        f.clients.push(client);
+        let mut admission = None;
+        if panic {
+            let mut envelope = take_paired(&mut f, 0);
+            admission = Some(f.clients[0].consume_paired(&mut envelope).unwrap());
+            assert!(matches!(
+                f.clients[0].send(S::PlayerLoaded(Empty)),
+                SendAdmission::Admitted { .. }
+            ));
+        }
+        assert!(f.until(|f| !f.clients[0].observe().terminals.is_empty()));
+        let observation = f.clients[0].observe();
+        assert!(observation.terminals.iter().any(|terminal| if panic {
+            matches!(terminal.outcome, crate::net::RetainedOutcome::Panic)
+        } else {
+            matches!(terminal.outcome, crate::net::RetainedOutcome::Spawn(_))
+        }));
+        if let Some(admission) = admission {
+            assert!(!admission.is_live());
+        } else {
+            assert!(f.clients[0].retained_test_configured_custody());
+        }
+        assert!(f.hub().guests.is_empty());
+        f.close();
+    }
+    let (mut f, expected) = paired_fixture(true);
+    for _ in 0..2 {
+        let mut client = paired_connect(
+            &mut f,
+            &expected,
+            true,
+            "SameConfigured",
+            Duration::from_secs(6),
+        );
+        client.start().unwrap();
+        f.clients.push(client);
+    }
+    assert!(f.until(|f| {
+        original_lan(f).harvest();
+        let o = original_lan(f).observe();
+        o.attempts.len() == 2
+            && o.attempts.iter().filter(|a| a.uuid.is_some()).count() == 1
+            && o.terminals.iter().any(|t| t.conn.is_some())
+    }));
+    assert_eq!(original_lan(&f).online(), 1);
+    assert!(f.until(|f| {
+        f.turn(false, false);
+        f.hub().guests.len() == 1
+    }));
+    let conn = f.hub().guests[0].conn;
+    let uuid = f.hub().guests[0].uuid;
+    assert!(
+        f.hub()
+            .retained_identity()
+            .unwrap()
+            .matches_configured_guest(f.hub.as_ref().unwrap(), conn, uuid)
+    );
+    assert_eq!(
+        original_lan(&f).online(),
+        1,
+        "refused duplicate cannot release genuine reservation"
+    );
+    super::super::super::conn::retained_test_pause_writer(conn);
+    f.hub().guests[0].send(&C::KeepAlive(
+        horizon_protocol::packets::configuration::KeepAlive { id: 123 },
+    ));
+    assert!(f.until(|_| super::super::super::conn::retained_test_writer_entered()));
+    original_lan(&f).fence();
+    assert!(f.until(|f| {
+        original_lan(f).harvest();
+        original_lan(f)
+            .observe()
+            .attempts
+            .iter()
+            .any(|a| a.conn == conn && !a.outer_pending && a.writer_pending)
+    }));
+    let observation = original_lan(&f).observe();
+    assert!(
+        observation
+            .attempts
+            .iter()
+            .any(|a| a.conn == conn && !a.released)
+    );
+    assert_eq!(
+        original_lan(&f).online(),
+        1,
+        "outer join alone cannot release original UUID"
+    );
+    super::super::super::conn::retained_test_release_writer();
+    let closed = f.close();
+    assert_eq!(closed.hub.guests.len(), 1);
+    assert!(
+        closed
+            .hub
+            .retained_close_view()
+            .unwrap()
+            .transport
+            .attempts
+            .iter()
+            .all(|a| !a.outer_pending && !a.writer_pending)
+    );
+}
+
+#[test]
+#[ignore = "pinned pair/resources; actual server publication close and writer failures"]
+fn paired_retained_server_publication_and_writer_failure_custody() {
+    for case in 0..3 {
+        let (mut f, expected) = paired_fixture(false);
+        let reached = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        if case == 0 {
+            original_lan(&f).retained_test_paired_publication(reached.clone(), release.clone());
+        } else {
+            super::super::super::conn::retained_test_writer_fault(1, case == 2);
+        }
+        let mut client = paired_connect(
+            &mut f,
+            &expected,
+            false,
+            "ServerFailure",
+            Duration::from_secs(6),
+        );
+        client.start().unwrap();
+        f.clients.push(client);
+        if case == 0 {
+            reached.wait();
+            let mut envelope = take_paired(&mut f, 0);
+            original_lan(&f).fence();
+            release.wait();
+            assert!(f.until(|f| !f.clients[0].observe().terminals.is_empty()));
+            assert!(f.clients[0].consume_paired(&mut envelope).is_err());
+            let mut server = take_server_paired(&mut f);
+            assert!(original_lan(&f).consume_paired(&mut server).is_err());
+            assert!(server.joined().is_some());
+        } else if case == 1 {
+            assert!(f.until(|f| {
+                original_lan(f).harvest();
+                original_lan(f)
+                    .observe()
+                    .terminals
+                    .iter()
+                    .any(|t| matches!(t.outcome, super::super::super::RetainedOutcome::Spawn(_)))
+            }));
+            assert!(
+                original_lan(&f).retained_test_configured_custody(),
+                "server spawn refusal retains original envelope"
+            );
+        } else {
+            let mut envelope = take_paired(&mut f, 0);
+            let admission = f.clients[0].consume_paired(&mut envelope).unwrap();
+            assert!(f.until(|f| {
+                f.turn(true, false);
+                original_lan(f).harvest();
+                original_lan(f)
+                    .observe()
+                    .terminals
+                    .iter()
+                    .any(|t| matches!(t.outcome, super::super::super::RetainedOutcome::Panic))
+            }));
+            assert!(f.until(|_| !admission.is_live()));
+            assert_eq!(
+                f.hub().guests.len(),
+                1,
+                "terminal after consume preserves admitted Guest"
+            );
+        }
+        super::super::super::conn::retained_test_writer_fault(0, false);
+        f.close();
     }
 }
 

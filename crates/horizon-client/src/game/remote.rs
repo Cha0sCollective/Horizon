@@ -1289,6 +1289,17 @@ impl Game<'_> {
                         }
                     }
                 }
+                Event::PairedJoined(envelope) => {
+                    self.remote
+                        .as_mut()
+                        .unwrap()
+                        .io
+                        .fixed_mut()
+                        .unwrap()
+                        .pending
+                        .push_front(Event::PairedJoined(envelope));
+                    return Err("native Game configured installation is not enabled".into());
+                }
                 Event::Joined {
                     registries,
                     name,
@@ -1439,6 +1450,15 @@ impl Game<'_> {
                     if let Some(r) = self.remote.as_mut() {
                         r.status = s;
                     }
+                }
+                #[cfg(feature = "paired-packages")]
+                Event::PairedJoined(envelope) => {
+                    self.remote
+                        .as_mut()
+                        .unwrap()
+                        .backlog
+                        .push_front(Received::Event(Event::PairedJoined(envelope)));
+                    return Err("legacy Game refuses paired configured installation".into());
                 }
                 Event::Joined {
                     registries,
