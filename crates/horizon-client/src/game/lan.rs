@@ -325,6 +325,7 @@ impl Game<'_> {
             level.read_player(tag);
             level.player_extra = Some(tag.clone());
         } else {
+            level.dimension = super::Dim::Overworld.id().into();
             level.position = Some(self.server_player_spawn(spawn));
             level.game_mode = host.hub.config.default_game_mode;
             level.creative = level.game_mode == 1;

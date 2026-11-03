@@ -564,16 +564,49 @@ fn send(client: &RetainedSession, packet: S) {
 #[test]
 #[ignore = "pinned resources; original server Game, MemoryPipe and TCP, native player readback"]
 fn original_server_memory_tcp_play_and_native_close() {
+    original_server_players_play_and_native_close(false);
+}
+
+#[test]
+#[ignore = "pinned resources; first Memory/TCP players have no staged native files"]
+fn original_server_first_players_play_and_native_close() {
+    original_server_players_play_and_native_close(true);
+}
+
+fn original_server_players_play_and_native_close(first_players: bool) {
+    let saved_profiles = [("ServerMemory", 3), ("ServerTcp", 5)];
     let mut fixture = Fixture::start(
-        "memory-tcp",
+        if first_players {
+            "first-memory-tcp"
+        } else {
+            "memory-tcp"
+        },
         Startup {
             refuse_live_consume: true,
             ..Default::default()
         },
-        &[("ServerMemory", 3), ("ServerTcp", 5)],
+        if first_players { &[] } else { &saved_profiles },
         false,
     );
     fixture.ready();
+    if first_players {
+        for name in ["ServerMemory", "ServerTcp"] {
+            let uuid = offline_uuid(name);
+            for world in [fixture.base.join("staging"), fixture.root.join("world")] {
+                assert!(!horizon_client::lan::playerdata::path(&world, uuid).exists());
+                for family in ["stats", "advancements"] {
+                    assert!(
+                        !crate::game::stats::player_json(
+                            &world,
+                            family,
+                            horizon_client::lan::playerdata::uuid_ints(uuid)
+                        )
+                        .exists()
+                    );
+                }
+            }
+        }
+    }
     let first = fixture.supervisor.snapshot().world_time;
     fixture.connect(false, "ServerMemory");
     fixture.connect(true, "ServerTcp");
@@ -673,7 +706,7 @@ fn original_server_memory_tcp_play_and_native_close() {
             .iter()
             .map(|g| g["items"].as_u64().unwrap())
             .sum::<u64>(),
-        8
+        if first_players { 0 } else { 8 }
     );
     let before = fixture.supervisor.snapshot();
     assert!(before.transport.as_ref().unwrap().failure.is_none());
@@ -730,8 +763,24 @@ fn original_server_memory_tcp_play_and_native_close() {
     eprintln!(
         "ORIGINAL_SERVER_NATIVE_COMPLETE worker_joined=true application_result={outcome:?} raw_transport={transport:?}"
     );
-    assert_eq!(count(&fixture.player("ServerMemory")), 3);
-    assert_eq!(count(&fixture.player("ServerTcp")), 5);
+    assert_eq!(
+        count(&fixture.player("ServerMemory")),
+        if first_players { 0 } else { 3 }
+    );
+    assert_eq!(
+        count(&fixture.player("ServerTcp")),
+        if first_players { 0 } else { 5 }
+    );
+    for name in ["ServerMemory", "ServerTcp"] {
+        let player = fixture.player(name);
+        assert_eq!(player.dimension, "minecraft:overworld");
+        assert_eq!(
+            player.player_extra.as_ref().unwrap().get("UUID"),
+            Some(&Tag::IntArray(
+                horizon_client::lan::playerdata::uuid_ints(offline_uuid(name)).to_vec()
+            ))
+        );
+    }
     assert_eq!(fixture.player("ServerMemory").rotation[0], 15.0);
     assert_eq!(fixture.player("ServerTcp").rotation[0], 15.0);
     let level = Level::read(&fixture.root.join("world")).expect("actual native level readback");
