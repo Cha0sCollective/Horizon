@@ -67,6 +67,7 @@ impl NativeCheckpointOrigin {
 /// guest/domain authority. Neither observations nor a Game can mint this owner.
 #[cfg(feature = "paired-packages")]
 pub(super) struct NativeCloseAuthority {
+    profile: ColdProfile,
     save: std::sync::Weak<SaveDir>,
     world: horizon_client::world::counter_restore::WorldId,
     root: PathBuf,
@@ -74,14 +75,34 @@ pub(super) struct NativeCloseAuthority {
     level_dimension: String,
     origin: std::sync::Weak<()>,
 }
+#[cfg(feature = "paired-packages")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ColdProfile {
+    InFrameClient,
+    HeadlessServer,
+}
 
 #[cfg(feature = "paired-packages")]
 impl NativeCloseAuthority {
+    pub(super) fn is_server(&self) -> bool {
+        self.profile == ColdProfile::HeadlessServer
+    }
     pub(super) fn authorizes(&self, game: &Game<'_>) -> bool {
         let Some(game_save) = game.save.as_ref() else {
             return false;
         };
-        game.options.execution_role.is_client()
+        let profile = match self.profile {
+            ColdProfile::InFrameClient => {
+                game.options.execution_role.is_client()
+                    && game.retained_server.is_none()
+                    && game.lan.is_none()
+            }
+            ColdProfile::HeadlessServer => game
+                .retained_server
+                .as_ref()
+                .is_some_and(|server| server.authorizes_close(game)),
+        };
+        profile
             && game.options.test_terrain
             && !game.options.server_thread
             && game.options.server.is_none()
@@ -89,7 +110,6 @@ impl NativeCloseAuthority {
             && game.options.dimension.is_none()
             && game.remote.is_none()
             && game.integrated.is_none()
-            && game.lan.is_none()
             && game.serving.is_none()
             && game.lan_acting.is_none()
             && game.world_root == self.root
@@ -584,6 +604,7 @@ pub(super) enum PreparedOutcome {
 #[cfg(feature = "paired-packages")]
 pub(super) struct ColdPreparation {
     outcome: PreparedOutcome,
+    profile: ColdProfile,
 }
 
 #[cfg(feature = "paired-packages")]
@@ -596,7 +617,87 @@ impl ColdPreparation {
         settings: &Settings,
         entry: &RetainedEntryIdentity,
     ) -> Self {
+        Self::prepare_profile(
+            request,
+            res,
+            pack,
+            options,
+            settings,
+            entry,
+            ColdProfile::InFrameClient,
+            #[cfg(test)]
+            None,
+        )
+    }
+    pub(super) fn prepare_server(
+        request: WorldRequest,
+        res: &Resources,
+        pack: &PackResources,
+        options: &Options,
+        settings: &Settings,
+        entry: &RetainedEntryIdentity,
+    ) -> Self {
+        Self::prepare_profile(
+            request,
+            res,
+            pack,
+            options,
+            settings,
+            entry,
+            ColdProfile::HeadlessServer,
+            #[cfg(test)]
+            None,
+        )
+    }
+    #[cfg(test)]
+    pub(super) fn prepare_server_failure_for_test(
+        request: WorldRequest,
+        res: &Resources,
+        pack: &PackResources,
+        options: &Options,
+        settings: &Settings,
+        entry: &RetainedEntryIdentity,
+    ) -> Self {
+        let (entered, _observed) = std::sync::mpsc::channel();
+        let (release, receive) = std::sync::mpsc::channel();
+        release.send(()).unwrap();
+        let control = RetainedPrepareControl {
+            stage: RetainedPrepareStage::StreamingAcquired,
+            entered,
+            release: receive,
+            fail: true,
+            #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+            streaming: None,
+            #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+            streaming_threads: None,
+        };
+        Self::prepare_profile(
+            request,
+            res,
+            pack,
+            options,
+            settings,
+            entry,
+            ColdProfile::HeadlessServer,
+            Some(control),
+        )
+    }
+    #[allow(clippy::too_many_arguments)] // Joint original cold inputs, distinct profile, and a fixed test-stage gate.
+    fn prepare_profile(
+        request: WorldRequest,
+        res: &Resources,
+        pack: &PackResources,
+        options: &Options,
+        settings: &Settings,
+        entry: &RetainedEntryIdentity,
+        profile: ColdProfile,
+        #[cfg(test)] control: Option<RetainedPrepareControl>,
+    ) -> Self {
         let mut owner = PrepareOwner::new(request);
+        #[cfg(test)]
+        {
+            owner.control = control;
+        }
         owner.entry_token = Some(RetainedEntryIdentity {
             token: entry.token,
             owner: entry.owner.clone(),
@@ -609,10 +710,29 @@ impl ColdPreparation {
             || owner.request.expected_checkpoint_world.is_some()
             || !options.test_terrain
             || options.dimension.is_some()
-            || !options.execution_role.is_client()
+            || !match profile {
+                ColdProfile::InFrameClient => options.execution_role.is_client(),
+                ColdProfile::HeadlessServer => {
+                    options.execution_role == super::execution_role::ExecutionRole::DedicatedServer
+                        && options.server.is_none()
+                        && options.dedicated.is_none()
+                        && options.dev_mods.is_empty()
+                        && options.mod_packages.catalog().is_none()
+                        && settings.mods.enabled.is_empty()
+                        && settings.horizon.lod_distance == 0
+                        && settings.render_distance == 2
+                        && settings.simulation_distance == 2
+                        && cfg!(target_os = "linux")
+                        && !cfg!(feature = "controllers")
+                        && !cfg!(feature = "audio")
+                }
+            }
             || options.server_thread
         {
-            Err("cold retained preparation requires a new identified in-frame native TestTerrain world".into())
+            Err(match profile {
+                ColdProfile::InFrameClient => "cold retained preparation requires a new identified in-frame native TestTerrain world",
+                ColdProfile::HeadlessServer => "cold retained preparation requires its exact new identified headless native TestTerrain profile",
+            }.into())
         } else {
             owner.prepare(res, pack, options, settings)
         };
@@ -623,7 +743,7 @@ impl ColdPreparation {
                 PreparedOutcome::Failed(PrepareFailure { owner })
             }
         };
-        Self { outcome }
+        Self { outcome, profile }
     }
 
     pub(super) fn original_error(&self) -> Option<&str> {
@@ -634,14 +754,27 @@ impl ColdPreparation {
         self,
         entry: &RetainedEntryIdentity,
     ) -> std::result::Result<ColdPreparedWorld, Self> {
+        let profile = self.profile;
         let outcome = match self.outcome {
             PreparedOutcome::Ready(ready) if ready.may_adopt(entry) => {
                 match ready.into_cold_parts() {
-                    Ok(prepared) => {
+                    Ok(mut prepared) => {
+                        // A fresh Level derives an empty dimension string. The
+                        // native sync codec later writes its canonical id. Bind
+                        // the headless constructor to that same Overworld id
+                        // before issuing authority, preserving exact equality
+                        // across native metadata commit. Client recipes retain
+                        // their existing representation and gates.
+                        if profile == ColdProfile::HeadlessServer
+                            && prepared.level.dimension.is_empty()
+                        {
+                            prepared.level.dimension = Dim::Overworld.id().into();
+                        }
                         // The complete original cold transfer and exact entry
                         // checks precede issuance. No other constructor issues
                         // this capability, including the raw fixture transfer.
                         let authority = NativeCloseAuthority {
+                            profile,
                             save: Arc::downgrade(&prepared.save),
                             world: *prepared.session_lock.expected_world().unwrap(),
                             root: prepared.save_root.clone(),
@@ -661,7 +794,7 @@ impl ColdPreparation {
             }
             outcome => outcome,
         };
-        Err(Self { outcome })
+        Err(Self { outcome, profile })
     }
 
     pub(super) fn begin_close(&mut self, deadline: std::time::Instant) {
@@ -680,9 +813,10 @@ impl ColdPreparation {
     }
 
     pub(super) fn finish_close(self) -> std::result::Result<PreparationClosed, Self> {
+        let profile = self.profile;
         self.outcome
             .finish_close()
-            .map_err(|outcome| Self { outcome })
+            .map_err(|outcome| Self { outcome, profile })
     }
 }
 #[cfg(feature = "paired-packages")]

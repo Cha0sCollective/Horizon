@@ -1129,6 +1129,10 @@ impl Game<'_> {
 
     /// A new level for `dim`, opened from the save (`MinecraftServer.createLevels`).
     fn open_level(&self, dim: Dim) -> Result<Parked> {
+        #[cfg(feature = "paired-packages")]
+        if self.retained_server.is_some() {
+            return Err("fixed retained server refuses additional native levels".into());
+        }
         let (streaming, save, locator) = super::world_loading::make_streaming(
             &self.res,
             &self.pack,
@@ -1277,6 +1281,10 @@ impl Game<'_> {
     /// clock and weather go with the swap. `host` is the hub when the caller
     /// holds it (`self.lan` is taken during the network tick).
     pub(super) fn enter_level(&mut self, host: Option<&mut LanHost>, target: Dim) -> Result<()> {
+        #[cfg(feature = "paired-packages")]
+        if self.retained_server.is_some() && (target != Dim::Overworld || self.dim != target) {
+            return Err("fixed retained server refuses dimension transitions".into());
+        }
         // The in-frame game keeps its one level (`enter_dimension`).
         if self.options.execution_role.is_client() {
             return Ok(());
@@ -1338,6 +1346,8 @@ impl Game<'_> {
     /// the next ones only their level. While `paused`, only the connections
     /// run.
     pub(super) fn tick_server(&mut self, paused: bool) -> Result<()> {
+        #[cfg(feature = "paired-packages")]
+        self.retained_server_check_running()?;
         let dims = self.levels_to_tick();
         let n = dims.len();
         let mut result = Ok(());
@@ -1352,10 +1362,17 @@ impl Game<'_> {
             };
             self.update_dedicated_streaming();
             self.update_world();
+            #[cfg(feature = "paired-packages")]
+            if let Err(error) = self.retained_server_check_running() {
+                result = Err(error);
+                break;
+            }
             // What server mods set in this level since its last tick.
             self.apply_mod_block_writes();
             result = if paused {
                 self.tick_lan(true);
+                #[cfg(feature = "paired-packages")]
+                self.retained_server_check_running()?;
                 Ok(())
             } else if k == 0 {
                 self.tick()
@@ -1440,6 +1457,10 @@ impl Game<'_> {
     /// (the Overworld, the Nether, the End): every level with a player in
     /// it, forced chunks or a `/pregen` task, or the Overworld while idle.
     pub(super) fn levels_to_tick(&self) -> Vec<Dim> {
+        #[cfg(feature = "paired-packages")]
+        if self.retained_server.is_some() {
+            return vec![Dim::Overworld];
+        }
         let guests = self
             .lan
             .as_ref()

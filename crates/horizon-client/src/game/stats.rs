@@ -105,14 +105,18 @@ impl Stats {
     }
     /// `ServerStatsCounter.parseLocal`: the counters of a stats file.
     pub(super) fn read(path: &Path) -> Self {
+        let json = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok());
+        Self::from_saved_json(json.as_ref())
+    }
+    /// Shared native interpretation; checked callers retain their single read.
+    pub(super) fn from_saved_json(json: Option<&serde_json::Value>) -> Self {
         let mut stats = Self {
             loaded: true,
             ..Self::default()
         };
-        let Some(json) = std::fs::read_to_string(path)
-            .ok()
-            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
-        else {
+        let Some(json) = json else {
             return stats;
         };
         if let Some(all) = json.get("stats").and_then(|s| s.as_object()) {

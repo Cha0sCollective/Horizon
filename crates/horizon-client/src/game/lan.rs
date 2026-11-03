@@ -33,6 +33,483 @@ use std::{
 /// The registries and tags are the same for every world: load them once.
 static SYNC: Mutex<Option<std::result::Result<Arc<SyncData>, String>>> = Mutex::new(None);
 
+#[cfg(feature = "paired-packages")]
+pub(super) struct NativeAdmission {
+    pub(super) uuid: u128,
+    tag: Option<Option<horizon_world::nbt::Tag>>,
+    stats: Option<Option<serde_json::Value>>,
+    advancements: Option<Option<serde_json::Value>>,
+    /// Includes the failed path, original JSON input where available, and the
+    /// original diagnostic. Successful stages are never reread on Retry.
+    failures: Vec<(std::path::PathBuf, Option<Vec<u8>>, String)>,
+    installed: bool,
+    #[allow(clippy::vec_box)]
+    // Keep each original failed candidate allocation, not a replacement body.
+    partial_bodies: Vec<Box<horizon_client::motion::PlayerMotion>>,
+}
+#[cfg(feature = "paired-packages")]
+impl NativeAdmission {
+    pub(super) fn new(uuid: u128) -> Self {
+        Self {
+            uuid,
+            tag: None,
+            stats: None,
+            advancements: None,
+            failures: Vec::new(),
+            installed: false,
+            partial_bodies: Vec::new(),
+        }
+    }
+    pub(super) fn installed(&self) -> bool {
+        self.installed
+    }
+    fn read_json(&mut self, path: &std::path::Path) -> Result<Option<serde_json::Value>> {
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                let detail = format!("{}: {error}", path.display());
+                self.failures.push((path.to_owned(), None, detail.clone()));
+                return Err(detail.into());
+            }
+        };
+        match serde_json::from_slice(&bytes) {
+            Ok(json) => Ok(Some(json)),
+            Err(error) => {
+                let detail = format!("{}: {error}", path.display());
+                self.failures
+                    .push((path.to_owned(), Some(bytes), detail.clone()));
+                Err(detail.into())
+            }
+        }
+    }
+    fn read_inputs(&mut self, root: &std::path::Path) -> Result<()> {
+        let path = playerdata::path(root, self.uuid);
+        if self.tag.is_none() {
+            match horizon_client::save::read_dat_checked(&path) {
+                Ok(tag) => self.tag = Some(tag),
+                Err(error) => {
+                    let detail = format!("{}: {error}", path.display());
+                    self.failures.push((path, None, detail.clone()));
+                    return Err(detail.into());
+                }
+            }
+        }
+        let uuid = playerdata::uuid_ints(self.uuid);
+        if self.stats.is_none() {
+            self.stats = Some(self.read_json(&super::stats::player_json(root, "stats", uuid))?);
+        }
+        if self.advancements.is_none() {
+            self.advancements =
+                Some(self.read_json(&super::stats::player_json(root, "advancements", uuid))?);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "paired-packages")]
+fn retained_guest_untouched(host: &LanHost, g: &lan::guest::Guest) -> bool {
+    !g.placed
+        && !g.loaded
+        && g.motion.is_none()
+        && !host.play.contains_key(&g.conn)
+        && g.inventory.len() == 36
+        && g.inventory.iter().all(Option::is_none)
+        && g.ender_items.len() == 27
+        && g.ender_items.iter().all(Option::is_none)
+        && g.armor.iter().all(Option::is_none)
+        && g.offhand.is_none()
+        && g.loaded_body.is_none()
+        && g.saved_absorption.is_none()
+        && g.saved.is_none()
+        && g.logs_kept.is_none()
+        && g.carried.is_none()
+        && g.craft_grid.iter().all(Option::is_none)
+        && g.craft_result.is_none()
+        && g.menu.is_none()
+        && g.drag.is_none()
+        && g.vehicle.is_none()
+        && !g.dead
+        && g.death_time == 0
+        && !g.sleeping
+        && g.bed.is_none()
+        && g.awaiting_teleport.is_none()
+        && !g.advancements_loaded
+        && g.advancements.criteria.is_empty()
+        && g.effects.saved().is_empty()
+        && g.health == 20.0
+        && g.food == 20
+        && g.saturation == 5.0
+        && g.xp_level == 0
+        && g.xp_total == 0
+        && g.xp_progress == 0.0
+        && g.xp_seed == 0
+        && g.spawn.is_none()
+        && g.respawn_elsewhere.is_none()
+        && g.last_death.is_none()
+        && g.left_reason.is_empty()
+        && !g.seen_credits
+}
+
+#[cfg(feature = "paired-packages")]
+impl Game<'_> {
+    #[cfg(test)]
+    pub(super) fn test_refuse_original_retained_host(&mut self) {
+        let identity = self
+            .retained_server
+            .as_ref()
+            .unwrap()
+            .hub_identity()
+            .unwrap()
+            .clone();
+        let host = self.lan.take().unwrap();
+        let bodies = host
+            .hub
+            .guests
+            .iter()
+            .map(|g| (g.conn, g.motion.as_deref().map(std::ptr::from_ref)))
+            .collect::<Vec<_>>();
+        let play = host.play.len();
+        let host = match host.try_retained_closed() {
+            Err(host) => host,
+            Ok(_) => {
+                eprintln!("fatal: open original server host consumed without closure");
+                std::process::abort();
+            }
+        };
+        assert!(identity.matches(&host.hub));
+        assert_eq!(play, host.play.len());
+        assert_eq!(
+            bodies,
+            host.hub
+                .guests
+                .iter()
+                .map(|g| (g.conn, g.motion.as_deref().map(std::ptr::from_ref)))
+                .collect::<Vec<_>>()
+        );
+        self.lan = Some(host);
+        self.retained_server
+            .as_mut()
+            .unwrap()
+            .consume_refusal_checked = true;
+    }
+
+    pub(super) fn install_original_retained_host(
+        &mut self,
+        sync: Arc<SyncData>,
+        encoder: ChunkEncoder,
+        config: HubConfig,
+        offline: lan::RetainedOfflineConfig,
+    ) -> std::result::Result<(), String> {
+        if self.lan.is_some()
+            || !self
+                .retained_server
+                .as_ref()
+                .is_some_and(|s| s.can_bind_hub())
+        {
+            // This fixed call is made once by the cold factory, before offers.
+            return Err("original retained host is already bound".into());
+        }
+        let mut hub = match Hub::new_retained(sync, encoder, config, offline) {
+            Ok(hub) => hub,
+            Err(refusal) => {
+                let detail = refusal.reason.clone();
+                self.retained_server
+                    .as_mut()
+                    .unwrap()
+                    .hold_hub_refusal(refusal);
+                return Err(detail);
+            }
+        };
+        hub.flat_world = self.world_flat;
+        self.retained_server
+            .as_mut()
+            .unwrap()
+            .bind_hub(hub.retained_identity().unwrap());
+        self.world.block_log = Some(Vec::new());
+        self.world.light_log = Some(Default::default());
+        self.lan = Some(LanHost {
+            hub,
+            settings: LanSettings {
+                port: 0,
+                guest_commands: false,
+                force_game_mode: false,
+            },
+            host_entity: 0,
+            host_swings: self.swings_started,
+            host_crack: None,
+            host_uuid: 0,
+            host_name: "Retained server".into(),
+            models: HashMap::new(),
+            host_mode: self.mode_id(),
+            play: HashMap::new(),
+            broken: Vec::new(),
+            mob_state: HashMap::new(),
+            mob_players: HashMap::new(),
+            owner: None,
+            waypoints: Default::default(),
+            waypoint_dead: Default::default(),
+            border_sent: None,
+            commands: Vec::new(),
+            quiet: Default::default(),
+            states: Default::default(),
+        });
+        self.audio.capture = Some(Vec::new());
+        Ok(())
+    }
+
+    fn install_retained_guest(
+        &mut self,
+        host: &mut LanHost,
+        conn: u32,
+        spawn: [f64; 3],
+    ) -> Result<()> {
+        let server = self
+            .retained_server
+            .as_ref()
+            .ok_or("not an original retained server")?;
+        let g = host
+            .hub
+            .guest(conn)
+            .ok_or("original admitted Guest missing")?;
+        if !server
+            .hub_identity()
+            .is_some_and(|id| id.matches_guest(&host.hub, conn, g.uuid))
+        {
+            return Err("original admitted connection identity differs".into());
+        }
+        if server.native_installed(conn, g.uuid) {
+            return Ok(());
+        }
+        if !retained_guest_untouched(host, g) {
+            return Err("native installation requires the original untouched Guest".into());
+        }
+        let uuid = g.uuid;
+        let mut admission = self
+            .retained_server
+            .as_mut()
+            .unwrap()
+            .admissions
+            .remove(&conn)
+            .unwrap_or_else(|| NativeAdmission::new(uuid));
+        let outcome = self.prepare_retained_guest(host, conn, spawn, &mut admission);
+        self.retained_server
+            .as_mut()
+            .unwrap()
+            .admissions
+            .insert(conn, admission);
+        outcome
+    }
+
+    fn prepare_retained_guest(
+        &mut self,
+        host: &mut LanHost,
+        conn: u32,
+        spawn: [f64; 3],
+        admission: &mut NativeAdmission,
+    ) -> Result<()> {
+        if host.hub.guest(conn).map(|g| g.uuid) != Some(admission.uuid) {
+            return Err("native admission profile changed".into());
+        }
+        admission.read_inputs(&self.world_root)?;
+        let tag = admission.tag.as_ref().unwrap();
+        let mut level = horizon_client::save::Level {
+            health: 20.0,
+            food: 20,
+            saturation: 5.0,
+            player_uuid: Some(playerdata::uuid_ints(admission.uuid)),
+            ..Default::default()
+        };
+        if let Some(tag) = tag {
+            validate_session_player_tag(tag)?;
+            level.read_player(tag);
+            level.player_extra = Some(tag.clone());
+        } else {
+            level.position = Some(self.server_player_spawn(spawn));
+            level.game_mode = host.hub.config.default_game_mode;
+            level.creative = level.game_mode == 1;
+        }
+        if level.player_uuid != Some(playerdata::uuid_ints(admission.uuid))
+            || level.dimension != "minecraft:overworld"
+            || !level.active_effects.is_empty()
+            || level.selected_slot < 0
+            || level.selected_slot >= 9
+            || level.inventory.iter().any(|(slot, _, _, _)| *slot > 35)
+        {
+            return Err("unsupported native retained player profile".into());
+        }
+        let p = level.position.ok_or("native player has no position")?;
+        if !p.iter().all(|n| n.is_finite()) {
+            return Err("native player position is nonfinite".into());
+        }
+        // All fallible body work precedes consumption of the original Guest's
+        // saved body, absorption and logs. The legacy .ok() branch never runs.
+        let mut body = Box::new(horizon_client::motion::PlayerMotion::new(
+            self.motion,
+            Vec3::new(p[0], p[1], p[2]),
+        )?);
+        let mut pending = true;
+        if let Err(error) = body
+            .load_saved_state_once(&mut pending, &level)
+            .and_then(|()| body.internal_set_absorption(level.absorption))
+        {
+            admission.partial_bodies.push(body);
+            let detail = error.to_string();
+            admission.failures.push((
+                self.world_root.clone(),
+                None,
+                format!("native first body: {detail}"),
+            ));
+            return Err(error);
+        }
+        body.velocity = Vec3::new(level.motion[0], level.motion[1], level.motion[2]);
+        body.health.food.exhaustion = level.food_exhaustion;
+        body.health.food.timer = level.food_tick_timer;
+        body.yaw = level.rotation[0];
+        body.head_yaw = body.yaw;
+        body.pitch = level.rotation[1];
+        body.ground.on_ground = level.on_ground;
+        body.server_copy = true;
+        body.may_fly = matches!(level.mode(), 1 | 3);
+        body.invulnerable = body.may_fly;
+        body.spectator = level.mode() == 3;
+        body.flying = level.flying;
+        let tree = self.adv.tree.clone();
+        if tree.list.is_empty() || self.adv.pending_tree.is_some() {
+            admission.partial_bodies.push(body);
+            return Err("complete native advancement resources missing".into());
+        }
+        let mut progress = admission
+            .advancements
+            .as_ref()
+            .unwrap()
+            .as_ref()
+            .map(horizon_client::advancements::Progress::from_json)
+            .unwrap_or_default();
+        progress
+            .criteria
+            .retain(|id, _| tree.by_id.contains_key(id));
+        let mut stats =
+            super::stats::Stats::from_saved_json(admission.stats.as_ref().unwrap().as_ref());
+        stats.mark_all_dirty();
+        let g = host.hub.guest_mut(conn).unwrap();
+        playerdata::apply(g, &level);
+        g.loaded_body
+            .take()
+            .expect("native apply installed body")
+            .apply(&mut body);
+        g.saved_absorption
+            .take()
+            .expect("native apply installed absorption");
+        if let Some((hurts, attacks)) = g.logs_kept.take() {
+            body.hurt_log = hurts;
+            body.attack_log = attacks;
+        }
+        g.motion = Some(body);
+        g.advancements = progress;
+        g.advancements_loaded = true;
+        host.play.entry(conn).or_default().stats = stats;
+        admission.installed = true;
+        self.retained_server
+            .as_mut()
+            .unwrap()
+            .record_installation(conn, admission.uuid);
+        Ok(())
+    }
+
+    fn place_retained_guest(
+        &mut self,
+        host: &mut LanHost,
+        conn: u32,
+        state: Option<&HostState>,
+        entities: &[EntityState],
+        spawn: [f64; 3],
+    ) {
+        let clock_rate = self.network_clock_rate();
+        let mut ctx = TickCtx {
+            world: &mut self.world,
+            host: state,
+            entities,
+            next_entity: &mut self.next_entity,
+            spawn,
+            difficulty: i32::from(self.ui.difficulty),
+            difficulty_locked: self.level.difficulty_locked,
+            clock_rate,
+            tick_rate: self.clock.rate(),
+            tick_frozen: self.clock.frozen(),
+            tick_steps: self.clock.step_state(),
+            collision: Some(self.collision),
+            border: &self.border,
+        };
+        host.hub.place_new_player(conn, &mut ctx);
+    }
+
+    /// Only explicit close Retry invokes this. It finishes already-started
+    /// native reads/body installation, never placement, input or simulation.
+    pub(super) fn retry_retained_admissions(&mut self) -> Result<()> {
+        let conns = self
+            .retained_server
+            .as_ref()
+            .ok_or("server missing")?
+            .admissions
+            .iter()
+            .filter_map(|(conn, admission)| (!admission.installed()).then_some(*conn))
+            .collect::<Vec<_>>();
+        let Some(mut host) = self.lan.take() else {
+            return if conns.is_empty() {
+                Ok(())
+            } else {
+                Err("original admission host missing".into())
+            };
+        };
+        let spawn = self.spawn.map_or([0.5, 80.0, 0.5], |s| [s.x, s.y, s.z]);
+        let mut result = Ok(());
+        for conn in conns {
+            if let Err(error) = self.install_retained_guest(&mut host, conn, spawn) {
+                result = Err(error);
+                break;
+            }
+        }
+        self.lan = Some(host);
+        result
+    }
+
+    /// Hub movement owns these fields before the next as_guest handoff. A
+    /// mid-turn stop completes only that fixed native movement handoff, without
+    /// physics, wire replay, acknowledgments, or replacing the installed body.
+    pub(super) fn fence_retained_native_motion(&mut self) -> Result<()> {
+        let server = self
+            .retained_server
+            .as_ref()
+            .ok_or("original server missing")?;
+        let Some(host) = &mut self.lan else {
+            return Ok(());
+        };
+        for g in &mut host.hub.guests {
+            if !server.native_installed(g.conn, g.uuid) {
+                continue;
+            }
+            let body = g
+                .motion
+                .as_mut()
+                .ok_or("original installed body missing at freeze")?;
+            if !g.position.iter().all(|n| n.is_finite())
+                || !g.yaw.is_finite()
+                || !g.pitch.is_finite()
+            {
+                return Err("nonfinite original movement at freeze".into());
+            }
+            body.position = Vec3::new(g.position[0], g.position[1], g.position[2]);
+            body.yaw = g.yaw;
+            body.pitch = g.pitch;
+            body.ground.on_ground = g.on_ground;
+            body.sprinting = g.sprinting;
+            body.flying = g.flying;
+        }
+        Ok(())
+    }
+}
+
 /// The registries and tags a server sends, loaded from `root` the first time.
 pub(super) fn sync_data(root: &std::path::Path) -> std::result::Result<Arc<SyncData>, String> {
     let mut sync = SYNC.lock().unwrap_or_else(|e| e.into_inner());
@@ -54,8 +531,8 @@ pub struct LanSettings {
     pub force_game_mode: bool,
 }
 
-pub(super) struct LanHost {
-    pub hub: Hub,
+pub(super) struct LanHost<H = Hub> {
+    pub hub: H,
     pub settings: LanSettings,
     pub host_entity: i32,
     /// The host's swings the guests were told of (`Game::swings_started`).
@@ -95,6 +572,64 @@ pub(super) struct LanHost {
 }
 
 impl LanHost {
+    #[cfg(feature = "paired-packages")]
+    #[allow(clippy::result_large_err)] // Refusal returns the entire original host.
+    pub(super) fn try_retained_closed(
+        self,
+    ) -> std::result::Result<LanHost<lan::hub::ClosedHub>, Self> {
+        let Self {
+            hub,
+            settings,
+            host_entity,
+            host_swings,
+            host_crack,
+            host_uuid,
+            host_name,
+            models,
+            host_mode,
+            play,
+            broken,
+            mob_state,
+            mob_players,
+            owner,
+            waypoints,
+            waypoint_dead,
+            border_sent,
+            commands,
+            quiet,
+            states,
+        } = self;
+        macro_rules! restore {
+            ($hub:expr) => {
+                LanHost {
+                    hub: $hub,
+                    settings,
+                    host_entity,
+                    host_swings,
+                    host_crack,
+                    host_uuid,
+                    host_name,
+                    models,
+                    host_mode,
+                    play,
+                    broken,
+                    mob_state,
+                    mob_players,
+                    owner,
+                    waypoints,
+                    waypoint_dead,
+                    border_sent,
+                    commands,
+                    quiet,
+                    states,
+                }
+            };
+        }
+        match hub.try_retained_closed() {
+            Ok(hub) => Ok(restore!(hub)),
+            Err(hub) => Err(restore!(hub)),
+        }
+    }
     /// `PlayerList.remove`: `player.awardStat(Stats.LEAVE_GAME)` before the
     /// player is saved. Once per guest, however often they are saved.
     pub(super) fn award_leave_game(&mut self, conn: u32) {
@@ -153,10 +688,28 @@ type ParticipantCheck<T> = std::result::Result<T, ParticipantPreflightError>;
 #[cfg(feature = "paired-packages")]
 #[allow(dead_code)] // No complete capture operation consumes this observation yet.
 pub(in crate::game) struct ParticipantRoster {
-    host_identity: Arc<lan::Shared>,
+    host_identity: ParticipantHostIdentity,
     owner_uuid: Option<u128>,
     level_player_uuid: Option<[i32; 4]>,
     identities: Vec<ParticipantIdentity>,
+}
+#[cfg(feature = "paired-packages")]
+enum ParticipantHostIdentity {
+    Legacy(Arc<lan::Shared>),
+    Retained(lan::hub::RetainedHubIdentity),
+}
+#[cfg(feature = "paired-packages")]
+impl ParticipantHostIdentity {
+    fn matches(&self, host: &LanHost) -> bool {
+        match self {
+            Self::Legacy(shared) => host
+                .hub
+                .lan
+                .legacy()
+                .is_some_and(|lan| Arc::ptr_eq(shared, &lan.shared)),
+            Self::Retained(identity) => identity.matches(&host.hub),
+        }
+    }
 }
 #[cfg(feature = "paired-packages")]
 #[allow(dead_code)]
@@ -253,6 +806,125 @@ impl ParticipantRoster {
 #[cfg(feature = "paired-packages")]
 #[allow(dead_code)] // Dormant; this does not qualify global capture readiness.
 impl Game<'_> {
+    /// Distinct NativeWorld population. Network acknowledgments and inboxes
+    /// remain original owned inputs; they are not coherent-session readiness.
+    fn observe_retained_native_participants(&self) -> ParticipantCheck<ParticipantRoster> {
+        use ParticipantPreflightError as E;
+        let host = self.checkpoint_participant_host()?;
+        let server = self.retained_server.as_ref().ok_or(E::NotAuthoritative)?;
+        let identity = server.hub_identity().ok_or(E::NotAuthoritative)?;
+        if !identity.matches(&host.hub)
+            || host.owner.is_some()
+            || self.player.is_some()
+            || self.lan_acting.is_some()
+            || !self.server_trips.is_empty()
+            || !self.level_teleports.is_empty()
+            || !host.commands.is_empty()
+            || !host.quiet.is_empty()
+            || self.inventory.iter().any(Option::is_some)
+            || self.armor.iter().any(Option::is_some)
+            || self.offhand.is_some()
+            || self.carried.is_some()
+            || self.craft_grid.iter().any(Option::is_some)
+            || self.container.is_some()
+            || self.station.is_some()
+            || self.ender_open.is_some()
+            || self.craft_table.is_some()
+            || self.inv_drag.is_some()
+            || self.last_quick_moved.is_some()
+        {
+            return Err(E::UnsupportedServerState);
+        }
+        let mut identities = Vec::new();
+        for guest in &host.hub.guests {
+            if !identity.matches_guest(&host.hub, guest.conn, guest.uuid) {
+                return Err(E::InvalidIdentity { conn: guest.conn });
+            }
+            if server.is_untouched(guest.conn) {
+                if !retained_guest_untouched(host, guest) {
+                    return Err(E::UnsupportedPlayer { conn: guest.conn });
+                }
+                continue;
+            }
+            if !server.native_installed(guest.conn, guest.uuid)
+                || guest.motion.is_none()
+                || guest.loaded_body.is_some()
+                || guest.saved_absorption.is_some()
+                || guest.logs_kept.is_some()
+                || guest.dimension != "minecraft:overworld"
+                || guest.inventory.len() != 36
+                || guest.ender_items.len() != 27
+                || guest.selected >= 9
+                || guest.carried.is_some()
+                || guest.craft_grid.iter().any(Option::is_some)
+                || guest.craft_result.is_some()
+                || guest.menu.is_some()
+                || guest.drag.is_some()
+                || guest.vehicle.is_some()
+                || guest.sleeping
+                || guest.bed.is_some()
+                || guest.dead
+                || guest.death_time != 0
+                || !host.play.contains_key(&guest.conn)
+            {
+                return Err(E::UnsupportedPlayer { conn: guest.conn });
+            }
+            identities.push(ParticipantIdentity {
+                conn: guest.conn,
+                uuid: guest.uuid,
+                dimension: guest.dimension.clone(),
+                sender_identity: guest.sender.pending.clone(),
+                storage: ParticipantStorage::External {
+                    record_uuid: playerdata::uuid_ints(guest.uuid),
+                },
+            });
+        }
+        if host
+            .play
+            .keys()
+            .any(|conn| !identities.iter().any(|p| p.conn == *conn))
+        {
+            return Err(E::UnsupportedServerState);
+        }
+        let roster = ParticipantRoster {
+            host_identity: ParticipantHostIdentity::Retained(identity.clone()),
+            owner_uuid: None,
+            level_player_uuid: self.level.player_uuid,
+            identities,
+        };
+        roster.validate()?;
+        Ok(roster)
+    }
+
+    fn project_native_participant_rows(
+        &self,
+        expected: &ParticipantRoster,
+    ) -> Result<Vec<SessionPlayerRow>> {
+        if self.retained_server.is_none() {
+            return self.project_session_participant_rows(expected);
+        }
+        let current = self
+            .observe_retained_native_participants()
+            .map_err(|e| format!("retained native population: {e:?}"))?;
+        let host = self.lan.as_ref().ok_or("retained native host missing")?;
+        if !expected.host_identity.matches(host)
+            || current.identities.len() != expected.identities.len()
+            || current
+                .identities
+                .iter()
+                .zip(&expected.identities)
+                .any(|(a, b)| {
+                    a.conn != b.conn
+                        || a.uuid != b.uuid
+                        || a.dimension != b.dimension
+                        || a.storage != b.storage
+                })
+        {
+            return Err("retained native participant owner changed".into());
+        }
+        self.pack_checked_participant_rows(expected)
+    }
+
     fn checkpoint_participant_host(&self) -> ParticipantCheck<&LanHost> {
         use ParticipantPreflightError as E;
         if self.remote.is_some()
@@ -315,13 +987,14 @@ impl Game<'_> {
             });
         }
         let roster = ParticipantRoster {
-            host_identity: host
-                .hub
-                .lan
-                .legacy()
-                .expect("legacy host factory")
-                .shared
-                .clone(),
+            host_identity: ParticipantHostIdentity::Legacy(
+                host.hub
+                    .lan
+                    .legacy()
+                    .ok_or(E::NotAuthoritative)?
+                    .shared
+                    .clone(),
+            ),
             owner_uuid,
             level_player_uuid: self.level.player_uuid,
             identities,
@@ -339,7 +1012,9 @@ impl Game<'_> {
         self.checkpoint_participant_host()?;
         expected.validate()?;
         let current = self.observe_checkpoint_participants()?;
-        if !Arc::ptr_eq(&current.host_identity, &expected.host_identity)
+        if !expected
+            .host_identity
+            .matches(self.checkpoint_participant_host()?)
             || current.owner_uuid != expected.owner_uuid
             || current.level_player_uuid != expected.level_player_uuid
             || current.identities.len() != expected.identities.len()
@@ -822,6 +1497,22 @@ fn session_player_level(
     guest: &horizon_client::lan::guest::Guest,
     record_uuid: [i32; 4],
 ) -> Result<horizon_client::save::Level> {
+    pack_player_level(guest, record_uuid, PlayerBodyProjection::Coherent)
+}
+
+#[cfg(feature = "paired-packages")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PlayerBodyProjection {
+    Coherent,
+    RetainedNative,
+}
+
+#[cfg(feature = "paired-packages")]
+fn pack_player_level(
+    guest: &horizon_client::lan::guest::Guest,
+    record_uuid: [i32; 4],
+    profile: PlayerBodyProjection,
+) -> Result<horizon_client::save::Level> {
     use horizon_client::save::Level;
     let body = guest
         .motion
@@ -832,7 +1523,32 @@ fn session_player_level(
             .catalog()
             .default_base("minecraft:player", key.attribute())
             != Some(value.base_value())
-            || !value.modifiers().is_empty()
+            || (profile == PlayerBodyProjection::RetainedNative
+                && !value.permanent_modifiers().is_empty())
+            || value.modifiers().iter().any(|modifier| {
+                // Original ServerPlayer.updatePlayerAttributes derives these
+                // transient reach modifiers from creative mode each tick. The
+                // native codec persists that mode; keep the actual instances
+                // intact while checking their exact native derivation here.
+                let expected = match key.name() {
+                    "minecraft:block_interaction_range" => {
+                        Some(("minecraft:creative_mode_block_range", 0.5))
+                    }
+                    "minecraft:entity_interaction_range" => {
+                        Some(("minecraft:creative_mode_entity_range", 2.0))
+                    }
+                    _ => None,
+                };
+                profile != PlayerBodyProjection::RetainedNative
+                    || guest.game_mode != 1
+                    || value.modifiers().len() != 1
+                    || !expected.is_some_and(|(id, amount)| {
+                        modifier.id() == id
+                            && modifier.amount() == amount
+                            && modifier.operation()
+                                == horizon_world::attributes::Operation::AddValue
+                    })
+            })
     }) {
         return Err("nondefault session player body attributes are unsupported".into());
     }
@@ -940,6 +1656,13 @@ impl Game<'_> {
         // research projection (which deliberately retains its cached Level rules).
         self.preflight_checkpoint_participants(expected)
             .map_err(|error| format!("session participant preflight: {error:?}"))?;
+        self.pack_checked_participant_rows(expected)
+    }
+
+    fn pack_checked_participant_rows(
+        &self,
+        expected: &ParticipantRoster,
+    ) -> Result<Vec<SessionPlayerRow>> {
         if self.adv.tree.list.is_empty() || self.adv.pending_tree.is_some() {
             return Err("session advancement tree is unavailable".into());
         }
@@ -1050,7 +1773,12 @@ impl Game<'_> {
                 ParticipantStorage::IntegratedOwner { record_uuid } => (record_uuid, true),
                 ParticipantStorage::External { record_uuid } => (record_uuid, false),
             };
-            let level = session_player_level(guest, record_uuid)?;
+            let level = match &expected.host_identity {
+                ParticipantHostIdentity::Legacy(_) => session_player_level(guest, record_uuid)?,
+                ParticipantHostIdentity::Retained(_) => {
+                    pack_player_level(guest, record_uuid, PlayerBodyProjection::RetainedNative)?
+                }
+            };
             rows.try_reserve(1)
                 .map_err(|_| "session player row allocation")?;
             rows.push(SessionPlayerRow {
@@ -1641,12 +2369,18 @@ impl Game<'_> {
         let roster = self
             .lan
             .as_ref()
-            .map(|_| self.observe_checkpoint_participants())
+            .map(|_| {
+                if self.retained_server.is_some() {
+                    self.observe_retained_native_participants()
+                } else {
+                    self.observe_checkpoint_participants()
+                }
+            })
             .transpose()
             .map_err(|error| format!("native close roster: {error:?}"))?;
         let rows = match &roster {
             Some(roster) => self
-                .project_session_participant_rows(roster)
+                .project_native_participant_rows(roster)
                 .map_err(|error| error.to_string())?,
             None => Vec::new(),
         };
@@ -1695,7 +2429,7 @@ impl Game<'_> {
         }
         let rows = match &expected.roster {
             Some(roster) => self
-                .project_session_participant_rows(roster)
+                .project_native_participant_rows(roster)
                 .map_err(|error| error.to_string())?,
             None if self.lan.is_none() => Vec::new(),
             None => return Err("native close acquired a participant host".into()),
@@ -3080,6 +3814,18 @@ impl Game<'_> {
     /// (`IntegratedServer.tickPaused`): `ServerGamePacketListenerImpl.tick`
     /// skips `tickPlayer`, so no player's air, hunger or damage moves on.
     pub(super) fn tick_lan(&mut self, paused: bool) {
+        #[cfg(all(test, feature = "paired-packages"))]
+        if self
+            .retained_server
+            .as_ref()
+            .is_some_and(|s| s.test.hold_first_poll())
+        {
+            return;
+        }
+        #[cfg(feature = "paired-packages")]
+        if self.retained_server_check_running().is_err() {
+            return;
+        }
         let Some(mut host) = self.lan.take() else {
             return;
         };
@@ -3176,11 +3922,30 @@ impl Game<'_> {
                 // (`tick_server`): the network is read once, before the first.
                 let pass = self.level_pass;
                 let mut events = if pass.first {
+                    #[cfg(feature = "paired-packages")]
+                    if self.retained_server.is_some() {
+                        host.hub.poll_retained(&mut ctx, 16)
+                    } else {
+                        host.hub.poll(&mut ctx)
+                    }
+                    #[cfg(not(feature = "paired-packages"))]
                     host.hub.poll(&mut ctx)
                 } else {
                     Vec::new()
                 };
-                events.extend(host.hub.tick_level(&mut ctx));
+                #[cfg(feature = "paired-packages")]
+                let retained_allowed = if let Some(server) = &mut self.retained_server {
+                    server.check_hub(&host.hub);
+                    server.check_inboxes(&host.hub);
+                    !server.frozen()
+                } else {
+                    true
+                };
+                #[cfg(not(feature = "paired-packages"))]
+                let retained_allowed = true;
+                if retained_allowed {
+                    events.extend(host.hub.tick_level(&mut ctx));
+                }
                 if pass.last {
                     host.hub.end_tick();
                 }
@@ -3192,7 +3957,45 @@ impl Game<'_> {
                 host.host_mode = state.game_mode;
                 host.hub.set_host_game_mode(state.uuid, state.game_mode);
             }
-            for event in events {
+            #[cfg(feature = "paired-packages")]
+            let events = if let Some(server) = &mut self.retained_server {
+                server.pending.extend(events);
+                #[cfg(test)]
+                if server.test.stop_on_untouched_join
+                    && server
+                        .pending
+                        .iter()
+                        .any(|e| matches!(e, HostEvent::Joined(_)))
+                {
+                    server.fail("controlled untouched original Joined stop".into());
+                }
+                if !server.frozen() {
+                    server.check_hub(&host.hub);
+                }
+                if server.frozen() {
+                    host.states = states;
+                    self.lan = Some(host);
+                    return;
+                }
+                std::mem::take(&mut server.pending)
+                    .into_iter()
+                    .collect::<Vec<_>>()
+            } else {
+                events
+            };
+            let mut events = events.into_iter();
+            while let Some(event) = events.next() {
+                #[cfg(feature = "paired-packages")]
+                if let Some(server) = &mut self.retained_server {
+                    server.check_hub(&host.hub);
+                }
+                #[cfg(feature = "paired-packages")]
+                if self.retained_server.as_ref().is_some_and(|s| s.frozen()) {
+                    let server = self.retained_server.as_mut().unwrap();
+                    server.pending.push_back(event);
+                    server.pending.extend(events);
+                    break;
+                }
                 match event {
                     event @ (HostEvent::Chat { .. } | HostEvent::Warn(_) | HostEvent::Error(_)) => {
                         self.lan_log_event(event);
@@ -3201,6 +4004,27 @@ impl Game<'_> {
                         self.mod_player_chat(super::server_mods::Who::Uuid(sender), &text);
                     }
                     HostEvent::Joined(conn) => {
+                        #[cfg(feature = "paired-packages")]
+                        if self.retained_server.is_some() {
+                            if let Err(error) = self.install_retained_guest(&mut host, conn, spawn)
+                            {
+                                let server = self.retained_server.as_mut().unwrap();
+                                server.fail(error.to_string());
+                                server.pending.push_back(HostEvent::Joined(conn));
+                                server.pending.extend(events);
+                                break;
+                            }
+                            self.place_retained_guest(
+                                &mut host,
+                                conn,
+                                state.as_ref(),
+                                entities,
+                                spawn,
+                            );
+                        } else {
+                            self.lan_guest_joined(&mut host, conn, state.as_ref(), entities, spawn);
+                        }
+                        #[cfg(not(feature = "paired-packages"))]
                         self.lan_guest_joined(&mut host, conn, state.as_ref(), entities, spawn);
                         if self.options.dedicated.is_some()
                             && let Some(g) = host.hub.guest(conn)
@@ -3289,6 +4113,14 @@ impl Game<'_> {
             }
             host.states = states;
         }
+        #[cfg(feature = "paired-packages")]
+        if let Some(server) = &mut self.retained_server {
+            server.check_hub(&host.hub);
+            if server.frozen() {
+                self.lan = Some(host);
+                return;
+            }
+        }
         if !host.quiet.is_empty() {
             self.lan = Some(host);
             self.run_quiet_commands();
@@ -3309,6 +4141,14 @@ impl Game<'_> {
         self.lan_update_waypoints(&mut host, state.as_ref());
         self.lan_sync_scoreboard(&mut host);
         self.lan_sync_border(&mut host);
+        #[cfg(feature = "paired-packages")]
+        if let Some(server) = &mut self.retained_server {
+            server.check_hub(&host.hub);
+            if server.frozen() {
+                self.lan = Some(host);
+                return;
+            }
+        }
         drop(holding);
         lan::flush_all(host.hub.guests.iter().map(|g| &g.sender));
         self.lan = Some(host);

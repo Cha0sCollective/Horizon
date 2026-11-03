@@ -175,6 +175,8 @@ pub struct RetainedHubCloseView {
 }
 #[cfg(feature = "paired-packages")]
 struct RetainedTransport {
+    identity: Arc<()>,
+    connections: Vec<OriginalConnection>,
     lan: Option<RetainedLan>,
     closed: Option<ClosedLan>,
     pending: VecDeque<NetEvent>,
@@ -185,6 +187,40 @@ struct RetainedTransport {
     port: u16,
     max_players: usize,
     motd: String,
+}
+#[cfg(feature = "paired-packages")]
+struct OriginalConnection {
+    conn: u32,
+    uuid: u128,
+    sender: super::super::PlayerSender,
+}
+/// Identity of one actual constructor-issued Hub, not a close or storage receipt.
+#[cfg(feature = "paired-packages")]
+#[derive(Clone)]
+pub struct RetainedHubIdentity {
+    original: Arc<()>,
+}
+#[cfg(feature = "paired-packages")]
+impl RetainedHubIdentity {
+    pub fn matches(&self, hub: &Hub) -> bool {
+        matches!(&hub.lan.kind, Transport::Retained(owner) if Arc::ptr_eq(&self.original, &owner.identity))
+    }
+    pub fn matches_guest(&self, hub: &Hub, conn: u32, uuid: u128) -> bool {
+        let Transport::Retained(owner) = &hub.lan.kind else {
+            return false;
+        };
+        if !Arc::ptr_eq(&self.original, &owner.identity) {
+            return false;
+        }
+        let Some(guest) = hub.guests.iter().find(|g| g.conn == conn && g.uuid == uuid) else {
+            return false;
+        };
+        owner.connections.iter().any(|original| {
+            original.conn == conn
+                && original.uuid == uuid
+                && original.sender.same_retained_connection(&guest.sender)
+        })
+    }
 }
 #[cfg(feature = "paired-packages")]
 impl RetainedTransport {
@@ -232,6 +268,15 @@ impl ClosedHub {
 
 #[cfg(feature = "paired-packages")]
 impl Hub {
+    #[cfg(feature = "paired-packages")]
+    pub fn retained_identity(&self) -> Option<RetainedHubIdentity> {
+        match &self.lan.kind {
+            Transport::Retained(owner) => Some(RetainedHubIdentity {
+                original: owner.identity.clone(),
+            }),
+            Transport::Legacy(_) => None,
+        }
+    }
     pub fn new_retained(
         sync: Arc<SyncData>,
         encoder: ChunkEncoder,
@@ -264,6 +309,8 @@ impl Hub {
         };
         let transport = HubTransport {
             kind: Transport::Retained(Box::new(RetainedTransport {
+                identity: Arc::new(()),
+                connections: Vec::new(),
                 max_players: lan.max_players(),
                 motd: lan.motd(),
                 lan: Some(lan),
@@ -384,6 +431,13 @@ impl Hub {
             if let Some(reason) = refusal {
                 owner.fail(reason);
                 break;
+            }
+            if let NetEvent::Joined(joined) = event {
+                owner.connections.push(OriginalConnection {
+                    conn: joined.conn,
+                    uuid: joined.uuid,
+                    sender: joined.sender.clone(),
+                });
             }
             let event = owner.pending.pop_front().expect("front retained");
             match event {

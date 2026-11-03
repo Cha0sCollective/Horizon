@@ -170,6 +170,8 @@ mod render_tick;
 mod residency_control;
 mod respawn_anchor;
 mod retained_remote;
+#[cfg(feature = "paired-packages")]
+mod retained_server;
 mod saves_control;
 mod saving;
 mod scoreboard;
@@ -352,6 +354,8 @@ struct Options {
 struct ParsedLaunch {
     options: Options,
     #[cfg(feature = "paired-packages")]
+    retained_server: Option<retained_server::Launch>,
+    #[cfg(feature = "paired-packages")]
     retained_remote: Option<window_close::RemoteLaunch>,
     #[cfg(feature = "paired-packages")]
     native_window: Option<window_close::Launch>,
@@ -374,6 +378,19 @@ impl Options {
         Self::read_from(raw_args)
     }
     fn read_from(raw_args: Vec<String>) -> Result<Option<ParsedLaunch>> {
+        #[cfg(feature = "paired-packages")]
+        let retained_server = retained_server::Launch::parse(&raw_args)?;
+        #[cfg(feature = "paired-packages")]
+        let raw_args = retained_server
+            .as_ref()
+            .map_or(raw_args.clone(), |launch| launch.ordinary_args());
+        #[cfg(not(feature = "paired-packages"))]
+        if raw_args
+            .iter()
+            .any(|arg| arg.starts_with("--retained-server"))
+        {
+            return Err("retained server requires paired-packages".into());
+        }
         #[cfg(feature = "paired-packages")]
         let retained_remote = window_close::RemoteLaunch::parse(&raw_args)?;
         #[cfg(feature = "paired-packages")]
@@ -575,6 +592,10 @@ impl Options {
         if let Some(launch) = &retained_remote {
             launch.configure(&mut o);
         }
+        #[cfg(feature = "paired-packages")]
+        if let Some(launch) = &retained_server {
+            launch.configure(&mut o);
+        }
         // The launcher's account: online-mode servers need it. A bad file
         // only leaves the game offline.
         if let Some(path) = session_file.filter(|p| !p.is_empty()) {
@@ -588,6 +609,8 @@ impl Options {
         }
         Ok(Some(ParsedLaunch {
             options: o,
+            #[cfg(feature = "paired-packages")]
+            retained_server,
             #[cfg(feature = "paired-packages")]
             retained_remote,
             #[cfg(feature = "paired-packages")]
@@ -2056,6 +2079,8 @@ struct Game<'a> {
     native_checkpoint_origin: Option<world_loading::NativeCheckpointOrigin>,
     #[cfg(feature = "paired-packages")]
     native_close_authority: Option<world_loading::NativeCloseAuthority>,
+    #[cfg(feature = "paired-packages")]
+    retained_server: Option<retained_server::ServerGameState>,
     audio: Audio,
     music: horizon_client::music::MusicManager,
     ambience: horizon_client::ambience::Ambience,
@@ -5497,6 +5522,8 @@ impl Game<'_> {
         self.with_level(|b, level, ticks| b.notify_written(level, ticks, position, flags));
     }
     fn tick(&mut self) -> Result<()> {
+        #[cfg(feature = "paired-packages")]
+        self.retained_server_check_running()?;
         if self.agent.hold_server {
             return Ok(());
         }
@@ -5569,7 +5596,11 @@ impl Game<'_> {
         self.sync_player_body();
         let Some(player) = self.player.as_mut() else {
             // A dedicated server has no local player: the world still runs.
-            if self.options.dedicated.is_some() {
+            #[cfg(feature = "paired-packages")]
+            let retained_server = self.retained_server.is_some();
+            #[cfg(not(feature = "paired-packages"))]
+            let retained_server = false;
+            if self.options.dedicated.is_some() || retained_server {
                 return self.tick_world(running);
             }
             return Ok(());
@@ -5883,6 +5914,8 @@ impl Game<'_> {
     /// What the tick runs after the local player's own update: effects, the
     /// world's entities and blocks, and the network hub.
     fn tick_world(&mut self, running: bool) -> Result<()> {
+        #[cfg(feature = "paired-packages")]
+        self.retained_server_check_running()?;
         self.share_spawn_conditions();
         self.update_chunk_tickets();
         horizon_client::spans::time("tick_effects", || self.tick_effects(running));
@@ -5937,6 +5970,8 @@ impl Game<'_> {
             });
         }
         horizon_client::spans::time("tick_lan", || self.tick_lan(false));
+        #[cfg(feature = "paired-packages")]
+        self.retained_server_check_running()?;
         self.tick_friends();
         horizon_client::spans::time("tick_hand", || self.tick_hand());
         horizon_client::spans::time("tick_sleep", || self.tick_sleep());
@@ -12961,6 +12996,11 @@ impl Game<'_> {
         if let Err(e) = self.poll_remote() {
             log::warn!("Horizon: {e}");
         }
+        #[cfg(feature = "paired-packages")]
+        if self.retained_server.is_none() {
+            self.prepare_lod();
+        }
+        #[cfg(not(feature = "paired-packages"))]
         self.prepare_lod();
         if self.lod.is_some() {
             for &((x, _, z), _, _) in &self.world.light_edits {
@@ -13035,6 +13075,10 @@ impl Game<'_> {
                     .save_later(&modified, self.pack.assets.registry, self.res.biomes())
             })
         {
+            #[cfg(feature = "paired-packages")]
+            if let Some(server) = &mut self.retained_server {
+                server.fail(format!("original native unloaded save: {e}"));
+            }
             log::warn!("Horizon: failed to save unloaded chunks: {e}");
         }
         let (far_distance, far_reduced) = self.far_terrain_choice();
@@ -14706,6 +14750,8 @@ impl<'a> Game<'a> {
             native_checkpoint_origin: None,
             #[cfg(feature = "paired-packages")]
             native_close_authority: None,
+            #[cfg(feature = "paired-packages")]
+            retained_server: None,
             audio,
             music: {
                 // The manager starts with the saved option (MusicManager's constructor).
@@ -14972,6 +15018,9 @@ impl<'a> Game<'a> {
                 game.rand_sequences = random;
                 game.end.set_locator(locator);
                 game.native_checkpoint_origin = origin;
+                if authority.is_server() {
+                    game.retained_server = Some(retained_server::ServerGameState::from_cold());
+                }
                 game.native_close_authority = Some(authority);
                 game.block_ticks = Ticks::new(game.level.seed as i32);
                 game.dim = Dim::Overworld;
@@ -16528,12 +16577,18 @@ pub fn run() -> Result<()> {
     let ParsedLaunch {
         mut options,
         #[cfg(feature = "paired-packages")]
+        retained_server,
+        #[cfg(feature = "paired-packages")]
         retained_remote,
         #[cfg(feature = "paired-packages")]
         native_window,
         #[cfg(feature = "paired-packages")]
         frozen,
     } = parsed;
+    #[cfg(feature = "paired-packages")]
+    if let Some(launch) = retained_server {
+        return retained_server::run(options, launch);
+    }
     #[cfg(feature = "paired-packages")]
     if let Some(launch) = retained_remote {
         return window_close::run_remote(options, launch);

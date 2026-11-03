@@ -251,6 +251,13 @@ impl PlayerSender {
             .as_ref()
             .is_some_and(|owner| Arc::ptr_eq(owner, outbound))
     }
+    #[cfg(feature = "paired-packages")]
+    pub(in crate::lan) fn same_retained_connection(&self, other: &Self) -> bool {
+        match (&self.retained, &other.retained) {
+            (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+            _ => false,
+        }
+    }
     pub fn new(tx: Sender<Out>, pending: Arc<AtomicUsize>) -> Self {
         Self {
             tx,

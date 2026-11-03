@@ -904,6 +904,14 @@ pub(super) struct NativeReady<'window> {
 }
 pub(super) struct NativeDisposed {
     _native_only: (),
+    server_transport: Option<horizon_client::lan::hub::RetainedHubCloseView>,
+}
+impl NativeDisposed {
+    pub(super) fn server_transport(
+        &self,
+    ) -> Option<&horizon_client::lan::hub::RetainedHubCloseView> {
+        self.server_transport.as_ref()
+    }
 }
 fn dormant_async_owners_absent(game: &Game<'_>, allow_constructor_lan: bool) -> bool {
     (allow_constructor_lan || game.lan.is_none())
@@ -925,6 +933,46 @@ fn dormant_async_owners_absent(game: &Game<'_>, allow_constructor_lan: bool) -> 
         && game.renderer.is_none()
 }
 impl NativeReady<'_> {
+    /// This server path keeps the original Ready Hub in Game until native
+    /// projection, metadata acknowledgment and all writers have completed.
+    pub(super) fn try_dispose_server(mut self) -> Result<NativeDisposed, (Self, String)> {
+        let game = self.owner.game.as_ref().unwrap();
+        if !self.owner.native_ready_proven()
+            || !matches!(self.owner.profile, CloseProfile::NativeWorld)
+            || !dormant_async_owners_absent(game, true)
+            || !game
+                .native_close_authority
+                .as_ref()
+                .is_some_and(|authority| authority.is_server() && authority.authorizes(game))
+        {
+            return Err((
+                self,
+                "original server native/transport completion incomplete".into(),
+            ));
+        }
+        let host = self.owner.game.as_mut().unwrap().lan.take();
+        let closed = match host {
+            Some(host) => match host.try_retained_closed() {
+                Ok(closed) => Some(closed),
+                Err(host) => {
+                    self.owner.game.as_mut().unwrap().lan = Some(host);
+                    return Err((
+                        self,
+                        "original server Hub consuming close refused; host restored".into(),
+                    ));
+                }
+            },
+            None => None,
+        };
+        self.owner.armed = false;
+        let server_transport = closed.as_ref().map(|host| host.hub.view());
+        drop(self.owner.game.take());
+        drop(closed);
+        Ok(NativeDisposed {
+            _native_only: (),
+            server_transport,
+        })
+    }
     pub(super) fn observe(&self) -> CloseObservation {
         self.owner.observe()
     }
@@ -975,10 +1023,14 @@ impl NativeReady<'_> {
         // thread. No GPU-driver quiescence or hard Drop latency is asserted.
         drop(self.owner.game.take());
         drop(completion);
-        Ok(NativeDisposed { _native_only: () })
+        Ok(NativeDisposed {
+            _native_only: (),
+            server_transport: None,
+        })
     }
     pub(super) fn try_dispose_dormant(mut self) -> Result<NativeDisposed, (Self, String)> {
         if !self.owner.native_ready_proven()
+            || self.owner.game.as_ref().unwrap().retained_server.is_some()
             || !dormant_async_owners_absent(self.owner.game.as_ref().unwrap(), false)
         {
             return Err((
@@ -990,7 +1042,10 @@ impl NativeReady<'_> {
         // Metadata has already been acknowledged and every native actual handle
         // is terminal; remaining native file/resource owners have no writer.
         drop(self.owner.game.take());
-        Ok(NativeDisposed { _native_only: () })
+        Ok(NativeDisposed {
+            _native_only: (),
+            server_transport: None,
+        })
     }
 }
 
@@ -1488,6 +1543,9 @@ impl<'window> CloseOwner<'window> {
     }
     fn advance(&mut self) -> Result<Option<CloseIoJob>, String> {
         let game = self.game.as_mut().ok_or("original close Game absent")?;
+        if game.retained_server.is_some() && !matches!(self.profile, CloseProfile::NativeWorld) {
+            return Err("retained headless server has no coherent-session admission".into());
+        }
         match self.phase {
             ClosePhase::Resources => {
                 if matches!(self.profile, CloseProfile::CoherentSession { .. })
@@ -2076,7 +2134,10 @@ impl<'window> TestCloseCustody<'window> {
         // The original channel receivers remained in this custody for the whole
         // populated positive; dispose them only together with the proven host.
         self.receivers.clear();
-        Ok(NativeDisposed { _native_only: () })
+        Ok(NativeDisposed {
+            _native_only: (),
+            server_transport: None,
+        })
     }
 }
 

@@ -7588,6 +7588,11 @@ impl Drop for SaveDir {
 pub fn read_dat(path: &Path) -> Option<Tag> {
     read_dat_native(path).ok().flatten()
 }
+/// Read the same native player format without turning IO/codec errors into absence.
+#[cfg(feature = "paired-packages")]
+pub fn read_dat_checked(path: &Path) -> Result<Option<Tag>> {
+    read_dat_native(path)
+}
 fn read_dat_native(path: &Path) -> Result<Option<Tag>> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,

@@ -38,7 +38,9 @@ pub mod chat;
 mod retained;
 pub use retained::HubTransport;
 #[cfg(feature = "paired-packages")]
-pub use retained::{ClosedHub, RetainedHubCloseView, RetainedHubPhase, RetainedHubRefusal};
+pub use retained::{
+    ClosedHub, RetainedHubCloseView, RetainedHubIdentity, RetainedHubPhase, RetainedHubRefusal,
+};
 
 pub mod game_event {
     pub const START_RAINING: u8 = 1;
