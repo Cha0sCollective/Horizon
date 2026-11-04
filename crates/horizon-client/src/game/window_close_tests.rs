@@ -19,11 +19,29 @@ pub(super) fn ordinary_owned_dispatch_refusal_controls(
         request
     };
     let select = || {
-        request().into_ordinary_network(
+        let network = request().into_ordinary_network(
             working,
             Some(original.clone()),
             Instant::now() + Duration::from_secs(120),
-        )
+        );
+        let local = request().into_ordinary_local(
+            working,
+            Some(original.clone()),
+            Instant::now() + Duration::from_secs(120),
+        );
+        assert_eq!(
+            network.is_ok(),
+            local.is_ok(),
+            "ordinary OWN adapters must preserve the same strict route checks"
+        );
+        if let Ok(local) = local {
+            assert_eq!(local.anchor, anchor);
+            assert!(matches!(
+                local.request,
+                retained_server::OrdinaryRequest::RecoverOwned(_)
+            ));
+        }
+        network
     };
     let selected = select().unwrap();
     assert_eq!(selected.anchor, anchor);

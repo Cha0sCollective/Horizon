@@ -271,7 +271,7 @@ fn ordinary_generation(
                         )
                     }
                     local => {
-                        let mut request = ordinary_local_request(local)?;
+                        let request = ordinary_local_request(local)?;
                         let original = frontend
                             .retained
                             .as_ref()
@@ -367,64 +367,111 @@ fn ordinary_generation(
                                 frontend,
                             )
                         } else {
-                            // LOCAL keeps its existing process-owned native
-                            // route until the responsive OWN adapter is ready.
-                            if let Some(original) = original {
-                                request = request.with_ordinary_reopen(original)?;
-                            }
-                            request.check_ordinary_native_entry()?;
+                            let selection = request.into_ordinary_local(
+                                &std::env::current_dir()?,
+                                original,
+                                Instant::now() + Duration::from_secs(120),
+                            )?;
+                            let anchor = selection.anchor;
                             let activated = startup
-                                .activate(
-                                    options.execution_role,
-                                    options.server_thread,
-                                    false,
-                                    &settings,
-                                )
+                                .activate(options.execution_role, false, false, &settings)
                                 .map_err(|refused| refused.reason.clone())?;
-                            let Some(prepared) = prepare_ordinary_in_frame(
-                                event_loop,
-                                frontend,
-                                request,
-                                &resources,
-                                pack.as_ref().unwrap(),
-                                &options,
-                                &settings,
-                                &association,
-                                startup.clone(),
-                            )?
-                            else {
-                                return Ok(None);
+                            let (mut game, construction) = match selection.request {
+                                retained_server::OrdinaryRequest::Native(request) => {
+                                    let Some(prepared) = prepare_ordinary_in_frame(
+                                        event_loop,
+                                        frontend,
+                                        request,
+                                        &resources,
+                                        pack.as_ref().unwrap(),
+                                        &options,
+                                        &settings,
+                                        &association,
+                                        startup.clone(),
+                                    )?
+                                    else {
+                                        return Ok(None);
+                                    };
+                                    let construction =
+                                        Construction::from_prepared(prepared.prepared());
+                                    let mut game = Box::new(Game::new_with_world(&resources,
+                                        pack.take().unwrap(), frontend.gui.take().unwrap(), options.clone(),
+                                        settings, Audio::silent(&root), Some(prepared_cpu),
+                                        InitialGameWorld::Ordinary(Box::new(prepared)))
+                                        .unwrap_or_else(|error| {
+                                            eprintln!("fatal: original ordinary in-frame transfer: {error}");
+                                            std::process::abort();
+                                        }));
+                                    if let Err(original) = game.adopt_activated_startup(activated) {
+                                        eprintln!(
+                                            "fatal: original local runtime association refused: {}",
+                                            original.1
+                                        );
+                                        std::process::abort();
+                                    }
+                                    game.title = None;
+                                    game.screen = Screen::Playing;
+                                    game.restore_ordinary_native_player();
+                                    game.load_world_state();
+                                    (game, construction)
+                                }
+                                retained_server::OrdinaryRequest::RecoverOwned(request) => {
+                                    let Some((gui, tree)) =
+                                        prepare_local_seed_resources(event_loop, frontend, &root)?
+                                    else {
+                                        return Ok(None);
+                                    };
+                                    // Genuine renderer-free, no-world Game on its owning UI thread.
+                                    let mut seed = Box::new(Game::new_with_world(
+                                        &resources,
+                                        pack.as_ref().unwrap().clone(),
+                                        gui,
+                                        options.clone(),
+                                        settings,
+                                        Audio::silent(&root),
+                                        Some(prepared_cpu),
+                                        InitialGameWorld::OrdinaryRecoverySeed(startup.clone()),
+                                    )?);
+                                    if let Err(original) = seed.adopt_activated_startup(activated) {
+                                        eprintln!(
+                                            "fatal: original LOCAL seed runtime association refused: {}",
+                                            original.1
+                                        );
+                                        std::process::abort();
+                                    }
+                                    seed.adv.tree = tree;
+                                    let Some((mut game, construction)) = prepare_owned_in_frame(
+                                        event_loop,
+                                        frontend,
+                                        seed,
+                                        association.clone(),
+                                        *request,
+                                    )?
+                                    else {
+                                        return Ok(None);
+                                    };
+                                    // The original atlas and renderer stayed with Loading throughout.
+                                    // Transfer that same presentation only after actual publication.
+                                    std::mem::swap(&mut game.gui, frontend.gui.as_mut().unwrap());
+                                    let _ = frontend.gui.take();
+                                    let _ = pack.take();
+                                    (game, construction)
+                                }
+                                retained_server::OrdinaryRequest::Recover(_) => {
+                                    return Err("ordinary LOCAL selection returned an unrequested process route".into());
+                                }
                             };
-                            let construction = Construction::from_prepared(prepared.prepared());
-                            let audio = Audio::silent(&root);
-                            let mut game = Game::new_with_world(
-                                &resources,
-                                pack.take().unwrap(),
-                                frontend.gui.take().unwrap(),
-                                options.clone(),
-                                settings,
-                                audio,
-                                Some(prepared_cpu),
-                                InitialGameWorld::Ordinary(Box::new(prepared)),
-                            )
-                            .unwrap_or_else(|error| {
-                                eprintln!("fatal: original ordinary in-frame transfer: {error}");
-                                std::process::abort();
-                            });
-                            if let Err(original) = game.adopt_activated_startup(activated) {
-                                eprintln!(
-                                    "fatal: original local runtime association refused: {}",
-                                    original.1
-                                );
-                                std::process::abort();
+                            game.options.world = Some(anchor.to_string_lossy().into_owned());
+                            if let Some(owned) = game
+                                .session_lock
+                                .as_ref()
+                                .and_then(|session| session.owned())
+                            {
+                                game.local_continuation_archive = Some(owned.archive().to_owned());
                             }
-                            game.title = None;
-                            game.screen = Screen::Playing;
-                            game.restore_ordinary_native_player();
-                            game.load_world_state();
                             install_ordinary_presentation(&mut game, frontend);
                             ordinary_application(
-                                Phase::Running(Box::new(game)),
+                                Phase::Running(game),
                                 &options,
                                 Some(construction),
                                 None,
@@ -635,6 +682,104 @@ fn prepare_ordinary_in_frame(
                 Err(original) => owner = Some(original),
             },
             PreparationCloseStatus::Blocked(_) => blocked = true,
+            PreparationCloseStatus::Pending => {}
+        }
+    }
+}
+
+#[cfg(feature = "mods")]
+fn prepare_local_seed_resources(
+    event_loop: &mut EventLoop<()>,
+    frontend: &mut Loading,
+    root: &std::path::Path,
+) -> Result<Option<(UiResources, Arc<horizon_client::advancements::Tree>)>> {
+    let root = root.to_owned();
+    let defaults = frontend.vanilla_root.clone();
+    let handle = std::thread::Builder::new()
+        .name("LOCAL seed resources".into())
+        .spawn(move || {
+            UiResources::load(&root, &defaults)
+                .map(|gui| {
+                    (
+                        gui,
+                        Arc::new(horizon_client::advancements::Tree::load(&root.join("data"))),
+                    )
+                })
+                .map_err(|error| error.to_string())
+        })?;
+    let state = frontend.retained.as_mut().expect("actual frontend owner");
+    state.preparing = true;
+    state.entry_cancel = false;
+    state.entry_retry = false;
+    let mut cancelled = false;
+    while !handle.is_finished() {
+        pump_ordinary(event_loop, frontend);
+        let state = frontend.retained.as_ref().unwrap();
+        cancelled |= state.entry_cancel || state.close_requested;
+    }
+    let state = frontend.retained.as_mut().unwrap();
+    cancelled |= state.entry_cancel || state.close_requested;
+    state.preparing = false;
+    let resources = handle
+        .join()
+        .map_err(|_| "LOCAL resource loader panicked")??;
+    Ok((!cancelled).then_some(resources))
+}
+
+#[cfg(feature = "mods")]
+fn prepare_owned_in_frame<'a>(
+    event_loop: &mut EventLoop<()>,
+    frontend: &mut Loading,
+    seed: Box<Game<'a>>,
+    entry: RetainedEntryIdentity,
+    request: levels::session_checkpoint::OwnedRecoveryRequest,
+) -> Result<Option<(Box<Game<'a>>, Construction)>> {
+    let mut owner = levels::session_checkpoint::LocalOwnedRecovery::start(seed, entry, request);
+    let state = frontend.retained.as_mut().expect("actual frontend owner");
+    state.preparing = true;
+    state.entry_retry = false;
+    let mut closing = false;
+    let mut blocked = false;
+    let mut reason = None;
+    loop {
+        pump_ordinary(event_loop, frontend);
+        let state = frontend.retained.as_mut().unwrap();
+        let cancelled = state.entry_cancel || state.close_requested;
+        let retry = std::mem::take(&mut state.entry_retry);
+        if !closing {
+            if !cancelled {
+                match owner.poll_activate() {
+                    Ok(Some(game)) => {
+                        let construction = owner
+                            .take_construction()
+                            .expect("original recovered constructor stamp");
+                        frontend.retained.as_mut().unwrap().preparing = false;
+                        return Ok(Some((game, construction)));
+                    }
+                    Ok(None) => continue,
+                    Err(error) => reason = Some(error.to_string()),
+                }
+            }
+            owner.begin_close(Instant::now() + CLOSE_WAIT);
+            closing = true;
+        }
+        if retry && blocked && owner.retry_close(Instant::now() + CLOSE_WAIT).is_ok() {
+            blocked = false;
+        }
+        match owner.poll_close() {
+            PreparationCloseStatus::Complete => {
+                if reason.is_none() {
+                    reason = owner.original_error().map(str::to_owned);
+                }
+                frontend.retained.as_mut().unwrap().preparing = false;
+                return reason.map_or(Ok(None), |reason| Err(reason.into()));
+            }
+            PreparationCloseStatus::Blocked(error) => {
+                if !blocked {
+                    frontend.menu.retained_entry_error(&error);
+                }
+                blocked = true;
+            }
             PreparationCloseStatus::Pending => {}
         }
     }
@@ -902,13 +1047,13 @@ impl Launch {
 
 /// A fixed constructor-issued association. It is never reconstructed from an
 /// observation, pointer address, command, or mutable Game supplied by a caller.
-struct Construction {
+pub(in crate::game) struct Construction {
     save: Arc<SaveDir>,
     world: WorldId,
     root: PathBuf,
 }
 impl Construction {
-    fn from_prepared(prepared: &world_loading::PreparedWorld) -> Self {
+    pub(in crate::game) fn from_prepared(prepared: &world_loading::PreparedWorld) -> Self {
         Self {
             save: prepared.save.clone(),
             world: *prepared
@@ -1955,11 +2100,18 @@ impl Application<'_> {
                     game.clear_ordinary_input();
                     game.capture(false);
                 }
-                Phase::Closing(CloseOwner::begin(
-                    game,
-                    CloseProfile::NativeWorld,
-                    now + CLOSE_WAIT,
-                ))
+                let profile = if game.ordinary_startup.is_some() && game.local_checkpoint_owner() {
+                    game.session_lock
+                        .as_ref()
+                        .and_then(|session| session.owned())
+                        .map(|owned| CloseProfile::CoherentSession {
+                            archive: owned.archive().to_owned(),
+                        })
+                        .unwrap_or(CloseProfile::NativeWorld)
+                } else {
+                    CloseProfile::NativeWorld
+                };
+                Phase::Closing(CloseOwner::begin(game, profile, now + CLOSE_WAIT))
             }
             Phase::Cold(mut cold) => {
                 if let Some(owner) = &mut cold.owner {

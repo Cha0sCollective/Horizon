@@ -926,15 +926,31 @@ impl WorldRequest {
         original: Option<Arc<super::paired_close::OrdinaryClosedWorld>>,
         until: std::time::Instant,
     ) -> Result<OrdinaryNetworkSelection> {
+        self.into_ordinary_owned(working, original, until)
+    }
+    #[cfg(all(feature = "mods", feature = "paired-packages"))]
+    pub(in crate::game) fn into_ordinary_local(
+        self,
+        working: &std::path::Path,
+        original: Option<Arc<super::paired_close::OrdinaryClosedWorld>>,
+        until: std::time::Instant,
+    ) -> Result<OrdinaryNetworkSelection> {
+        self.into_ordinary_owned(working, original, until)
+    }
+    #[cfg(all(feature = "mods", feature = "paired-packages"))]
+    fn into_ordinary_owned(
+        self,
+        working: &std::path::Path,
+        original: Option<Arc<super::paired_close::OrdinaryClosedWorld>>,
+        until: std::time::Instant,
+    ) -> Result<OrdinaryNetworkSelection> {
         use super::retained_server::OrdinaryRequest;
         use host_identity::session_authority::OrdinaryOwnedLayout;
         if self.expected_checkpoint_world.is_some()
             || self.ordinary_reopen.is_some()
             || self.new_owned.is_some()
         {
-            return Err(
-                "ordinary network selection requires its original unacquired request".into(),
-            );
+            return Err("ordinary selection requires its original unacquired request".into());
         }
         let layout = OrdinaryOwnedLayout::checked(working, &self.save_root)?;
         match self.identity_intent {
@@ -977,7 +993,7 @@ impl WorldRequest {
                 })
             }
             IdentityIntent::Legacy => {
-                Err("paired ordinary network selection requires identified native intent".into())
+                Err("paired ordinary selection requires identified native intent".into())
             }
         }
     }

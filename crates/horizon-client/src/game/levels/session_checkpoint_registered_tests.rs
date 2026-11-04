@@ -2366,6 +2366,412 @@ mod local_tests {
         std::mem::forget(f);
     }
 
+    fn ordinary_local_stone_use_control(game: &mut Game<'_>, x: i32) {
+        // Actual loaded native support and a legal current player ray. Exercise
+        // use_item, whose ordinary ownership preflight the old test bypassed.
+        let old_position = game.player.as_ref().unwrap().position;
+        let old_look = (game.yaw, game.pitch);
+        let old_selected = game.selected;
+        let old_stack = game.inventory[2].take();
+        let stone = game
+            .pack
+            .assets
+            .registry
+            .default_state("minecraft:stone")
+            .unwrap();
+        game.world.set(x, 119, 4, stone).unwrap();
+        assert_eq!(game.world.block(x, 120, 4), game.world.air);
+        game.player.as_mut().unwrap().position = Vec3::new(f64::from(x) + 0.5, 120.0, 2.5);
+        game.yaw = 0.0;
+        game.pitch = 45.0;
+        game.sync_player_body();
+        game.inventory[2] = Some(ItemStack::new("minecraft:stone", 1));
+        game.selected = 2;
+        let hit = game.pick().expect("actual LOCAL legal stone ray");
+        assert_eq!(hit.pos, [x, 119, 4]);
+        assert_eq!(hit.face, [0, 1, 0]);
+        assert!(game.ordinary_stone_use_admitted());
+        // Preserve the SAME original constructor while proving the unpublished
+        // interval cannot borrow the cloneable local-source observation alone.
+        let original = game.native_close_authority.take().unwrap();
+        assert!(!game.ordinary_stone_use_admitted());
+        game.native_close_authority = Some(original);
+        let body = game.player.take().unwrap();
+        assert!(!game.ordinary_stone_use_admitted());
+        game.player = Some(body);
+        game.player.as_mut().unwrap().server_copy = true;
+        assert!(!game.ordinary_stone_use_admitted());
+        game.player.as_mut().unwrap().server_copy = false;
+        game.restore_player_state = true;
+        assert!(!game.ordinary_stone_use_admitted());
+        game.restore_player_state = false;
+        game.retained_entry_closing = true;
+        assert!(!game.ordinary_stone_use_admitted());
+        game.retained_entry_closing = false;
+        assert!(game.ordinary_stone_use_admitted());
+        let used = game.stats.get("used", "minecraft:stone");
+        assert!(
+            game.use_item().unwrap().is_some(),
+            "normal use_item must reach native placement"
+        );
+        assert_eq!(game.world.block(x, 120, 4), stone);
+        assert_eq!(game.world.block(x, 119, 4), stone);
+        assert_eq!(game.stats.get("used", "minecraft:stone"), used + 1);
+        assert_eq!(
+            game.inventory[2].as_ref().unwrap().count,
+            1,
+            "actual Creative count stays unchanged"
+        );
+        game.inventory[2] = old_stack;
+        game.selected = old_selected;
+        game.player.as_mut().unwrap().position = old_position;
+        (game.yaw, game.pitch) = old_look;
+        game.sync_player_body();
+        eprintln!(
+            "ORDINARY_LOCAL_NORMAL_USE_ITEM_STONE_PASS x={x} used={}",
+            used + 1
+        );
+    }
+
+    fn ordinary_local_pending_cancel_retry(
+        f: &Materialized,
+        startup: &Arc<crate::game::mod_packages::FrozenHostInputs>,
+        tree: &Arc<horizon_client::advancements::Tree>,
+        case: &Path,
+    ) {
+        use std::sync::atomic::Ordering;
+        let anchor = case.join("world");
+        let before = super::super::tree(&anchor, &["session.lock"]).unwrap();
+        let mut request = WorldRequest::new("unused", None, None, true, None)
+            .unwrap()
+            .with_identity_intent(IdentityIntent::RequireExistingIdentity);
+        request.save_root = anchor.clone();
+        let selected = request.into_ordinary_local(case, None, until()).unwrap();
+        let crate::game::retained_server::OrdinaryRequest::RecoverOwned(request) = selected.request
+        else {
+            panic!("actual pending LOCAL request absent");
+        };
+        let namespace = request.namespace.clone();
+        let destination = request.destination.clone();
+        let contender = destination.parent().unwrap().join("pending-contended");
+        let entry = RetainedEntryIdentity {
+            token: 500,
+            owner: Arc::new(()),
+        };
+        let pause = Arc::new(LocalOwnedWorkerPause::default());
+        let mut owner =
+            LocalOwnedRecovery::start(local_game(f, startup, tree, &entry, None), entry, *request);
+        owner.pause = Some(pause.clone());
+        while !pause.entered.load(Ordering::Acquire) {
+            if let Err(error) = owner.poll_activate() {
+                pause.released.store(true, Ordering::Release);
+                owner.begin_close(until());
+                loop {
+                    match owner.poll_close() {
+                        PreparationCloseStatus::Pending => std::thread::yield_now(),
+                        PreparationCloseStatus::Complete => break,
+                        PreparationCloseStatus::Blocked(reason) => {
+                            panic!("pending LOCAL cleanup {reason}; original {error}")
+                        }
+                    }
+                }
+                panic!("actual LOCAL preparation hold not reached: {error}");
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let held = namespace
+            .acquire_owned_recovery(&anchor, &contender)
+            .is_err();
+        owner.begin_close(Instant::now() + Duration::from_millis(1));
+        let started = Instant::now();
+        let pending = (0..3).all(|_| owner.poll_close() == PreparationCloseStatus::Pending);
+        let poll_time = started.elapsed();
+        std::thread::sleep(Duration::from_millis(5));
+        pause.released.store(true, Ordering::Release);
+        let blocked = loop {
+            match owner.poll_close() {
+                PreparationCloseStatus::Pending => std::thread::yield_now(),
+                PreparationCloseStatus::Blocked(reason) => break Some(reason),
+                PreparationCloseStatus::Complete => break None,
+            }
+        };
+        if blocked.is_some() {
+            owner.retry_close(until()).unwrap();
+            loop {
+                match owner.poll_close() {
+                    PreparationCloseStatus::Pending => std::thread::yield_now(),
+                    PreparationCloseStatus::Complete => break,
+                    PreparationCloseStatus::Blocked(reason) => {
+                        panic!("same LOCAL preparation Retry: {reason}")
+                    }
+                }
+            }
+        }
+        assert!(held && pending && blocked.is_some());
+        assert!(
+            poll_time < Duration::from_millis(200),
+            "pending native result must not join/wait on UI"
+        );
+        assert!(owner.core.work.game.as_ref().unwrap().save.is_none());
+        assert!(owner.core.work.game.as_ref().unwrap().streaming.is_vacant());
+        assert!(owner.core.lease.is_none() && !owner.core.work.armed);
+        assert!(!contender.exists());
+        assert_eq!(
+            super::super::tree(&anchor, &["session.lock"]).unwrap(),
+            before
+        );
+        let released = namespace
+            .acquire_owned_recovery(&anchor, &contender)
+            .unwrap();
+        let archive = released.owned().unwrap().archive().to_owned();
+        assert_eq!(
+            epochs(&archive).unwrap().len(),
+            1,
+            "cancelled unpublished recovery cannot publish"
+        );
+        drop(released);
+        eprintln!(
+            "ORDINARY_LOCAL_PENDING_NATIVE_CANCEL_RETRY_PASS poll_us={}",
+            poll_time.as_micros()
+        );
+    }
+
+    #[test]
+    #[ignore = "isolated ordinary LOCAL OWN routing in two fresh processes of the same executable"]
+    fn ordinary_local_owned_two_processes() {
+        let root =
+            std::env::temp_dir().join(format!("horizon-ordinary-local-{}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        eprintln!("ORDINARY_LOCAL_NATIVE_EVIDENCE_ROOT={}", root.display());
+        let exe = std::env::current_exe().unwrap();
+        let digest = Sha256::digest(fs::read(&exe).unwrap());
+        for phase in ["A", "B"] {
+            let home = root.join(format!("process-{phase}"));
+            fs::create_dir(&home).unwrap();
+            let temp = home.join("temp");
+            fs::create_dir(&temp).unwrap();
+            let mut child = std::process::Command::new(&exe)
+                .args(["--exact", "game::levels::session_checkpoint::tests::registered::local_tests::ordinary_local_owned_child",
+                    "--ignored", "--nocapture", "--test-threads=1"])
+                .env("HORIZON_LOCAL_OWN_PHASE", phase).env("HORIZON_LOCAL_OWN_ROOT", &root)
+                .env("HOME", &home).env("USERPROFILE", &home)
+                .env("XDG_CONFIG_HOME", &home).env("XDG_DATA_HOME", &home).env("XDG_CACHE_HOME", &home)
+                .env("TMPDIR", &temp).env("TMP", &temp).env("TEMP", &temp)
+                .current_dir(&home).spawn().unwrap();
+            let end = Instant::now() + Duration::from_secs(420);
+            let status = loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    break status;
+                }
+                if Instant::now() >= end {
+                    child.kill().unwrap();
+                    let _ = child.wait();
+                    panic!(
+                        "ordinary LOCAL child {phase} deadline; preserved {}",
+                        root.display()
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            assert!(
+                status.success(),
+                "ordinary LOCAL child {phase}; preserved {}",
+                root.display()
+            );
+            assert_eq!(Sha256::digest(fs::read(&exe).unwrap()), digest);
+        }
+        let a: Value = json(&fs::read(root.join("A.json")).unwrap(), STRUCTURED_LIMIT).unwrap();
+        let b: Value = json(&fs::read(root.join("B.json")).unwrap(), STRUCTURED_LIMIT).unwrap();
+        assert_ne!(a["pid"], b["pid"]);
+        assert_eq!(a["executable"], b["executable"]);
+        assert_eq!(b["completed"], true);
+        eprintln!("ORDINARY_LOCAL_FRESH_PROCESSES_UNPLACED_CLAIMED_PASS");
+    }
+    #[test]
+    #[ignore = "child only; invoked by exact ordinary LOCAL owned fixture"]
+    fn ordinary_local_owned_child() {
+        use crate::game::retained_server::OrdinaryRequest;
+        let phase = std::env::var("HORIZON_LOCAL_OWN_PHASE").expect("explicit LOCAL child phase");
+        assert!(matches!(phase.as_str(), "A" | "B"));
+        let root =
+            PathBuf::from(std::env::var_os("HORIZON_LOCAL_OWN_ROOT").expect("explicit LOCAL root"));
+        let f = Materialized::new(&format!("ordinary-local-{phase}"));
+        let (startup, tree) = owned_runtime(&f);
+        for claimed in [false, true] {
+            let case = root.join(if claimed { "claimed" } else { "unplaced" });
+            let anchor = case.join("world");
+            let entry = RetainedEntryIdentity {
+                token: if claimed { 502 } else { 501 },
+                owner: Arc::new(()),
+            };
+            if phase == "A" {
+                fs::create_dir(&case).unwrap();
+                let mut request =
+                    WorldRequest::new("unused", Some("Ordinary LOCAL OWN"), Some(17), true, None)
+                        .unwrap()
+                        .with_identity_intent(IdentityIntent::CreateNewIdentity);
+                request.save_root = anchor.clone();
+                let selected = request.into_ordinary_local(&case, None, until()).unwrap();
+                assert_eq!(selected.anchor, anchor);
+                let OrdinaryRequest::Native(request) = selected.request else {
+                    panic!("genuine NEW native route absent");
+                };
+                let mut game = local_game(&f, &startup, &tree, &entry, Some(request));
+                owned_player(&mut game, &f);
+                ordinary_local_stone_use_control(&mut game, 4);
+                let owned = game.session_lock.as_ref().unwrap().owned().unwrap().clone();
+                assert_eq!(
+                    owned.archive().parent().unwrap(),
+                    case.join("backups/horizon-owned/archives")
+                );
+                assert!(epochs(owned.archive()).unwrap().is_empty());
+                if claimed {
+                    let _ = owned_place(&mut game, &f);
+                }
+                let _closed = close_local(game, owned.archive(), false);
+                assert_eq!(epochs(owned.archive()).unwrap().len(), 1);
+                let record = case
+                    .join("backups/horizon-owned/authority")
+                    .join(owned.world().to_string())
+                    .join("owned.json");
+                fs::write(case.join("owned-before.json"), fs::read(record).unwrap()).unwrap();
+            } else {
+                if !claimed {
+                    ordinary_local_pending_cancel_retry(&f, &startup, &tree, &case);
+                }
+                let mut request = WorldRequest::new("unused", None, None, true, None)
+                    .unwrap()
+                    .with_identity_intent(IdentityIntent::RequireExistingIdentity);
+                request.save_root = anchor.clone();
+                let selected = request.into_ordinary_local(&case, None, until()).unwrap();
+                assert_eq!(selected.anchor, anchor);
+                let OrdinaryRequest::RecoverOwned(request) = selected.request else {
+                    panic!("original-anchor OWN route absent");
+                };
+                let destination = request.destination.clone();
+                let seed = local_game(&f, &startup, &tree, &entry, None);
+                assert!(
+                    seed.renderer.is_none() && seed.save.is_none() && seed.streaming.is_vacant()
+                );
+                let mut owner = LocalOwnedRecovery::start(seed, entry, *request);
+                let mut polls = 0;
+                let mut game = loop {
+                    polls += 1;
+                    match owner.poll_activate() {
+                        Ok(Some(game)) => break game,
+                        Ok(None) => std::thread::sleep(Duration::from_millis(1)),
+                        Err(error) => {
+                            owner.begin_close(until());
+                            loop {
+                                match owner.poll_close() {
+                                    PreparationCloseStatus::Pending => std::thread::yield_now(),
+                                    PreparationCloseStatus::Complete => break,
+                                    PreparationCloseStatus::Blocked(reason) => panic!(
+                                        "LOCAL failed recovery close: {reason}; original {error}"
+                                    ),
+                                }
+                            }
+                            panic!("ordinary LOCAL recovery refused: {error}");
+                        }
+                    }
+                };
+                assert!(polls > 1 && owner.take_construction().is_some());
+                assert!(game.native_close_owner_authorized() && game.local_checkpoint_owner());
+                assert_eq!(game.world_root, destination);
+                assert_ne!(game.world_root, anchor);
+                let owned = game.session_lock.as_ref().unwrap().owned().unwrap().clone();
+                assert_eq!(
+                    game.local_continuation_archive.as_deref(),
+                    Some(owned.archive())
+                );
+                assert_eq!(game.stats.get("custom", "minecraft:jump"), 7);
+                let body = game.player.as_ref().unwrap();
+                assert!(!body.server_copy && body.flying);
+                assert_eq!(body.velocity, Vec3::new(0.125, -0.25, 0.5));
+                assert_eq!([body.yaw, body.pitch], [91.0, -17.0]);
+                assert_eq!(body.health.food.exhaustion, 2.25);
+                assert!(!game.ui.rules.bool("spawn_mobs"));
+                assert!(game.lan.is_none() && game.retained_server.is_none());
+                ordinary_local_stone_use_control(&mut game, 6);
+                if claimed {
+                    let GuestRuntimeState::ReadyActive { counter, slot } =
+                        game.world.guest_runtime_state().unwrap()
+                    else {
+                        panic!("actual restored Guest pair absent");
+                    };
+                    assert_eq!(
+                        game.world
+                            .read_persistent_counter(&counter)
+                            .unwrap()
+                            .counter(),
+                        1
+                    );
+                    let mut rich = session_items_rich();
+                    rich.count = 3;
+                    retirement_raw_equal(
+                        game.world
+                            .read_world_slot(&slot)
+                            .unwrap()
+                            .slot
+                            .stack()
+                            .unwrap(),
+                        &rich,
+                    );
+                    rich.count = 4;
+                    retirement_raw_equal(game.inventory[1].as_ref().unwrap(), &rich);
+                } else {
+                    let binding = crate::game::world_loading::owned_guest_binding(
+                        &game.options.mod_packages,
+                        game.pack.assets.registry,
+                    )
+                    .unwrap();
+                    game.session_lock
+                        .as_ref()
+                        .unwrap()
+                        .validate_owned_unplaced(&game.world, &binding)
+                        .unwrap();
+                    assert!(game.world.counter_domain_snapshot().is_none());
+                    assert_eq!(game.inventory[1].as_ref().unwrap().count, 7);
+                }
+                let record = case
+                    .join("backups/horizon-owned/authority")
+                    .join(owned.world().to_string())
+                    .join("owned.json");
+                assert_eq!(
+                    fs::read(&record).unwrap(),
+                    fs::read(case.join("owned-before.json")).unwrap()
+                );
+                let before = epochs(owned.archive()).unwrap();
+                let _closed = close_local(game, owned.archive(), false);
+                let after = epochs(owned.archive()).unwrap();
+                assert_eq!(after.len(), before.len() + 1);
+                assert!(after.last().unwrap().0 > before.last().unwrap().0);
+                assert_eq!(
+                    fs::read(&record).unwrap(),
+                    fs::read(case.join("owned-before.json")).unwrap()
+                );
+                eprintln!(
+                    "ORDINARY_LOCAL_B_RESTORED claimed={claimed} polls={polls} epoch={}",
+                    after.last().unwrap().0
+                );
+            }
+        }
+        let executable = format!(
+            "{:x}",
+            Sha256::digest(fs::read(std::env::current_exe().unwrap()).unwrap())
+        );
+        fs::write(
+            root.join(format!("{phase}.json")),
+            serde_json::to_vec(&serde_json::json!({
+                "phase":phase,"pid":std::process::id(),"executable":executable,"completed":true
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        eprintln!("ORDINARY_LOCAL_CHILD_{phase}_PASS");
+        std::mem::forget(f);
+    }
+
     #[test]
     #[ignore = "isolated captured pair and native resources: actual ordinary LOCAL body, coherent Retry, unpublished recovery and cancellation"]
     fn ordinary_local_actual_body_coherent_retry_recovery_and_cancel() {

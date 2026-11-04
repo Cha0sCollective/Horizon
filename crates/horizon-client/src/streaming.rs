@@ -3054,6 +3054,18 @@ impl Streaming {
             Self::native_fence_wait(deadline)?;
         }
     }
+    /// Observe the current native producer/written predicate without servicing it.
+    /// This neither fences work nor polls storage, and issues no transferable
+    /// readiness or admission. A staged caller must retain the original native
+    /// owners, exclude scheduling and poll every actual writer before this fresh
+    /// observation under the same exclusive owner borrow.
+    #[cfg(feature = "paired-packages")]
+    pub fn native_write_fence_current(&self) -> crate::Result<bool> {
+        if self.retained_sealed() {
+            return Err("retained producer submissions are sealed".into());
+        }
+        Ok(self.native_fence_producers_closed()? && self.written.is_empty())
+    }
     fn native_fence_deadline(deadline: std::time::Instant) -> crate::Result<()> {
         if std::time::Instant::now() >= deadline {
             return Err("native write fence deadline exceeded".into());
@@ -9814,6 +9826,86 @@ mod native_work_tests {
         }
         fn short() -> Instant {
             Instant::now() + Duration::from_millis(30)
+        }
+
+        #[cfg(feature = "paired-packages")]
+        #[test]
+        #[ignore = "owned prepared resources: actual current native fence observation"]
+        fn native_write_fence_current_observes_without_servicing() {
+            let (mut streaming, probe, workers, events, mut init) = fixture(1, false, false, false);
+            workers.recv_timeout(WAIT).unwrap();
+            init.release();
+            initialized(&streaming, 1);
+            let before = format!("{:?}", streaming.observe_native_work());
+            assert!(streaming.native_write_fence_current().unwrap());
+            assert_eq!(format!("{:?}", streaming.observe_native_work()), before);
+            let mut held = gate(&probe, NativeWorkOrigin::Generate);
+            streaming.generating.insert((0, 0));
+            streaming.submit(None, 0, Job::Generate(0, 0));
+            assert_eq!(
+                events.recv_timeout(WAIT).unwrap(),
+                NativeWorkOrigin::Generate
+            );
+            let before = counts(&streaming, NativeWorkOrigin::Generate);
+            let order = streaming.order;
+            assert!(!streaming.native_write_fence_current().unwrap());
+            assert_eq!(counts(&streaming, NativeWorkOrigin::Generate), before);
+            assert_eq!(streaming.order, order);
+            assert!(streaming.deferred.is_empty());
+            held.release();
+            streaming.wait(WAIT);
+            assert!(!streaming.native_write_fence_current().unwrap());
+            assert_eq!(streaming.deferred.len(), 1);
+            assert_eq!(counts(&streaming, NativeWorkOrigin::Generate).returned, 1);
+            streaming
+                .native_write_fence_until(&mut world(), Instant::now() + WAIT, || Ok(true))
+                .unwrap();
+            assert!(streaming.native_write_fence_current().unwrap());
+
+            for failure in [false, true] {
+                let (mut streaming, probe, workers, _events, mut init) =
+                    fixture(1, false, false, false);
+                workers.recv_timeout(WAIT).unwrap();
+                if failure {
+                    *probe.failure.lock().unwrap() =
+                        Some("controlled proto enqueue failure".into());
+                }
+                let region = Box::new(std::array::from_fn(|i| {
+                    payload(301 + i as u64, (i as i32 % 3 - 1, i as i32 / 3 - 1)).0
+                }));
+                streaming.decorating = 1;
+                streaming.submit(None, 0, Job::Decorate(0, 0, region));
+                init.release();
+                streaming.wait(WAIT);
+                streaming.reconcile_native_fence_results(&mut world());
+                assert_eq!(streaming.written.len(), 9);
+                let before = format!("{:?}", streaming.observe_native_work());
+                let written = streaming.written.clone();
+                let order = streaming.order;
+                assert!(!streaming.native_write_fence_current().unwrap());
+                assert_eq!(streaming.written, written);
+                assert_eq!(streaming.order, order);
+                assert_eq!(format!("{:?}", streaming.observe_native_work()), before);
+                assert!(probe.seen.lock().unwrap().is_empty());
+                let closed =
+                    streaming
+                        .native_write_fence_until(&mut world(), Instant::now() + WAIT, || Ok(true));
+                assert_eq!(closed.is_err(), failure);
+                if failure {
+                    assert!(streaming.native_write_fence_current().is_err());
+                    assert_eq!(streaming.written, written);
+                } else {
+                    assert!(streaming.native_write_fence_current().unwrap());
+                }
+            }
+            let (mut streaming, _probe, workers, _events, mut init) =
+                fixture(1, false, true, false);
+            workers.recv_timeout(WAIT).unwrap();
+            init.release();
+            for worker in streaming.threads.drain(..) {
+                assert!(worker.join().is_err());
+            }
+            assert!(streaming.native_write_fence_current().is_err());
         }
 
         #[test]

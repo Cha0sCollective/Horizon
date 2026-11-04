@@ -69,6 +69,14 @@ impl CheckedSessionItems {
         resident: &BTreeSet<(i32, i32)>,
         queued: &[((i32, i32), Vec<Tag>)],
     ) -> SResult<()> {
+        self.check_arrivals_context(&SessionValidationContext::from_game(game), resident, queued)
+    }
+    pub(super) fn check_arrivals_context(
+        &self,
+        context: &SessionValidationContext,
+        resident: &BTreeSet<(i32, i32)>,
+        queued: &[((i32, i32), Vec<Tag>)],
+    ) -> SResult<()> {
         require(
             self.columns().is_subset(resident),
             "item columns not all resident",
@@ -90,7 +98,7 @@ impl CheckedSessionItems {
                 "unexpected/duplicate entity arrival column",
             )?;
             for tag in tags {
-                insert_item(game, &mut actual, tag, *at)?;
+                insert_item_context(context, &mut actual, tag, *at)?;
             }
         }
         require(

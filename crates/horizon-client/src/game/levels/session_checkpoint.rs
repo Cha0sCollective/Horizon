@@ -2367,6 +2367,54 @@ struct NativeSnapshot {
     random: u64,
     entity_head: u32,
 }
+/// Immutable actual-state projection captured while the original Game remains
+/// unpublished and frozen. Native encoding belongs to the retained validation
+/// worker; the original synchronous callers use the same encoder immediately.
+struct NativeSnapshotInput {
+    players: Vec<SessionPlayerRow>,
+    chunks: Vec<Arc<Chunk>>,
+    tables: Option<Arc<save::SaveTables>>,
+    raids: Option<Tag>,
+    items: ItemProjection,
+    item_memory: crate::game::persist::SessionItemMemoryProjection,
+    item_portals: crate::game::nether_portal::SessionItemPortalProjection,
+    clocks: (i64, i64),
+    random: u64,
+    entity_head: u32,
+}
+impl NativeSnapshotInput {
+    fn encode(self, context: &SessionValidationContext) -> SResult<NativeSnapshot> {
+        let mut columns = BTreeMap::new();
+        for chunk in &self.chunks {
+            let named = save::encode_with(
+                chunk,
+                context.assets.registry,
+                context.res.biomes(),
+                self.tables.as_deref(),
+                LevelShape::OVERWORLD,
+            );
+            columns.insert((chunk.x, chunk.z), named);
+        }
+        for row in &self.players {
+            context.validate_player(&row.player)?;
+            let _ = nbt_bytes(&row.player)?;
+            let _ = json_bytes(&row.advancements, STRUCTURED_LIMIT)?;
+            let _ = json_bytes(&row.stats, STRUCTURED_LIMIT)?;
+        }
+        Ok(NativeSnapshot {
+            players: self.players,
+            residents: columns.keys().copied().collect(),
+            columns,
+            raids: self.raids,
+            items: self.items,
+            item_memory: self.item_memory,
+            item_portals: self.item_portals,
+            clocks: self.clocks,
+            random: self.random,
+            entity_head: self.entity_head,
+        })
+    }
+}
 impl std::ops::Deref for Snapshot {
     type Target = NativeSnapshot;
     fn deref(&self) -> &Self::Target {
@@ -4501,6 +4549,15 @@ impl Game<'_> {
         local_uuid: [i32; 4],
         players: Vec<SessionPlayerRow>,
     ) -> SResult<NativeSnapshot> {
+        self.capture_native_snapshot_input(raids, local_uuid, players)?
+            .encode(&SessionValidationContext::from_game(self))
+    }
+    fn capture_native_snapshot_input(
+        &self,
+        raids: Option<Tag>,
+        local_uuid: [i32; 4],
+        players: Vec<SessionPlayerRow>,
+    ) -> SResult<NativeSnapshotInput> {
         self.session_context_cpu()?;
         checked(self.inspect_session_checkpoint_owners())?;
         let items = self.project_session_checkpoint_items()?;
@@ -4521,36 +4578,18 @@ impl Game<'_> {
                 "dedicated cached local player authority",
             )?;
         }
-        let mut columns = BTreeMap::new();
-        for chunk in self.world.chunks.values() {
-            // Every resident uses the exact current native save projection,
-            // including ticks and inhabited time, without changing dirty markers.
-            let saved = self.with_entities([chunk]).remove(0);
-            let named = save::encode_with(
-                &saved,
-                self.pack.assets.registry,
-                self.res.biomes(),
-                self.save
-                    .as_ref()
-                    .ok_or_else(|| fail("native storage owner absent"))?
-                    .tables
-                    .get()
-                    .map(Arc::as_ref),
-                LevelShape::OVERWORLD,
-            );
-            columns.insert((chunk.x, chunk.z), named);
-        }
-        let residents = columns.keys().copied().collect();
-        for row in &players {
-            SessionValidationContext::from_game(self).validate_player(&row.player)?;
-            let _ = nbt_bytes(&row.player)?;
-            let _ = json_bytes(&row.advancements, STRUCTURED_LIMIT)?;
-            let _ = json_bytes(&row.stats, STRUCTURED_LIMIT)?;
-        }
-        Ok(NativeSnapshot {
+        let chunks = self.with_entities(self.world.chunks.values());
+        let tables = self
+            .save
+            .as_ref()
+            .ok_or_else(|| fail("native storage owner absent"))?
+            .tables
+            .get()
+            .cloned();
+        Ok(NativeSnapshotInput {
             players,
-            columns,
-            residents,
+            chunks,
+            tables,
             raids,
             items,
             item_memory,
@@ -5364,66 +5403,371 @@ impl RecoveryData {
         }
     }
 }
-impl<'a> SessionRecoveryWork<'a> {
-    fn reconcile_ordinary_reads(
-        game: &Game<'_>,
-        prepared: &mut crate::game::world_loading::PreparedWorld,
-        columns: &BTreeMap<(i32, i32), Arc<Chunk>>,
-    ) -> SResult<()> {
-        let context = game.capture_native_validation_context();
-        let accepted = BTreeSet::new();
-        while let Some(view) = checked(prepared.streaming.poll_retained_open_load())? {
-            let load = view.load();
-            if let Some(error) = load.error() {
-                return Err(fail(error));
-            }
-            let chunk = load
-                .chunk()
-                .ok_or_else(|| fail("ordinary recovery read has no native column"))?;
-            let result = checked(
-                crate::game::world_loading::validate_retained_column_context(
-                    &context,
-                    &game.pack,
-                    &game.res,
-                    &game.persist.uuids,
-                    &prepared.save_root,
-                    Some(&prepared.level),
-                    Some(&prepared.world),
-                    Some(&prepared.session_lock),
-                    &prepared.save,
-                    prepared.native_checkpoint_origin.as_ref(),
-                    &accepted,
-                    chunk,
-                    load.evidence(),
-                ),
-            )?;
-            match result {
-                None => break,
-                Some((horizon_client::streaming::RetainedColumnDisposition::AlreadyStored, _)) => {}
-                Some(_) => {
-                    return Err(fail(
-                        "ordinary recovery cannot adopt freshly generated saved input",
-                    ));
-                }
-            }
-            let expected = columns.get(&(chunk.x, chunk.z)).ok_or_else(|| {
-                fail("ordinary recovered original read is outside verified native image")
-            })?;
-            let encoded = save::encode(expected, game.pack.assets.registry, game.res.biomes());
-            checked(crate::game::world_loading::validate_retained_projection(
-                chunk, &encoded, expected,
-            ))?;
-            let ticket = view.into_ticket();
-            if !checked(
-                prepared
-                    .streaming
-                    .accept_retained_open_load(ticket, &mut prepared.world),
-            )? {
-                break;
+/// Actual immutable loader inputs captured from one fresh Game. Native workers
+/// own preparations and leases, never a surrogate Game or its renderer/evaluator.
+struct NativePreparationInputs {
+    context: SessionValidationContext,
+    pack: crate::game::PackResources,
+    options: crate::game::Options,
+    settings: crate::game::Settings,
+    uuids: std::collections::HashMap<u32, [i32; 4]>,
+}
+impl NativePreparationInputs {
+    fn capture(game: &Game<'_>) -> Self {
+        Self {
+            context: game.capture_native_validation_context(),
+            pack: game.pack.clone(),
+            options: game.options.clone(),
+            settings: game.settings.clone(),
+            uuids: game.persist.uuids.clone(),
+        }
+    }
+}
+fn reconcile_native_recovery_reads(
+    inputs: &NativePreparationInputs,
+    prepared: &mut crate::game::world_loading::PreparedWorld,
+    columns: &BTreeMap<(i32, i32), Arc<Chunk>>,
+) -> SResult<()> {
+    let accepted = BTreeSet::new();
+    while let Some(view) = checked(prepared.streaming.poll_retained_open_load())? {
+        let load = view.load();
+        if let Some(error) = load.error() {
+            return Err(fail(error));
+        }
+        let chunk = load
+            .chunk()
+            .ok_or_else(|| fail("ordinary recovery read has no native column"))?;
+        let result = checked(
+            crate::game::world_loading::validate_retained_column_context(
+                &inputs.context,
+                &inputs.pack,
+                &inputs.context.res,
+                &inputs.uuids,
+                &prepared.save_root,
+                Some(&prepared.level),
+                Some(&prepared.world),
+                Some(&prepared.session_lock),
+                &prepared.save,
+                prepared.native_checkpoint_origin.as_ref(),
+                &accepted,
+                chunk,
+                load.evidence(),
+            ),
+        )?;
+        match result {
+            None => break,
+            Some((horizon_client::streaming::RetainedColumnDisposition::AlreadyStored, _)) => {}
+            Some(_) => {
+                return Err(fail(
+                    "ordinary recovery cannot adopt freshly generated saved input",
+                ));
             }
         }
-        Ok(())
+        let expected = columns.get(&(chunk.x, chunk.z)).ok_or_else(|| {
+            fail("ordinary recovered original read is outside verified native image")
+        })?;
+        let encoded = save::encode(
+            expected,
+            inputs.pack.assets.registry,
+            inputs.context.res.biomes(),
+        );
+        checked(crate::game::world_loading::validate_retained_projection(
+            chunk, &encoded, expected,
+        ))?;
+        let ticket = view.into_ticket();
+        if !checked(
+            prepared
+                .streaming
+                .accept_retained_open_load(ticket, &mut prepared.world),
+        )? {
+            break;
+        }
     }
+    Ok(())
+}
+#[allow(clippy::too_many_arguments)]
+fn load_native_recovery_preparation(
+    inputs: &NativePreparationInputs,
+    retained: &mut Option<RecoveryPreparation>,
+    ordinary: Option<&(
+        crate::game::world_loading::RetainedEntryIdentity,
+        Arc<crate::game::mod_packages::FrozenHostInputs>,
+    )>,
+    local: Option<&LocalRecoveryPreparation>,
+    world: WorldId,
+    destination: &Path,
+    until: Instant,
+    native: &VerifiedNativeView<'_>,
+    mut centers: BTreeSet<(i32, i32)>,
+    center: (i32, i32),
+    #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))] target: Option<
+        CounterTarget,
+    >,
+    #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+        mut item_load_test: Option<&mut SessionItemLoadTest>,
+) -> SResult<((i64, i64), u64)> {
+    let coverage = required_coverage(&centers)?;
+    for at in &coverage {
+        require(
+            native.columns.contains_key(at),
+            "recovery required native full coverage missing before loader",
+        )?;
+    }
+    centers.extend(native.items.columns());
+    require(centers.len() <= NODES, "recovery load center union bound")?;
+    let world_inventory = tree(&native.selected.join("world"), &[])?;
+    copy_tree(
+        &native.selected.join("world"),
+        destination,
+        &world_inventory,
+        until,
+    )?;
+    require(
+        tree(&native.selected.join("world"), &[])? == world_inventory,
+        "selected image changed during recovery copy",
+    )?;
+    sync_tree(destination)?;
+    sync_dir(
+        destination
+            .parent()
+            .ok_or_else(|| fail("native destination parent"))?,
+    )?;
+    let mut open = checked(WorldRequest::new(
+        destination
+            .to_str()
+            .ok_or_else(|| fail("destination UTF8"))?,
+        None,
+        None,
+        false,
+        None,
+    ))?;
+    open.save_root = destination.to_owned();
+    let open = open.with_expected_checkpoint_world(world);
+    *retained = Some(if let Some((entry, startup)) = ordinary {
+        let preparation = crate::game::world_loading::OrdinaryPreparation::prepare_recovery(
+            open,
+            &inputs.context.res,
+            &inputs.pack,
+            &inputs.options,
+            &inputs.settings,
+            entry,
+            startup.clone(),
+            local,
+        );
+        match preparation.into_prepared(entry) {
+            Ok(prepared) => RecoveryPreparation::Ordinary(prepared),
+            Err(preparation) => {
+                let reason = preparation
+                    .original_error()
+                    .unwrap_or("ordinary recovery preparation transfer refused")
+                    .to_owned();
+                *retained = Some(RecoveryPreparation::Failed(preparation));
+                return Err(fail(reason));
+            }
+        }
+    } else {
+        RecoveryPreparation::Legacy(checked(open.prepare(
+            &inputs.context.res,
+            &inputs.pack,
+            &inputs.options,
+            &inputs.settings,
+        ))?)
+    });
+    let prepared = retained
+        .as_mut()
+        .expect("original acquired preparation")
+        .prepared_mut();
+    // Retain the newly acquired native lock while rechecking complete bytes,
+    // identity and packages; native APIs have no permission to regenerate.
+    require(
+        prepared.session_lock.expected_world() == Some(&world),
+        "locked native identity",
+    )?;
+    identity(destination, world)?;
+    require(
+        tree(destination, &["session.lock"])? == world_inventory,
+        "recovery copy changed under native lock",
+    )?;
+    checked(inputs.options.mod_packages.check_world(destination))?;
+    let under_lock = columns_context(&inputs.context, destination, native.saved_clock)?;
+    let locked_items = items::read_session_checkpoint_items_context(
+        &inputs.context,
+        destination,
+        &native.residents.iter().copied().collect(),
+        &under_lock,
+    )?;
+    require(
+        locked_items.projection == native.items.projection,
+        "locked native entity projection changed",
+    )?;
+    for at in &coverage {
+        require(
+            under_lock.contains_key(at),
+            "locked native coverage missing",
+        )?;
+    }
+    require(
+        prepared.native_checkpoint_origin.is_some() && prepared.locator.is_none(),
+        "recovery requires witnessed TestTerrain native provider",
+    )?;
+    require(
+        prepared.world.game_time == native.saved_clock,
+        "prepared native clock",
+    )?;
+    // Declared after `prepared`: on any failure the owned receipt releases
+    // BEFORE prepared Streaming is dropped and its actual workers are joined.
+    #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+    let mut item_load_receipt = None;
+    #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+    if let Some(test) = item_load_test.as_deref_mut() {
+        require(
+            native.items.columns().contains(&test.column)
+                && !player_centers(
+                    native.players,
+                    target
+                        .as_ref()
+                        .ok_or_else(|| fail("item-load control needs claimed target"))?,
+                )?
+                .contains(&test.column)
+                && !prepared.world.chunks.contains_key(&test.column),
+            "item load test requires an unarrived verified distant item column",
+        )?;
+        let receipt = checked(
+            prepared
+                .streaming
+                .arm_native_column_load_test_control(test.column),
+        )?;
+        test.observer = Some(receipt.observer());
+        if matches!(test.mode, SessionItemLoadTestMode::DropBeforeEntry) {
+            drop(receipt);
+        } else {
+            item_load_receipt = Some(receipt);
+        }
+    }
+    let clocks = (prepared.world.game_time, prepared.world.day_time);
+    let recovery_random = prepared.world.random.state();
+    prepared.streaming.radius = 0;
+    prepared.streaming.extra = centers.iter().copied().map(|at| (at, 0)).collect();
+    require(
+        prepared.streaming.forced.is_empty(),
+        "recovery forced native producer",
+    )?;
+
+    for &center in &centers {
+        prepared.streaming.center = center;
+        loop {
+            deadline(until)?;
+            let _ = prepared.streaming.update(&mut prepared.world);
+            if ordinary.is_some() {
+                reconcile_native_recovery_reads(inputs, prepared, &under_lock)?;
+            }
+            #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+            if item_load_test.as_ref().is_some_and(|test| {
+                matches!(test.mode, SessionItemLoadTestMode::ReleaseAfterEntry)
+                    && test
+                        .observer
+                        .as_ref()
+                        .is_some_and(|observer| observer.entered())
+            }) && let Some(mut receipt) = item_load_receipt.take()
+            {
+                checked(receipt.wait_entered(until.saturating_duration_since(Instant::now())))?;
+                receipt.release();
+            }
+            require(
+                (prepared.world.game_time, prepared.world.day_time) == clocks,
+                "streaming advanced native clocks",
+            )?;
+            require(
+                prepared.world.random.state() == recovery_random,
+                "streaming drew from native world random",
+            )?;
+            if prepared.world.chunks.contains_key(&center) {
+                break;
+            }
+            std::thread::yield_now();
+        }
+    }
+    // Return center to the machine while real arrivals may enlarge residency.
+    prepared.streaming.center = center;
+    if ordinary.is_some() {
+        // Every outstanding original saved read must be consumed before the
+        // existing native fence; that fence intentionally never adopts reads.
+        loop {
+            deadline(until)?;
+            let _ = prepared.streaming.update(&mut prepared.world);
+            reconcile_native_recovery_reads(inputs, prepared, &under_lock)?;
+            let work = prepared.streaming.observe_native_work();
+            require(
+                !work.accounting_fault
+                    && !work.receipt_mismatch
+                    && !work.worker_initialization_fault
+                    && !work.worker_exit_fault
+                    && !work.result_disconnected
+                    && !work.stopped,
+                "ordinary recovery native read ownership fault",
+            )?;
+            let (_, generated) = work
+                .origins
+                .iter()
+                .find(|(origin, _)| {
+                    *origin == horizon_client::streaming::NativeWorkOrigin::Generate
+                })
+                .unwrap();
+            require(
+                generated.unresolved == 0,
+                "ordinary recovery has unresolved original reads",
+            )?;
+            if generated.queued == 0
+                && generated.worker_held == 0
+                && generated.returned == 0
+                && generated.reconciling == 0
+            {
+                break;
+            }
+            std::thread::yield_now();
+        }
+    }
+    let save = prepared.save.clone();
+    checked(
+        prepared
+            .streaming
+            .native_write_fence_until(&mut prepared.world, until, || save.writes_finished()),
+    )?;
+    require(
+        (prepared.world.game_time, prepared.world.day_time) == clocks,
+        "fence advanced native clocks",
+    )?;
+    require(
+        prepared.world.random.state() == recovery_random,
+        "recovery fence drew from native world random",
+    )?;
+    for (at, chunk) in &prepared.world.chunks {
+        let expected = under_lock
+            .get(at)
+            .ok_or_else(|| fail("unexpected regenerated native arrival"))?;
+        let a = save::encode(
+            chunk,
+            inputs.pack.assets.registry,
+            inputs.context.res.biomes(),
+        );
+        let b = save::encode(
+            expected,
+            inputs.pack.assets.registry,
+            inputs.context.res.biomes(),
+        );
+        require(
+            lan::session_player_tags_equal(&a.tag, &b.tag),
+            "native arrival changed saved semantics",
+        )?;
+    }
+    native.items.check_arrivals_context(
+        &inputs.context,
+        &prepared.world.chunks.keys().copied().collect(),
+        &prepared.world.loaded_entities,
+    )?;
+    Ok((clocks, recovery_random))
+}
+impl<'a> SessionRecoveryWork<'a> {
     fn legacy(game: Box<Game<'a>>) -> Self {
         Self {
             game: Some(game),
@@ -5441,271 +5785,42 @@ impl<'a> SessionRecoveryWork<'a> {
         destination: &Path,
         until: Instant,
         native: &VerifiedNativeView<'_>,
-        mut centers: BTreeSet<(i32, i32)>,
+        centers: BTreeSet<(i32, i32)>,
         center: (i32, i32),
         #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))] target: Option<
             CounterTarget,
         >,
         #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
-        mut item_load_test: Option<&mut SessionItemLoadTest>,
+        item_load_test: Option<&mut SessionItemLoadTest>,
     ) -> SResult<((i64, i64), u64)> {
         let game = self
             .game
-            .as_mut()
+            .as_ref()
             .expect("same original recovery candidate");
-        let coverage = required_coverage(&centers)?;
-        for at in &coverage {
+        let mut inputs = NativePreparationInputs::capture(game);
+        if let Some(local) = &self.local {
             require(
-                native.columns.contains_key(at),
-                "recovery required native full coverage missing before loader",
+                local.context.same_owners(game),
+                "LOCAL native decoder owners changed",
             )?;
+            inputs.context = local.context.clone();
         }
-        centers.extend(native.items.columns());
-        require(centers.len() <= NODES, "recovery load center union bound")?;
-        let world_inventory = tree(&native.selected.join("world"), &[])?;
-        copy_tree(
-            &native.selected.join("world"),
+        load_native_recovery_preparation(
+            &inputs,
+            &mut self.preparation,
+            self.ordinary.as_ref(),
+            self.local.as_ref(),
+            world,
             destination,
-            &world_inventory,
             until,
-        )?;
-        require(
-            tree(&native.selected.join("world"), &[])? == world_inventory,
-            "selected image changed during recovery copy",
-        )?;
-        sync_tree(destination)?;
-        sync_dir(
-            destination
-                .parent()
-                .ok_or_else(|| fail("native destination parent"))?,
-        )?;
-        let mut open = checked(WorldRequest::new(
-            destination
-                .to_str()
-                .ok_or_else(|| fail("destination UTF8"))?,
-            None,
-            None,
-            false,
-            None,
-        ))?;
-        open.save_root = destination.to_owned();
-        let open = open.with_expected_checkpoint_world(world);
-        self.preparation = Some(if let Some((entry, startup)) = self.ordinary.as_ref() {
-            let preparation = crate::game::world_loading::OrdinaryPreparation::prepare_recovery(
-                open,
-                &game.res,
-                &game.pack,
-                &game.options,
-                &game.settings,
-                entry,
-                startup.clone(),
-                self.local.as_ref(),
-            );
-            match preparation.into_prepared(entry) {
-                Ok(prepared) => RecoveryPreparation::Ordinary(prepared),
-                Err(preparation) => {
-                    let reason = preparation
-                        .original_error()
-                        .unwrap_or("ordinary recovery preparation transfer refused")
-                        .to_owned();
-                    self.preparation = Some(RecoveryPreparation::Failed(preparation));
-                    return Err(fail(reason));
-                }
-            }
-        } else {
-            RecoveryPreparation::Legacy(checked(open.prepare(
-                &game.res,
-                &game.pack,
-                &game.options,
-                &game.settings,
-            ))?)
-        });
-        let prepared = self
-            .preparation
-            .as_mut()
-            .expect("original acquired preparation")
-            .prepared_mut();
-        // Retain the newly acquired native lock while rechecking complete bytes,
-        // identity and packages; native APIs have no permission to regenerate.
-        require(
-            prepared.session_lock.expected_world() == Some(&world),
-            "locked native identity",
-        )?;
-        identity(destination, world)?;
-        require(
-            tree(destination, &["session.lock"])? == world_inventory,
-            "recovery copy changed under native lock",
-        )?;
-        checked(game.options.mod_packages.check_world(destination))?;
-        let under_lock = columns(game, destination, native.saved_clock)?;
-        let locked_items = read_session_checkpoint_items(
-            game,
-            destination,
-            &native.residents.iter().copied().collect(),
-            &under_lock,
-        )?;
-        require(
-            locked_items.projection == native.items.projection,
-            "locked native entity projection changed",
-        )?;
-        for at in &coverage {
-            require(
-                under_lock.contains_key(at),
-                "locked native coverage missing",
-            )?;
-        }
-        require(
-            prepared.native_checkpoint_origin.is_some() && prepared.locator.is_none(),
-            "recovery requires witnessed TestTerrain native provider",
-        )?;
-        require(
-            prepared.world.game_time == native.saved_clock,
-            "prepared native clock",
-        )?;
-        // Declared after `prepared`: on any failure the owned receipt releases
-        // BEFORE prepared Streaming is dropped and its actual workers are joined.
-        #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
-        let mut item_load_receipt = None;
-        #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
-        if let Some(test) = item_load_test.as_deref_mut() {
-            require(
-                native.items.columns().contains(&test.column)
-                    && !player_centers(
-                        native.players,
-                        target
-                            .as_ref()
-                            .ok_or_else(|| fail("item-load control needs claimed target"))?,
-                    )?
-                    .contains(&test.column)
-                    && !prepared.world.chunks.contains_key(&test.column),
-                "item load test requires an unarrived verified distant item column",
-            )?;
-            let receipt = checked(
-                prepared
-                    .streaming
-                    .arm_native_column_load_test_control(test.column),
-            )?;
-            test.observer = Some(receipt.observer());
-            if matches!(test.mode, SessionItemLoadTestMode::DropBeforeEntry) {
-                drop(receipt);
-            } else {
-                item_load_receipt = Some(receipt);
-            }
-        }
-        let clocks = (prepared.world.game_time, prepared.world.day_time);
-        let recovery_random = prepared.world.random.state();
-        prepared.streaming.radius = 0;
-        prepared.streaming.extra = centers.iter().copied().map(|at| (at, 0)).collect();
-        require(
-            prepared.streaming.forced.is_empty(),
-            "recovery forced native producer",
-        )?;
-
-        for &center in &centers {
-            prepared.streaming.center = center;
-            loop {
-                deadline(until)?;
-                let _ = prepared.streaming.update(&mut prepared.world);
-                if self.ordinary.is_some() {
-                    Self::reconcile_ordinary_reads(game, prepared, &under_lock)?;
-                }
-                #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
-                if item_load_test.as_ref().is_some_and(|test| {
-                    matches!(test.mode, SessionItemLoadTestMode::ReleaseAfterEntry)
-                        && test
-                            .observer
-                            .as_ref()
-                            .is_some_and(|observer| observer.entered())
-                }) && let Some(mut receipt) = item_load_receipt.take()
-                {
-                    checked(receipt.wait_entered(until.saturating_duration_since(Instant::now())))?;
-                    receipt.release();
-                }
-                require(
-                    (prepared.world.game_time, prepared.world.day_time) == clocks,
-                    "streaming advanced native clocks",
-                )?;
-                require(
-                    prepared.world.random.state() == recovery_random,
-                    "streaming drew from native world random",
-                )?;
-                if prepared.world.chunks.contains_key(&center) {
-                    break;
-                }
-                std::thread::yield_now();
-            }
-        }
-        // Return center to the machine while real arrivals may enlarge residency.
-        prepared.streaming.center = center;
-        if self.ordinary.is_some() {
-            // Every outstanding original saved read must be consumed before the
-            // existing native fence; that fence intentionally never adopts reads.
-            loop {
-                deadline(until)?;
-                let _ = prepared.streaming.update(&mut prepared.world);
-                Self::reconcile_ordinary_reads(game, prepared, &under_lock)?;
-                let work = prepared.streaming.observe_native_work();
-                require(
-                    !work.accounting_fault
-                        && !work.receipt_mismatch
-                        && !work.worker_initialization_fault
-                        && !work.worker_exit_fault
-                        && !work.result_disconnected
-                        && !work.stopped,
-                    "ordinary recovery native read ownership fault",
-                )?;
-                let (_, generated) = work
-                    .origins
-                    .iter()
-                    .find(|(origin, _)| {
-                        *origin == horizon_client::streaming::NativeWorkOrigin::Generate
-                    })
-                    .unwrap();
-                require(
-                    generated.unresolved == 0,
-                    "ordinary recovery has unresolved original reads",
-                )?;
-                if generated.queued == 0
-                    && generated.worker_held == 0
-                    && generated.returned == 0
-                    && generated.reconciling == 0
-                {
-                    break;
-                }
-                std::thread::yield_now();
-            }
-        }
-        let save = prepared.save.clone();
-        checked(
-            prepared
-                .streaming
-                .native_write_fence_until(&mut prepared.world, until, || save.writes_finished()),
-        )?;
-        require(
-            (prepared.world.game_time, prepared.world.day_time) == clocks,
-            "fence advanced native clocks",
-        )?;
-        require(
-            prepared.world.random.state() == recovery_random,
-            "recovery fence drew from native world random",
-        )?;
-        for (at, chunk) in &prepared.world.chunks {
-            let expected = under_lock
-                .get(at)
-                .ok_or_else(|| fail("unexpected regenerated native arrival"))?;
-            let a = save::encode(chunk, game.pack.assets.registry, game.res.biomes());
-            let b = save::encode(expected, game.pack.assets.registry, game.res.biomes());
-            require(
-                lan::session_player_tags_equal(&a.tag, &b.tag),
-                "native arrival changed saved semantics",
-            )?;
-        }
-        native.items.check_arrivals(
-            game,
-            &prepared.world.chunks.keys().copied().collect(),
-            &prepared.world.loaded_entities,
-        )?;
-        Ok((clocks, recovery_random))
+            native,
+            centers,
+            center,
+            #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+            target,
+            #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+            item_load_test,
+        )
     }
     fn adopt_verified_native(
         &mut self,
@@ -5952,6 +6067,820 @@ pub(in crate::game) struct OrdinaryRecoveryWork<'a> {
     close_deadline: Option<Instant>,
     native_close_started: bool,
 }
+/// The actual LOCAL Game stays on its owning thread. Only this concrete native
+/// job crosses threads, retaining every acquired exclusion/preparation on error.
+struct LocalOwnedNativeJob {
+    inputs: NativePreparationInputs,
+    entry: crate::game::world_loading::RetainedEntryIdentity,
+    startup: Arc<crate::game::mod_packages::FrozenHostInputs>,
+    request: OwnedRecoveryRequest,
+    lease: Option<crate::game::world_loading::host_identity::session_authority::WorldAuthority>,
+    owned: Option<crate::game::world_loading::host_identity::session_authority::OwnedAssociation>,
+    binding: Option<NativeBinding>,
+    local: Option<LocalRecoveryPreparation>,
+    preparation: Option<RecoveryPreparation>,
+    image: Option<Verified>,
+    unplaced: Option<OwnedUnplacedRecoveryData>,
+    data: Option<RecoveryData>,
+    selected: Option<(u64, PathBuf)>,
+    loaded: Option<((i64, i64), u64)>,
+    snapshot: Option<NativeSnapshotInput>,
+    domain: Option<(SessionCounter, Vec<u8>)>,
+    failure: Option<String>,
+    armed: bool,
+    #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+    pause: Option<Arc<LocalOwnedWorkerPause>>,
+}
+#[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+#[derive(Default)]
+struct LocalOwnedWorkerPause {
+    entered: std::sync::atomic::AtomicBool,
+    released: std::sync::atomic::AtomicBool,
+}
+impl Drop for LocalOwnedNativeJob {
+    fn drop(&mut self) {
+        if self.armed {
+            eprintln!("fatal: unresolved original LOCAL native job");
+            std::process::abort();
+        }
+    }
+}
+#[derive(Clone, Copy)]
+enum LocalOwnedStage {
+    Selection,
+    Preparation,
+    Validation,
+}
+impl LocalOwnedNativeJob {
+    fn select(&mut self) -> SResult<()> {
+        use crate::game::world_loading::host_identity::session_authority::OwnedProfile;
+        deadline(self.request.deadline)?;
+        self.lease = Some(checked(
+            self.request
+                .namespace
+                .acquire_owned_recovery(&self.request.anchor, &self.request.destination),
+        )?);
+        let owned = self
+            .lease
+            .as_ref()
+            .unwrap()
+            .owned()
+            .ok_or_else(|| fail("acquired LOCAL OWN absent"))?
+            .clone();
+        checked(owned.check_profile(&OwnedProfile::Local, owned.native_player()))?;
+        require(
+            self.inputs.options.execution_role.is_client()
+                && !self.inputs.options.server_thread
+                && self.inputs.options.server.is_none()
+                && self.inputs.options.dedicated.is_none(),
+            "actual in-frame LOCAL seed required",
+        )?;
+        let binding = checked(crate::game::world_loading::owned_guest_binding(
+            &self.inputs.options.mod_packages,
+            self.inputs.pack.assets.registry,
+        ))?;
+        checked(owned.check_binding(&binding))?;
+        // Acquired original exclusion, not request/UUID data, selects this policy.
+        self.inputs.context.local_player = true;
+        self.local = Some(LocalRecoveryPreparation {
+            context: self.inputs.context.clone(),
+            startup: self.startup.clone(),
+            world: owned.world(),
+            destination: self.request.destination.clone(),
+            player: owned.native_player(),
+        });
+        self.owned = Some(owned);
+        self.binding = Some(binding);
+        Ok(())
+    }
+    fn prepare(&mut self) -> SResult<()> {
+        deadline(self.request.deadline)?;
+        let owned = self
+            .owned
+            .as_ref()
+            .ok_or_else(|| fail("actual LOCAL OWN absent"))?;
+        checked(owned.recheck())?;
+        let (epoch, selected) = epochs(owned.archive())?
+            .pop()
+            .ok_or_else(|| fail("no complete owned epoch; preserve native working world"))?;
+        let head: Value = json(
+            &read(&selected.join("manifest.json"), MANIFEST_LIMIT)?,
+            MANIFEST_LIMIT,
+        )?;
+        self.selected = Some((epoch, selected.clone()));
+        match head.get("kind").and_then(Value::as_str) {
+            Some(UNPLACED_KIND) => {
+                let verified = verify_unplaced_image_context(
+                    &self.inputs.context,
+                    &selected,
+                    epoch,
+                    owned,
+                    self.binding.as_ref().unwrap(),
+                )?;
+                let native = VerifiedNativeView::unplaced(&verified, &selected);
+                let centers = native_player_centers(native.players)?;
+                let center = *centers
+                    .first()
+                    .ok_or_else(|| fail("LOCAL native player center absent"))?;
+                let loaded = load_native_recovery_preparation(
+                    &self.inputs,
+                    &mut self.preparation,
+                    Some(&(self.entry.clone(), self.startup.clone())),
+                    self.local.as_ref(),
+                    owned.world(),
+                    &self.request.destination,
+                    self.request.deadline,
+                    &native,
+                    centers,
+                    center,
+                    #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+                    None,
+                    #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+                    None,
+                )?;
+                self.loaded = Some(loaded);
+                self.unplaced = Some(OwnedUnplacedRecoveryData {
+                    owned: owned.clone(),
+                    binding: self.binding.as_ref().unwrap().clone(),
+                    verified,
+                    selected,
+                    clocks: loaded.0,
+                    random: loaded.1,
+                    deadline: self.request.deadline,
+                    epoch,
+                    admitted: false,
+                });
+            }
+            Some(GUEST_KIND) => {
+                let manifest: Manifest = json(
+                    &read(&selected.join("manifest.json"), MANIFEST_LIMIT)?,
+                    MANIFEST_LIMIT,
+                )?;
+                let verified = verify_image_context(
+                    &self.inputs.context,
+                    &selected,
+                    epoch,
+                    owned.world(),
+                    &manifest.target,
+                    owned.type_id(),
+                )?;
+                require(
+                    verified.counter.is_guest(),
+                    "owned LOCAL claimed image requires captured Guest",
+                )?;
+                checked(
+                    owned.check_binding(&binding_context(&self.inputs.context, &verified.counter)?),
+                )?;
+                checked(owned.check_pin(&selected.join("world")))?;
+                require(
+                    native_local_uuid(&selected.join("world"))? == owned.native_player()
+                        && verified
+                            .players
+                            .rows()
+                            .iter()
+                            .all(|row| row.player.get("playerGameType") == Some(&Tag::Int(1))),
+                    "owned LOCAL claimed native mapping/mode differs",
+                )?;
+                let native = VerifiedNativeView::claimed(&verified, &selected);
+                let centers = player_centers(native.players, &manifest.target)?;
+                let center = (
+                    manifest.target.position[0] >> 4,
+                    manifest.target.position[2] >> 4,
+                );
+                self.loaded = Some(load_native_recovery_preparation(
+                    &self.inputs,
+                    &mut self.preparation,
+                    Some(&(self.entry.clone(), self.startup.clone())),
+                    self.local.as_ref(),
+                    owned.world(),
+                    &self.request.destination,
+                    self.request.deadline,
+                    &native,
+                    centers,
+                    center,
+                    #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+                    Some(manifest.target.clone()),
+                    #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+                    None,
+                )?);
+                self.image = Some(verified);
+            }
+            _ => return Err(fail("unknown/mixed owned complete image kind")),
+        }
+        checked(owned.recheck())?;
+        Ok(())
+    }
+    fn validate(&mut self) -> SResult<()> {
+        deadline(self.request.deadline)?;
+        let context = &self.inputs.context;
+        let root = &self.request.destination;
+        let mut input = self
+            .snapshot
+            .take()
+            .ok_or_else(|| fail("actual frozen LOCAL projection absent"))?;
+        // Same live-or-disk policy as effective_session_raids, with disk IO here.
+        let disk = raid_metadata(root)?;
+        input.raids = input.raids.or(disk);
+        let snapshot = input.encode(context)?;
+        if let Some(data) = &self.unplaced {
+            verify_unplaced_restored_native(context, root, data, &snapshot)?;
+        } else {
+            let data = self
+                .data
+                .as_ref()
+                .ok_or_else(|| fail("actual LOCAL claimed image absent"))?;
+            let current = verify_image_context(
+                context,
+                &data.selected,
+                data.receipt.epoch,
+                data.request.expected_world,
+                &data.request.expected_target,
+                &data.request.expected_type,
+            )?;
+            require(
+                current.manifest == data.verified.manifest
+                    && current.counter == data.verified.counter,
+                "selected LOCAL claimed image changed before publication",
+            )?;
+            verify_restored_native_columns(context, &snapshot, &current.columns)?;
+            let (counter, slot) = self
+                .domain
+                .take()
+                .ok_or_else(|| fail("actual frozen LOCAL domain absent"))?;
+            let clocks = snapshot.clocks;
+            let random = snapshot.random;
+            validate_native_local_player(
+                root,
+                &snapshot.players.iter().map(descriptor).collect::<Vec<_>>(),
+            )?;
+            verify_recovery_snapshot_context(
+                context,
+                root,
+                clocks,
+                random,
+                &data.request,
+                &data.verified,
+                &data.selected,
+                data.clocks,
+                data.random,
+                Snapshot {
+                    counter,
+                    slot,
+                    native: snapshot,
+                },
+            )?;
+        }
+        let owned = self
+            .owned
+            .as_ref()
+            .ok_or_else(|| fail("original LOCAL OWN observation absent"))?;
+        checked(owned.recheck())?;
+        checked(owned.check_working_root(root))?;
+        checked(owned.check_pin(root))?;
+        require(
+            native_local_uuid(root)? == owned.native_player(),
+            "LOCAL native player file changed",
+        )?;
+        deadline(self.request.deadline)
+    }
+}
+fn verify_restored_native_columns(
+    context: &SessionValidationContext,
+    snapshot: &NativeSnapshot,
+    expected: &BTreeMap<(i32, i32), Arc<Chunk>>,
+) -> SResult<()> {
+    for (at, actual) in &snapshot.columns {
+        let expected = expected
+            .get(at)
+            .ok_or_else(|| fail("recovery generated an unknown native column"))?;
+        let tables = actual
+            .tag
+            .get("Heightmaps")
+            .is_some()
+            .then(|| save::SaveTables::new(&context.assets));
+        let expected = save::encode_with(
+            expected,
+            context.assets.registry,
+            context.res.biomes(),
+            tables.as_ref(),
+            LevelShape::OVERWORLD,
+        );
+        require(
+            lan::session_player_tags_equal(&actual.tag, &expected.tag),
+            "recovered native column differs",
+        )?;
+    }
+    Ok(())
+}
+struct LocalFrozenAttempt {
+    context: SessionValidationContext,
+    save: Arc<save::SaveDir>,
+    root: PathBuf,
+    world: WorldId,
+    clocks: (i64, i64),
+    random: u64,
+    chunks: BTreeMap<(i32, i32), Arc<Chunk>>,
+}
+/// Concrete three-stage adapter. It exposes no mutable Game before publication.
+/// Cancel waits for its original dispatched result, then closes those same owners.
+pub(in crate::game) struct LocalOwnedRecovery<'a> {
+    core: OrdinaryRecoveryWork<'a>,
+    job: Option<LocalOwnedNativeJob>,
+    worker: Option<std::thread::JoinHandle<LocalOwnedNativeJob>>,
+    stage: LocalOwnedStage,
+    frozen: Option<LocalFrozenAttempt>,
+    construction: Option<crate::game::window_close::Construction>,
+    #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+    pause: Option<Arc<LocalOwnedWorkerPause>>,
+}
+impl Drop for LocalOwnedRecovery<'_> {
+    fn drop(&mut self) {
+        if self.worker.is_some() || self.job.as_ref().is_some_and(|job| job.armed) {
+            eprintln!("fatal: unresolved original LOCAL worker");
+            std::process::abort();
+        }
+    }
+}
+impl<'a> LocalOwnedRecovery<'a> {
+    pub(in crate::game) fn start(
+        game: Box<Game<'a>>,
+        entry: crate::game::world_loading::RetainedEntryIdentity,
+        request: OwnedRecoveryRequest,
+    ) -> Self {
+        let startup = game
+            .ordinary_startup
+            .as_ref()
+            .expect("actual LOCAL recovery seed")
+            .clone();
+        let job = LocalOwnedNativeJob {
+            inputs: NativePreparationInputs::capture(&game),
+            entry: entry.clone(),
+            startup: startup.clone(),
+            request: OwnedRecoveryRequest {
+                namespace: request.namespace.clone(),
+                anchor: request.anchor.clone(),
+                destination: request.destination.clone(),
+                deadline: request.deadline,
+            },
+            lease: None,
+            owned: None,
+            binding: None,
+            local: None,
+            preparation: None,
+            image: None,
+            unplaced: None,
+            data: None,
+            selected: None,
+            loaded: None,
+            snapshot: None,
+            domain: None,
+            failure: None,
+            armed: true,
+            #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+            pause: None,
+        };
+        let mut work = SessionRecoveryWork::legacy(game);
+        work.ordinary = Some((entry, startup));
+        work.armed = true;
+        let core = OrdinaryRecoveryWork {
+            work,
+            request: OrdinaryRecoveryRoute::Owned(request),
+            lease: None,
+            data: None,
+            unplaced: None,
+            players: None,
+            closed_host: None,
+            closed_native: None,
+            failure: None,
+            close_deadline: None,
+            native_close_started: false,
+        };
+        let mut owner = Self {
+            core,
+            job: Some(job),
+            worker: None,
+            stage: LocalOwnedStage::Selection,
+            frozen: None,
+            construction: None,
+            #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+            pause: None,
+        };
+        owner.dispatch(LocalOwnedStage::Selection);
+        owner
+    }
+    fn dispatch(&mut self, stage: LocalOwnedStage) {
+        // Register the empty worker BEFORE sending custody. Spawn refusal leaves
+        // the original job here; send refusal returns the same original job.
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<LocalOwnedNativeJob>(1);
+        match std::thread::Builder::new()
+            .name("LOCAL native recovery".into())
+            .spawn(move || {
+                let mut job = receiver.recv().unwrap_or_else(|_| {
+                    eprintln!("fatal: registered LOCAL worker lost its dispatch");
+                    std::process::abort();
+                });
+                let result = match stage {
+                    LocalOwnedStage::Selection => job.select(),
+                    LocalOwnedStage::Preparation => job.prepare(),
+                    LocalOwnedStage::Validation => job.validate(),
+                };
+                if let Err(error) = result {
+                    job.failure.get_or_insert(error.to_string());
+                }
+                #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+                if matches!(stage, LocalOwnedStage::Preparation)
+                    && job.failure.is_none()
+                    && let Some(pause) = &job.pause
+                {
+                    use std::sync::atomic::Ordering;
+                    // Hold this ACTUAL completed native preparation and acquired
+                    // authority in its registered worker, never a fabricated owner.
+                    pause.entered.store(true, Ordering::Release);
+                    while !pause.released.load(Ordering::Acquire) {
+                        if Instant::now() >= job.request.deadline {
+                            job.failure = Some("controlled LOCAL preparation hold deadline".into());
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                }
+                job
+            }) {
+            Ok(handle) => self.worker = Some(handle),
+            Err(error) => {
+                self.job.as_mut().unwrap().failure = Some(error.to_string());
+                return;
+            }
+        }
+        self.stage = stage;
+        if let Err(original) = sender.send(self.job.take().unwrap()) {
+            self.job = Some(original.0);
+            eprintln!("fatal: registered LOCAL native worker refused original custody");
+            std::process::abort();
+        }
+    }
+    fn join_finished(&mut self) -> bool {
+        if self
+            .worker
+            .as_ref()
+            .is_some_and(|handle| !handle.is_finished())
+        {
+            return false;
+        }
+        if let Some(handle) = self.worker.take() {
+            self.job = Some(handle.join().unwrap_or_else(|_| {
+                eprintln!("fatal: LOCAL native worker panicked with unknown custody");
+                std::process::abort();
+            }));
+        }
+        true
+    }
+    fn retain_job(&mut self) {
+        if let Some(mut job) = self.job.take() {
+            if let Some(lease) = job.lease.take() {
+                assert!(self.core.lease.is_none());
+                self.core.lease = Some(lease);
+            }
+            if let Some(preparation) = job.preparation.take() {
+                assert!(self.core.work.preparation.is_none());
+                self.core.work.preparation = Some(preparation);
+            }
+            if let Some(local) = job.local.take() {
+                assert!(self.core.work.local.is_none());
+                self.core.work.local = Some(local);
+            }
+            if let Some(data) = job.data.take() {
+                assert!(self.core.data.is_none());
+                self.core.data = Some(data);
+            }
+            if let Some(unplaced) = job.unplaced.take() {
+                assert!(self.core.unplaced.is_none());
+                self.core.unplaced = Some(unplaced);
+            }
+            if let Some(reason) = job.failure.take() {
+                self.core.fail(reason);
+            }
+            job.armed = false;
+        }
+    }
+    fn adopt(&mut self, job: &mut LocalOwnedNativeJob) -> SResult<()> {
+        let game = self.core.work.game.as_ref().unwrap();
+        require(
+            job.inputs.context.same_owners(game),
+            "LOCAL native preparation owners changed",
+        )?;
+        game.fresh_session_candidate_for_local(job.local.as_ref())?;
+        self.construction = Some(crate::game::window_close::Construction::from_prepared(
+            job.preparation
+                .as_mut()
+                .ok_or_else(|| fail("original LOCAL preparation absent"))?
+                .prepared_mut(),
+        ));
+        self.core.work.preparation = job.preparation.take();
+        self.core.work.local = job.local.take();
+        self.core.lease = job.lease.take();
+        let (clocks, random) = job
+            .loaded
+            .ok_or_else(|| fail("original LOCAL load result absent"))?;
+        if let Some(data) = job.unplaced.take() {
+            self.core.unplaced = Some(data);
+            let data = self.core.unplaced.as_ref().unwrap();
+            let native = VerifiedNativeView::unplaced(&data.verified, &data.selected);
+            self.core
+                .work
+                .adopt_verified_native(&native, random, |_, _| Ok(()))?;
+        } else {
+            let image = job
+                .image
+                .take()
+                .ok_or_else(|| fail("verified LOCAL claimed image absent"))?;
+            let game = self.core.work.game.as_mut().unwrap();
+            game.prepare_guest_image_evaluator(&image.counter)?;
+            let prepared = self.core.work.preparation.as_mut().unwrap().prepared_mut();
+            let binding = binding(game, &image.counter)?;
+            let SessionCounter::Guest(frame) = &image.counter else {
+                return Err(fail("LOCAL image lost Guest profile"));
+            };
+            let target = &image.manifest.target;
+            checked(prepared.world.restore_guest_counter_frame(
+                &binding,
+                image.manifest.world_uuid,
+                target,
+                frame,
+            ))?;
+            prepared
+                .world
+                .restore_guest_world_slot(
+                    &binding,
+                    game.res.items(),
+                    image.manifest.world_uuid,
+                    target,
+                    image.slot,
+                )
+                .map_err(|error| fail(error.error))?;
+            let state = CoreRecoveryState::Guest(checked(prepared.world.guest_runtime_state())?);
+            let (epoch, selected) = job.selected.as_ref().unwrap();
+            let native = VerifiedNativeView {
+                selected,
+                saved_clock: image.manifest.saved_clock,
+                residents: &image.manifest.resident,
+                players: image.players.rows(),
+                columns: &image.columns,
+                raids: image.raids.as_ref(),
+                items: &image.items,
+            };
+            self.core
+                .work
+                .adopt_verified_native(&native, random, |_, _| Ok(()))?;
+            self.core.data = Some(RecoveryData {
+                request: RecoveryRequest {
+                    expected_world: image.manifest.world_uuid,
+                    expected_target: image.manifest.target.clone(),
+                    expected_type: image.manifest.type_id.clone(),
+                    archive_root: job.owned.as_ref().unwrap().archive().to_owned(),
+                    destination: job.request.destination.clone(),
+                    deadline: job.request.deadline,
+                },
+                verified: NativeRecoveryImage {
+                    manifest: image.manifest,
+                    counter: image.counter,
+                    players: image.players,
+                    raids: image.raids,
+                    items: image.items,
+                },
+                selected: selected.clone(),
+                clocks,
+                random,
+                receipt: CoreRecoveryReceipt {
+                    epoch: *epoch,
+                    state,
+                },
+            });
+        }
+        let game = self.core.work.game.as_mut().unwrap();
+        let owned = job.owned.as_ref().unwrap();
+        require(
+            game.level.player_uuid == Some(owned.native_player()),
+            "LOCAL adopted native UUID changed",
+        )?;
+        checked(
+            game.session_lock
+                .as_mut()
+                .ok_or_else(|| fail("actual LOCAL session absent"))?
+                .install_authority(&mut self.core.lease),
+        )?;
+        let players = if let Some(data) = &self.core.unplaced {
+            CheckedSessionPlayers {
+                rows: data.verified.native.rows.clone(),
+            }
+        } else {
+            CheckedSessionPlayers {
+                rows: self
+                    .core
+                    .data
+                    .as_ref()
+                    .unwrap()
+                    .verified
+                    .players
+                    .rows
+                    .clone(),
+            }
+        };
+        checked(game.install_local_checkpoint_player(&players))?;
+        let world = game.session_context_cpu()?;
+        let roster = checked(game.observe_coherent_participants())?;
+        let rows = checked(game.project_coherent_participants(&roster))?;
+        let snapshot = game.capture_native_snapshot_input(
+            checked(game.session_checkpoint_raids())?,
+            owned.native_player(),
+            rows,
+        )?;
+        self.frozen = Some(LocalFrozenAttempt {
+            context: job.inputs.context.clone(),
+            save: game.save.as_ref().unwrap().clone(),
+            root: game.world_root.clone(),
+            world,
+            clocks: snapshot.clocks,
+            random: snapshot.random,
+            chunks: game
+                .world
+                .chunks
+                .iter()
+                .map(|(at, chunk)| (*at, chunk.clone()))
+                .collect(),
+        });
+        if self.core.data.is_some() {
+            let counter = checked(SessionCounter::from_world(&game.world))?;
+            let slot = checked(counter.slot_bytes(&game.world, game.res.items()))?;
+            job.domain = Some((counter, slot));
+        }
+        job.snapshot = Some(snapshot);
+        job.data = self.core.data.take();
+        job.unplaced = self.core.unplaced.take();
+        Ok(())
+    }
+    fn publish(&mut self) -> SResult<Option<Box<Game<'a>>>> {
+        let stamp = self
+            .frozen
+            .as_ref()
+            .ok_or_else(|| fail("actual frozen LOCAL attempt absent"))?;
+        let game = self.core.work.game.as_mut().unwrap();
+        require(
+            stamp.context.same_owners(game)
+                && game.world_root == stamp.root
+                && game
+                    .save
+                    .as_ref()
+                    .is_some_and(|save| Arc::ptr_eq(save, &stamp.save))
+                && game.session_context_cpu()? == stamp.world
+                && (game.world.game_time, game.world.day_time) == stamp.clocks
+                && game.world.random.state() == stamp.random
+                && game.renderer.is_none()
+                && game.world.chunks.len() == stamp.chunks.len()
+                && game.world.chunks.iter().all(|(at, chunk)| {
+                    stamp
+                        .chunks
+                        .get(at)
+                        .is_some_and(|old| Arc::ptr_eq(old, chunk))
+                }),
+            "LOCAL validation result no longer belongs to its frozen original attempt",
+        )?;
+        checked(game.inspect_session_checkpoint_owners())?;
+        let owned = game
+            .session_lock
+            .as_ref()
+            .and_then(|session| session.owned())
+            .ok_or_else(|| fail("LOCAL publication lost actual OWN custody"))?;
+        checked(
+            owned.check_profile(
+                &game.actual_owned_profile()?,
+                game.level
+                    .player_uuid
+                    .ok_or_else(|| fail("LOCAL player absent"))?,
+            ),
+        )?;
+        let until = match &self.core.request {
+            OrdinaryRecoveryRoute::Owned(request) => request.deadline,
+            _ => unreachable!(),
+        };
+        deadline(until)?;
+        // There is exactly one participating native SaveDir: CPU checks above
+        // exclude parked dimensions. Poll it BEFORE the fresh producer predicate.
+        require(
+            checked(stamp.save.writes_finished())?,
+            "LOCAL validation native writer is not complete",
+        )?;
+        require(
+            checked(
+                game.streaming
+                    .expect_existing()
+                    .native_write_fence_current(),
+            )?,
+            "LOCAL validation native producer state changed",
+        )?;
+        if self.core.unplaced.is_some() {
+            return self.core.publish_verified_unplaced();
+        }
+        let continuation = self.core.request.continuation(
+            game.session_lock
+                .as_ref()
+                .and_then(|session| session.owned()),
+        )?;
+        let original = self
+            .core
+            .work
+            .unpublished
+            .take()
+            .ok_or_else(|| fail("original LOCAL constructor absent"))?;
+        if let Err(original) = original.publish(game) {
+            self.core.work.unpublished = Some(original);
+            return Err(fail("verified LOCAL original constructor changed"));
+        }
+        game.local_continuation_archive = Some(continuation);
+        self.core.work.armed = false;
+        Ok(self.core.work.game.take())
+    }
+    pub(in crate::game) fn poll_activate(&mut self) -> SResult<Option<Box<Game<'a>>>> {
+        require(
+            self.core.failure.is_none() && self.core.close_deadline.is_none(),
+            "refused LOCAL recovery cannot activate",
+        )?;
+        if !self.join_finished() {
+            return Ok(None);
+        }
+        let mut job = self
+            .job
+            .take()
+            .ok_or_else(|| fail("original LOCAL native job absent"))?;
+        if let Some(reason) = &job.failure {
+            let error = fail(reason);
+            self.job = Some(job);
+            self.retain_job();
+            return Err(error);
+        }
+        let result = match self.stage {
+            LocalOwnedStage::Selection => {
+                let game = self.core.work.game.as_ref().unwrap();
+                require(
+                    job.inputs.context.same_owners(game),
+                    "LOCAL selected resource owners changed",
+                )
+                .and_then(|()| game.fresh_session_candidate_for_local(job.local.as_ref()))
+            }
+            LocalOwnedStage::Preparation => self.adopt(&mut job),
+            LocalOwnedStage::Validation => Ok(()),
+        };
+        if let Err(error) = result {
+            job.failure = Some(error.to_string());
+            self.job = Some(job);
+            self.retain_job();
+            return Err(error);
+        }
+        self.job = Some(job);
+        match self.stage {
+            LocalOwnedStage::Selection => {
+                #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+                {
+                    self.job.as_mut().unwrap().pause = self.pause.clone();
+                }
+                self.dispatch(LocalOwnedStage::Preparation);
+            }
+            LocalOwnedStage::Preparation => self.dispatch(LocalOwnedStage::Validation),
+            LocalOwnedStage::Validation => {
+                self.retain_job();
+                let result = self.publish();
+                if let Err(error) = &result {
+                    self.core.fail(error.to_string());
+                }
+                return result;
+            }
+        }
+        Ok(None)
+    }
+    pub(in crate::game) fn original_error(&self) -> Option<&str> {
+        self.core.original_error()
+    }
+    pub(in crate::game) fn take_construction(
+        &mut self,
+    ) -> Option<crate::game::window_close::Construction> {
+        self.construction.take()
+    }
+    pub(in crate::game) fn begin_close(&mut self, until: Instant) {
+        self.core.begin_close(until);
+    }
+    pub(in crate::game) fn poll_close(
+        &mut self,
+    ) -> crate::game::world_loading::PreparationCloseStatus {
+        if !self.join_finished() {
+            return crate::game::world_loading::PreparationCloseStatus::Pending;
+        }
+        self.retain_job();
+        self.core.poll_close()
+    }
+    pub(in crate::game) fn retry_close(&mut self, until: Instant) -> SResult<()> {
+        self.core.retry_close(until)
+    }
+}
 struct OwnedUnplacedRecoveryData {
     owned: crate::game::world_loading::host_identity::session_authority::OwnedAssociation,
     binding: NativeBinding,
@@ -5962,6 +6891,50 @@ struct OwnedUnplacedRecoveryData {
     deadline: Instant,
     epoch: u64,
     admitted: bool,
+}
+fn verify_unplaced_restored_native(
+    context: &SessionValidationContext,
+    root: &Path,
+    data: &OwnedUnplacedRecoveryData,
+    snapshot: &NativeSnapshot,
+) -> SResult<()> {
+    require(
+        snapshot.clocks == data.clocks
+            && snapshot.random == data.random
+            && same_players(&snapshot.players, &data.verified.native.rows)
+            && snapshot.items == data.verified.native.items.projection
+            && snapshot.raids == data.verified.native.raids
+            && raid_metadata(root)? == data.verified.native.raids,
+        "complete Unplaced restored native/player/item projection differs",
+    )?;
+    verify_restored_native_columns(context, snapshot, &data.verified.native.columns)?;
+    checked(data.owned.recheck())?;
+    checked(data.owned.check_working_root(root))?;
+    checked(data.owned.check_pin(root))?;
+    require(
+        data.selected
+            == data
+                .owned
+                .archive()
+                .join(format!("epoch-{:020}", data.epoch)),
+        "Unplaced selected complete route changed",
+    )?;
+    let current = verify_unplaced_image_context(
+        context,
+        &data.selected,
+        data.epoch,
+        &data.owned,
+        &data.binding,
+    )?;
+    require(
+        current.manifest == data.verified.manifest,
+        "Unplaced selected complete image changed before admission",
+    )?;
+    validate_native_local_player(
+        root,
+        &snapshot.players.iter().map(descriptor).collect::<Vec<_>>(),
+    )?;
+    deadline(data.deadline)
 }
 impl<'a> OrdinaryRecoveryWork<'a> {
     fn prepare_owned_native(&mut self) -> SResult<()> {
@@ -6349,61 +7322,24 @@ impl<'a> OrdinaryRecoveryWork<'a> {
             native_local_uuid(&game.world_root)?,
             rows,
         )?;
-        require(
-            snapshot.clocks == data.clocks
-                && snapshot.random == data.random
-                && same_players(&snapshot.players, &data.verified.native.rows)
-                && snapshot.items == data.verified.native.items.projection
-                && snapshot.raids == data.verified.native.raids
-                && raid_metadata(&game.world_root)? == data.verified.native.raids,
-            "complete Unplaced restored native/player/item projection differs",
-        )?;
-        for (at, actual) in &snapshot.columns {
-            let expected = data
-                .verified
-                .native
-                .columns
-                .get(at)
-                .ok_or_else(|| fail("Unplaced recovery generated an unknown column"))?;
-            let tables = actual
-                .tag
-                .get("Heightmaps")
-                .is_some()
-                .then(|| save::SaveTables::new(&game.pack.assets));
-            let expected = save::encode_with(
-                expected,
-                game.pack.assets.registry,
-                game.res.biomes(),
-                tables.as_ref(),
-                LevelShape::OVERWORLD,
-            );
-            require(
-                lan::session_player_tags_equal(&actual.tag, &expected.tag),
-                "Unplaced recovered native column differs",
-            )?;
-        }
-        checked(data.owned.recheck())?;
-        checked(data.owned.check_working_root(&game.world_root))?;
-        checked(data.owned.check_pin(&game.world_root))?;
-        require(
-            data.selected
-                == data
-                    .owned
-                    .archive()
-                    .join(format!("epoch-{:020}", data.epoch)),
-            "Unplaced selected complete route changed",
-        )?;
-        let current = verify_unplaced_image_context(
+        verify_unplaced_restored_native(
             &SessionValidationContext::from_game(game),
-            &data.selected,
-            data.epoch,
-            &data.owned,
-            &data.binding,
+            &game.world_root,
+            data,
+            &snapshot,
         )?;
-        require(
-            current.manifest == data.verified.manifest,
-            "Unplaced selected complete image changed before admission",
+        validate_native_local_player(
+            &game.world_root,
+            &snapshot.players.iter().map(descriptor).collect::<Vec<_>>(),
         )?;
+        self.publish_verified_unplaced()
+    }
+    fn publish_verified_unplaced(&mut self) -> SResult<Option<Box<Game<'a>>>> {
+        let data = self
+            .unplaced
+            .as_mut()
+            .ok_or_else(|| fail("verified Unplaced recovery absent"))?;
+        let game = self.work.game.as_mut().unwrap();
         checked(
             data.owned.check_profile(
                 &game.actual_owned_profile()?,
@@ -6418,10 +7354,6 @@ impl<'a> OrdinaryRecoveryWork<'a> {
                 .and_then(|session| session.owned())
                 .is_some_and(|owned| owned.same_route(&data.owned)),
             "Unplaced lost actual namespace custody",
-        )?;
-        validate_native_local_player(
-            &game.world_root,
-            &snapshot.players.iter().map(descriptor).collect::<Vec<_>>(),
         )?;
         deadline(data.deadline)?;
         if !data.admitted {
@@ -6952,26 +7884,48 @@ fn verify_recovery_snapshot(
     random: u64,
     snapshot: Snapshot,
 ) -> SResult<()> {
-    require(
-        (game.world.game_time, game.world.day_time) == clocks,
-        "recovery advanced native clocks",
-    )?;
-    require(
-        game.world.random.state() == random,
-        "recovery drew from world random",
-    )?;
+    game.session_context_cpu()?;
+    checked(game.inspect_session_checkpoint_owners())?;
+    verify_recovery_snapshot_context(
+        &SessionValidationContext::from_game(game),
+        &game.world_root,
+        (game.world.game_time, game.world.day_time),
+        game.world.random.state(),
+        request,
+        verified,
+        selected,
+        clocks,
+        random,
+        snapshot,
+    )
+}
+#[allow(clippy::too_many_arguments)]
+fn verify_recovery_snapshot_context(
+    context: &SessionValidationContext,
+    root: &Path,
+    current_clocks: (i64, i64),
+    current_random: u64,
+    request: &RecoveryRequest,
+    verified: &NativeRecoveryImage,
+    selected: &Path,
+    clocks: (i64, i64),
+    random: u64,
+    snapshot: Snapshot,
+) -> SResult<()> {
+    require(current_clocks == clocks, "recovery advanced native clocks")?;
+    require(current_random == random, "recovery drew from world random")?;
     require(
         snapshot.counter == verified.counter
             && same_players(&snapshot.players, verified.players.rows())
             && snapshot.raids == verified.raids
             && snapshot.items == verified.items.projection
-            && raid_metadata(&game.world_root)? == verified.raids,
+            && raid_metadata(root)? == verified.raids,
         "final restored counter/player mismatch",
     )?;
     let recovered_slot = checked(
         snapshot
             .counter
-            .decode_slot(&snapshot.slot, game.res.items()),
+            .decode_slot(&snapshot.slot, context.res.items()),
     )?;
     correlate(&verified.manifest, &snapshot.counter, &recovered_slot)?;
     // The slot bytes are deterministic current-schema output; compare the
@@ -6980,11 +7934,9 @@ fn verify_recovery_snapshot(
         snapshot.slot == read(&selected.join(SLOT), STRUCTURED_LIMIT)?,
         "final restored slot mismatch",
     )?;
-    require(
-        game.session_context()? == request.expected_world,
-        "final native origin/identity",
-    )?;
-    checked(game.inspect_session_checkpoint_owners())?;
+    identity(root, request.expected_world)?;
+    checked(context.packages.check_world(root))?;
+    let _: Value = json(&read(&root.join(PIN), 64 << 10)?, 64 << 10)?;
     deadline(request.deadline)?;
     Ok(())
 }

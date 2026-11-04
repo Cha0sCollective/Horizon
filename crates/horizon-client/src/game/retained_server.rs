@@ -720,12 +720,23 @@ impl Game<'_> {
             .as_ref()
             .and_then(|session| session.owned())
             .is_some()
-            && self
-                .retained_server
-                .as_ref()
-                .is_none_or(|server| server.checkpoint_roster.is_none())
         {
-            return false;
+            let original_player_ready = match self.retained_server.as_ref() {
+                Some(server) => server.checkpoint_roster.is_some(),
+                None => {
+                    self.local_checkpoint_owner()
+                        && self
+                            .native_close_authority
+                            .as_ref()
+                            .is_some_and(|original| original.retains_ordinary_source(self))
+                        && self.player.as_ref().is_some_and(|body| !body.server_copy)
+                        && !self.restore_player_state
+                        && !self.retained_entry_closing
+                }
+            };
+            if !original_player_ready {
+                return false;
+            }
         }
         if !self.creative
             || self.hand != Hand::Main
