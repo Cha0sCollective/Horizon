@@ -1437,6 +1437,44 @@ pub fn build(base: &Path, mods: &[ContentMod], out: &Path) -> Result<Vec<String>
             overlay.write(&own, &fs::read(&vanilla)?)?;
         }
     }
+    // BlockItem prototypes rename their own item_model to the alias. Supply
+    // its client definition too, independently of any custom blockstate. Keep
+    // the definition's native model/texture references intact.
+    if plan.blocks.iter().any(|block| block.decl.item) {
+        let prototypes = read_json(&base.join("items.json"))?;
+        for block in plan.blocks.iter().filter(|block| block.decl.item) {
+            let template = block
+                .item
+                .as_deref()
+                .ok_or("planned BlockItem template absent")?;
+            // A prototype referring to another existing native model was not
+            // renamed by Plan::items; its original definition still applies.
+            if !matches!(prototypes.get(template).and_then(|item|item.get("minecraft:item_model")), Some(J::Str(model)) if model == template)
+            {
+                continue;
+            }
+            let (ns, path) = block
+                .decl
+                .id
+                .split_once(':')
+                .ok_or("BlockItem alias namespace absent")?;
+            let own = format!("assets/{ns}/items/{path}.json");
+            if mods.iter().any(|m| m.content.files.contains(&own)) {
+                continue;
+            }
+            let (template_ns, template_path) = template
+                .split_once(':')
+                .ok_or("template item namespace absent")?;
+            let original = base.join(format!("assets/{template_ns}/items/{template_path}.json"));
+            let bytes = fs::read(&original).map_err(|error| {
+                format!(
+                    "{}: template item {template} client definition missing: {error}",
+                    block.decl.id
+                )
+            })?;
+            overlay.write(&own, &bytes)?;
+        }
+    }
     let mut namespaces: Vec<&str> = mods
         .iter()
         .flat_map(|m| m.content.namespaces.iter().map(String::as_str))

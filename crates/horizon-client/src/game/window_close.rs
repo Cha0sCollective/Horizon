@@ -204,10 +204,17 @@ fn ordinary_generation(
                         settings.horizon.api,
                     )?);
                 }
-                let prepared_cpu = match cpu.take() {
+                let mut prepared_cpu = match cpu.take() {
                     Some(cpu) => cpu,
                     None => GameCpuResources::load(&root)?,
                 };
+                prepare_ordinary_creative(
+                    &mut prepared_cpu,
+                    &resources,
+                    &options.mod_packages,
+                    pack.as_ref().unwrap(),
+                    &startup,
+                )?;
                 *entry_token = entry_token
                     .checked_add(1)
                     .ok_or("ordinary entry token exhausted")?;

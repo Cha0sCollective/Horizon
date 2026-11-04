@@ -89,6 +89,157 @@ fn static_state_mod(dir: &Path) -> ContentMod {
 
 #[cfg(feature = "paired-packages")]
 #[test]
+#[ignore = "isolated owned prepared resources: actual BlockItem template definitions and item resolution"]
+fn block_item_client_definitions_reuse_templates_and_keep_overrides() {
+    use horizon_assets::item_model::{Context, DisplayContext, LayerContent, NoEnv, StackView};
+    let base = PathBuf::from(
+        std::env::var_os("HORIZON_TEST_RESOURCES")
+            .expect("explicit owned prepared resources required"),
+    );
+    let scratch = std::env::temp_dir().join(format!(
+        "horizon-block-item-definitions-{}",
+        std::process::id()
+    ));
+    fs::create_dir(&scratch).unwrap();
+    eprintln!("BLOCK_ITEM_DEFINITION_EVIDENCE_ROOT={}", scratch.display());
+    let native = crate::item_render::ItemRenderer::load(&base).unwrap();
+    let ctx = Context {
+        display: DisplayContext::Gui,
+        owner: None,
+        level: None,
+        seed: 0,
+    };
+    let alias = "state_demo:marker";
+    let mut base_before = Vec::new();
+    for item in ["iron_block", "torch", "stone"] {
+        let path = base.join(format!("assets/minecraft/items/{item}.json"));
+        base_before.push((path.clone(), fs::read(path).unwrap()));
+    }
+    for (label, template, item, custom_blockstate, custom_item) in [
+        (
+            "fallback",
+            "minecraft:iron_block",
+            "minecraft:iron_block",
+            false,
+            false,
+        ),
+        (
+            "own-blockstate",
+            "minecraft:iron_block",
+            "minecraft:iron_block",
+            true,
+            false,
+        ),
+        (
+            "own-item",
+            "minecraft:iron_block",
+            "minecraft:iron_block",
+            false,
+            true,
+        ),
+        (
+            "different-item",
+            "minecraft:wall_torch",
+            "minecraft:torch",
+            false,
+            false,
+        ),
+    ] {
+        let source = scratch.join(format!("source-{label}"));
+        let declaration = format!("{{\"template\":\"{template}\"}}");
+        let _ = paired_state_mod(&source, &declaration);
+        let blockstate = br#"{"variants":{"":{"model":"minecraft:block/iron_block"}}}"#;
+        let own = br#"{"model":{"type":"minecraft:model","model":"minecraft:block/stone"}}"#;
+        if custom_blockstate {
+            let path = source.join("assets/state_demo/blockstates/marker.json");
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, blockstate).unwrap();
+        }
+        if custom_item {
+            let path = source.join("assets/state_demo/items/marker.json");
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, own).unwrap();
+        }
+        let content = paired_state_mod(&source, &declaration);
+        let plan = Plan::new(&base, std::slice::from_ref(&content)).unwrap();
+        assert_eq!(
+            plan.blocks[0].item.as_deref(),
+            Some(item),
+            "actual template item mapping {label}"
+        );
+        let root =
+            resource_root(&base, &[content], &scratch.join(format!("cache-{label}"))).unwrap();
+        let item_file = root.join("assets/state_demo/items/marker.json");
+        let expected = if custom_item {
+            own.to_vec()
+        } else {
+            fs::read(base.join(format!(
+                "assets/{}/items/{}.json",
+                item.split_once(':').unwrap().0,
+                item.split_once(':').unwrap().1
+            )))
+            .unwrap()
+        };
+        assert_eq!(
+            fs::read(&item_file).unwrap(),
+            expected,
+            "client definition and original model references {label}"
+        );
+        if custom_blockstate {
+            assert_eq!(
+                fs::read(root.join("assets/state_demo/blockstates/marker.json")).unwrap(),
+                blockstate
+            );
+        }
+        let renderer = crate::item_render::ItemRenderer::load(&root).unwrap();
+        let resolved = renderer
+            .models
+            .resolve(&StackView::new(alias, 1), &ctx, &NoEnv);
+        assert!(
+            !resolved.layers.is_empty()
+                && resolved
+                    .layers
+                    .iter()
+                    .all(|layer| !matches!(layer.content, LayerContent::Missing))
+        );
+        if custom_item {
+            assert!(
+                matches!(&resolved.layers[0].content,LayerContent::Model {model} if model=="minecraft:block/stone")
+            );
+        } else {
+            assert_eq!(
+                resolved,
+                native
+                    .models
+                    .resolve(&StackView::new(item, 1), &ctx, &NoEnv),
+                "same actual GUI resolution as template {label}"
+            );
+        }
+        let baked = renderer.resolve(
+            &StackView::new(alias, 1),
+            DisplayContext::Gui,
+            None,
+            None,
+            0,
+            &NoEnv,
+        );
+        assert!(baked.layers.iter().any(|layer|matches!(&layer.geometry,crate::item_render::LayerGeometry::Quads(model) if !model.quads.is_empty())),"actual drawable GUI geometry {label}");
+        assert_eq!(fs::read(item_file).unwrap(), expected);
+        eprintln!("BLOCK_ITEM_DEFINITION_CASE_PASS={label} template={template} item={item}");
+    }
+    for (path, bytes) in base_before {
+        assert_eq!(
+            fs::read(path).unwrap(),
+            bytes,
+            "native template input changed"
+        );
+    }
+    eprintln!("BLOCK_ITEM_CLIENT_DEFINITIONS_AND_RESOLUTION_PASS");
+    // Keep authored inputs and overlays for the isolated caller's diagnostics.
+}
+
+#[cfg(feature = "paired-packages")]
+#[test]
 #[ignore = "full owned content root: run explicitly for machine metadata materialization"]
 fn machine_metadata_preserves_vanilla_ids_and_template_geometry() {
     use horizon_world::registry::{BlockRegistry, BlockTableFile};

@@ -820,6 +820,502 @@ fn ordinary_own_observation(view: &View) -> serde_json::Value {
     players.sort_by(|a, b| a["uuid"].as_str().unwrap().cmp(b["uuid"].as_str().unwrap()));
     serde_json::json!({"clock":view.world_time,"players":players})
 }
+
+#[cfg(all(feature = "mods", target_os = "linux"))]
+pub(super) fn ordinary_counter_admission_controls(game: &Game<'_>) -> bool {
+    let Some(host) = &game.lan else {
+        return false;
+    };
+    if host.hub.guests.is_empty() {
+        return false;
+    }
+    let Some(startup) = game.ordinary_startup.as_deref() else {
+        return false;
+    };
+    let Ok((_, id)) = ordinary_counter_item(
+        &game.res,
+        &game.options.mod_packages,
+        game.pack.assets.registry,
+        startup,
+    ) else {
+        return false;
+    };
+    let slot = |slot, item| S::SetCreativeModeSlot(play::SetCreativeModeSlot { slot, item });
+    let valid = horizon_protocol::item::Stack::new(id, 64);
+    let mut components = valid.clone();
+    components.added.push((
+        horizon_protocol::item::component::DAMAGE,
+        horizon_protocol::item::Component::Int(1),
+    ));
+    let negatives = [
+        slot(9, Some(valid.clone())),
+        slot(36, Some(horizon_protocol::item::Stack::new(-1, 1))),
+        slot(36, Some(horizon_protocol::item::Stack::new(id, 65))),
+        slot(36, Some(components)),
+    ];
+    host.hub.guests.iter().all(|guest| {
+        if negatives.iter().any(|packet| {
+            game.validate_ordinary_stone_packet(host, guest.conn, packet)
+                .is_ok()
+        }) {
+            return false;
+        }
+        if guest.inventory[0]
+            .as_ref()
+            .is_some_and(|stack| game.ordinary_counter_stack(stack))
+        {
+            let count = guest.inventory[0].as_ref().unwrap().count as i32;
+            if [
+                slot(36, None),
+                slot(
+                    36,
+                    Some(horizon_protocol::item::Stack::new(
+                        id,
+                        if count == 1 { 2 } else { 1 },
+                    )),
+                ),
+            ]
+            .iter()
+            .any(|packet| {
+                game.validate_ordinary_stone_packet(host, guest.conn, packet)
+                    .is_ok()
+            }) {
+                return false;
+            }
+        }
+        true
+    })
+}
+
+#[cfg(all(feature = "mods", target_os = "linux"))]
+fn ordinary_counter_player<'a>(view: &'a View, name: &str) -> &'a serde_json::Value {
+    let uuid = format!("{:032x}", offline_uuid(name));
+    view.ordinary_counter["players"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|player| player["uuid"] == uuid)
+        .expect("actual named native player observation")
+}
+
+/// Real permitted Creative flight/movement packets approach observed native
+/// terrain. No test body, support block, grant or counter value is injected.
+#[cfg(all(feature = "mods", target_os = "linux"))]
+fn ordinary_counter_reach_floor(run: &mut OrdinaryRun, actor: &str) {
+    let view = run.supervisor.snapshot();
+    let player = ordinary_counter_player(&view, actor);
+    if player["supports"].as_array().unwrap().len() >= 2 {
+        return;
+    }
+    let target: [f64; 3] =
+        serde_json::from_value(player["approach"].clone()).expect("native clear approach absent");
+    let mut position: [f64; 3] = serde_json::from_value(player["position"].clone()).unwrap();
+    let cruise = position[1].floor() + 4.0;
+    send(
+        &run.clients[0].session,
+        S::PlayerAbilities(play::PlayerAbilitiesRequest { flags: 2 }),
+    );
+    assert!(
+        run.until(
+            |run| ordinary_counter_player(&run.supervisor.snapshot(), actor)["flying"] == true
+        )
+    );
+    for waypoint in [
+        [position[0], cruise, position[2]],
+        [target[0], cruise, position[2]],
+        [target[0], cruise, target[2]],
+        target,
+    ] {
+        for axis in 0..3 {
+            while (position[axis] - waypoint[axis]).abs() > 0.001 {
+                position[axis] += (waypoint[axis] - position[axis]).clamp(-0.5, 0.5);
+                send(&run.clients[0].session, S::ClientTickEnd(Empty {}));
+                send(
+                    &run.clients[0].session,
+                    S::MovePlayerPosRot(play::MovePlayerPosRot {
+                        x: position[0],
+                        y: position[1],
+                        z: position[2],
+                        yaw: 0.0,
+                        pitch: 90.0,
+                        flags: 0,
+                    }),
+                );
+                assert!(
+                    run.until(|run| {
+                        let actual: [f64; 3] = serde_json::from_value(
+                            ordinary_counter_player(&run.supervisor.snapshot(), actor)["position"]
+                                .clone(),
+                        )
+                        .unwrap();
+                        (0..3).all(|axis| (actual[axis] - position[axis]).abs() < 0.001)
+                    }),
+                    "actual native Creative movement refused at {position:?}"
+                );
+            }
+        }
+    }
+    assert!(run.until(|run| {
+        ordinary_counter_player(&run.supervisor.snapshot(), actor)["supports"]
+            .as_array()
+            .unwrap()
+            .len()
+            >= 2
+    }));
+    eprintln!(
+        "ORDINARY_EMPTY_COUNTER_NATIVE_FLIGHT_APPROACH_PASS actor={actor} position={position:?}"
+    );
+}
+
+#[cfg(all(
+    feature = "mods",
+    target_os = "linux",
+    feature = "native-writer-test-control",
+    debug_assertions
+))]
+#[test]
+#[ignore = "isolated captured ordinary counter; six same-executable children cover three phases in Memory, two-client TCP and LOCAL"]
+fn ordinary_empty_counter_three_process_modes() {
+    use sha2::{Digest, Sha256};
+    let root = std::env::temp_dir().join(format!(
+        "horizon-ordinary-empty-counter-{}",
+        std::process::id()
+    ));
+    fs::create_dir(&root).unwrap();
+    eprintln!("ORDINARY_EMPTY_COUNTER_NATIVE_ROOT={}", root.display());
+    let exe = std::env::current_exe().unwrap();
+    let executable = format!("{:x}", Sha256::digest(fs::read(&exe).unwrap()));
+    let mut pids = std::collections::HashSet::new();
+    for phase in ["A", "B", "C"] {
+        for (mode, test) in [
+            (
+                "local",
+                "game::levels::session_checkpoint::tests::registered::local_tests::ordinary_empty_counter_local_child",
+            ),
+            (
+                "network",
+                "game::retained_server::tests::ordinary_empty_counter_network_child",
+            ),
+        ] {
+            let home = root.join(format!("process-{mode}-{phase}"));
+            fs::create_dir(&home).unwrap();
+            let temp = home.join("temp");
+            fs::create_dir(&temp).unwrap();
+            let mut child = std::process::Command::new(&exe)
+                .args([
+                    "--exact",
+                    test,
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env("HORIZON_EMPTY_COUNTER_PHASE", phase)
+                .env("HORIZON_EMPTY_COUNTER_ROOT", &root)
+                .env("HOME", &home)
+                .env("USERPROFILE", &home)
+                .env("XDG_CONFIG_HOME", &home)
+                .env("XDG_DATA_HOME", &home)
+                .env("XDG_CACHE_HOME", &home)
+                .env("TMPDIR", &temp)
+                .env("TMP", &temp)
+                .env("TEMP", &temp)
+                .current_dir(&home)
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(600);
+            let status = loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    break status;
+                }
+                if Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    let _ = child.wait();
+                    panic!(
+                        "counter child {mode}/{phase} deadline; retained {}",
+                        root.display()
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            assert!(
+                status.success(),
+                "counter child {mode}/{phase} failed; retained {}",
+                root.display()
+            );
+            let result: serde_json::Value = serde_json::from_slice(
+                &fs::read(root.join(format!("{mode}-{phase}.json"))).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(result["executable"], executable);
+            assert_eq!(result["completed"], true);
+            assert!(pids.insert(result["pid"].as_u64().unwrap()));
+        }
+    }
+    assert_eq!(
+        format!("{:x}", Sha256::digest(fs::read(&exe).unwrap())),
+        executable
+    );
+    eprintln!("ORDINARY_EMPTY_COUNTER_THREE_PROCESS_ALL_MODES_PASS");
+}
+
+#[cfg(all(feature = "mods", target_os = "linux"))]
+#[test]
+#[ignore = "child only, exact ordinary empty-counter parent"]
+fn ordinary_empty_counter_network_child() {
+    use sha2::{Digest, Sha256};
+    let phase = std::env::var("HORIZON_EMPTY_COUNTER_PHASE").expect("explicit counter phase");
+    assert!(matches!(phase.as_str(), "A" | "B" | "C"));
+    let root = PathBuf::from(std::env::var_os("HORIZON_EMPTY_COUNTER_ROOT").unwrap());
+    let bundle = OrdinaryBundle::new(&format!("empty-counter-{phase}"));
+    for (label, role) in [
+        ("memory", execution_role::ExecutionRole::IntegratedServer),
+        ("tcp", execution_role::ExecutionRole::DedicatedServer),
+    ] {
+        let case = root.join(label);
+        if phase == "A" {
+            fs::create_dir(&case).unwrap();
+        }
+        let selection = ordinary_own_selection(&case, phase == "A");
+        let input = bundle.input(role, selection.request, None, None);
+        assert!(
+            input.test.ordinary.is_none(),
+            "positive test must never bootstrap"
+        );
+        let mut run = OrdinaryRun::start(input);
+        run.supervisor.paused.store(true, Ordering::SeqCst);
+        assert!(
+            run.until(|run| run.supervisor.snapshot().ready),
+            "counter offer: {:?}",
+            run.supervisor.snapshot()
+        );
+        let tcp = label == "tcp";
+        let actor = if tcp { "OrdinaryA" } else { "OrdinaryOwner" };
+        run.connect(
+            &bundle,
+            tcp,
+            if tcp { "OrdinaryA" } else { "OrdinaryOwner" },
+        );
+        if tcp {
+            run.connect(&bundle, true, "OrdinaryB");
+        }
+        assert!(
+            run.until(|run| run
+                .clients
+                .iter()
+                .all(|client| client.login && client.terrain)
+                && run.supervisor.snapshot().owned_editable
+                && run.supervisor.snapshot().ordinary_counter["policy"] == true),
+            "counter population: {:?}",
+            run.supervisor.snapshot()
+        );
+        let before = run.supervisor.snapshot();
+        assert_eq!(before.ordinary_counter["mutating_control_absent"], true);
+        assert_eq!(before.ordinary_counter["admission_controls"], true);
+        if phase != "A" {
+            let previous = if phase == "B" { "A" } else { "B" };
+            let expected: serde_json::Value = serde_json::from_slice(
+                &fs::read(case.join(format!("{previous}-observation.json"))).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(ordinary_own_observation(&before), expected["native"]);
+            assert_eq!(before.ordinary_counter["active"], expected["counter"]);
+            assert_eq!(
+                before.ordinary_counter["players"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|p| p["inventory"].clone())
+                    .collect::<Vec<_>>(),
+                expected["inventories"].as_array().unwrap().clone()
+            );
+        }
+        let (_, id) = ordinary_counter_item(
+            &bundle.resources,
+            &bundle.packages,
+            bundle.pack.assets.registry,
+            &bundle.startup,
+        )
+        .unwrap();
+        if phase == "A" {
+            assert_eq!(before.ordinary_counter["domain"], serde_json::Value::Null);
+            send(
+                &run.clients[0].session,
+                S::SetCreativeModeSlot(play::SetCreativeModeSlot {
+                    slot: 36,
+                    item: Some(horizon_protocol::item::Stack::new(id, 64)),
+                }),
+            );
+            assert!(
+                run.until(
+                    |run| ordinary_counter_player(&run.supervisor.snapshot(), actor)["inventory"]
+                        [0]["count"]
+                        == 64
+                )
+            );
+            assert_eq!(
+                run.supervisor.snapshot().ordinary_counter["domain"],
+                serde_json::Value::Null
+            );
+        } else {
+            ordinary_counter_reach_floor(&mut run, actor);
+            if phase == "B" {
+                let placed_view = run.supervisor.snapshot();
+                let supports = ordinary_counter_player(&placed_view, actor)["supports"]
+                    .as_array()
+                    .unwrap();
+                assert!(supports.len() >= 2, "actual legal native floor absent");
+                let pos: [i32; 3] = serde_json::from_value(supports[0].clone()).unwrap();
+                fs::write(case.join("target.json"), serde_json::to_vec(&pos).unwrap()).unwrap();
+                send(
+                    &run.clients[0].session,
+                    S::UseItemOn(play::UseItemOn {
+                        hand: 0,
+                        pos,
+                        face: 1,
+                        cursor: [0.5, 1.0, 0.5],
+                        inside: false,
+                        world_border: false,
+                        sequence: 1,
+                    }),
+                );
+                assert!(
+                    run.until(
+                        |run| run.supervisor.snapshot().ordinary_counter["active"].is_object()
+                    ),
+                    "actual BlockItem placement: {:?}",
+                    run.supervisor.snapshot()
+                );
+                assert_eq!(
+                    run.supervisor.snapshot().ordinary_counter["active"]["value"],
+                    0
+                );
+            }
+            let value = run.supervisor.snapshot().ordinary_counter["active"]["value"]
+                .as_u64()
+                .unwrap();
+            run.supervisor.paused.store(false, Ordering::SeqCst);
+            assert!(
+                run.until(
+                    |run| run.supervisor.snapshot().ordinary_counter["active"]["value"]
+                        .as_u64()
+                        .is_some_and(|v| v >= value + 3)
+                ),
+                "real captured Wasm advance: {:?}",
+                run.supervisor.snapshot()
+            );
+            run.supervisor.paused.store(true, Ordering::SeqCst);
+            assert!(run.until(|run| run.supervisor.snapshot().paused));
+            let active = run.supervisor.snapshot().ordinary_counter["active"].clone();
+            assert_eq!(active["generation"], 1);
+            assert_eq!(active["slot_empty"], true);
+            if phase == "C" {
+                let at = ordinary_counter_player(&run.supervisor.snapshot(), actor)["supports"]
+                    .as_array()
+                    .unwrap()[0]
+                    .clone();
+                let pos = serde_json::from_value(at).unwrap();
+                send(
+                    &run.clients[0].session,
+                    S::UseItemOn(play::UseItemOn {
+                        hand: 0,
+                        pos,
+                        face: 1,
+                        cursor: [0.5, 1.0, 0.5],
+                        inside: false,
+                        world_border: false,
+                        sequence: 2,
+                    }),
+                );
+                send(
+                    &run.clients[0].session,
+                    S::SetCarriedItem(play::SetCarriedItem { slot: 1 }),
+                );
+                assert!(run.until(|run| ordinary_counter_player(
+                    &run.supervisor.snapshot(),
+                    actor
+                )["selected"]
+                    == 1));
+                assert_eq!(
+                    run.supervisor.snapshot().ordinary_counter["active"],
+                    active,
+                    "second target must not replace domain/slot/value"
+                );
+                assert_eq!(run.supervisor.snapshot().ordinary_counter["domain"], 1);
+                assert!(
+                    ordinary_counter_player(&run.supervisor.snapshot(), actor)["supports"]
+                        .as_array()
+                        .unwrap()
+                        .contains(&serde_json::to_value(pos).unwrap()),
+                    "second physical alias refused"
+                );
+                send(
+                    &run.clients[0].session,
+                    S::SetCarriedItem(play::SetCarriedItem { slot: 0 }),
+                );
+                assert!(run.until(|run| ordinary_counter_player(
+                    &run.supervisor.snapshot(),
+                    actor
+                )["selected"]
+                    == 0));
+            }
+        }
+        let observed = run.supervisor.snapshot();
+        assert_eq!(observed.ordinary_counter["admission_controls"], true);
+        assert!(
+            observed.ordinary_counter["players"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|p| p["carried_empty"] == true)
+        );
+        let observation = serde_json::json!({"native":ordinary_own_observation(&observed),"counter":observed.ordinary_counter["active"],
+            "inventories":observed.ordinary_counter["players"].as_array().unwrap().iter().map(|p|p["inventory"].clone()).collect::<Vec<_>>()});
+        run.finish()
+            .expect("actual coherent ordinary counter close");
+        let archive = ordinary_own_archive(&case);
+        let epoch = match phase.as_str() {
+            "A" => 1,
+            "B" => 2,
+            _ => 3,
+        };
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &fs::read(archive.join(format!("epoch-{epoch:020}/manifest.json"))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            manifest["kind"],
+            if phase == "A" {
+                "horizon-owned-unplaced-session-checkpoint"
+            } else {
+                "horizon-registered-guest-session-checkpoint"
+            }
+        );
+        let identity: serde_json::Value = serde_json::from_slice(
+            &fs::read(case.join("saves/Owned/horizon-world-identity.json")).unwrap(),
+        )
+        .unwrap();
+        let record = fs::read(
+            case.join("backups/horizon-owned/authority")
+                .join(identity["world_uuid"].as_str().unwrap())
+                .join("owned.json"),
+        )
+        .unwrap();
+        if phase == "A" {
+            fs::write(case.join("OWN-original.json"), &record).unwrap();
+        } else {
+            assert_eq!(record, fs::read(case.join("OWN-original.json")).unwrap());
+        }
+        fs::write(
+            case.join(format!("{phase}-observation.json")),
+            serde_json::to_vec_pretty(&observation).unwrap(),
+        )
+        .unwrap();
+        eprintln!("ORDINARY_EMPTY_COUNTER_NETWORK_{phase}_{label}_PASS epoch={epoch}");
+    }
+    fs::write(root.join(format!("network-{phase}.json")),serde_json::to_vec(&serde_json::json!({"completed":true,"pid":std::process::id(),
+        "executable":format!("{:x}",Sha256::digest(fs::read(std::env::current_exe().unwrap()).unwrap()))})).unwrap()).unwrap();
+    std::mem::forget(bundle);
+}
 #[cfg(all(feature = "mods", target_os = "linux"))]
 #[test]
 #[ignore = "isolated captured resources: ordinary network factories and original workers, serial fresh-process Memory/TCP OWN Unplaced reopen"]

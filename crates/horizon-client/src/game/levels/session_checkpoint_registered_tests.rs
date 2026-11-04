@@ -1501,6 +1501,15 @@ mod local_tests {
                 panic!("actual LOCAL runtime activation: {}", refused.reason)
             });
         let ordinary = request.is_some();
+        let mut cpu = GameCpuResources::load(&f.root).unwrap();
+        crate::game::prepare_ordinary_creative(
+            &mut cpu,
+            &f.resources,
+            &f.packages,
+            &f.pack,
+            startup,
+        )
+        .unwrap();
         let initial = if let Some(request) = request {
             let preparation = OrdinaryPreparation::prepare(
                 request,
@@ -1526,7 +1535,7 @@ mod local_tests {
                 options,
                 settings,
                 horizon_client::audio::Audio::silent(&f.root),
-                Some(GameCpuResources::load(&f.root).unwrap()),
+                Some(cpu),
                 initial,
             )
             .unwrap(),
@@ -2769,6 +2778,298 @@ mod local_tests {
         )
         .unwrap();
         eprintln!("ORDINARY_LOCAL_CHILD_{phase}_PASS");
+        std::mem::forget(f);
+    }
+
+    /// Aim the SAME native player at existing generated terrain; never write a
+    /// support or fabricate a body/hit to make the ordinary placement succeed.
+    fn ordinary_local_counter_aim(game: &mut Game<'_>, x: i32, z: i32) -> [i32; 3] {
+        let y = (-63..319)
+            .rev()
+            .find(|y| game.validate_ordinary_stone_target([x, *y, z], 1).is_ok())
+            .expect("loaded generated native support");
+        game.player.as_mut().unwrap().position =
+            Vec3::new(f64::from(x) + 0.5, f64::from(y) + 1.0, f64::from(z) - 1.5);
+        game.yaw = 0.0;
+        game.pitch = 45.0;
+        game.selected = 0;
+        game.sync_player_body();
+        let hit = game.pick().expect("actual native terrain ray");
+        assert_eq!(hit.face, [0, 1, 0]);
+        game.validate_ordinary_stone_target(hit.pos, 1).unwrap();
+        hit.pos
+    }
+
+    #[test]
+    #[ignore = "child only; selected by the ordinary empty-counter three-phase parent"]
+    fn ordinary_empty_counter_local_child() {
+        use crate::game::retained_server::OrdinaryRequest;
+        use horizon_client::menu::Input;
+        let phase = std::env::var("HORIZON_EMPTY_COUNTER_PHASE").expect("explicit counter phase");
+        assert!(matches!(phase.as_str(), "A" | "B" | "C"));
+        let root = PathBuf::from(std::env::var_os("HORIZON_EMPTY_COUNTER_ROOT").unwrap());
+        let case = root.join("local");
+        if phase == "A" {
+            fs::create_dir(&case).unwrap();
+        }
+        let f = Materialized::new(&format!("empty-local-{phase}"));
+        let (startup, tree) = owned_runtime(&f);
+        let entry = RetainedEntryIdentity {
+            token: 601,
+            owner: Arc::new(()),
+        };
+        let mut request = WorldRequest::new(
+            "unused",
+            (phase == "A").then_some("Ordinary empty counter"),
+            (phase == "A").then_some(17),
+            true,
+            None,
+        )
+        .unwrap()
+        .with_identity_intent(if phase == "A" {
+            IdentityIntent::CreateNewIdentity
+        } else {
+            IdentityIntent::RequireExistingIdentity
+        });
+        request.save_root = case.join("world");
+        let selection = request.into_ordinary_local(&case, None, until()).unwrap();
+        let mut game = match selection.request {
+            OrdinaryRequest::Native(request) if phase == "A" => {
+                let mut game = local_game(&f, &startup, &tree, &entry, Some(request));
+                owned_player(&mut game, &f);
+                game.inventory[0] = None;
+                game
+            }
+            OrdinaryRequest::RecoverOwned(request) if phase != "A" => {
+                let seed = local_game(&f, &startup, &tree, &entry, None);
+                let mut work = LocalOwnedRecovery::start(seed, entry, *request);
+                let deadline = until();
+                loop {
+                    match work.poll_activate().unwrap() {
+                        Some(game) => {
+                            assert!(work.take_construction().is_some());
+                            break game;
+                        }
+                        None => {
+                            assert!(Instant::now() < deadline);
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                    }
+                }
+            }
+            _ => panic!("ordinary original route differs"),
+        };
+        // The same non-rendering loading steps used before ordinary native
+        // frames. The cold residency fixture cannot own a recovered world.
+        let clock = game.world.game_time;
+        let ready_deadline = until();
+        while !game.streaming.expect_existing().is_lit(0, 0) {
+            game.update_world();
+            game.poll_ordinary_native_reads().unwrap();
+            assert!(
+                game.error.is_none() && Instant::now() < ready_deadline,
+                "ordinary recovered native column did not become ready"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            game.world.game_time, clock,
+            "loading cannot advance the counter clock"
+        );
+        let binding =
+            crate::game::world_loading::owned_guest_binding(&f.packages, f.pack.assets.registry)
+                .unwrap();
+        let observe = |game: &Game<'_>| match game.world.guest_runtime_state() {
+            Ok(GuestRuntimeState::ReadyActive { counter, slot }) => {
+                serde_json::json!({"world":counter.placement().world.to_string(),
+                    "position":counter.placement().position,"generation":counter.placement().generation,
+                    "value":game.world.read_persistent_counter(&counter).unwrap().counter(),"slot_incarnation":slot.incarnation(),
+                    "slot_empty":game.world.read_world_slot(&slot).unwrap().slot.stack().is_none()})
+            }
+            _ => serde_json::Value::Null,
+        };
+        assert!(
+            !game.world.has_registered_guest_placement_policy(),
+            "recovery restores committed state before ordinary arming"
+        );
+        assert!(!game.ordinary_counter_use_ready());
+        let domain_before = game.world.counter_domain_snapshot();
+        let committed_before = observe(&game);
+        let original = game.session_lock.take().unwrap();
+        assert!(
+            !game.arm_ordinary_owned_counter().unwrap(),
+            "no actual OWN cannot arm"
+        );
+        game.session_lock = Some(original);
+        if phase != "A" {
+            assert!(
+                game.world.chunks.contains_key(&(0, 0)),
+                "verified recovery already owns the complete native support column"
+            );
+            ordinary_local_counter_aim(&mut game, 6, 6);
+            assert!(
+                !game.ordinary_stone_use_admitted(),
+                "counter input waits for policy"
+            );
+            assert!(game.use_item().unwrap().is_none());
+        }
+        assert!(game.arm_ordinary_owned_counter().unwrap());
+        assert!(
+            game.arm_ordinary_owned_counter().unwrap(),
+            "same binding arming is idempotent"
+        );
+        assert!(game.world.has_registered_guest_placement_policy());
+        assert_eq!(
+            game.world.counter_domain_snapshot(),
+            domain_before,
+            "arming cannot allocate history"
+        );
+        assert_eq!(
+            observe(&game),
+            committed_before,
+            "arming cannot reset committed state or mint another slot"
+        );
+        if phase == "A" {
+            assert!(game.world.counter_domain_snapshot().is_none());
+            game.session_lock
+                .as_ref()
+                .unwrap()
+                .validate_owned_unplaced(&game.world, &binding)
+                .unwrap();
+            let original = game.inventory.clone();
+            game.screen = crate::game::Screen::Creative;
+            game.creative_screen.selected = game
+                .creative_screen
+                .tabs
+                .iter()
+                .position(|tab| !tab.search && !tab.inventory)
+                .unwrap();
+            game.creative_screen.scroll = 1.0;
+            let items = game.creative_screen.items(&game.pack.names);
+            let index = items
+                .iter()
+                .position(|stack| stack.item.as_ref() == f.alias)
+                .unwrap();
+            let first = game.creative_screen.first_row(&game.pack.names);
+            let display = crate::game::Creative::DISPLAY + index - first * 9;
+            assert!(
+                (crate::game::Creative::DISPLAY..crate::game::Creative::DISPLAY + 45)
+                    .contains(&display)
+            );
+            assert!(
+                !game.menu_click(Some(display), 0, Input::Pickup),
+                "counter carried pickup closed"
+            );
+            assert!(
+                game.menu_click(Some(display), 0, Input::Swap),
+                "existing native hotbar selection"
+            );
+            assert!(game.carried.is_none());
+            assert!(game.ordinary_counter_stack(game.inventory[0].as_ref().unwrap()));
+            assert_eq!(game.inventory[1..], original[1..]);
+            assert!(
+                !game.menu_click(Some(0), 0, Input::Pickup),
+                "counter pickup stays closed"
+            );
+            game.screen = crate::game::Screen::Playing;
+            assert!(game.world.counter_domain_snapshot().is_none());
+        } else {
+            let previous = if phase == "B" { "A" } else { "B" };
+            let expected: serde_json::Value = serde_json::from_slice(
+                &fs::read(case.join(format!("{previous}-counter.json"))).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                observe(&game),
+                expected,
+                "coherent committed value/identity restored"
+            );
+            assert_eq!(game.inventory[0].as_ref().unwrap().count, 64);
+            assert_eq!(game.inventory[1].as_ref().unwrap().count, 7);
+            assert_eq!(game.stats.get("custom", "minecraft:jump"), 7);
+            assert!(game.carried.is_none());
+            if phase == "B" {
+                let support = ordinary_local_counter_aim(&mut game, 2, 2);
+                let original = game.native_close_authority.take().unwrap();
+                assert!(!game.arm_ordinary_owned_counter().unwrap());
+                assert!(!game.ordinary_stone_use_admitted());
+                game.native_close_authority = Some(original);
+                assert!(game.ordinary_stone_use_admitted());
+                assert!(
+                    game.use_item().unwrap().is_some(),
+                    "normal native BlockItem ingress"
+                );
+                assert_eq!(
+                    game.world.block(support[0], support[1] + 1, support[2]),
+                    binding.state_id()
+                );
+                assert_eq!(observe(&game)["value"], 0);
+            }
+            let initial = observe(&game)["value"].as_u64().unwrap();
+            for _ in 0..3 {
+                game.tick().unwrap();
+            }
+            assert_eq!(
+                observe(&game)["value"],
+                initial + 3,
+                "actual Game ticks run captured Wasm"
+            );
+            assert_eq!(observe(&game)["slot_empty"], true);
+            if phase == "C" {
+                let active = observe(&game);
+                let support = ordinary_local_counter_aim(&mut game, 4, 4);
+                game.use_delay = 0;
+                game.use_item().unwrap();
+                assert_eq!(
+                    game.world.block(support[0], support[1] + 1, support[2]),
+                    game.world.air
+                );
+                assert_eq!(observe(&game), active);
+                assert_eq!(game.world.counter_domain_snapshot().unwrap().high_water, 1);
+                assert_eq!(game.inventory[0].as_ref().unwrap().count, 64);
+            }
+            // Restore the original native fixture pose, never a counter/domain value.
+            let body = game.player.as_mut().unwrap();
+            body.position = Vec3::new(2.5, 120.0, 0.5);
+            body.velocity = Vec3::new(0.125, -0.25, 0.5);
+            body.ground.on_ground = false;
+            body.health.food.exhaustion = 2.25;
+            body.health.food.timer = 7;
+            body.flying = true;
+            game.yaw = 91.0;
+            game.pitch = -17.0;
+            game.sync_player_body();
+        }
+        let observed = observe(&game);
+        let owned = game.session_lock.as_ref().unwrap().owned().unwrap().clone();
+        let record = case
+            .join("backups/horizon-owned/authority")
+            .join(owned.world().to_string())
+            .join("owned.json");
+        let bytes = fs::read(&record).unwrap();
+        if phase == "A" {
+            fs::write(case.join("OWN-original.json"), &bytes).unwrap();
+        } else {
+            assert_eq!(bytes, fs::read(case.join("OWN-original.json")).unwrap());
+        }
+        close_local(game, owned.archive(), false);
+        assert_eq!(
+            epochs(owned.archive()).unwrap().len(),
+            match phase.as_str() {
+                "A" => 1,
+                "B" => 2,
+                _ => 3,
+            }
+        );
+        assert_eq!(fs::read(record).unwrap(), bytes);
+        fs::write(
+            case.join(format!("{phase}-counter.json")),
+            serde_json::to_vec_pretty(&observed).unwrap(),
+        )
+        .unwrap();
+        fs::write(root.join(format!("local-{phase}.json")),serde_json::to_vec(&serde_json::json!({"completed":true,"pid":std::process::id(),
+            "executable":format!("{:x}",Sha256::digest(fs::read(std::env::current_exe().unwrap()).unwrap()))})).unwrap()).unwrap();
+        eprintln!("ORDINARY_EMPTY_COUNTER_LOCAL_{phase}_PASS");
         std::mem::forget(f);
     }
 

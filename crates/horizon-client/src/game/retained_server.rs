@@ -451,6 +451,66 @@ fn ordinary_stone_candidate(packet: &Serverbound) -> bool {
 }
 
 impl Game<'_> {
+    /// Actual published native population, never a UI observation or close right.
+    fn ordinary_owned_population_ready(&self) -> bool {
+        self.session_lock
+            .as_ref()
+            .and_then(|session| session.owned())
+            .is_some()
+            && match self.retained_server.as_ref() {
+                Some(server) => !server.frozen() && server.checkpoint_roster.is_some(),
+                None => {
+                    self.local_checkpoint_owner()
+                        && self
+                            .native_close_authority
+                            .as_ref()
+                            .is_some_and(|original| original.retains_ordinary_source(self))
+                        && self.player.as_ref().is_some_and(|body| !body.server_copy)
+                        && !self.restore_player_state
+                        && !self.retained_entry_closing
+                }
+            }
+    }
+    pub(super) fn arm_ordinary_owned_counter(&mut self) -> Result<bool> {
+        if !self.ordinary_owned_population_ready() {
+            return Ok(false);
+        }
+        let binding = world_loading::owned_guest_binding(
+            &self.options.mod_packages,
+            self.pack.assets.registry,
+        )?;
+        self.arm_registered_guest_placement(binding.type_id())?;
+        Ok(true)
+    }
+    /// Frontend metadata only. Authoritative admission remains a separate check.
+    pub(super) fn ordinary_counter_stack(&self, stack: &ItemStack) -> bool {
+        let Some(startup) = self.ordinary_startup.as_deref().or_else(|| {
+            self.retained_server
+                .as_ref()
+                .and_then(|server| server.startup.as_deref())
+        }) else {
+            return false;
+        };
+        ordinary_counter_item(
+            &self.res,
+            &self.options.mod_packages,
+            self.pack.assets.registry,
+            startup,
+        )
+        .is_ok_and(|(binding, _)| {
+            stack.item.as_ref() == binding.physical_descriptor().name
+                && stack.damage == 0
+                && stack.extra.is_none()
+                && self
+                    .res
+                    .items()
+                    .get(&stack.item)
+                    .is_some_and(|info| stack.count > 0 && stack.count <= info.max_stack.min(64))
+        })
+    }
+    pub(super) fn ordinary_counter_use_ready(&self) -> bool {
+        self.ordinary_owned_population_ready() && self.world.has_registered_guest_placement_policy()
+    }
     /// Publish the fixed actual native population once. The retained opaque
     /// roster is monotonic: losing a player can block close, never make an OWN
     /// world eligible for original-new native cancellation again.
@@ -472,10 +532,11 @@ impl Game<'_> {
             return Err("OWN server lost its actual startup/archive route".into());
         }
         if let Some(roster) = &server.checkpoint_roster {
+            self.preflight_checkpoint_participants(roster)
+                .map_err(|error| format!("published OWN native population changed: {error:?}"))?;
             return self
-                .preflight_checkpoint_participants(roster)
-                .map(|()| true)
-                .map_err(|error| format!("published OWN native population changed: {error:?}"));
+                .arm_ordinary_owned_counter()
+                .map_err(|error| error.to_string());
         }
         let expected = if server.integrated_owner().is_some() {
             1
@@ -525,7 +586,8 @@ impl Game<'_> {
                 .map_err(|error| error.to_string())?;
         }
         self.retained_server.as_mut().unwrap().checkpoint_roster = Some(roster);
-        Ok(true)
+        self.arm_ordinary_owned_counter()
+            .map_err(|error| error.to_string())
     }
     /// Only the actual never-editable NEW constructor may use the existing
     /// native-only cancellation close. This neither publishes a complete image
@@ -714,35 +776,49 @@ impl Game<'_> {
                     && info.block == self.pack.assets.registry.default_state("minecraft:stone")
             })
     }
+    fn ordinary_wire_stack(
+        &self,
+        host: &super::lan::LanHost,
+        wire: &horizon_protocol::item::Stack,
+    ) -> std::result::Result<ItemStack, String> {
+        if !(1..=64).contains(&wire.count) || !wire.added.is_empty() || !wire.removed.is_empty() {
+            return Err("ordinary item requires plain native components/count".into());
+        }
+        let decoded = host.hub.stack_from_network(wire);
+        if (!self.ordinary_plain_stone(&decoded) && !self.ordinary_counter_stack(&decoded))
+            || decoded.count != wire.count as u32
+            || host.hub.registry_id("minecraft:item", &decoded.item) != Some(wire.item)
+            || host.hub.registry_name("minecraft:item", wire.item) != Some(&*decoded.item)
+        {
+            return Err("ordinary item native identity/count differs".into());
+        }
+        let encoded = horizon_client::lan::guest::stack_to_network(
+            |name| host.hub.registry_id("minecraft:item", name).unwrap_or(-1),
+            |kind, name| host.hub.registry_id(kind, name),
+            &Some(decoded.clone()),
+        );
+        if encoded.as_ref() != Some(wire) {
+            return Err("ordinary native item roundtrip differs".into());
+        }
+        Ok(decoded)
+    }
     pub(super) fn ordinary_stone_use_admitted(&self) -> bool {
         if self
             .session_lock
             .as_ref()
             .and_then(|session| session.owned())
             .is_some()
+            && !self.ordinary_owned_population_ready()
         {
-            let original_player_ready = match self.retained_server.as_ref() {
-                Some(server) => server.checkpoint_roster.is_some(),
-                None => {
-                    self.local_checkpoint_owner()
-                        && self
-                            .native_close_authority
-                            .as_ref()
-                            .is_some_and(|original| original.retains_ordinary_source(self))
-                        && self.player.as_ref().is_some_and(|body| !body.server_copy)
-                        && !self.restore_player_state
-                        && !self.retained_entry_closing
-                }
-            };
-            if !original_player_ready {
-                return false;
-            }
+            return false;
         }
         if !self.creative
             || self.hand != Hand::Main
-            || !self
-                .held()
-                .is_some_and(|stack| self.ordinary_plain_stone(stack))
+            || !self.held().is_some_and(|stack| {
+                self.ordinary_plain_stone(stack)
+                    || (self.ordinary_counter_stack(stack)
+                        && (self.remote.is_some() || self.ordinary_counter_use_ready()))
+            })
         {
             return false;
         }
@@ -818,8 +894,26 @@ impl Game<'_> {
                             .into(),
                     );
                 }
-                if guest
-                    .menu_slot(packet.slot as usize)
+                let decoded = packet
+                    .item
+                    .as_ref()
+                    .map(|wire| self.ordinary_wire_stack(host, wire))
+                    .transpose()?;
+                let current = guest.menu_slot(packet.slot as usize);
+                if current
+                    .as_ref()
+                    .is_some_and(|stack| self.ordinary_counter_stack(stack))
+                {
+                    return if (36..=44).contains(&packet.slot)
+                        && self.ordinary_counter_use_ready()
+                        && decoded.as_ref() == current.as_ref()
+                    {
+                        Ok(())
+                    } else {
+                        Err("ordinary counter stack cannot be cleared or replaced".into())
+                    };
+                }
+                if current
                     .as_ref()
                     .is_some_and(|stack| !self.ordinary_plain_stone(stack))
                 {
@@ -828,20 +922,11 @@ impl Game<'_> {
                             .into(),
                     );
                 }
-                if let Some(stack) = &packet.item {
-                    let startup = server.startup.as_ref().unwrap();
-                    let stone = startup
-                        .sync()
-                        .builtin
-                        .get("minecraft:item")
-                        .and_then(|ids| ids.id("minecraft:stone"));
-                    let decoded = host.hub.stack_from_network(stack);
-                    if stone != Some(stack.item)
-                        || !self.ordinary_plain_stone(&decoded)
-                        || decoded.count != stack.count as u32
-                    {
-                        return Err("ordinary creative edit requires exact native stone identity/count/components".into());
-                    }
+                if let Some(stack) = &decoded
+                    && self.ordinary_counter_stack(stack)
+                    && (!(36..=44).contains(&packet.slot) || !self.ordinary_counter_use_ready())
+                {
+                    return Err("ordinary counter creation requires an armed OWN hotbar".into());
                 }
                 Ok(())
             }
@@ -859,7 +944,11 @@ impl Game<'_> {
                 }
                 if !guest.inventory[guest.selected]
                     .as_ref()
-                    .is_some_and(|stack| self.ordinary_plain_stone(stack))
+                    .is_some_and(|stack| {
+                        self.ordinary_plain_stone(stack)
+                            || (self.ordinary_counter_stack(stack)
+                                && self.ordinary_counter_use_ready())
+                    })
                     || !guest.within_block_range(packet.pos, 0.0)
                 {
                     return Err("ordinary placement requires native stone in the actual main hand within native reach".into());
@@ -959,6 +1048,8 @@ impl Game<'_> {
 
 #[derive(Clone, Debug)]
 pub(super) struct View {
+    #[cfg(all(test, feature = "mods", target_os = "linux"))]
+    ordinary_counter: serde_json::Value,
     ordinary_closed_world: Arc<Mutex<Option<super::paired_close::OrdinaryClosedWorld>>>,
     phase: &'static str,
     pub(super) attempt: u64,
@@ -985,6 +1076,8 @@ pub(super) struct View {
 impl Default for View {
     fn default() -> Self {
         Self {
+            #[cfg(all(test, feature = "mods", target_os = "linux"))]
+            ordinary_counter: serde_json::Value::Null,
             ordinary_closed_world: Arc::new(Mutex::new(None)),
             phase: "Preparing",
             attempt: 0,
@@ -2276,6 +2369,106 @@ fn player_observations(game: &Game<'_>) -> Vec<serde_json::Value> {
         "book_open":g.recipe_book.open[0],"book_filtering":g.recipe_book.filtering[0],"position":g.position})).collect()).unwrap_or_default()
 }
 
+/// Test observation only: no bootstrap, terrain edit, grant or evaluator call.
+#[cfg(all(test, feature = "mods", target_os = "linux"))]
+fn ordinary_counter_approach(
+    game: &Game<'_>,
+    guest: &horizon_client::lan::guest::Guest,
+) -> Option<[f64; 3]> {
+    let [x, y, z] = guest.position.map(|axis| axis.floor() as i32);
+    if y + 6 >= 320 {
+        return None;
+    }
+    let clear = |cx: i32, cz: i32, low: i32| {
+        game.world
+            .chunks
+            .contains_key(&(cx.div_euclid(16), cz.div_euclid(16)))
+            && (low..=y + 6).all(|cy| game.world.block(cx, cy, cz) == game.world.air)
+    };
+    if !clear(x, z, y) {
+        return None;
+    }
+    let mut candidates = Vec::new();
+    for dx in -8..=8_i32 {
+        for dz in -8..=8_i32 {
+            for dy in 1..=16 {
+                let at = [x + dx, y - dy, z + dz];
+                if game.validate_ordinary_stone_target(at, 1).is_ok()
+                    && clear(at[0], at[2], at[1] + 1)
+                    && (x.min(at[0])..=x.max(at[0])).all(|cx| clear(cx, z, y + 4))
+                    && (z.min(at[2])..=z.max(at[2])).all(|cz| clear(at[0], cz, y + 4))
+                {
+                    candidates.push((dx * dx + dy * dy + dz * dz, at));
+                }
+            }
+        }
+    }
+    candidates.sort_by_key(|(distance, at)| (*distance, *at));
+    candidates.first().map(|(_, at)| {
+        [
+            f64::from(at[0]) + 0.5,
+            f64::from(at[1]) + 3.0,
+            f64::from(at[2]) + 0.5,
+        ]
+    })
+}
+
+#[cfg(all(test, feature = "mods", target_os = "linux"))]
+fn ordinary_counter_observation(game: &Game<'_>) -> serde_json::Value {
+    use horizon_client::world::counter_restore::GuestRuntimeState;
+    if game
+        .session_lock
+        .as_ref()
+        .and_then(|session| session.owned())
+        .is_none()
+        || !game
+            .retained_server
+            .as_ref()
+            .is_some_and(|server| server.startup.is_some() && server.test.ordinary.is_none())
+    {
+        return serde_json::Value::Null;
+    }
+    let active = match game.world.guest_runtime_state() {
+        Ok(GuestRuntimeState::ReadyActive { counter, slot }) => {
+            let placement = counter.placement();
+            serde_json::json!({"world":placement.world.to_string(),"dimension":placement.dimension,
+                "position":placement.position,"generation":placement.generation,
+                "value":game.world.read_persistent_counter(&counter).unwrap().counter(),
+                "slot_incarnation":slot.incarnation(),
+                "slot_empty":game.world.read_world_slot(&slot).unwrap().slot.stack().is_none(),
+                "native":game.world.block(placement.position[0],placement.position[1],placement.position[2]).0})
+        }
+        _ => serde_json::Value::Null,
+    };
+    let host = game.lan.as_ref().unwrap();
+    let mut players = host.hub.guests.iter().map(|guest| {
+        let mut supports = Vec::new();
+        let [x,y,z] = guest.position.map(|axis| axis.floor() as i32);
+        for dy in 1..=4 {
+            for dz in -2..=2 {
+                for dx in -2..=2 {
+                    let at = [x+dx,y-dy,z+dz];
+                    if game.validate_ordinary_stone_target(at,1).is_ok() && guest.within_block_range(at,0.0) {
+                        supports.push(at);
+                    }
+                }
+            }
+        }
+        let approach=if supports.len()<2 {ordinary_counter_approach(game,guest)} else {None};
+        serde_json::json!({"uuid":format!("{:032x}",guest.uuid),"supports":supports,"selected":guest.selected,
+            "position":guest.position,"flying":guest.flying,"approach":approach,
+            "inventory":guest.inventory.iter().map(|stack|stack.as_ref().map(|s|serde_json::json!({
+                "name":s.item.as_ref(),"count":s.count,"damage":s.damage,"extra":format!("{:?}",s.extra)}))).collect::<Vec<_>>(),
+            "carried_empty":guest.carried.is_none()})
+    }).collect::<Vec<_>>();
+    players.sort_by(|a, b| a["uuid"].as_str().unwrap().cmp(b["uuid"].as_str().unwrap()));
+    serde_json::json!({"policy":game.world.has_registered_guest_placement_policy(),
+        "domain":game.world.counter_domain_snapshot().map(|domain|domain.high_water),
+        "mutating_control_absent":game.retained_server.as_ref().unwrap().test.ordinary.is_none(),
+        "admission_controls":tests::ordinary_counter_admission_controls(game),
+        "active":active,"players":players})
+}
+
 fn run_game<'a>(
     game: Box<Game<'a>>,
     commands: mpsc::Receiver<Command>,
@@ -2496,6 +2689,10 @@ fn run_game_from<'a>(
                     .as_ref()
                     .and_then(|host| host.hub.retained_close_view());
                 view.players = player_observations(game);
+                #[cfg(all(test, feature = "mods", target_os = "linux"))]
+                {
+                    view.ordinary_counter = ordinary_counter_observation(game);
+                }
                 #[cfg(test)]
                 {
                     if game

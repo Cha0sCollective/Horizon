@@ -14993,6 +14993,14 @@ impl<'a> Game<'a> {
                     }
                     return Ok(());
                 }
+                if pressed
+                    && !event.repeat
+                    && self.screen == Screen::Creative
+                    && HOTBAR_DIGITS.contains(&key)
+                {
+                    self.inventory_hotkey(key);
+                    return Ok(());
+                }
                 for mapped in self.settings.keys.translate_all(key).into_iter().flatten() {
                     let admitted = matches!(
                         mapped,
@@ -15146,7 +15154,13 @@ impl<'a> Game<'a> {
                 let first = self.creative_screen.first_row(&self.pack.names);
                 items
                     .get(first * 9 + slot - Creative::DISPLAY)
-                    .is_some_and(|stack| self.ordinary_plain_stone(stack))
+                    .is_some_and(|stack| {
+                        self.ordinary_plain_stone(stack)
+                            || (input == Input::Swap
+                                && self.carried.is_none()
+                                && self.ordinary_counter_stack(stack)
+                                && (self.remote.is_some() || self.ordinary_counter_use_ready()))
+                    })
             }
             _ => false,
         }
@@ -15218,6 +15232,7 @@ impl<'a> Game<'a> {
             return Err(error.to_string().into());
         }
         self.spawn_player()?;
+        self.arm_ordinary_owned_counter()?;
         let paused = self.pauses_game();
         if paused {
             self.clear_ordinary_input();
@@ -15954,6 +15969,124 @@ impl GameCpuResources {
             creative_screen: Creative::load(root)?,
         })
     }
+}
+
+/// Data-only recognition of the one captured BlockItem. This never grants world
+/// admission; the authoritative input path separately checks its actual owners.
+#[cfg(feature = "paired-packages")]
+fn ordinary_counter_item(
+    resources: &Resources,
+    packages: &mod_packages::Packages,
+    registry: &'static horizon_world::registry::BlockRegistry,
+    startup: &mod_packages::FrozenHostInputs,
+) -> Result<(horizon_client::world::counter_restore::NativeBinding, i32)> {
+    if !startup.retains_startup(packages, registry) {
+        return Err("ordinary counter lost its original captured registry".into());
+    }
+    let binding = world_loading::owned_guest_binding(packages, registry)?;
+    let name = &binding.physical_descriptor().name;
+    let info = resources
+        .items()
+        .get(name)
+        .ok_or("captured counter item absent")?;
+    let behaviour = resources.behaviours();
+    let item = behaviour
+        .item_binding(name)
+        .ok_or("captured BlockItem absent")?;
+    if !(1..=64).contains(&info.max_stack)
+        || info.block != Some(binding.state_id())
+        || item.kind != horizon_world::level::ItemKind::Block
+        || item.block != behaviour.block(binding.state_id())
+    {
+        return Err("captured counter item/block binding differs".into());
+    }
+    let ids = startup
+        .sync()
+        .builtin
+        .get("minecraft:item")
+        .ok_or("item registry absent")?;
+    let id = ids
+        .id(name)
+        .ok_or("captured counter native item ID absent")?;
+    if id <= 0 || ids.name(id) != Some(name.as_str()) {
+        return Err("captured counter native item ID is not reversible".into());
+    }
+    let stack = ItemStack {
+        item: Arc::from(name.as_str()),
+        count: 1,
+        damage: 0,
+        extra: None,
+    };
+    let encoded = horizon_client::lan::guest::stack_to_network(
+        |name| ids.id(name).unwrap_or(-1),
+        |kind, name| startup.sync().id(kind, name),
+        &Some(stack.clone()),
+    )
+    .ok_or("captured counter stack did not encode")?;
+    if encoded.item != id
+        || encoded.count != 1
+        || !encoded.added.is_empty()
+        || !encoded.removed.is_empty()
+        || horizon_client::item_sync::from_network(
+            &encoded,
+            &startup.sync().builtin,
+            &startup.sync().dynamic,
+        ) != stack
+    {
+        return Err("captured counter native stack roundtrip differs".into());
+    }
+    Ok((binding, id))
+}
+
+/// Decorate only fresh, unused CPU data, before native/remote acquisition and
+/// before Creative caches its displayed items. All fallible checks precede edits.
+#[cfg(feature = "paired-packages")]
+fn prepare_ordinary_creative(
+    cpu: &mut GameCpuResources,
+    resources: &Resources,
+    packages: &mod_packages::Packages,
+    pack: &PackResources,
+    startup: &mod_packages::FrozenHostInputs,
+) -> Result<()> {
+    let (binding, _) = ordinary_counter_item(resources, packages, pack.assets.registry, startup)?;
+    let name = &binding.physical_descriptor().name;
+    let model = pack
+        .item_renderer
+        .models
+        .prototypes
+        .get(name)
+        .and_then(|prototype| prototype.get("minecraft:item_model"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or("captured counter item model reference absent")?;
+    let model = horizon_assets::item_model::identifier(model)?;
+    if !pack.item_renderer.models.definitions.contains_key(&model) {
+        return Err("captured counter client item definition absent".into());
+    }
+    let tab = cpu
+        .creative_screen
+        .tabs
+        .iter()
+        .position(|tab| !tab.search && !tab.inventory)
+        .ok_or("ordinary counter requires an existing native item tab")?;
+    let expected = ItemStack {
+        item: Arc::from(name.as_str()),
+        count: 1,
+        damage: 0,
+        extra: None,
+    };
+    let mut present = false;
+    for (index, candidate) in cpu.creative_screen.tabs.iter().enumerate() {
+        for stack in candidate.items.iter().filter(|stack| &*stack.item == name) {
+            if present || index != tab || stack != &expected {
+                return Err("captured counter Creative entry conflicts".into());
+            }
+            present = true;
+        }
+    }
+    if !present {
+        cpu.creative_screen.tabs[tab].items.push(expected);
+    }
+    Ok(())
 }
 
 /// The data the background loader produces for `Game::new`.
