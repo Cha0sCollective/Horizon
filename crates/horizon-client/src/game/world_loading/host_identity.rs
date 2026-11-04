@@ -79,6 +79,49 @@ impl WorldSession {
     ) -> Option<&mut horizon_client::world::counter_restore::HostCounterBootstrap> {
         self.counter_bootstrap.as_mut()
     }
+    #[cfg(feature = "paired-packages")]
+    pub(in crate::game) fn validate_owned_unplaced(
+        &self,
+        world: &horizon_client::world::World,
+        binding: &horizon_client::world::counter_restore::NativeBinding,
+    ) -> Result<()> {
+        let owned = self
+            .owned()
+            .ok_or("unused coherent source requires its actual owned namespace session")?;
+        owned.check_binding(binding)?;
+        let grant = self
+            .counter_bootstrap
+            .as_ref()
+            .ok_or("unused source has no original session admission")?;
+        world.validate_unplaced_host_admission(
+            binding,
+            self.world.ok_or("unused native identity absent")?,
+            "minecraft:overworld",
+            grant,
+        )?;
+        Ok(())
+    }
+    #[cfg(feature = "paired-packages")]
+    pub(in crate::game) fn install_verified_unplaced_admission(
+        &mut self,
+        proof: &mut Option<crate::game::levels::session_checkpoint::VerifiedUnplacedAdmission>,
+        world: &horizon_client::world::World,
+    ) -> Result<()> {
+        if self.counter_bootstrap.is_some() {
+            return Err("native session already owns first-placement admission".into());
+        }
+        proof
+            .as_ref()
+            .ok_or("verified Unplaced admission absent")?
+            .validate(self, world)?;
+        self.counter_bootstrap = Some(
+            proof
+                .take()
+                .expect("checked original Unplaced admission")
+                .into_bootstrap(),
+        );
+        Ok(())
+    }
 }
 #[cfg(feature = "paired-packages")]
 use {

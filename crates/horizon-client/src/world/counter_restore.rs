@@ -54,6 +54,17 @@ pub struct HostCounterBootstrap {
     bound: bool,
     spent: bool,
 }
+/// A NEW admission for one actual restored, unused World incarnation. This is
+/// not the former grant, a decoded frame, or a constructor from a UUID alone.
+/// The native host must first verify the complete Unplaced image under its locks.
+pub struct RecoveredUnplacedAdmission {
+    grant: HostCounterBootstrap,
+}
+impl RecoveredUnplacedAdmission {
+    pub fn into_bootstrap(self) -> HostCounterBootstrap {
+        self.grant
+    }
+}
 impl HostCounterBootstrap {
     pub fn for_new_host_world(world: WorldId) -> Self {
         Self {
@@ -707,6 +718,111 @@ impl Domain {
 }
 
 impl World {
+    fn check_unplaced_guest_world(
+        &self,
+        binding: &NativeBinding,
+        actual_dimension: &str,
+        clock: i64,
+    ) -> Result<()> {
+        if binding.profile != NativeBindingProfile::RegisteredCube || binding.guest.is_none() {
+            return Err(RestoreError::BindingMismatch);
+        }
+        if actual_dimension != "minecraft:overworld" {
+            return Err(RestoreError::IdentityMismatch);
+        }
+        if clock < 0 || self.game_time != clock {
+            return Err(RestoreError::ClockMismatch);
+        }
+        self.vacant_counter_domain()?;
+        if self.world_slot_trial.is_some() {
+            return Err(RestoreError::Occupied);
+        }
+        if self
+            .registered_guest_placement
+            .as_ref()
+            .is_some_and(|policy| {
+                policy.package != binding.package
+                    || policy.block_id != binding.block_id
+                    || policy.type_id() != binding.type_id()
+                    || policy.state_id != binding.state_id
+            })
+        {
+            return Err(RestoreError::BindingMismatch);
+        }
+        if self.chunks.values().any(|chunk| {
+            chunk
+                .sections
+                .iter()
+                .any(|section| (0..4096).any(|cell| section.get(cell) == binding.state_id.0))
+        }) {
+            return Err(RestoreError::StateMismatch);
+        }
+        Ok(())
+    }
+    /// Actual session custody, not absent files, proves that this live source has
+    /// never spent its original or verified-recovered first-placement admission.
+    pub fn validate_unplaced_host_admission(
+        &self,
+        binding: &NativeBinding,
+        expected_world: WorldId,
+        actual_dimension: &str,
+        grant: &HostCounterBootstrap,
+    ) -> Result<()> {
+        self.check_unplaced_guest_world(binding, actual_dimension, self.game_time)?;
+        let marker = self
+            .host_counter_bootstrap
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .ok_or(RestoreError::IdentityMismatch)?;
+        if grant.world != expected_world
+            || !grant.bound
+            || grant.spent
+            || !Arc::ptr_eq(&marker, &grant.marker)
+        {
+            return Err(RestoreError::IdentityMismatch);
+        }
+        Ok(())
+    }
+    /// Native host recovery seam. Complete archive/native/player verification
+    /// and original lock custody are host obligations; the library checks this
+    /// actual World, genuine binding, clock, absent owners and incarnation marker.
+    /// A subsequent failure still belongs to that unpublished native recovery.
+    pub fn restore_verified_unplaced_admission(
+        &mut self,
+        binding: &NativeBinding,
+        expected_world: WorldId,
+        actual_dimension: &str,
+        saved_clock: i64,
+    ) -> Result<RecoveredUnplacedAdmission> {
+        self.check_unplaced_guest_world(binding, actual_dimension, saved_clock)?;
+        if self.host_counter_bootstrap.is_some() {
+            return Err(RestoreError::Occupied);
+        }
+        let marker = Arc::new(HostCounterMarker);
+        self.host_counter_bootstrap = Some(Arc::downgrade(&marker));
+        Ok(RecoveredUnplacedAdmission {
+            grant: HostCounterBootstrap {
+                world: expected_world,
+                marker,
+                bound: true,
+                spent: false,
+            },
+        })
+    }
+    pub fn validate_recovered_unplaced_admission(
+        &self,
+        binding: &NativeBinding,
+        expected_world: WorldId,
+        actual_dimension: &str,
+        admission: &RecoveredUnplacedAdmission,
+    ) -> Result<()> {
+        self.validate_unplaced_host_admission(
+            binding,
+            expected_world,
+            actual_dimension,
+            &admission.grant,
+        )
+    }
     /// Bind once during preparation, before publishing the actual initial World.
     /// Supplying the actual dimension is a native-host responsibility; chunks do
     /// not identify their World/dimension. Replacement never rebinds this grant.

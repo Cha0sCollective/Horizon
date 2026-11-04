@@ -1,6 +1,8 @@
 //! Dormant managed-world exclusion. All cooperating entries use one trusted namespace.
 #![allow(dead_code)] // No ordinary startup, close, networking or item ingress caller.
 use super::*;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 
 #[derive(Clone)]
@@ -11,8 +13,238 @@ pub(in crate::game) struct AuthorityNamespace {
 /// No Clone, raw-UUID constructor, serializable grant or lock-file cleanup.
 pub(in crate::game) struct WorldAuthority {
     world: WorldId,
+    namespace: PathBuf,
     _authority_lock: SessionLock,
     _anchor_lock: Option<SessionLock>,
+    owned: Option<OwnedAssociation>,
+}
+
+const OWN_FILE: &str = "owned.json";
+const OWN_LIMIT: u64 = 16 << 10;
+const PACKAGE_PIN: &str = "horizon-paired-packages.json";
+
+/// Serializable policy, not the original actor, constructor or lock ownership.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", deny_unknown_fields)]
+pub(in crate::game) enum OwnedProfile {
+    Local,
+    Integrated { owner: String },
+    Dedicated,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OwnedRecord {
+    format: u32,
+    world: WorldId,
+    anchor: PathBuf,
+    archive: PathBuf,
+    destination_parent: PathBuf,
+    profile: OwnedProfile,
+    native_player: [i32; 4],
+    terrain: String,
+    spawn_mobs: bool,
+    dimension: String,
+    package_pin_sha256: String,
+    package_identity: String,
+    type_id: String,
+    block_id: String,
+    schema: u32,
+}
+
+/// Cloneable route observations cannot acquire a native world or mint admission.
+#[derive(Clone)]
+pub(in crate::game) struct OwnedAssociation {
+    namespace: AuthorityNamespace,
+    path: PathBuf,
+    encoded: Vec<u8>,
+    record: OwnedRecord,
+}
+
+/// Explicit trusted creation configuration, never decoded from a world image.
+pub(in crate::game) struct NewOwnedRoute {
+    namespace: AuthorityNamespace,
+    archive_parent: PathBuf,
+    destination_parent: PathBuf,
+}
+
+fn own_digest(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+fn own_regular(path: &Path, limit: u64) -> Result<Vec<u8>> {
+    let metadata = fs::symlink_metadata(path)?;
+    if linked(&metadata) || !metadata.is_file() || metadata.len() > limit {
+        return Err("owned record requires a bounded regular unlinked file".into());
+    }
+    let mut bytes = Vec::new();
+    File::open(path)?.take(limit + 1).read_to_end(&mut bytes)?;
+    if bytes.is_empty() || bytes.len() as u64 > limit {
+        return Err("owned record byte bound".into());
+    }
+    Ok(bytes)
+}
+fn own_sync_directory(path: &Path) -> Result<()> {
+    File::open(directory_path(path, true)?)?.sync_all()?;
+    Ok(())
+}
+/// Conservative layout for the explicit OWN profile. UUID components belong to
+/// actual archives or internal namespace keys, never caller-configured roots.
+/// This rejects nesting beneath a different world before constructor effects.
+fn own_route(path: &Path, existing: bool) -> Result<PathBuf> {
+    let path = directory_path(path, existing)?;
+    if path.components().any(|component| {
+        component
+            .as_os_str()
+            .to_str()
+            .is_some_and(|text| WorldId::parse(&text.to_ascii_lowercase()).is_ok())
+    }) {
+        return Err("owned configured route cannot contain a logical UUID component".into());
+    }
+    Ok(path)
+}
+impl NewOwnedRoute {
+    pub(in crate::game) fn namespace(&self) -> AuthorityNamespace {
+        self.namespace.clone()
+    }
+    pub(in crate::game) fn matches_namespace(
+        &self,
+        namespace: Option<&AuthorityNamespace>,
+    ) -> bool {
+        namespace.is_some_and(|namespace| namespace.root == self.namespace.root)
+    }
+    pub(in crate::game) fn canonical_new_root(&self, root: &Path) -> Result<PathBuf> {
+        self.check_new_root(root)?;
+        directory_path(root, false)
+    }
+    pub(in crate::game) fn check_new_root(&self, root: &Path) -> Result<()> {
+        self.namespace.check_new_world(root)?;
+        let root = own_route(root, false)?;
+        let archive = own_route(&self.archive_parent, true)?;
+        let destination = own_route(&self.destination_parent, true)?;
+        own_route(&self.namespace.root, true)?;
+        for other in [&archive, &destination] {
+            separate(&root, other)?;
+            separate(&self.namespace.root, other)?;
+        }
+        separate(&archive, &destination)?;
+        Ok(())
+    }
+}
+impl OwnedAssociation {
+    pub(in crate::game) fn same_route(&self, other: &Self) -> bool {
+        self.namespace.root == other.namespace.root
+            && self.path == other.path
+            && self.encoded == other.encoded
+    }
+    pub(in crate::game) fn matches_working_route(&self, root: &Path) -> bool {
+        root == self.record.anchor
+            || root.parent() == Some(self.record.destination_parent.as_path())
+    }
+    pub(in crate::game) fn world(&self) -> WorldId {
+        self.record.world
+    }
+    pub(in crate::game) fn anchor(&self) -> &Path {
+        &self.record.anchor
+    }
+    pub(in crate::game) fn archive(&self) -> &Path {
+        &self.record.archive
+    }
+    pub(in crate::game) fn destination_parent(&self) -> &Path {
+        &self.record.destination_parent
+    }
+    pub(in crate::game) fn native_player(&self) -> [i32; 4] {
+        self.record.native_player
+    }
+    pub(in crate::game) fn profile(&self) -> &OwnedProfile {
+        &self.record.profile
+    }
+    pub(in crate::game) fn check_profile(
+        &self,
+        profile: &OwnedProfile,
+        native_player: [i32; 4],
+    ) -> Result<()> {
+        if &self.record.profile != profile || self.record.native_player != native_player {
+            return Err("owned native role/player mapping differs".into());
+        }
+        Ok(())
+    }
+    pub(in crate::game) fn type_id(&self) -> &str {
+        &self.record.type_id
+    }
+    pub(in crate::game) fn recheck(&self) -> Result<()> {
+        own_route(&self.namespace.root, true)?;
+        if self.path
+            != self
+                .namespace
+                .checked_key(self.record.world)?
+                .join(OWN_FILE)
+            || own_regular(&self.path, OWN_LIMIT)? != self.encoded
+        {
+            return Err("original owned association changed".into());
+        }
+        let anchor = own_route(&self.record.anchor, true)?;
+        let archive = directory_path(&self.record.archive, true)?;
+        own_route(archive.parent().ok_or("owned archive parent absent")?, true)?;
+        let destination = own_route(&self.record.destination_parent, true)?;
+        for root in [&anchor, &archive, &destination] {
+            separate(&self.namespace.root, root)?;
+        }
+        separate(&anchor, &archive)?;
+        separate(&anchor, &destination)?;
+        separate(&archive, &destination)?;
+        if anchor != self.record.anchor
+            || archive != self.record.archive
+            || destination != self.record.destination_parent
+        {
+            return Err("owned canonical route changed".into());
+        }
+        if archive.file_name().and_then(|name| name.to_str())
+            != Some(self.record.world.to_string().as_str())
+        {
+            return Err("owned archive must be addressed by its actual logical UUID".into());
+        }
+        Ok(())
+    }
+    pub(in crate::game) fn check_pin(&self, root: &Path) -> Result<()> {
+        if own_digest(&own_regular(&root.join(PACKAGE_PIN), 64 << 10)?)
+            != self.record.package_pin_sha256
+        {
+            return Err("owned exact native executable/package pin differs".into());
+        }
+        Ok(())
+    }
+    pub(in crate::game) fn check_binding(
+        &self,
+        binding: &horizon_client::world::counter_restore::NativeBinding,
+    ) -> Result<()> {
+        use horizon_client::world::counter_restore::NativeBindingProfile;
+        let package = binding
+            .package_identity()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        if binding.profile() != NativeBindingProfile::RegisteredCube
+            || self.record.package_identity != package
+            || self.record.type_id != binding.type_id()
+            || self.record.block_id != binding.block_id()
+            || self.record.schema != 1
+        {
+            return Err("owned registered Guest binding differs".into());
+        }
+        Ok(())
+    }
+    pub(in crate::game) fn check_working_root(&self, root: &Path) -> Result<()> {
+        let root = own_route(root, true)?;
+        if root != self.record.anchor
+            && root.parent() != Some(self.record.destination_parent.as_path())
+        {
+            return Err("owned working root is outside its bound route".into());
+        }
+        Ok(())
+    }
 }
 
 fn linked(meta: &fs::Metadata) -> bool {
@@ -88,6 +320,96 @@ impl AuthorityNamespace {
         })
     }
 
+    pub(in crate::game) fn new_owned_route(
+        &self,
+        archive_parent: &Path,
+        destination_parent: &Path,
+    ) -> Result<NewOwnedRoute> {
+        own_route(&self.root, true)?;
+        let archive_parent = own_route(archive_parent, true)?;
+        let destination_parent = own_route(destination_parent, true)?;
+        separate(&self.root, &archive_parent)?;
+        separate(&self.root, &destination_parent)?;
+        separate(&archive_parent, &destination_parent)?;
+        Ok(NewOwnedRoute {
+            namespace: self.clone(),
+            archive_parent,
+            destination_parent,
+        })
+    }
+
+    /// This returns observations only. Acquisition below rechecks the same bytes
+    /// while holding BOTH the actual anchor and namespace locks.
+    fn read_owned(&self, anchor: &Path) -> Result<OwnedAssociation> {
+        let anchor = directory_path(anchor, true)?;
+        let identity = IdentityAnchor::read(&anchor)?;
+        let path = self.checked_key(identity.world)?.join(OWN_FILE);
+        let encoded = own_regular(&path, OWN_LIMIT)?;
+        let record: OwnedRecord = serde_json::from_slice(&encoded)?;
+        let digest = |value: &str| {
+            value.len() == 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        };
+        let role = match &record.profile {
+            OwnedProfile::Local | OwnedProfile::Dedicated => true,
+            OwnedProfile::Integrated { owner } => {
+                owner.len() == 32
+                    && owner
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            }
+        };
+        if record.format != 1
+            || record.world != identity.world
+            || record.anchor != anchor
+            || record.terrain != "test-terrain"
+            || record.spawn_mobs
+            || record.dimension != "minecraft:overworld"
+            || record.schema != 1
+            || !role
+            || !digest(&record.package_pin_sha256)
+            || !digest(&record.package_identity)
+            || record.type_id.is_empty()
+            || record.type_id.len() > 256
+            || record.block_id.is_empty()
+            || record.block_id.len() > 256
+        {
+            return Err("unsupported or inconsistent owned association".into());
+        }
+        let association = OwnedAssociation {
+            namespace: self.clone(),
+            path,
+            encoded,
+            record,
+        };
+        association.recheck()?;
+        Ok(association)
+    }
+
+    /// No image or caller-supplied UUID constructs this ownership. The selected
+    /// anchor identifies the immutable route; original locks seal its recheck.
+    pub(in crate::game) fn acquire_owned_recovery(
+        &self,
+        anchor: &Path,
+        destination: &Path,
+    ) -> Result<WorldAuthority> {
+        own_route(destination, false)?;
+        let association = self.read_owned(anchor)?;
+        let destination = directory_path(destination, false)?;
+        if destination.parent() != Some(association.destination_parent()) {
+            return Err("owned recovery destination is outside its bound parent".into());
+        }
+        let mut authority = self.acquire_recovery(anchor, association.archive(), &destination)?;
+        association.recheck()?;
+        if authority.world != association.world() || authority.namespace != self.root {
+            return Err("owned recovery original lock association changed".into());
+        }
+        authority.owned = Some(association);
+        Ok(authority)
+    }
+
     pub(in crate::game) fn check_new_world(&self, root: &Path) -> Result<()> {
         directory_path(&self.root, true)?;
         let root = directory_path(root, false)?;
@@ -109,8 +431,10 @@ impl AuthorityNamespace {
         lock_path(&key)?;
         Ok(WorldAuthority {
             world,
+            namespace: self.root.clone(),
             _authority_lock: lock,
             _anchor_lock: anchor,
+            owned: None,
         })
     }
 
@@ -273,8 +597,10 @@ impl RetainedAuthorityAcquisition {
         // No fallible operation after taking the actual ready lock.
         Ok(WorldAuthority {
             world: self.world,
+            namespace: self.namespace.root.clone(),
             _authority_lock: lock,
             _anchor_lock: None,
+            owned: None,
         })
     }
     /// Only the authority lock owned here. Never releases the caller's native
@@ -344,8 +670,105 @@ impl WorldAuthority {
     pub(in crate::game) fn world(&self) -> WorldId {
         self.world
     }
+    pub(in crate::game) fn owned(&self) -> Option<&OwnedAssociation> {
+        self.owned.as_ref()
+    }
 }
 impl WorldSession {
+    /// Only an original new-world session can establish OWN. A recovered lease
+    /// retains an anchor lock and cannot relabel its working copy as new.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::game) fn establish_owned(
+        &mut self,
+        plan: &NewOwnedRoute,
+        root: &Path,
+        profile: OwnedProfile,
+        native_player: [i32; 4],
+        binding: &horizon_client::world::counter_restore::NativeBinding,
+        world: &horizon_client::world::World,
+    ) -> Result<()> {
+        plan.check_new_root(root)?;
+        let authority = self
+            .authority
+            .as_mut()
+            .ok_or("owned creation requires its original namespace lock")?;
+        if authority._anchor_lock.is_some()
+            || authority.owned.is_some()
+            || authority.namespace != plan.namespace.root
+            || self.world != Some(authority.world)
+            || self.counter_bootstrap.is_none()
+            || world.counter_domain_snapshot().is_some()
+            || world.counter_trial_snapshot().is_some()
+            || world.world_slot_snapshot().is_some()
+        {
+            return Err(
+                "owned creation requires the original unused native new-world constructor".into(),
+            );
+        }
+        let anchor = directory_path(root, true)?;
+        let identity = IdentityAnchor::read(&anchor)?;
+        if identity.world != authority.world {
+            return Err("owned new native identity changed".into());
+        }
+        let package_pin_sha256 = own_digest(&own_regular(&anchor.join(PACKAGE_PIN), 64 << 10)?);
+        // Actual constructor UUIDs address distinct archives even when two new
+        // worlds use one configured parent before either first publication.
+        let archive = directory_path(
+            &plan.archive_parent.join(authority.world.to_string()),
+            false,
+        )?;
+        fs::create_dir(&archive)?;
+        own_sync_directory(&archive)?;
+        own_sync_directory(&plan.archive_parent)?;
+        let record = OwnedRecord {
+            format: 1,
+            world: authority.world,
+            anchor,
+            archive,
+            destination_parent: plan.destination_parent.clone(),
+            profile,
+            native_player,
+            terrain: "test-terrain".into(),
+            spawn_mobs: false,
+            dimension: "minecraft:overworld".into(),
+            package_pin_sha256,
+            package_identity: binding
+                .package_identity()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+            type_id: binding.type_id().into(),
+            block_id: binding.block_id().into(),
+            schema: 1,
+        };
+        let encoded = serde_json::to_vec(&record)?;
+        if encoded.len() as u64 > OWN_LIMIT {
+            return Err("owned record encoding bound".into());
+        }
+        let key = plan.namespace.checked_key(authority.world)?;
+        let path = key.join(OWN_FILE);
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        file.write_all(&encoded)?;
+        file.sync_all()?;
+        own_sync_directory(&key)?;
+        own_sync_directory(&plan.namespace.root)?;
+        let association = OwnedAssociation {
+            namespace: plan.namespace.clone(),
+            path,
+            encoded,
+            record,
+        };
+        association.recheck()?;
+        association.check_binding(binding)?;
+        authority.owned = Some(association);
+        Ok(())
+    }
+    pub(in crate::game) fn owned(&self) -> Option<&OwnedAssociation> {
+        self.authority.as_ref()?.owned()
+    }
     /// Borrowing the option preserves the caller's lease until its unpublished
     /// Game has dropped on error. No failing consuming attachment can release it early.
     pub(in crate::game) fn install_authority(

@@ -19,6 +19,33 @@ pub(super) struct WorldRequest {
     expected_checkpoint_world: Option<horizon_client::world::counter_restore::WorldId>,
     #[cfg(feature = "paired-packages")]
     ordinary_reopen: Option<super::paired_close::NativeReopenClaim>,
+    #[cfg(feature = "paired-packages")]
+    new_owned: Option<host_identity::session_authority::NewOwnedRoute>,
+}
+
+#[cfg(feature = "paired-packages")]
+pub(in crate::game) fn owned_guest_binding(
+    packages: &super::mod_packages::Packages,
+    registry: &'static horizon_world::registry::BlockRegistry,
+) -> Result<horizon_client::world::counter_restore::NativeBinding> {
+    let catalog = packages
+        .catalog()
+        .ok_or("owned world requires its genuine captured pair")?;
+    if catalog.prepared().len() != 1 {
+        return Err("owned world supports exactly one captured pair".into());
+    }
+    let prepared = catalog.prepared().values().next().unwrap();
+    let types = prepared.content().machine_types().types();
+    if types.len() != 1 {
+        return Err("owned world supports exactly one registered machine type".into());
+    }
+    Ok(
+        horizon_client::world::counter_restore::NativeBinding::from_registered_guest_prepared(
+            prepared,
+            types[0].id(),
+            registry,
+        )?,
+    )
 }
 
 pub(super) struct PreparedWorld {
@@ -87,6 +114,19 @@ enum NativeProfile {
     InFrameClient,
     HeadlessServer,
     IntegratedServer { owner: u128 },
+}
+#[cfg(feature = "paired-packages")]
+impl NativeProfile {
+    fn owned_profile(self) -> host_identity::session_authority::OwnedProfile {
+        use host_identity::session_authority::OwnedProfile;
+        match self {
+            Self::InFrameClient => OwnedProfile::Local,
+            Self::HeadlessServer => OwnedProfile::Dedicated,
+            Self::IntegratedServer { owner } => OwnedProfile::Integrated {
+                owner: format!("{owner:032x}"),
+            },
+        }
+    }
 }
 
 /// Constructor observation only: never a native close, publication or bootstrap
@@ -592,6 +632,20 @@ impl OrdinaryPreparation {
         owner.ordinary_mob_free = true;
         let result: Result<()> = (|| {
             owner.request.check_ordinary_test_terrain(options)?;
+            if let Some(plan) = &owner.request.new_owned {
+                if owner.request.identity_intent != IdentityIntent::CreateNewIdentity
+                    || !owner.request.creative
+                    || owner.request.expected_checkpoint_world.is_some()
+                    || owner.request.ordinary_reopen.is_some()
+                    || !plan.matches_namespace(owner.request.authority_namespace.as_ref())
+                {
+                    return Err(
+                        "owned creation requires the actual new Creative native request".into(),
+                    );
+                }
+                plan.check_new_root(&owner.request.save_root)?;
+                let _ = owned_guest_binding(&options.mod_packages, pack.assets.registry)?;
+            }
             if owner.request.identity_intent == IdentityIntent::Legacy
                 || options.server_thread
                 || options.server.is_some()
@@ -656,6 +710,33 @@ impl OrdinaryPreparation {
             }
             if local.is_some_and(|permit| level.player_uuid != Some(permit.native_player())) {
                 return Err("LOCAL prepared native player differs from original source".into());
+            }
+            if let Some(plan) = &owner.request.new_owned {
+                if level.mode() != 1 || GameRules::load(&owner.request.save_root).bool("spawn_mobs")
+                {
+                    return Err(
+                        "owned creation requires actual Creative mob-free native state".into(),
+                    );
+                }
+                let level = owner.level.as_mut().unwrap();
+                level.ensure_player_uuid();
+                let native_player = level.player_uuid.ok_or("owned native player UUID absent")?;
+                let binding = owned_guest_binding(&options.mod_packages, pack.assets.registry)?;
+                owner
+                    .session
+                    .as_mut()
+                    .ok_or("original owned native session absent")?
+                    .establish_owned(
+                        plan,
+                        &owner.request.save_root,
+                        profile.owned_profile(),
+                        native_player,
+                        &binding,
+                        owner
+                            .world
+                            .as_deref()
+                            .ok_or("original owned native World absent")?,
+                    )?;
             }
             Ok(())
         })();
@@ -832,6 +913,23 @@ impl Drop for OrdinaryWorldLoader {
 
 impl WorldRequest {
     #[cfg(feature = "paired-packages")]
+    #[allow(dead_code)] // Explicit owned core entry; ordinary dispatch follows separately.
+    pub(in crate::game) fn with_new_owned_route(
+        mut self,
+        plan: host_identity::session_authority::NewOwnedRoute,
+    ) -> Result<Self> {
+        if self.identity_intent != IdentityIntent::CreateNewIdentity
+            || self.expected_checkpoint_world.is_some()
+            || self.ordinary_reopen.is_some()
+        {
+            return Err("owned route may only configure a genuinely new ordinary request".into());
+        }
+        self.save_root = plan.canonical_new_root(&self.save_root)?;
+        self.authority_namespace = Some(plan.namespace());
+        self.new_owned = Some(plan);
+        Ok(self)
+    }
+    #[cfg(feature = "paired-packages")]
     pub(in crate::game) fn with_ordinary_reopen(
         mut self,
         original: Arc<super::paired_close::OrdinaryClosedWorld>,
@@ -897,6 +995,8 @@ impl WorldRequest {
             expected_checkpoint_world: None,
             #[cfg(feature = "paired-packages")]
             ordinary_reopen: None,
+            #[cfg(feature = "paired-packages")]
+            new_owned: None,
         })
     }
 
@@ -933,6 +1033,10 @@ impl WorldRequest {
         options: &Options,
         settings: &Settings,
     ) -> Result<PreparedWorld> {
+        #[cfg(feature = "paired-packages")]
+        if self.new_owned.is_some() {
+            return Err("owned creation must retain its original ordinary preparation".into());
+        }
         #[cfg(feature = "paired-packages")]
         if self.ordinary_reopen.is_some() {
             return Err(
@@ -974,6 +1078,8 @@ impl WorldRequest {
             expected_checkpoint_world,
             #[cfg(feature = "paired-packages")]
                 ordinary_reopen: _,
+            #[cfg(feature = "paired-packages")]
+                new_owned: _,
         } = self;
         let name = name.as_deref();
         let create = create.as_ref();
@@ -2262,6 +2368,7 @@ impl RetainedParkedConstruction {
             authority_namespace: None,
             expected_checkpoint_world: None,
             ordinary_reopen: None,
+            new_owned: None,
         };
         let mut owner = PrepareOwner::new(request);
         owner.save = Some(Arc::new(SaveDir::new_retained(

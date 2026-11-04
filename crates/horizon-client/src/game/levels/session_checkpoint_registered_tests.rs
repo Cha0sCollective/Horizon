@@ -1601,6 +1601,771 @@ mod local_tests {
             .expect("actual consuming LOCAL completion")
     }
 
+    fn owned_runtime(
+        f: &Materialized,
+    ) -> (
+        Arc<crate::game::mod_packages::FrozenHostInputs>,
+        Arc<horizon_client::advancements::Tree>,
+    ) {
+        let startup = Arc::new(
+            f.packages
+                .freeze_peer_inputs(
+                    Arc::new(horizon_client::lan::data::SyncData::load(&f.root).unwrap()),
+                    f.pack.assets.registry,
+                )
+                .unwrap()
+                .unwrap(),
+        );
+        let tree = Arc::new(horizon_client::advancements::Tree::load(
+            &f.root.join("data"),
+        ));
+        assert!(!tree.list.is_empty());
+        (startup, tree)
+    }
+    fn owned_player(game: &mut Game<'_>, f: &Materialized) {
+        residency(game, 2, (0, 0));
+        let end = until();
+        while game.player.is_none() {
+            update_native(game);
+            game.spawn_player().unwrap();
+            assert!(Instant::now() < end, "actual owned player spawn deadline");
+            std::thread::yield_now();
+        }
+        residency(game, 2, (0, 0));
+        game.load_stats();
+        game.load_advancements();
+        let body = game.player.as_mut().unwrap();
+        body.position = Vec3::new(2.5, 120.0, 0.5);
+        body.velocity = Vec3::new(0.125, -0.25, 0.5);
+        body.ground.on_ground = false;
+        body.health.food.exhaustion = 2.25;
+        body.health.food.timer = 7;
+        body.may_fly = true;
+        body.invulnerable = true;
+        body.flying = true;
+        game.yaw = 91.0;
+        game.pitch = -17.0;
+        game.sync_player_body();
+        game.inventory = vec![None; 36];
+        game.inventory[0] = Some(ItemStack::new(f.alias.as_str(), 3));
+        game.inventory[1] = Some(session_items_rich());
+        game.ender_items[4] = Some(session_items_rich());
+        game.stats
+            .values
+            .entry("minecraft:custom".into())
+            .or_default()
+            .insert("minecraft:jump".into(), 7);
+        let advancement = game
+            .adv
+            .tree
+            .list
+            .iter()
+            .find(|entry| !entry.criteria.is_empty())
+            .unwrap();
+        assert!(game.adv.progress.grant(
+            &advancement.id,
+            &advancement.criteria[0].name,
+            "2026-01-01 00:00:00 +0000"
+        ));
+        assert!(!game.ui.rules.bool("spawn_mobs"));
+    }
+    fn owned_place(game: &mut Game<'_>, f: &Materialized) -> (RuntimeCounterKey, SlotKey) {
+        game.arm_registered_guest_placement(&f.type_id).unwrap();
+        let stone = game
+            .pack
+            .assets
+            .registry
+            .default_state("minecraft:stone")
+            .unwrap();
+        game.world
+            .set(POSITION[0], POSITION[1] - 1, POSITION[2], stone)
+            .unwrap();
+        let hit = crate::game::Hit {
+            pos: [POSITION[0], POSITION[1] - 1, POSITION[2]],
+            face: [0, 1, 0],
+            point: [2.5, 120.0, 2.5],
+        };
+        game.use_hand(Some(&hit)).unwrap();
+        let GuestRuntimeState::ReadyActive { counter, slot } =
+            game.world.guest_runtime_state().unwrap()
+        else {
+            panic!("actual owned first placement absent")
+        };
+        assert!(
+            game.session_lock
+                .as_mut()
+                .unwrap()
+                .counter_bootstrap()
+                .is_some()
+        );
+        assert!(
+            game.bootstrap_registered_host_counter(&f.type_id, [4, 120, 2])
+                .is_err(),
+            "second target cannot mint another initial allocation"
+        );
+        game.world.set(4, 119, 2, stone).unwrap();
+        let second = crate::game::Hit {
+            pos: [4, 119, 2],
+            face: [0, 1, 0],
+            point: [4.5, 120.0, 2.5],
+        };
+        game.use_hand(Some(&second)).unwrap();
+        assert_eq!(
+            game.world.block(4, 120, 2),
+            game.world.air,
+            "actual second click cannot allocate"
+        );
+        assert_eq!(game.world.counter_domain_snapshot().unwrap().high_water, 1);
+        let binding = crate::game::world_loading::owned_guest_binding(
+            &game.options.mod_packages,
+            game.pack.assets.registry,
+        )
+        .unwrap();
+        assert!(
+            game.session_lock
+                .as_ref()
+                .unwrap()
+                .validate_owned_unplaced(&game.world, &binding)
+                .is_err(),
+            "spent unused admission is stale after the actual first placement"
+        );
+        game.tickets.update(Some(Sources {
+            players: vec![(0, 0)],
+            forced: Vec::new(),
+            view_distance: 2,
+            simulation_distance: 2,
+        }));
+        game.world.game_time += 1;
+        game.tick_counter_trial(true);
+        assert_eq!(
+            game.world
+                .read_persistent_counter(&counter)
+                .unwrap()
+                .counter(),
+            1
+        );
+        assert!(
+            matches!(game.transfer_world_slot_inventory_cell(&slot, 1, Direction::IntoMachine, 3).unwrap(), TransferOutcome::Committed(row) if row.moved==3)
+        );
+        (counter, slot)
+    }
+    fn owned_native_close(game: Box<Game<'_>>) {
+        let mut owner = CloseOwner::begin(game, CloseProfile::NativeWorld, until());
+        loop {
+            match owner.poll() {
+                CloseStatus::Pending(_) => std::thread::yield_now(),
+                CloseStatus::NativeReady => break,
+                CloseStatus::Blocked(error) => panic!("owned native close: {error}"),
+            }
+        }
+        let ready = owner
+            .try_native_ready()
+            .unwrap_or_else(|_| panic!("owned native ready absent"));
+        let _disposed = ready
+            .try_dispose_dormant()
+            .unwrap_or_else(|(_, error)| panic!("owned native disposal: {error}"));
+    }
+    fn owned_refusal_close(work: &mut OrdinaryRecoveryWork<'_>) {
+        work.begin_close(until());
+        loop {
+            match work.poll_close() {
+                PreparationCloseStatus::Pending => std::thread::yield_now(),
+                PreparationCloseStatus::Complete => break,
+                PreparationCloseStatus::Blocked(error) => {
+                    panic!("owned original refused preparation close: {error}")
+                }
+            }
+        }
+        assert!(work.game_mut().save.is_none() && work.game_mut().session_lock.is_none());
+    }
+    fn owned_reopen<'a>(
+        f: &'a Materialized,
+        startup: &Arc<crate::game::mod_packages::FrozenHostInputs>,
+        tree: &Arc<horizon_client::advancements::Tree>,
+        root: &Path,
+        suffix: &str,
+    ) -> Box<Game<'a>> {
+        let entry = RetainedEntryIdentity {
+            token: 401,
+            owner: Arc::new(()),
+        };
+        let namespace =
+            crate::game::world_loading::host_identity::session_authority::AuthorityNamespace::new(
+                &root.join("authority"),
+            )
+            .unwrap();
+        let request = OwnedRecoveryRequest {
+            namespace,
+            anchor: root.join("world"),
+            destination: root.join("destinations").join(suffix),
+            deadline: until(),
+        };
+        let mut owner = OrdinaryRecoveryWork::prepare_owned(
+            local_game(f, startup, tree, &entry, None),
+            entry,
+            request,
+        );
+        assert!(
+            owner.original_error().is_none(),
+            "owned original native recovery: {:?}",
+            owner.original_error()
+        );
+        assert!(owner.game_mut().native_close_authority.is_none());
+        let game = owner
+            .try_activate()
+            .unwrap()
+            .expect("actual LOCAL owned recovery needs no fake network participant");
+        assert!(game.native_close_owner_authorized() && game.local_checkpoint_owner());
+        assert_eq!(
+            game.local_continuation_archive.as_deref(),
+            Some(owned_observed_archive(root).as_path())
+        );
+        game
+    }
+    fn owned_observed_archive(root: &Path) -> PathBuf {
+        // Expected-result observation ONLY. OwnedRecoveryRequest never consumes
+        // a decoded archive path or UUID; its real owner acquires/rechecks OWN.
+        let identity: Value = json(
+            &fs::read(root.join("world/horizon-world-identity.json")).unwrap(),
+            1024,
+        )
+        .unwrap();
+        let world = identity["world_uuid"].as_str().unwrap();
+        let own: Value = json(
+            &fs::read(root.join("authority").join(world).join("owned.json")).unwrap(),
+            16 << 10,
+        )
+        .unwrap();
+        directory(Path::new(own["archive"].as_str().unwrap())).unwrap()
+    }
+    fn owned_actual_recovery_refusals(
+        f: &Materialized,
+        startup: &Arc<crate::game::mod_packages::FrozenHostInputs>,
+        tree: &Arc<horizon_client::advancements::Tree>,
+        root: &Path,
+    ) {
+        let identity: Value = json(
+            &fs::read(root.join("world/horizon-world-identity.json")).unwrap(),
+            1024,
+        )
+        .unwrap();
+        let record = root
+            .join("authority")
+            .join(identity["world_uuid"].as_str().unwrap())
+            .join("owned.json");
+        let original = fs::read(&record).unwrap();
+        let native_before = super::super::tree(&root.join("world"), &["session.lock"]).unwrap();
+        let controls = root.join("negative-inputs");
+        fs::create_dir(&controls).unwrap();
+        for kind in ["strict-association", "profile", "native-uuid", "pin"] {
+            let mut bad: Value = json(&original, 16 << 10).unwrap();
+            match kind {
+                "strict-association" => {
+                    bad["unexpected"] = true.into();
+                }
+                "profile" => {
+                    bad["profile"] = serde_json::to_value(crate::game::world_loading::host_identity::session_authority::OwnedProfile::Dedicated).unwrap();
+                }
+                "native-uuid" => {
+                    bad["native_player"][0] =
+                        (bad["native_player"][0].as_i64().unwrap() ^ 1).into();
+                }
+                "pin" => {
+                    bad["package_pin_sha256"] = "00".repeat(32).into();
+                }
+                _ => unreachable!(),
+            }
+            let bytes = serde_json::to_vec_pretty(&bad).unwrap();
+            fs::write(controls.join(format!("owned-{kind}.json")), &bytes).unwrap();
+            fs::write(&record, &bytes).unwrap();
+            let entry = RetainedEntryIdentity {
+                token: 405,
+                owner: Arc::new(()),
+            };
+            let destination = root.join("destinations").join(format!("refused-{kind}"));
+            let mut refused = OrdinaryRecoveryWork::prepare_owned(local_game(f,startup,tree,&entry,None),entry,OwnedRecoveryRequest {
+                namespace: crate::game::world_loading::host_identity::session_authority::AuthorityNamespace::new(&root.join("authority")).unwrap(),
+                anchor:root.join("world"), destination:destination.clone(), deadline:until(),
+            });
+            assert!(
+                refused.original_error().is_some(),
+                "actual owned {kind} recovery must refuse"
+            );
+            eprintln!(
+                "OWNED_ACTUAL_RECOVERY_REFUSAL {kind}: {}",
+                refused.original_error().unwrap()
+            );
+            owned_refusal_close(&mut refused);
+            assert!(
+                !destination.exists(),
+                "refusal must precede copied native construction"
+            );
+            assert_eq!(
+                super::super::tree(&root.join("world"), &["session.lock"]).unwrap(),
+                native_before
+            );
+            fs::write(&record, &original).unwrap();
+        }
+    }
+    #[test]
+    #[ignore = "isolated native resources and exact same executable: two serial real processes, complete Unplaced/Claimed owned restart"]
+    fn owned_durable_processes_restore_unplaced_and_claimed() {
+        let root =
+            std::env::temp_dir().join(format!("horizon-owned-restart-{}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        eprintln!("OWNED_NATIVE_EVIDENCE_ROOT={}", root.display());
+        let exe = std::env::current_exe().unwrap();
+        let digest = Sha256::digest(fs::read(&exe).unwrap());
+        for phase in ["A", "B"] {
+            let home = root.join(format!("process-{phase}"));
+            fs::create_dir(&home).unwrap();
+            let temp = home.join("temp");
+            fs::create_dir(&temp).unwrap();
+            let mut child = std::process::Command::new(&exe)
+                .args(["--exact", "game::levels::session_checkpoint::tests::registered::local_tests::owned_durable_process_child", "--ignored", "--nocapture", "--test-threads=1"])
+                .env("HORIZON_OWN_PHASE", phase).env("HORIZON_OWN_ROOT", &root)
+                .env("HOME", &home).env("USERPROFILE", &home)
+                .env("XDG_CONFIG_HOME", &home).env("XDG_DATA_HOME", &home).env("XDG_CACHE_HOME", &home)
+                .env("TMPDIR", &temp).env("TMP", &temp).env("TEMP", &temp)
+                .current_dir(&home).spawn().unwrap();
+            let end = Instant::now() + Duration::from_secs(600);
+            let status = loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    break status;
+                }
+                if Instant::now() >= end {
+                    child.kill().unwrap();
+                    let _ = child.wait();
+                    panic!("owned child {phase} deadline; preserved {}", root.display());
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            assert!(
+                status.success(),
+                "owned child {phase} failed; preserved {}",
+                root.display()
+            );
+            assert_eq!(
+                Sha256::digest(fs::read(&exe).unwrap()),
+                digest,
+                "same pinned child executable"
+            );
+        }
+        let a: Value = json(&fs::read(root.join("A.json")).unwrap(), STRUCTURED_LIMIT).unwrap();
+        let b: Value = json(&fs::read(root.join("B.json")).unwrap(), STRUCTURED_LIMIT).unwrap();
+        assert_ne!(a["pid"], b["pid"]);
+        assert_eq!(a["executable"], b["executable"]);
+        assert_eq!(b["completed"], true);
+        eprintln!("OWNED_TWO_PROCESS_UNPLACED_CLAIMED_SAME_ARCHIVE_PASS");
+    }
+    #[test]
+    #[ignore = "child only; invoked by the exact two-process owned fixture"]
+    fn owned_durable_process_child() {
+        use crate::game::world_loading::host_identity::session_authority::{
+            AuthorityNamespace, OwnedProfile,
+        };
+        let phase = std::env::var("HORIZON_OWN_PHASE").expect("explicit child phase");
+        assert!(matches!(phase.as_str(), "A" | "B"));
+        let root = PathBuf::from(
+            std::env::var_os("HORIZON_OWN_ROOT").expect("explicit owned fixture root"),
+        );
+        let f = Materialized::new(&format!("own-{phase}"));
+        let (startup, tree) = owned_runtime(&f);
+        let mut created: BTreeMap<bool, Box<Game<'_>>> = BTreeMap::new();
+        if phase == "A" {
+            for claimed in [false, true] {
+                let case = root.join(if claimed { "claimed" } else { "unplaced" });
+                fs::create_dir(&case).unwrap();
+                for name in ["authority", "archive", "destinations"] {
+                    fs::create_dir(case.join(name)).unwrap();
+                }
+            }
+            let shared_archive_parent = root.join("unplaced/archive");
+            // BOTH actual constructors succeed before either publishes. The
+            // constructor UUID, never caller-selected emptiness, separates them.
+            for claimed in [false, true] {
+                let case = root.join(if claimed { "claimed" } else { "unplaced" });
+                let namespace = AuthorityNamespace::new(&case.join("authority")).unwrap();
+                if claimed {
+                    let first: &Game<'_> = created.get(&false).unwrap();
+                    let first_archive = first
+                        .session_lock
+                        .as_ref()
+                        .unwrap()
+                        .owned()
+                        .unwrap()
+                        .archive();
+                    let before = super::super::tree(first_archive, &[]).unwrap();
+                    assert!(
+                        namespace
+                            .new_owned_route(first_archive, &case.join("destinations"))
+                            .is_err(),
+                        "another UUID archive cannot become a configured parent"
+                    );
+                    let valid = namespace
+                        .new_owned_route(&shared_archive_parent, &case.join("destinations"))
+                        .unwrap();
+                    assert!(
+                        valid
+                            .check_new_root(&first_archive.join("nested-native-world"))
+                            .is_err(),
+                        "native root cannot poison another UUID archive"
+                    );
+                    assert!(!case.join("world").exists());
+                    assert_eq!(super::super::tree(first_archive, &[]).unwrap(), before);
+                    eprintln!("OWNED_NESTED_PARENT_NATIVE_ROOT_REFUSED_BEFORE_EFFECTS_PASS");
+                }
+                let mut request = WorldRequest::new(
+                    "unused",
+                    Some("Owned restart fixture"),
+                    Some(17),
+                    true,
+                    None,
+                )
+                .unwrap()
+                .with_identity_intent(IdentityIntent::CreateNewIdentity);
+                request.save_root = case.join("world");
+                request = request
+                    .with_new_owned_route(
+                        namespace
+                            .new_owned_route(&shared_archive_parent, &case.join("destinations"))
+                            .unwrap(),
+                    )
+                    .unwrap();
+                let entry = RetainedEntryIdentity {
+                    token: if claimed { 400 } else { 399 },
+                    owner: Arc::new(()),
+                };
+                let game = local_game(&f, &startup, &tree, &entry, Some(request));
+                let owned = game.session_lock.as_ref().unwrap().owned().unwrap();
+                assert_eq!(
+                    owned.archive().file_name().unwrap().to_str().unwrap(),
+                    owned.world().to_string()
+                );
+                created.insert(claimed, game);
+            }
+            assert_ne!(
+                created[&false]
+                    .session_lock
+                    .as_ref()
+                    .unwrap()
+                    .owned()
+                    .unwrap()
+                    .archive(),
+                created[&true]
+                    .session_lock
+                    .as_ref()
+                    .unwrap()
+                    .owned()
+                    .unwrap()
+                    .archive()
+            );
+            eprintln!("OWNED_TWO_NEW_CONSTRUCTORS_SHARED_PARENT_DISTINCT_UUID_ARCHIVES_PASS");
+        }
+        for claimed in [false, true] {
+            let case = root.join(if claimed { "claimed" } else { "unplaced" });
+            let archive = if phase == "A" {
+                created[&claimed]
+                    .session_lock
+                    .as_ref()
+                    .unwrap()
+                    .owned()
+                    .unwrap()
+                    .archive()
+                    .to_owned()
+            } else {
+                owned_observed_archive(&case)
+            };
+            if phase == "A" {
+                let namespace = AuthorityNamespace::new(&case.join("authority")).unwrap();
+                let mut game = created.remove(&claimed).unwrap();
+                owned_player(&mut game, &f);
+                let owned = game.session_lock.as_ref().unwrap().owned().unwrap().clone();
+                assert!(
+                    owned
+                        .check_profile(&OwnedProfile::Dedicated, owned.native_player())
+                        .is_err()
+                );
+                let mut wrong = owned.native_player();
+                wrong[0] ^= 1;
+                assert!(owned.check_profile(&OwnedProfile::Local, wrong).is_err());
+                assert!(
+                    namespace
+                        .acquire_owned_recovery(
+                            &case.join("world"),
+                            &case.join("destinations/contended")
+                        )
+                        .is_err()
+                );
+                assert!(!case.join("destinations/contended").exists());
+                if claimed {
+                    let _keys = owned_place(&mut game, &f);
+                } else {
+                    assert!(game.prepare_coherent_image_context(&archive).is_ok());
+                    game.world.set(4, 120, 2, f.binding().state_id()).unwrap();
+                    assert!(
+                        game.prepare_coherent_image_context(&archive).is_err(),
+                        "any resident alias without history refuses"
+                    );
+                    game.world.set(4, 120, 2, game.world.air).unwrap();
+                    game.arm_registered_guest_placement(&f.type_id).unwrap();
+                }
+                let _closed = close_local(game, &archive, true);
+                let (epoch, selected) = epochs(&archive).unwrap().pop().unwrap();
+                let pin_path = case.join("world").join(PIN);
+                let pin = fs::read(&pin_path).unwrap();
+                fs::write(&pin_path, b"{}").unwrap();
+                assert!(owned.check_pin(&case.join("world")).is_err());
+                fs::write(&pin_path, &pin).unwrap();
+                assert!(owned.check_pin(&case.join("world")).is_ok());
+                if !claimed {
+                    let parked = archive.join(format!(".pending-{epoch:020}"));
+                    fs::rename(&selected, &parked).unwrap();
+                    let before =
+                        super::super::tree(&case.join("world"), &["session.lock"]).unwrap();
+                    let entry = RetainedEntryIdentity {
+                        token: 404,
+                        owner: Arc::new(()),
+                    };
+                    let mut refused = OrdinaryRecoveryWork::prepare_owned(
+                        local_game(&f, &startup, &tree, &entry, None),
+                        entry,
+                        OwnedRecoveryRequest {
+                            namespace: namespace.clone(),
+                            anchor: case.join("world"),
+                            destination: case.join("destinations/zero"),
+                            deadline: until(),
+                        },
+                    );
+                    assert!(
+                        refused
+                            .original_error()
+                            .unwrap()
+                            .contains("no complete owned epoch")
+                    );
+                    owned_refusal_close(&mut refused);
+                    assert!(!case.join("destinations/zero").exists());
+                    assert_eq!(
+                        super::super::tree(&case.join("world"), &["session.lock"]).unwrap(),
+                        before
+                    );
+                    fs::rename(&parked, &selected).unwrap();
+                } else {
+                    // Genuine newer working native state, but no newer complete
+                    // coherent image. An authored interrupted candidate is kept;
+                    // the existing FailCopied/Retry case above covers real I/O.
+                    let mut newer = owned_reopen(&f, &startup, &tree, &case, "A-newer");
+                    newer.inventory[1].as_mut().unwrap().count = 2;
+                    newer.world.game_time += 1;
+                    newer.tick_counter_trial(true);
+                    owned_native_close(newer);
+                    let pending = archive.join(format!(
+                        ".pending-{:020}",
+                        next_session_checkpoint_epoch(&archive).unwrap()
+                    ));
+                    fs::create_dir(&pending).unwrap();
+                    fs::write(
+                        pending.join("interrupted-native-clock.txt"),
+                        b"newer native working state has no complete manifest",
+                    )
+                    .unwrap();
+                }
+                eprintln!("OWNED_A_COMPLETE claimed={claimed} epoch={epoch}");
+            } else {
+                if !claimed {
+                    owned_actual_recovery_refusals(&f, &startup, &tree, &case);
+                }
+                let before = epochs(&archive).unwrap();
+                let (old_epoch, old_root) = before.last().unwrap();
+                let old_counter = if claimed {
+                    Some(fs::read(old_root.join(COUNTER)).unwrap())
+                } else {
+                    None
+                };
+                let old_slot = if claimed {
+                    Some(fs::read(old_root.join(SLOT)).unwrap())
+                } else {
+                    None
+                };
+                let pending_before = fs::read_dir(&archive)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path())
+                    .filter(|path| {
+                        path.file_name()
+                            .unwrap()
+                            .to_string_lossy()
+                            .starts_with(".pending-")
+                    })
+                    .map(|path| {
+                        let inventory = super::super::tree(&path, &[]).unwrap();
+                        (path, inventory)
+                    })
+                    .collect::<Vec<_>>();
+                let mut game = owned_reopen(&f, &startup, &tree, &case, "B-first");
+                assert_eq!(game.stats.get("custom", "minecraft:jump"), 7);
+                let (counter, slot) = if claimed {
+                    assert!(
+                        game.session_lock
+                            .as_mut()
+                            .unwrap()
+                            .counter_bootstrap()
+                            .is_none(),
+                        "claimed image has no unused grant"
+                    );
+                    assert_eq!(
+                        SessionCounter::from_world(&game.world)
+                            .unwrap()
+                            .encode()
+                            .unwrap(),
+                        old_counter.unwrap()
+                    );
+                    assert_eq!(
+                        SessionCounter::from_world(&game.world)
+                            .unwrap()
+                            .slot_bytes(&game.world, game.res.items())
+                            .unwrap(),
+                        old_slot.unwrap()
+                    );
+                    let GuestRuntimeState::ReadyActive { counter, slot } =
+                        game.world.guest_runtime_state().unwrap()
+                    else {
+                        panic!("claimed pair absent")
+                    };
+                    assert_eq!(
+                        game.world
+                            .read_persistent_counter(&counter)
+                            .unwrap()
+                            .counter(),
+                        1
+                    );
+                    assert_eq!(
+                        game.inventory[1].as_ref().unwrap().count,
+                        4,
+                        "restore complete older item owner, never newer working count2"
+                    );
+                    (counter, slot)
+                } else {
+                    assert!(game.world.counter_domain_snapshot().is_none());
+                    assert_eq!(game.inventory[1].as_ref().unwrap().count, 7);
+                    let binding = crate::game::world_loading::owned_guest_binding(
+                        &game.options.mod_packages,
+                        game.pack.assets.registry,
+                    )
+                    .unwrap();
+                    let world = *game
+                        .session_lock
+                        .as_ref()
+                        .unwrap()
+                        .expected_world()
+                        .unwrap();
+                    let wrong_world = horizon_client::world::World::new(game.world.air, 0);
+                    assert!(
+                        game.session_lock
+                            .as_ref()
+                            .unwrap()
+                            .validate_owned_unplaced(&wrong_world, &binding)
+                            .is_err()
+                    );
+                    assert!(
+                        game.world
+                            .restore_verified_unplaced_admission(
+                                &binding,
+                                world,
+                                Dim::Overworld.id(),
+                                game.world.game_time
+                            )
+                            .is_err(),
+                        "duplicate recovery cannot replace the actual live incarnation admission"
+                    );
+                    game.session_lock
+                        .as_ref()
+                        .unwrap()
+                        .validate_owned_unplaced(&game.world, &binding)
+                        .unwrap();
+                    owned_place(&mut game, &f)
+                };
+                let mut rich = session_items_rich();
+                rich.count = 3;
+                retirement_raw_equal(
+                    game.world
+                        .read_world_slot(&slot)
+                        .unwrap()
+                        .slot
+                        .stack()
+                        .unwrap(),
+                    &rich,
+                );
+                rich.count = 4;
+                retirement_raw_equal(game.inventory[1].as_ref().unwrap(), &rich);
+                rich.count = 7;
+                retirement_raw_equal(game.ender_items[4].as_ref().unwrap(), &rich);
+                let heads = (
+                    game.world.counter_domain_snapshot().unwrap().high_water,
+                    game.world
+                        .persistent_world_slot_metadata()
+                        .unwrap()
+                        .high_water,
+                );
+                let _closed = close_local(game, &archive, false);
+                let latest = epochs(&archive).unwrap();
+                assert_eq!(latest.len(), before.len() + 1);
+                assert!(latest.last().unwrap().0 > *old_epoch);
+                for (path, inventory) in pending_before {
+                    assert_eq!(
+                        super::super::tree(&path, &[]).unwrap(),
+                        inventory,
+                        "preserve original failed/interrupted predecessor"
+                    );
+                }
+                let mut successor = owned_reopen(&f, &startup, &tree, &case, "B-successor");
+                assert!(
+                    successor
+                        .session_lock
+                        .as_mut()
+                        .unwrap()
+                        .counter_bootstrap()
+                        .is_none()
+                );
+                assert!(successor.world.read_persistent_counter(&counter).is_err());
+                assert!(successor.world.read_world_slot(&slot).is_err());
+                assert_eq!(
+                    (
+                        successor
+                            .world
+                            .counter_domain_snapshot()
+                            .unwrap()
+                            .high_water,
+                        successor
+                            .world
+                            .persistent_world_slot_metadata()
+                            .unwrap()
+                            .high_water
+                    ),
+                    heads
+                );
+                owned_native_close(successor);
+                eprintln!(
+                    "OWNED_B_SAME_ARCHIVE_SUCCESSOR claimed={claimed} epoch={}",
+                    latest.last().unwrap().0
+                );
+            }
+        }
+        assert_eq!(
+            package_files(&f.pair),
+            f.pair_before,
+            "captured source inputs changed"
+        );
+        assert_eq!(
+            input_files(&f.base),
+            f.base_before,
+            "shared base tables changed"
+        );
+        let exe = std::env::current_exe().unwrap();
+        fs::write(root.join(format!("{phase}.json")), serde_json::to_vec_pretty(&serde_json::json!({"pid":std::process::id(),"executable":format!("{:x}",Sha256::digest(fs::read(exe).unwrap())),"completed":true})).unwrap()).unwrap();
+        eprintln!("OWNED_CHILD_{phase}_PASS");
+        std::mem::forget(f);
+    }
+
     #[test]
     #[ignore = "isolated captured pair and native resources: actual ordinary LOCAL body, coherent Retry, unpublished recovery and cancellation"]
     fn ordinary_local_actual_body_coherent_retry_recovery_and_cancel() {
