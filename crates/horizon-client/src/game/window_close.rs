@@ -16,6 +16,686 @@ use world_loading::{
 
 const CLOSE_WAIT: Duration = Duration::from_secs(10);
 
+#[cfg(test)]
+pub(super) fn hold_ordinary_rest_loader() -> std::result::Result<(), String> {
+    tests::hold_ordinary_rest_loader()
+}
+
+#[cfg(feature = "mods")]
+fn pump_ordinary(event_loop: &mut EventLoop<()>, application: &mut impl ApplicationHandler) {
+    use winit::platform::pump_events::{EventLoopExtPumpEvents, PumpStatus};
+    if let PumpStatus::Exit(_) =
+        event_loop.pump_app_events(Some(Duration::from_millis(8)), application)
+    {
+        eprintln!("fatal: ordinary event loop stopped outside its owned completion transition");
+        std::process::abort();
+    }
+}
+
+/// Normal selected-package entry, bounded to the owner's explicit test provider.
+/// Every Game borrows one lexical resource generation; only owned presentation
+/// returns from its completed application. No title Game or leaked Arc is used.
+#[cfg(feature = "mods")]
+pub(super) fn run_ordinary(
+    options: Options,
+    settings: Settings,
+    vanilla_root: PathBuf,
+    started: Instant,
+) -> Result<()> {
+    if !cfg!(target_os = "linux")
+        || cfg!(feature = "audio")
+        || cfg!(feature = "controllers")
+        || !options.test_terrain
+        || !options.mod_packages.has_pairs()
+        || settings.horizon.lod_distance != 0
+        || options.dimension.is_some()
+        || options.benchmark.is_some()
+        || options.offscreen
+    {
+        return Err("selected paired S1 startup requires Linux, explicit --test-terrain, no LOD/audio/controllers, and the bounded Overworld profile".into());
+    }
+    horizon_threads::catch_retained_stop_signals();
+    if options.execution_role == execution_role::ExecutionRole::DedicatedServer {
+        return retained_server::run_ordinary_dedicated(options, settings, vanilla_root, started);
+    }
+    let mut event_loop = new_event_loop()?;
+    let menu = startup_menu::StartupMenu::new(&options, None)?;
+    let progress = Progress::new();
+    let (receiver, handle) =
+        startup_menu::spawn_loader(&options, &settings, &vanilla_root, started, &progress)?;
+    let mut frontend = Loading {
+        retained: Some(RetainedFrontendState::default()),
+        window: None,
+        renderer: None,
+        gui: None,
+        settings,
+        fullscreen: horizon_client::window::FullscreenState::new(false),
+        options: Some(options),
+        vanilla_root,
+        pack_error: None,
+        started,
+        panorama_rotation: Default::default(),
+        progress,
+        receiver,
+        loaded: None,
+        handle: Some(handle),
+        shown: false,
+        menu,
+        error: None,
+    };
+    let mut entry_token = 0u64;
+    loop {
+        while !frontend.retained_frontend_helpers_closed()
+            || (!frontend.retained_menu_closing() && !matches!(frontend.loaded, Some(Ok(_))))
+        {
+            pump_ordinary(&mut event_loop, &mut frontend);
+        }
+        if frontend.retained_menu_closing() {
+            break;
+        }
+        let loaded = frontend.take_retained_generation()?;
+        // This call owns Resources lexically until all borrowing worlds finish.
+        let reload = ordinary_generation(&mut event_loop, &mut frontend, loaded, &mut entry_token)?;
+        if !reload || frontend.retained_menu_closing() {
+            break;
+        }
+        let options = frontend
+            .options
+            .as_mut()
+            .expect("original frontend options");
+        options.mod_packages =
+            mod_packages::Packages::read(&frontend.settings.mods.enabled, &options.dev_mods)?;
+        if !options.mod_packages.has_pairs() {
+            return Err("changing to an unpaired startup requires a new launch".into());
+        }
+        let progress = Progress::new();
+        let (receiver, handle) = startup_menu::spawn_loader(
+            options,
+            &frontend.settings,
+            &frontend.vanilla_root,
+            started,
+            &progress,
+        )?;
+        frontend.menu.reload_packs = false;
+        frontend.retained.as_mut().unwrap().generation_issued = false;
+        frontend.receiver = receiver;
+        frontend.handle = Some(handle);
+        frontend.progress = progress;
+    }
+    // No event-loop exit was used for a phase change. Resource helpers and every
+    // world application are actually complete before this owning-thread disposal.
+    if let Some(error) = frontend.error.take() {
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "mods")]
+fn ordinary_generation(
+    event_loop: &mut EventLoop<()>,
+    frontend: &mut Loading,
+    loaded: Loaded,
+    entry_token: &mut u64,
+) -> Result<bool> {
+    if loaded.rest_loader.is_some() || loaded.pack_error.is_some() {
+        return Err(
+            "paired generation requires actual completed resources without fallback".into(),
+        );
+    }
+    let resources = loaded.resources;
+    let root = loaded.root;
+    let mut pack = Some(loaded.pack);
+    let mut cpu = loaded.game_cpu;
+    if frontend.gui.is_none() {
+        frontend.gui = loaded.gui;
+    }
+    let sync = Arc::new(horizon_client::lan::data::SyncData::load(&root)?);
+    let startup = Arc::new(
+        frontend
+            .options
+            .as_ref()
+            .expect("original options")
+            .mod_packages
+            .freeze_peer_inputs(sync, pack.as_ref().unwrap().assets.registry)?
+            .ok_or("ordinary selected-pair generation missing its captured package owners")?,
+    );
+    loop {
+        if frontend.retained_menu_closing() {
+            return Ok(false);
+        }
+        if frontend.menu.reload_packs {
+            return Ok(true);
+        }
+        if let Some(entry) = frontend.menu.pending.take() {
+            let options = frontend.options.as_ref().expect("original options");
+            let mut options = options.clone();
+            options.resources = root.clone();
+            let settings = frontend.settings.clone();
+            let result: Result<Option<(ReturnedFrontend, bool, Option<String>)>> = (|| {
+                let gui = frontend
+                    .gui
+                    .as_ref()
+                    .ok_or("complete menu bundle missing")?;
+                let window = frontend
+                    .window
+                    .clone()
+                    .ok_or("original frontend window missing")?;
+                if !frontend
+                    .renderer
+                    .as_ref()
+                    .is_some_and(Renderer::has_inline_occlusion_provenance)
+                {
+                    if let Some(old) = &mut frontend.renderer {
+                        old.release_surface();
+                    }
+                    frontend.renderer = Some(renderer(
+                        window,
+                        pack.as_ref().unwrap(),
+                        gui,
+                        settings.horizon.api,
+                    )?);
+                }
+                let prepared_cpu = match cpu.take() {
+                    Some(cpu) => cpu,
+                    None => GameCpuResources::load(&root)?,
+                };
+                *entry_token = entry_token
+                    .checked_add(1)
+                    .ok_or("ordinary entry token exhausted")?;
+                let association = RetainedEntryIdentity {
+                    token: *entry_token,
+                    owner: Arc::new(()),
+                };
+                let mut application = match entry {
+                    PendingWorldEntry::Server {
+                        address,
+                        name,
+                        cookies,
+                    } => {
+                        if cookies.is_some() {
+                            return Err("paired S1 transfer cookies are unsupported".into());
+                        }
+                        let activated = startup
+                            .activate(
+                                options.execution_role,
+                                options.server_thread,
+                                true,
+                                &settings,
+                            )
+                            .map_err(|refused| refused.reason.clone())?;
+                        let prepared = RemotePreparation::new_paired(
+                            options.clone(),
+                            settings,
+                            prepared_cpu,
+                            name,
+                            startup.clone(),
+                            pack.as_ref().unwrap().assets.registry,
+                        )?;
+                        let attached = match prepared.attach(
+                            horizon_client::net::RetainedTarget::Address(address.clone()),
+                            address,
+                            RemoteFrontend::External,
+                        ) {
+                            Ok(attached) => attached,
+                            Err((_original, _target, reason)) => return Err(reason.into()),
+                        };
+                        let mut game = attached.into_game(
+                            &resources,
+                            pack.take().unwrap(),
+                            frontend.gui.take().unwrap(),
+                        );
+                        if let Err(original) = game.adopt_activated_startup(activated) {
+                            eprintln!(
+                                "fatal: original external client runtime association refused: {}",
+                                original.1
+                            );
+                            std::process::abort();
+                        }
+                        install_ordinary_presentation(&mut game, frontend);
+                        ordinary_application(
+                            Phase::RemoteRunning(Box::new(game)),
+                            &options,
+                            None,
+                            None,
+                            None,
+                            frontend,
+                        )
+                    }
+                    local => {
+                        let mut request = ordinary_local_request(local)?;
+                        if let Some(original) = frontend
+                            .retained
+                            .as_ref()
+                            .unwrap()
+                            .closed_worlds
+                            .iter()
+                            .find(|original| original.root() == request.save_root)
+                        {
+                            request = request.with_ordinary_reopen(original.clone())?;
+                        }
+                        request.check_ordinary_native_entry()?;
+                        if options.server_thread {
+                            let backend_cpu = GameCpuResources::load(&root)?;
+                            let tree = Arc::new(horizon_client::advancements::Tree::load(
+                                &root.join("data"),
+                            ));
+                            let name = options.player_name();
+                            let activated = startup
+                                .activate(
+                                    options.execution_role,
+                                    options.server_thread,
+                                    true,
+                                    &settings,
+                                )
+                                .map_err(|refused| refused.reason.clone())?;
+                            let prepared = RemotePreparation::new_paired(
+                                options.clone(),
+                                settings.clone(),
+                                prepared_cpu,
+                                name.clone(),
+                                startup.clone(),
+                                pack.as_ref().unwrap().assets.registry,
+                            )?;
+                            let mut backend_options = options.clone();
+                            backend_options.execution_role =
+                                execution_role::ExecutionRole::IntegratedServer;
+                            backend_options.server_thread = false;
+                            backend_options.server = None;
+                            backend_options.dedicated = Some(Vec::new());
+                            backend_options.player_name = Some(name);
+                            backend_options.control = None;
+                            let mut backend_settings = settings;
+                            backend_settings.render_distance = 2;
+                            backend_settings.simulation_distance = 2;
+                            let server_root = request.save_root.clone();
+                            let backend = retained_server::OrdinaryServerInput {
+                                options: backend_options,
+                                settings: backend_settings,
+                                request: retained_server::OrdinaryRequest::Native(request),
+                                entry: association,
+                                resources: resources.clone(),
+                                pack: pack.as_ref().unwrap().clone(),
+                                gui: UiResources::load(&root, &frontend.vanilla_root)?,
+                                cpu: backend_cpu,
+                                tree,
+                                startup: startup.clone(),
+                                offline: horizon_client::lan::RetainedOfflineConfig {
+                                    bind: None,
+                                    port: 0,
+                                    motd: "Singleplayer".into(),
+                                    max_players: 1,
+                                    compression_threshold: -1,
+                                    enable_status: false,
+                                    hide_online_players: true,
+                                    announce: false,
+                                },
+                                dedicated_setup: None,
+                                continuation_archive: None,
+                                #[cfg(test)]
+                                test: Default::default(),
+                            };
+                            let phase = Phase::IntegratedPreparing(Box::new(IntegratedPreparing {
+                                res: &resources,
+                                prepared: Some(prepared),
+                                ui: ColdUi {
+                                    pack: pack.take().unwrap(),
+                                    gui: frontend.gui.take().unwrap(),
+                                    renderer: frontend.renderer.take(),
+                                    window: frontend.window.take(),
+                                },
+                                server_root,
+                                refusal: None,
+                                targets: Vec::new(),
+                            }));
+                            ordinary_application(
+                                phase,
+                                &options,
+                                None,
+                                Some(backend),
+                                Some(activated),
+                                frontend,
+                            )
+                        } else {
+                            let activated = startup
+                                .activate(
+                                    options.execution_role,
+                                    options.server_thread,
+                                    false,
+                                    &settings,
+                                )
+                                .map_err(|refused| refused.reason.clone())?;
+                            let Some(prepared) = prepare_ordinary_in_frame(
+                                event_loop,
+                                frontend,
+                                request,
+                                &resources,
+                                pack.as_ref().unwrap(),
+                                &options,
+                                &settings,
+                                &association,
+                                startup.clone(),
+                            )?
+                            else {
+                                return Ok(None);
+                            };
+                            let construction = Construction::from_prepared(prepared.prepared());
+                            let audio = Audio::silent(&root);
+                            let mut game = Game::new_with_world(
+                                &resources,
+                                pack.take().unwrap(),
+                                frontend.gui.take().unwrap(),
+                                options.clone(),
+                                settings,
+                                audio,
+                                Some(prepared_cpu),
+                                InitialGameWorld::Ordinary(Box::new(prepared)),
+                            )
+                            .unwrap_or_else(|error| {
+                                eprintln!("fatal: original ordinary in-frame transfer: {error}");
+                                std::process::abort();
+                            });
+                            if let Err(original) = game.adopt_activated_startup(activated) {
+                                eprintln!(
+                                    "fatal: original local runtime association refused: {}",
+                                    original.1
+                                );
+                                std::process::abort();
+                            }
+                            game.title = None;
+                            game.screen = Screen::Playing;
+                            game.restore_ordinary_native_player();
+                            game.load_world_state();
+                            install_ordinary_presentation(&mut game, frontend);
+                            ordinary_application(
+                                Phase::Running(Box::new(game)),
+                                &options,
+                                Some(construction),
+                                None,
+                                None,
+                                frontend,
+                            )
+                        }
+                    }
+                };
+                if let Some(control) = &mut application.control
+                    && let Err(reason) = control.start()
+                {
+                    application.fail(reason);
+                }
+                if let Phase::RemoteRunning(game) = &mut application.phase
+                    && let Err(reason) = game.start_retained_remote()
+                {
+                    application.fail(reason);
+                }
+                while !matches!(application.phase, Phase::Done) {
+                    pump_ordinary(event_loop, &mut application);
+                }
+                let returned = application
+                    .ordinary
+                    .as_mut()
+                    .unwrap()
+                    .returned
+                    .take()
+                    .expect("actual completed ordinary frontend");
+                Ok(Some((
+                    returned,
+                    application.quit,
+                    application.original_error.take(),
+                )))
+            })();
+            frontend.menu.reset_retained_entry();
+            match result {
+                Ok(Some((returned, quit, error))) => {
+                    if let Some(closed) = returned.closed_world {
+                        let retained = frontend.retained.as_mut().unwrap();
+                        retained
+                            .closed_worlds
+                            .retain(|previous| previous.root() != closed.root());
+                        retained.closed_worlds.push(Arc::new(closed));
+                    }
+                    pack = Some(returned.pack);
+                    frontend.gui = Some(returned.gui);
+                    frontend.renderer = Some(returned.renderer);
+                    frontend.window = Some(returned.window);
+                    let mut options = returned.options;
+                    options.world = None;
+                    options.server = None;
+                    frontend.options = Some(options);
+                    frontend.settings = returned.settings;
+                    frontend.fullscreen = returned.fullscreen;
+                    frontend.panorama_rotation = returned.panorama_rotation;
+                    if let Some(error) = error {
+                        if quit {
+                            return Err(error.into());
+                        }
+                        // Completed native/transport custody permits returning
+                        // the same frontend while its original error stays
+                        // visible and remains the final application outcome.
+                        frontend.error.get_or_insert_with(|| error.clone().into());
+                        frontend.menu.retained_entry_error(&error);
+                    }
+                    if quit {
+                        return Ok(false);
+                    }
+                    frontend.apply_menu_settings();
+                }
+                Ok(None) => {}
+                Err(error) => frontend.menu.retained_entry_error(&error.to_string()),
+            }
+        }
+        pump_ordinary(event_loop, frontend);
+    }
+}
+
+#[cfg(feature = "mods")]
+fn ordinary_local_request(entry: PendingWorldEntry) -> Result<world_loading::WorldRequest> {
+    use world_loading::host_identity::IdentityIntent;
+    let (folder, name, seed, creative, create, explicit) = match entry {
+        PendingWorldEntry::Local {
+            folder,
+            name,
+            seed,
+            creative,
+            create,
+        } => (folder, name, seed, creative, create, None),
+        PendingWorldEntry::IdentifiedLocal {
+            folder,
+            name,
+            seed,
+            creative,
+            create,
+            identity_intent,
+        } => (folder, name, seed, creative, create, Some(identity_intent)),
+        PendingWorldEntry::Server { .. } => {
+            return Err("local preparation received a server entry".into());
+        }
+    };
+    let request = world_loading::WorldRequest::new(
+        &folder,
+        name.as_deref(),
+        seed,
+        creative,
+        create.as_deref(),
+    )?;
+    let intent = match explicit {
+        Some(intent) => intent,
+        None if name.is_some() => IdentityIntent::CreateNewIdentity,
+        None => match std::fs::symlink_metadata(&request.save_root) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && seed.is_some() => {
+                IdentityIntent::CreateNewIdentity
+            }
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error.into()),
+            _ => IdentityIntent::RequireExistingIdentity,
+        },
+    };
+    Ok(request.with_identity_intent(intent))
+}
+
+#[cfg(feature = "mods")]
+#[allow(clippy::too_many_arguments)]
+fn prepare_ordinary_in_frame(
+    event_loop: &mut EventLoop<()>,
+    frontend: &mut Loading,
+    request: world_loading::WorldRequest,
+    resources: &Arc<Resources>,
+    pack: &PackResources,
+    options: &Options,
+    settings: &Settings,
+    entry: &RetainedEntryIdentity,
+    startup: Arc<mod_packages::FrozenHostInputs>,
+) -> Result<Option<world_loading::OrdinaryPreparedWorld>> {
+    let mut loader = world_loading::OrdinaryWorldLoader::start(
+        request,
+        resources.clone(),
+        pack.clone(),
+        options.clone(),
+        settings.clone(),
+        entry.clone(),
+        startup,
+    )?;
+    let state = frontend.retained.as_mut().expect("actual frontend owner");
+    state.preparing = true;
+    state.entry_cancel = false;
+    state.entry_retry = false;
+    let mut owner = None;
+    let mut closing = false;
+    let mut blocked = false;
+    let mut reason = None;
+    loop {
+        pump_ordinary(event_loop, frontend);
+        let state = frontend.retained.as_mut().unwrap();
+        let cancelled = state.entry_cancel || state.close_requested;
+        let retry = std::mem::take(&mut state.entry_retry);
+        if cancelled {
+            loader.request_cancel();
+        }
+        if owner.is_none()
+            && let Some(prepared) = loader.poll()
+        {
+            owner = Some(prepared);
+        }
+        let Some(prepared) = owner.as_mut() else {
+            continue;
+        };
+        if !closing {
+            if !cancelled && prepared.original_error().is_none() {
+                match owner.take().unwrap().into_prepared(entry) {
+                    Ok(prepared) => {
+                        frontend.retained.as_mut().unwrap().preparing = false;
+                        return Ok(Some(prepared));
+                    }
+                    Err(prepared) => owner = Some(prepared),
+                }
+            }
+            let prepared = owner.as_mut().unwrap();
+            if !cancelled {
+                reason = Some(
+                    prepared
+                        .original_error()
+                        .unwrap_or("original ordinary preparation transfer refused")
+                        .to_owned(),
+                );
+            }
+            prepared.begin_close(Instant::now() + CLOSE_WAIT);
+            closing = true;
+        }
+        let prepared = owner.as_mut().unwrap();
+        if retry && blocked && prepared.retry_close(Instant::now() + CLOSE_WAIT).is_ok() {
+            blocked = false;
+        }
+        match prepared.poll_close() {
+            PreparationCloseStatus::Complete => match owner.take().unwrap().finish_close() {
+                Ok(closed) if closed.matches_entry(entry) => {
+                    frontend.retained.as_mut().unwrap().preparing = false;
+                    return reason.map_or(Ok(None), |reason| Err(reason.into()));
+                }
+                Ok(_wrong) => {
+                    eprintln!(
+                        "fatal: original ordinary preparation completion changed association"
+                    );
+                    std::process::abort();
+                }
+                Err(original) => owner = Some(original),
+            },
+            PreparationCloseStatus::Blocked(_) => blocked = true,
+            PreparationCloseStatus::Pending => {}
+        }
+    }
+}
+
+#[cfg(feature = "mods")]
+fn install_ordinary_presentation(game: &mut Game<'_>, frontend: &mut Loading) {
+    game.window = frontend.window.take();
+    game.renderer = frontend.renderer.take();
+    game.world_renderer_ready = game.renderer.is_some();
+    game.fullscreen = frontend.fullscreen;
+    game.panorama_rotation = frontend.panorama_rotation;
+    game.focused = game
+        .window
+        .as_ref()
+        .is_some_and(|window| window.has_focus());
+    game.previous = Instant::now();
+}
+
+#[cfg(feature = "mods")]
+fn ordinary_application<'a>(
+    phase: Phase<'a>,
+    options: &Options,
+    construction: Option<Construction>,
+    backend: Option<retained_server::OrdinaryServerInput>,
+    activation: Option<mod_packages::ActivatedStartup>,
+    frontend: &Loading,
+) -> Application<'a> {
+    Application {
+        ordinary: Some(OrdinaryApplication {
+            backend,
+            backend_refusal: None,
+            activation,
+            returned: None,
+            control_requested: options.control.is_some(),
+            fullscreen: frontend.fullscreen,
+            panorama_rotation: frontend.panorama_rotation,
+        }),
+        phase,
+        server: None,
+        server_result: None,
+        server_offer: None,
+        client_attempt: 0,
+        construction,
+        control: options
+            .control
+            .as_ref()
+            .map(|path| RetainedControl::prepare_window(path)),
+        closed_control: None,
+        lod: None,
+        closed_lod: None,
+        attempt: 0,
+        frame_generation: 0,
+        quit: false,
+        blocked: false,
+        detail: String::new(),
+        original_error: None,
+        late_error: None,
+        terminal_failure: false,
+        exit_acknowledged: false,
+        started: Instant::now(),
+        frames: 0,
+        frame_limit: options.frames,
+        timeout: options.timeout,
+        timeout_observed: false,
+        unclaimed_columns: Vec::new(),
+        status_presented: false,
+        surface_occluded: false,
+        #[cfg(all(
+            test,
+            feature = "native-writer-test-control",
+            debug_assertions,
+            target_os = "linux"
+        ))]
+        test: None,
+    }
+}
+
 enum RemoteDestination {
     Address(String),
     Integrated,
@@ -265,6 +945,76 @@ struct ColdUi {
     renderer: Option<Renderer>,
     window: Option<Arc<Window>>,
 }
+/// Only presentation/settings return to the no-world frontend. This contains no
+/// Game borrow, native save/authority, Session or configured admission.
+pub(super) struct ReturnedFrontend {
+    pub(super) closed_world: Option<super::paired_close::OrdinaryClosedWorld>,
+    pub(super) pack: PackResources,
+    pub(super) gui: UiResources,
+    pub(super) renderer: Renderer,
+    pub(super) window: Arc<Window>,
+    pub(super) options: Options,
+    pub(super) settings: Settings,
+    pub(super) fullscreen: horizon_client::window::FullscreenState,
+    pub(super) panorama_rotation: horizon_client::gfx::panorama::Rotation,
+}
+impl ReturnedFrontend {
+    /// Callers first prove actual native or remote completion. Moving the fields
+    /// here disposes the completed world remainder without retaining its authority.
+    pub(super) fn from_completed_game(mut game: Box<Game<'_>>) -> Self {
+        let renderer = game
+            .renderer
+            .take()
+            .expect("original presentation renderer");
+        let window = game.window.take().expect("original presentation window");
+        let Game {
+            pack,
+            gui,
+            options,
+            settings,
+            fullscreen,
+            panorama_rotation,
+            ..
+        } = *game;
+        Self {
+            closed_world: None,
+            pack,
+            gui,
+            renderer,
+            window,
+            options,
+            settings,
+            fullscreen,
+            panorama_rotation,
+        }
+    }
+}
+/// Constructor-bound completion for an ordinary world. Control is optional in
+/// normal launches; absence is checked against the actual original option rather
+/// than represented by a fabricated ClosedControl. LOD was never acquired here.
+pub(super) struct OrdinaryClientCompletion {
+    construction: Construction,
+    control: Option<ClosedControl>,
+    control_requested: bool,
+}
+impl OrdinaryClientCompletion {
+    pub(super) fn matches(&self, game: &Game<'_>) -> bool {
+        self.construction.matches(game)
+            && game.ordinary_startup.is_some()
+            && self.control_requested == game.options.control.is_some()
+            && match &self.control {
+                Some(control) => self.control_requested && control.observation().native_quiescent,
+                None => !self.control_requested,
+            }
+            && game.lod.is_none()
+            && game.settings.horizon.lod_distance == 0
+            && game
+                .renderer
+                .as_ref()
+                .is_some_and(Renderer::has_inline_occlusion_provenance)
+            && game.window.is_some()
+    }
+}
 struct ColdState {
     owner: Option<ColdPreparation>,
     closed: Option<PreparationClosed>,
@@ -379,6 +1129,8 @@ pub(super) fn run_remote(options: Options, launch: RemoteLaunch) -> Result<()> {
         }
     };
     let mut application = Application {
+        #[cfg(feature = "mods")]
+        ordinary: None,
         phase,
         server: None,
         server_result: None,
@@ -447,7 +1199,19 @@ pub(super) fn run_remote(options: Options, launch: RemoteLaunch) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "mods")]
+struct OrdinaryApplication {
+    backend: Option<retained_server::OrdinaryServerInput>,
+    backend_refusal: Option<Box<retained_server::OrdinaryStartRefusal>>,
+    activation: Option<mod_packages::ActivatedStartup>,
+    returned: Option<ReturnedFrontend>,
+    control_requested: bool,
+    fullscreen: horizon_client::window::FullscreenState,
+    panorama_rotation: horizon_client::gfx::panorama::Rotation,
+}
 struct Application<'a> {
+    #[cfg(feature = "mods")]
+    ordinary: Option<OrdinaryApplication>,
     phase: Phase<'a>,
     server: Option<retained_server::Supervisor>,
     server_result: Option<std::result::Result<(), String>>,
@@ -546,6 +1310,8 @@ pub(super) fn run(options: Options, launch: Launch) -> Result<()> {
     let control =
         RetainedControl::prepare_window(options.control.as_ref().expect("profile control path"));
     let mut application = Application {
+        #[cfg(feature = "mods")]
+        ordinary: None,
         phase: Phase::Done,
         server: None,
         server_result: None,
@@ -811,6 +1577,12 @@ pub(super) fn request_redraw(game: &Game<'_>, title: &str) {
 }
 
 impl Application<'_> {
+    fn is_ordinary(&self) -> bool {
+        #[cfg(feature = "mods")]
+        return self.ordinary.is_some();
+        #[cfg(not(feature = "mods"))]
+        false
+    }
     fn server_done(&self) -> bool {
         self.server.is_none() || self.server_result.is_some()
     }
@@ -821,11 +1593,30 @@ impl Application<'_> {
     }
     fn poll_integrated(&mut self) {
         let mut failure = None;
+        let ordinary = self.is_ordinary();
+        #[cfg(feature = "mods")]
+        if self.attempt == 0
+            && self.server.is_none()
+            && self.view().usable
+            && matches!(self.phase, Phase::IntegratedPreparing(_))
+            && let Some(mode) = &mut self.ordinary
+            && mode.backend_refusal.is_none()
+            && let Some(input) = mode.backend.take()
+        {
+            match retained_server::Supervisor::prepare_ordinary(input) {
+                Ok(server) => self.server = Some(server),
+                Err(refused) => {
+                    failure = Some(refused.reason.clone());
+                    mode.backend_refusal = Some(refused);
+                }
+            }
+        }
         #[cfg(test)]
         let hold_prepare = tests::hold_integrated_stage("prepare");
         #[cfg(not(test))]
         let hold_prepare = false;
-        if self.attempt == 0
+        if !ordinary
+            && self.attempt == 0
             && self.server.is_none()
             && self.view().usable
             && !hold_prepare
@@ -864,7 +1655,7 @@ impl Application<'_> {
                 }
             }
             if let Phase::RemoteRunning(game) = &self.phase {
-                server.set_paused(game.screen == Screen::Paused);
+                server.set_paused(game.pauses_game());
             }
         }
         #[cfg(test)]
@@ -898,6 +1689,22 @@ impl Application<'_> {
                                 assert!(seed.targets.is_empty());
                                 let mut game =
                                     attached.into_game(seed.res, seed.ui.pack, seed.ui.gui);
+                                #[cfg(feature = "mods")]
+                                if let Some(mode) = &mut self.ordinary {
+                                    let activated = mode
+                                        .activation
+                                        .take()
+                                        .expect("original activated client runtime");
+                                    if let Err(original) = game.adopt_activated_startup(activated) {
+                                        eprintln!(
+                                            "fatal: original integrated client runtime association refused: {}",
+                                            original.1
+                                        );
+                                        std::process::abort();
+                                    }
+                                    game.fullscreen = mode.fullscreen;
+                                    game.panorama_rotation = mode.panorama_rotation;
+                                }
                                 game.window = seed.ui.window;
                                 game.renderer = seed.ui.renderer;
                                 game.world_renderer_ready = game.renderer.is_some();
@@ -1091,7 +1898,10 @@ impl Application<'_> {
         } else {
             self.detail = error;
         }
-        self.begin_close(true);
+        // A late diagnostic cannot turn an already requested ordinary Leave
+        // into Quit. Explicit Quit and failures before close retain that intent.
+        let quit = !self.is_ordinary() || self.attempt == 0 || self.quit;
+        self.begin_close(quit);
     }
     fn begin_close(&mut self, quit: bool) {
         self.quit |= quit;
@@ -1123,11 +1933,17 @@ impl Application<'_> {
                 game.begin_retained_remote_close(now + CLOSE_WAIT);
                 Phase::RemoteClosing(game)
             }
-            Phase::Running(game) => Phase::Closing(CloseOwner::begin(
-                game,
-                CloseProfile::NativeWorld,
-                now + CLOSE_WAIT,
-            )),
+            Phase::Running(mut game) => {
+                if game.ordinary_startup.is_some() {
+                    game.clear_ordinary_input();
+                    game.capture(false);
+                }
+                Phase::Closing(CloseOwner::begin(
+                    game,
+                    CloseProfile::NativeWorld,
+                    now + CLOSE_WAIT,
+                ))
+            }
             Phase::Cold(mut cold) => {
                 if let Some(owner) = &mut cold.owner {
                     owner.begin_close(now + CLOSE_WAIT);
@@ -1363,8 +2179,18 @@ impl Application<'_> {
         }
         let world_closed =
             self.frontend_done() && self.server_done() && self.server_offer.is_none();
-        if !world_closed || !self.quit || !self.unclaimed_columns.is_empty() {
+        if !world_closed
+            || (!self.quit && !self.is_ordinary())
+            || !self.unclaimed_columns.is_empty()
+        {
             return;
+        }
+        if self.is_ordinary()
+            && self.control.is_none()
+            && self.closed_control.is_none()
+            && self.original_error.is_some()
+        {
+            self.terminal_failure = true;
         }
         // Once sealed, keep polling actual control completion regardless of
         // drawing. Before seal, require a positively presented original status
@@ -1466,6 +2292,11 @@ impl Application<'_> {
         }
     }
     fn complete(&mut self, event_loop: &ActiveEventLoop) {
+        #[cfg(feature = "mods")]
+        if self.ordinary.is_some() {
+            self.complete_ordinary();
+            return;
+        }
         if !self.server_done() || self.server_offer.is_some() {
             return;
         }
@@ -1526,6 +2357,83 @@ impl Application<'_> {
             other => self.phase = other,
         }
     }
+    #[cfg(feature = "mods")]
+    fn complete_ordinary(&mut self) {
+        if !self.frontend_done()
+            || !self.server_done()
+            || self.server_offer.is_some()
+            || self.control.is_some()
+            || !self.unclaimed_columns.is_empty()
+            || (self.terminal_failure && !self.exit_acknowledged)
+        {
+            return;
+        }
+        let mode = self
+            .ordinary
+            .as_mut()
+            .expect("ordinary application constructor");
+        if mode.control_requested != self.closed_control.is_some() {
+            return;
+        }
+        let phase = std::mem::replace(&mut self.phase, Phase::Done);
+        let mut returned = match phase {
+            Phase::Ready(ready) => {
+                let completion = OrdinaryClientCompletion {
+                    construction: self
+                        .construction
+                        .take()
+                        .expect("original native Game constructor"),
+                    control: self.closed_control.take(),
+                    control_requested: mode.control_requested,
+                };
+                match ready.try_return_window(completion) {
+                    Ok(returned) => returned,
+                    Err((ready, completion, reason)) => {
+                        self.phase = Phase::Ready(ready);
+                        self.construction = Some(completion.construction);
+                        self.closed_control = completion.control;
+                        self.blocked = true;
+                        self.detail = reason;
+                        return;
+                    }
+                }
+            }
+            Phase::RemoteReady(game) => {
+                // RemoteReady is reached only after the same Game's actual
+                // Session, decoder and streaming close. Joint server/Offer and
+                // optional control completion were checked above.
+                if mode.activation.is_some() {
+                    self.phase = Phase::RemoteReady(game);
+                    return;
+                }
+                ReturnedFrontend::from_completed_game(game)
+            }
+            Phase::IntegratedPreparing(mut seed) => {
+                let prepared = seed.prepared.take().expect("unconsumed original frontend");
+                ReturnedFrontend {
+                    closed_world: None,
+                    pack: seed.ui.pack,
+                    gui: seed.ui.gui,
+                    renderer: seed.ui.renderer.take().expect("original ordinary renderer"),
+                    window: seed.ui.window.take().expect("original ordinary window"),
+                    options: prepared.options,
+                    settings: prepared.settings,
+                    fullscreen: mode.fullscreen,
+                    panorama_rotation: mode.panorama_rotation,
+                }
+            }
+            other => {
+                self.phase = other;
+                return;
+            }
+        };
+        if let Some(server) = self.server.as_mut()
+            && let Some(closed) = server.take_ordinary_closed_world()
+        {
+            returned.closed_world = Some(closed);
+        }
+        mode.returned = Some(returned);
+    }
     fn redraw(&mut self) {
         #[cfg(all(
             test,
@@ -1555,6 +2463,7 @@ impl Application<'_> {
         let result = match &mut self.phase {
             Phase::RemoteRunning(game) => game.retained_remote_frame(),
             Phase::RemoteClosing(game) | Phase::RemoteReady(game) => draw_status(game, &stage),
+            Phase::Running(game) if game.ordinary_startup.is_some() => game.ordinary_native_frame(),
             Phase::Running(game) => game.render(),
             Phase::Closing(owner) => owner.draw_window_status(&stage),
             Phase::Ready(ready) => ready.draw_window_status(&stage),
@@ -1621,6 +2530,17 @@ impl Application<'_> {
         let Phase::Running(game) = &mut self.phase else {
             return;
         };
+        if game.ordinary_startup.is_some() && game.retained_entry_closing {
+            self.begin_close(false);
+            return;
+        }
+        if game.ordinary_startup.is_some() {
+            let error = game.error.as_ref().map(ToString::to_string);
+            if let Some(error) = error {
+                self.fail(error);
+            }
+            return;
+        }
         let (uploads, unloaded) = game.streaming.expect_existing_mut().update(&mut game.world);
         // This fixed constructor admits one constant center/radius and no
         // movement/dimension/replacement commands. Unexpected unload cannot be
@@ -1755,9 +2675,28 @@ impl ApplicationHandler for Application<'_> {
             self.update_view();
             return;
         }
+        if let Phase::Running(game) = &mut self.phase
+            && game.ordinary_startup.is_some()
+            && !matches!(
+                &event,
+                WindowEvent::CloseRequested
+                    | WindowEvent::Resized(_)
+                    | WindowEvent::RedrawRequested
+                    | WindowEvent::Occluded(_)
+            )
+        {
+            if let Err(error) = game.ordinary_player_input(event) {
+                self.fail(error.to_string());
+            }
+            self.update_view();
+            return;
+        }
         match event {
             WindowEvent::CloseRequested => {
                 if self.terminal_failure {
+                    if self.is_ordinary() {
+                        self.begin_close(true);
+                    }
                     self.exit_acknowledged = true;
                 } else {
                     self.begin_close(true);
@@ -1842,6 +2781,10 @@ impl ApplicationHandler for Application<'_> {
     fn device_event(&mut self, _: &ActiveEventLoop, _: DeviceId, event: DeviceEvent) {
         if let Phase::RemoteRunning(game) = &mut self.phase {
             game.retained_remote_device(event);
+        } else if let Phase::Running(game) = &mut self.phase
+            && game.ordinary_startup.is_some()
+        {
+            game.retained_remote_device(event);
         }
     }
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
@@ -1852,7 +2795,10 @@ impl ApplicationHandler for Application<'_> {
         if self.frame_limit.is_some_and(|n| self.frames >= n) {
             self.begin_close(true);
         }
-        if !self.timeout_observed && self.started.elapsed() >= self.timeout {
+        if !self.timeout_observed
+            && (!self.is_ordinary() || self.frame_limit.is_some())
+            && self.started.elapsed() >= self.timeout
+        {
             self.timeout_observed = true;
             self.fail("native window time limit reached");
         }

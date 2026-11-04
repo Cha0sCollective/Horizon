@@ -2080,6 +2080,8 @@ struct Game<'a> {
     #[cfg(feature = "paired-packages")]
     native_close_authority: Option<world_loading::NativeCloseAuthority>,
     #[cfg(feature = "paired-packages")]
+    ordinary_startup: Option<Arc<mod_packages::FrozenHostInputs>>,
+    #[cfg(feature = "paired-packages")]
     remote_frontend: RemoteFrontend,
     #[cfg(feature = "paired-packages")]
     retained_server: Option<retained_server::ServerGameState>,
@@ -4647,6 +4649,10 @@ impl Game<'_> {
     }
     /// The hand whose use ended the click, if any.
     fn use_item(&mut self) -> Result<Option<Hand>> {
+        #[cfg(feature = "paired-packages")]
+        if self.ordinary_startup.is_some() && !self.ordinary_stone_use_admitted() {
+            return Ok(None);
+        }
         self.with_player_actor(|game| game.use_item_as_player())
     }
     /// `Minecraft.startUseItem`: the main hand, then the off hand.
@@ -5557,6 +5563,12 @@ impl Game<'_> {
             self.tick_weather_effects();
         }
         self.autosaving = self.ticks.is_multiple_of(6000);
+        #[cfg(feature = "paired-packages")]
+        if self.ordinary_startup.is_some() {
+            // This bounded route publishes through its retained world close.
+            // A legacy periodic save must not bypass coherent owner custody.
+            self.autosaving = false;
+        }
         if let Some(serving) = &self.serving {
             serving.set_saving(self.autosaving);
         }
@@ -7111,6 +7123,12 @@ impl Game<'_> {
         button: i32,
         input: horizon_client::menu::Input,
     ) -> bool {
+        #[cfg(feature = "paired-packages")]
+        if self.ordinary_startup.is_some()
+            && !self.ordinary_inventory_click_allowed(slot, button, input)
+        {
+            return false;
+        }
         if let Some(slot) = slot
             && slot >= Creative::DISPLAY
             && self.creative_tab_open()
@@ -7150,6 +7168,14 @@ impl Game<'_> {
     /// Several clicks on one menu instance (a quick craft drag is three).
     fn menu_ops(&mut self, ops: &[(Option<usize>, i32, horizon_client::menu::Input)]) -> bool {
         use horizon_client::menu::Input;
+        #[cfg(feature = "paired-packages")]
+        if self.ordinary_startup.is_some()
+            && ops.iter().any(|&(slot, button, input)| {
+                !self.ordinary_inventory_click_allowed(slot, button, input)
+            })
+        {
+            return false;
+        }
         // BundleMouseActions.onSlotClicked: a Shift click or a swap clears the bundle's selection.
         for &(slot, _, input) in ops {
             if let (Some(slot), Input::QuickMove | Input::Swap) = (slot, input) {
@@ -9493,35 +9519,8 @@ impl Game<'_> {
         self.finish_open_world(prepared)
     }
 
-    fn finish_open_world(&mut self, prepared: world_loading::PreparedWorld) -> Result<()> {
-        let world_loading::PreparedWorld {
-            save_root,
-            level,
-            world,
-            streaming,
-            save,
-            session_lock,
-            rand_sequences,
-            locator,
-            #[cfg(feature = "paired-packages")]
-            native_checkpoint_origin,
-        } = prepared;
-        let dim = Dim::from_id(&level.dimension);
-        horizon_client::crash::set_detail(
-            "World",
-            format!("{} ({})", level.name, save_root.display()),
-        );
-        self.session_lock = Some(session_lock);
-        self.end.set_locator(locator);
-        self.share_spawn_conditions();
-        self.score = Default::default();
-        self.fns = Default::default();
-        self.bosses = Default::default();
-        reset_world_progress(&mut self.adv, &mut self.stats);
-        self.prefetch_advancement_tree();
-        self.restore_player_state = true;
-        self.rand_sequences = rand_sequences;
-        self.border = Default::default();
+    /// Shared native player-state adoption; no world, lock, producer or save replacement.
+    fn restore_native_player_inventory(&mut self, level: &Level) -> Vec<Option<ItemStack>> {
         self.set_mode_id(level.mode());
         let mut inventory = vec![None; 36];
         self.armor = [None, None, None, None];
@@ -9576,7 +9575,92 @@ impl Game<'_> {
         self.yaw = yaw;
         self.pitch = pitch;
         self.selected = level.selected_slot.clamp(0, 8) as usize;
-        self.streaming = streaming_owner::GameStreaming::from_existing(streaming);
+        inventory
+    }
+
+    #[cfg(feature = "paired-packages")]
+    fn restore_ordinary_native_player(&mut self) {
+        let level = self.level.clone();
+        self.restore_player_state = true;
+        self.inventory = self.restore_native_player_inventory(&level);
+        self.respawn_config = level
+            .respawn_elsewhere
+            .as_ref()
+            .map(respawn_anchor::RespawnConfig::from_saved);
+        self.experience = Experience {
+            level: level.xp_level,
+            progress: level.xp_progress,
+            total: level.xp_total,
+        };
+        self.restore_effects();
+    }
+
+    fn finish_open_world(&mut self, prepared: world_loading::PreparedWorld) -> Result<()> {
+        #[cfg(feature = "paired-packages")]
+        let ordinary_recovery = self.ordinary_startup.is_some();
+        #[cfg(not(feature = "paired-packages"))]
+        let ordinary_recovery = false;
+        #[cfg(feature = "paired-packages")]
+        if ordinary_recovery {
+            assert!(
+                self.save.is_none()
+                    && self.streaming.is_vacant()
+                    && self.session_lock.is_none()
+                    && self.native_checkpoint_origin.is_none(),
+                "ordinary recovery preflight precedes complete prepared transfer"
+            );
+        }
+        let world_loading::PreparedWorld {
+            save_root,
+            level,
+            world,
+            streaming,
+            save,
+            session_lock,
+            rand_sequences,
+            locator,
+            #[cfg(feature = "paired-packages")]
+            native_checkpoint_origin,
+        } = prepared;
+        let mut streaming = Some(streaming);
+        #[cfg(feature = "paired-packages")]
+        if ordinary_recovery
+            && self
+                .streaming
+                .try_install_vacant(streaming.take().unwrap())
+                .is_err()
+        {
+            // An internal custody violation cannot drop an unresolved pool.
+            eprintln!("fatal: preflighted ordinary vacant installation refused");
+            std::process::abort();
+        }
+        let dim = Dim::from_id(&level.dimension);
+        horizon_client::crash::set_detail(
+            "World",
+            format!("{} ({})", level.name, save_root.display()),
+        );
+        self.session_lock = Some(session_lock);
+        self.end.set_locator(locator);
+        self.share_spawn_conditions();
+        self.score = Default::default();
+        self.fns = Default::default();
+        self.bosses = Default::default();
+        if ordinary_recovery {
+            // Keep the actual preloaded generation. No hidden tree worker is
+            // acquired in the unpublished recovery candidate.
+            self.adv.progress = Default::default();
+            self.stats = Default::default();
+        } else {
+            reset_world_progress(&mut self.adv, &mut self.stats);
+            self.prefetch_advancement_tree();
+        }
+        self.restore_player_state = true;
+        self.rand_sequences = rand_sequences;
+        self.border = Default::default();
+        let inventory = self.restore_native_player_inventory(&level);
+        if let Some(streaming) = streaming {
+            self.streaming = streaming_owner::GameStreaming::from_existing(streaming);
+        }
         #[cfg(feature = "paired-packages")]
         self.retire_counter_trial("world-open");
         self.world = world;
@@ -9950,6 +10034,11 @@ impl Game<'_> {
         #[cfg(feature = "paired-packages")]
         if self.is_retained_remote() {
             self.retained_remote_request_leave();
+            return Ok(());
+        }
+        #[cfg(feature = "paired-packages")]
+        if self.ordinary_startup.is_some() && self.native_close_authority.is_some() {
+            self.retained_entry_closing = true;
             return Ok(());
         }
         self.clear_waypoints();
@@ -11869,6 +11958,11 @@ impl Game<'_> {
             }
         }
         if self.creative_inventory_open() {
+            #[cfg(feature = "paired-packages")]
+            if self.ordinary_startup.is_some() && Self::creative_trash_hovered(&batch, self.cursor)
+            {
+                return;
+            }
             if Self::creative_trash_hovered(&batch, self.cursor) {
                 if self.has_shift_down() {
                     let before = self.player_equipment();
@@ -12987,6 +13081,61 @@ impl Game<'_> {
             self.lod_observe.extend(self.world.chunks.keys().copied());
         }
     }
+    #[cfg(feature = "paired-packages")]
+    fn unload_ordinary_columns(
+        &mut self,
+        unloaded: &[Arc<horizon_client::chunk::Chunk>],
+    ) -> Result<()> {
+        if unloaded.is_empty() {
+            return Ok(());
+        }
+        let keys: HashSet<_> = unloaded.iter().map(|chunk| (chunk.x, chunk.z)).collect();
+        let dirty = unloaded
+            .iter()
+            .filter(|chunk| self.world.modified.contains(&(chunk.x, chunk.z)))
+            .cloned()
+            .collect::<Vec<_>>();
+        let modified = self.with_entities(&dirty);
+        self.spawn_loaded_entities();
+        // Project while all actual native entity owners remain in Game. The
+        // retained SaveDir owns accepted snapshots through native durability.
+        let entities = self.entity_chunks(&keys, false);
+        let save = self
+            .save
+            .as_ref()
+            .expect("original ordinary storage")
+            .clone();
+        let admitted: Result<()> = (|| {
+            if !modified.is_empty() {
+                save.save_later(&modified, self.pack.assets.registry, self.res.biomes())?;
+            }
+            save.save_entities_later(entities)?;
+            Ok(())
+        })();
+        if let Err(error) = admitted {
+            // No entity or dirty marker was removed. Restore the SAME streamed
+            // columns so checked close owns every unaccepted latest native state.
+            for chunk in unloaded {
+                if self
+                    .world
+                    .chunks
+                    .insert((chunk.x, chunk.z), chunk.clone())
+                    .is_some()
+                {
+                    eprintln!(
+                        "fatal: original ordinary unloaded column collided during refusal restoration"
+                    );
+                    std::process::abort();
+                }
+            }
+            return Err(error);
+        }
+        for chunk in &dirty {
+            self.world.modified.remove(&(chunk.x, chunk.z));
+        }
+        self.remove_saved_entities(&keys);
+        Ok(())
+    }
     fn update_world(&mut self) {
         #[cfg(feature = "paired-packages")]
         if self.is_retained_remote() {
@@ -13052,13 +13201,46 @@ impl Game<'_> {
                 }
             });
         }
-        let dirty: Vec<_> = unloaded
-            .iter()
-            .filter(|c| self.world.modified.remove(&(c.x, c.z)))
-            .cloned()
-            .collect();
-        let modified = horizon_client::spans::time("with_entities", || self.with_entities(&dirty));
-        horizon_client::spans::time("unload_entities", || self.unload_entities(&unloaded));
+        #[cfg(feature = "paired-packages")]
+        let ordinary = self.ordinary_startup.is_some();
+        #[cfg(not(feature = "paired-packages"))]
+        let ordinary = false;
+        if ordinary {
+            #[cfg(feature = "paired-packages")]
+            if let Err(error) = self.unload_ordinary_columns(&unloaded) {
+                let reason = error.to_string();
+                if let Some(server) = &mut self.retained_server {
+                    server.fail(reason.clone());
+                }
+                if self.error.is_none() {
+                    self.error = Some(reason.into());
+                }
+                return;
+            }
+        } else {
+            let dirty: Vec<_> = unloaded
+                .iter()
+                .filter(|c| self.world.modified.remove(&(c.x, c.z)))
+                .cloned()
+                .collect();
+            let modified =
+                horizon_client::spans::time("with_entities", || self.with_entities(&dirty));
+            horizon_client::spans::time("unload_entities", || self.unload_entities(&unloaded));
+            if !modified.is_empty()
+                && let Err(e) = horizon_client::spans::time("save_chunks", || {
+                    self.save
+                        .as_ref()
+                        .expect("current Game factory owns storage")
+                        .save_later(&modified, self.pack.assets.registry, self.res.biomes())
+                })
+            {
+                #[cfg(feature = "paired-packages")]
+                if let Some(server) = &mut self.retained_server {
+                    server.fail(format!("original native unloaded save: {e}"));
+                }
+                log::warn!("Horizon: failed to save unloaded chunks: {e}");
+            }
+        }
         if !unloaded.is_empty() {
             let gone: horizon_client::fast_hash::FxHashSet<(i32, i32)> =
                 unloaded.iter().map(|c| (c.x, c.z)).collect();
@@ -13068,20 +13250,6 @@ impl Game<'_> {
             self.world
                 .block_names
                 .retain(|p, _| !gone.contains(&(p.0 >> 4, p.2 >> 4)));
-        }
-        if !modified.is_empty()
-            && let Err(e) = horizon_client::spans::time("save_chunks", || {
-                self.save
-                    .as_ref()
-                    .expect("current Game factory owns storage")
-                    .save_later(&modified, self.pack.assets.registry, self.res.biomes())
-            })
-        {
-            #[cfg(feature = "paired-packages")]
-            if let Some(server) = &mut self.retained_server {
-                server.fail(format!("original native unloaded save: {e}"));
-            }
-            log::warn!("Horizon: failed to save unloaded chunks: {e}");
         }
         let (far_distance, far_reduced) = self.far_terrain_choice();
         if let Some(renderer) = self.renderer.as_mut() {
@@ -14250,6 +14418,10 @@ enum InitialGameWorld {
     },
     #[cfg(feature = "paired-packages")]
     Retained(Box<world_loading::ColdPreparedWorld>),
+    #[cfg(feature = "paired-packages")]
+    Ordinary(Box<world_loading::OrdinaryPreparedWorld>),
+    #[cfg(feature = "paired-packages")]
+    OrdinaryRecoverySeed(Arc<mod_packages::FrozenHostInputs>),
 }
 
 #[cfg(feature = "paired-packages")]
@@ -14261,6 +14433,7 @@ enum RemoteFrontend {
 
 #[cfg(feature = "paired-packages")]
 struct RemotePreparation {
+    startup: Option<Arc<mod_packages::FrozenHostInputs>>,
     options: Options,
     settings: Settings,
     cpu: GameCpuResources,
@@ -14305,6 +14478,41 @@ impl RemotePreparation {
             .ok_or("retained client requires complete registries")?;
         let language = Arc::new(horizon_client::net::load_language(&options.resources));
         Ok(Self {
+            startup: None,
+            options,
+            settings,
+            cpu,
+            builtin,
+            language,
+            name,
+        })
+    }
+    fn new_paired(
+        options: Options,
+        settings: Settings,
+        cpu: GameCpuResources,
+        name: String,
+        startup: Arc<mod_packages::FrozenHostInputs>,
+        blocks: &'static horizon_world::registry::BlockRegistry,
+    ) -> Result<Self> {
+        if !options.execution_role.is_client()
+            || !options.mod_packages.has_pairs()
+            || !startup.retains_startup(&options.mod_packages, blocks)
+            || cfg!(feature = "controllers")
+            || cfg!(feature = "audio")
+            || settings.horizon.lod_distance != 0
+            || name.is_empty()
+            || name.len() > 16
+            || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        {
+            return Err("ordinary paired frontend inputs or offline profile differ".into());
+        }
+        let builtin = horizon_protocol::registry::Builtin::find(&options.resources)
+            .and_then(|path| horizon_protocol::registry::Builtin::load(&path).ok())
+            .ok_or("ordinary paired frontend requires complete registries")?;
+        let language = Arc::new(horizon_client::net::load_language(&options.resources));
+        Ok(Self {
+            startup: Some(startup),
             options,
             settings,
             cpu,
@@ -14326,7 +14534,22 @@ impl RemotePreparation {
             self.settings.render_distance.clamp(2, 32) as i8,
             self.language.clone(),
         );
-        match horizon_client::net::RetainedSession::new_offline(target, settings) {
+        let session = if let Some(startup) = &self.startup {
+            let required = match startup.negotiation_expectation().and_then(|expected| {
+                horizon_client::lan::login_negotiation::RequiredNegotiation::new(
+                    expected,
+                    Duration::from_secs(30),
+                )
+                .map_err(|reason| reason.to_string())
+            }) {
+                Ok(required) => required,
+                Err(reason) => return Err((self, target, reason)),
+            };
+            horizon_client::net::RetainedSession::new_offline_paired(target, settings, required)
+        } else {
+            horizon_client::net::RetainedSession::new_offline(target, settings)
+        };
+        match session {
             Ok(session) => Ok(RemoteAttachment {
                 prepared: self,
                 session,
@@ -14346,6 +14569,7 @@ impl RemoteAttachment {
         gui: UiResources,
     ) -> Game<'a> {
         let RemotePreparation {
+            startup,
             options,
             settings,
             cpu,
@@ -14356,7 +14580,7 @@ impl RemoteAttachment {
         let audio = Audio::silent(&options.resources);
         // CPU and Session validation are complete before the original target is
         // adopted. This branch has no remaining ordinary fallible operation.
-        Game::new_with_world(
+        let mut game = Game::new_with_world(
             res,
             pack,
             gui,
@@ -14376,11 +14600,48 @@ impl RemoteAttachment {
         .unwrap_or_else(|error| {
             eprintln!("fatal: prevalidated remote Game construction: {error}");
             std::process::abort();
-        })
+        });
+        if let Some(startup) = startup {
+            game.ordinary_startup = Some(startup.clone());
+            game.remote
+                .as_mut()
+                .expect("original remote frontend")
+                .io
+                .fixed_mut()
+                .expect("original retained Session")
+                .startup = Some(startup);
+        }
+        game
     }
 }
 
 impl<'a> Game<'a> {
+    #[cfg(all(feature = "paired-packages", feature = "mods"))]
+    fn adopt_activated_startup(
+        &mut self,
+        input: mod_packages::ActivatedStartup,
+    ) -> std::result::Result<(), Box<(mod_packages::ActivatedStartup, String)>> {
+        if !self
+            .ordinary_startup
+            .as_ref()
+            .is_some_and(|original| Arc::ptr_eq(original, &input.original))
+            || self.options.execution_role != input.role
+            || self.options.server_thread != input.server_thread
+            || self.remote.is_some() != input.remote
+            || !input
+                .original
+                .retains_startup(&self.options.mod_packages, self.pack.assets.registry)
+        {
+            return Err(Box::new((
+                input,
+                "activated package belongs to a different constructor or execution role".into(),
+            )));
+        }
+        self.mods.server = input.runtime.runs_server();
+        self.mods.world = input.runtime.wants_world();
+        self.mods.mods = input.runtime;
+        Ok(())
+    }
     fn client_biome_profile(&self) -> Option<(horizon_core::biome::BiomeZoom, i32)> {
         if let Ok(s) = self.streaming.as_existing() {
             return Some((s.biome_zoom, s.biome_blend));
@@ -14490,6 +14751,9 @@ impl<'a> Game<'a> {
     }
     #[cfg(feature = "paired-packages")]
     fn retained_remote_input(&mut self, event: WindowEvent) -> Result<()> {
+        if self.ordinary_startup.is_some() {
+            return self.ordinary_player_input(event);
+        }
         if self.retained_remote_failure().is_some() || self.retained_remote_leave_requested() {
             return Ok(());
         }
@@ -14576,6 +14840,343 @@ impl<'a> Game<'a> {
         Ok(())
     }
     #[cfg(feature = "paired-packages")]
+    fn ordinary_player_input(&mut self, event: WindowEvent) -> Result<()> {
+        if self.retained_remote_failure().is_some()
+            || self.retained_remote_leave_requested()
+            || self.retained_entry_closing
+        {
+            return Ok(());
+        }
+        self.last_input = Instant::now();
+        match event {
+            WindowEvent::Focused(focused) => {
+                self.focused = focused;
+                if !focused {
+                    self.clear_ordinary_input();
+                    self.capture(false);
+                }
+            }
+            WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
+            WindowEvent::CursorMoved { position, .. } => {
+                if let Some(renderer) = &self.renderer {
+                    let batch = HudBatch::new([renderer.config.width, renderer.config.height]);
+                    self.cursor = (
+                        position.x as f32 / batch.scale,
+                        position.y as f32 / batch.scale,
+                    );
+                    if self.screen == Screen::Creative {
+                        let (_, oy) = Self::creative_origin(&batch);
+                        self.creative_screen.drag_scrollbar(self.cursor.1 - oy);
+                    }
+                }
+            }
+            WindowEvent::KeyboardInput {
+                event,
+                is_synthetic: false,
+                ..
+            } => {
+                let PhysicalKey::Code(key) = event.physical_key else {
+                    return Ok(());
+                };
+                let pressed = event.state == ElementState::Pressed;
+                if pressed {
+                    self.physical_keys.insert(key);
+                } else {
+                    self.physical_keys.remove(&key);
+                }
+                if key == KeyCode::Escape && pressed && !event.repeat {
+                    if matches!(
+                        self.screen,
+                        Screen::Creative | Screen::Inventory | Screen::Chat
+                    ) {
+                        self.key_pressed(KeyCode::Escape)?;
+                    } else if self.screen == Screen::Paused {
+                        self.screen = Screen::Playing;
+                        self.capture(true);
+                    } else if self.screen == Screen::Playing {
+                        self.screen = Screen::Paused;
+                        self.pause_menu = true;
+                        self.capture(false);
+                    }
+                    self.clear_ordinary_input();
+                    return Ok(());
+                }
+                if self.player.is_none() {
+                    return Ok(());
+                }
+                if pressed && self.screen == Screen::Creative && self.creative_screen.tab().search {
+                    if !self.search_tab_hotbar_key(key) {
+                        if let Some(shortcut) = self.edit_shortcut(&event) {
+                            self.creative_search_shortcut(shortcut);
+                        } else {
+                            let before = self.creative_screen.search.value.clone();
+                            let (ctrl, shift) = (self.has_control_down(), self.has_shift_down());
+                            if self.creative_screen.search.key(key, ctrl, shift) {
+                                if self.creative_screen.search.value != before {
+                                    self.creative_screen.scroll = 0.0;
+                                }
+                            } else {
+                                self.creative_search_edit(event.text.as_deref());
+                            }
+                        }
+                    }
+                    return Ok(());
+                }
+                for mapped in self.settings.keys.translate_all(key).into_iter().flatten() {
+                    let admitted = matches!(
+                        mapped,
+                        KeyCode::KeyW
+                            | KeyCode::KeyA
+                            | KeyCode::KeyS
+                            | KeyCode::KeyD
+                            | KeyCode::Space
+                            | KeyCode::ShiftLeft
+                            | KeyCode::ControlLeft
+                            | KeyCode::ArrowUp
+                            | KeyCode::ArrowDown
+                            | KeyCode::ArrowLeft
+                            | KeyCode::ArrowRight
+                            | KeyCode::Digit1
+                            | KeyCode::Digit2
+                            | KeyCode::Digit3
+                            | KeyCode::Digit4
+                            | KeyCode::Digit5
+                            | KeyCode::Digit6
+                            | KeyCode::Digit7
+                            | KeyCode::Digit8
+                            | KeyCode::Digit9
+                            | KeyCode::KeyE
+                            | KeyCode::F1
+                            | KeyCode::F5
+                            | KeyCode::F11
+                    );
+                    if admitted
+                        && (self.screen == Screen::Playing
+                            || (self.screen == Screen::Creative && mapped == KeyCode::KeyE))
+                    {
+                        self.mapped_key(mapped, pressed, event.repeat)?;
+                    }
+                }
+            }
+            WindowEvent::MouseInput { state, button, .. } if self.focused => {
+                let pressed = state == ElementState::Pressed;
+                match self.screen {
+                    Screen::Playing if self.player.is_some() => {
+                        if pressed && !self.captured {
+                            self.capture(true);
+                        } else if button == MouseButton::Right {
+                            self.play_mouse(button, pressed)?;
+                        }
+                    }
+                    Screen::Creative
+                        if matches!(button, MouseButton::Left | MouseButton::Right) =>
+                    {
+                        if pressed {
+                            self.click_creative(button == MouseButton::Right);
+                        } else {
+                            if button == MouseButton::Left {
+                                self.creative_screen.release();
+                            }
+                            self.inventory_mouse_release(button == MouseButton::Right);
+                        }
+                    }
+                    Screen::Paused if pressed && button == MouseButton::Left => {
+                        self.pause_click()?;
+                        self.clear_ordinary_input();
+                    }
+                    _ => {}
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let (x, y) = match delta {
+                    MouseScrollDelta::LineDelta(x, y) => (f64::from(x), f64::from(y)),
+                    MouseScrollDelta::PixelDelta(pos) => (pos.x / 30.0, pos.y / 30.0),
+                };
+                if self.screen == Screen::Creative {
+                    let y = if self.settings.discrete_scroll {
+                        horizon_client::mouse::java_signum(y)
+                    } else {
+                        y
+                    };
+                    self.creative_screen.wheel(
+                        y * f64::from(self.settings.mouse_wheel_sensitivity),
+                        &self.pack.names,
+                    );
+                } else if self.screen == Screen::Playing
+                    && self.player.is_some()
+                    && let Some((wheel, _)) = self.mouse.on_scroll(
+                        x,
+                        y,
+                        self.settings.discrete_scroll,
+                        f64::from(self.settings.mouse_wheel_sensitivity),
+                    )
+                {
+                    self.selected = horizon_client::mouse::ScrollWheelHandler::next_selection(
+                        f64::from(wheel),
+                        self.selected as i32,
+                        9,
+                    ) as usize;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    #[cfg(feature = "paired-packages")]
+    fn clear_ordinary_input(&mut self) {
+        self.keys.clear();
+        self.physical_keys.clear();
+        self.left = false;
+        self.right = false;
+        self.clock.reset();
+        self.previous = Instant::now();
+    }
+    #[cfg(feature = "paired-packages")]
+    fn ordinary_inventory_click_allowed(
+        &self,
+        slot: Option<usize>,
+        button: i32,
+        input: horizon_client::menu::Input,
+    ) -> bool {
+        use horizon_client::menu::Input;
+        if self.screen != Screen::Creative
+            || !self.creative
+            || self.container.is_some()
+            || self.station.is_some()
+            || self
+                .carried
+                .as_ref()
+                .is_some_and(|stack| !self.ordinary_plain_stone(stack))
+            || !matches!(
+                (input, button),
+                (Input::Pickup, 0 | 1) | (Input::Swap, 0..=8)
+            )
+        {
+            return false;
+        }
+        if input == Input::Swap
+            && self
+                .inventory
+                .get(button as usize)
+                .and_then(Option::as_ref)
+                .is_some_and(|stack| !self.ordinary_plain_stone(stack))
+        {
+            return false;
+        }
+        match slot {
+            Some(slot) if slot < 36 => self.inventory[slot]
+                .as_ref()
+                .is_none_or(|stack| self.ordinary_plain_stone(stack)),
+            Some(slot)
+                if self.creative_tab_open()
+                    && (Creative::DISPLAY..Creative::DISPLAY + 45).contains(&slot) =>
+            {
+                let items = self.creative_screen.items(&self.pack.names);
+                let first = self.creative_screen.first_row(&self.pack.names);
+                items
+                    .get(first * 9 + slot - Creative::DISPLAY)
+                    .is_some_and(|stack| self.ordinary_plain_stone(stack))
+            }
+            _ => false,
+        }
+    }
+    #[cfg(feature = "paired-packages")]
+    fn poll_ordinary_native_reads(&mut self) -> Result<()> {
+        if self.ordinary_startup.is_none() {
+            return Ok(());
+        }
+        let context = self.capture_native_validation_context();
+        let accepted = std::collections::BTreeSet::new();
+        let save = self
+            .save
+            .as_ref()
+            .ok_or("ordinary saved read without original storage")?;
+        let streaming = self
+            .streaming
+            .as_existing_mut()
+            .map_err(|_| "ordinary saved-load handoff requires its original existing stream")?;
+        for _ in 0..8 {
+            let Some(view) = streaming.poll_retained_open_load()? else {
+                break;
+            };
+            let load = view.load();
+            if let Some(error) = load.error() {
+                return Err(error.to_owned().into());
+            }
+            let chunk = load
+                .chunk()
+                .ok_or("ordinary saved read has no decoded column")?;
+            let result = world_loading::validate_retained_column_context(
+                &context,
+                &self.pack,
+                &self.res,
+                &self.persist.uuids,
+                &self.world_root,
+                Some(&self.level),
+                Some(&self.world),
+                self.session_lock.as_ref(),
+                save,
+                self.native_checkpoint_origin.as_ref(),
+                &accepted,
+                chunk,
+                load.evidence(),
+            )?;
+            match result {
+                None => break,
+                Some((horizon_client::streaming::RetainedColumnDisposition::AlreadyStored, _)) => {}
+                Some(_) => {
+                    return Err("ordinary saved read unexpectedly supplies fresh output".into());
+                }
+            }
+            let ticket = view.into_ticket();
+            if !streaming.accept_retained_open_load(ticket, &mut self.world)? {
+                break;
+            }
+        }
+        Ok(())
+    }
+    #[cfg(feature = "paired-packages")]
+    fn ordinary_native_frame(&mut self) -> Result<bool> {
+        let now = Instant::now();
+        let elapsed = now.saturating_duration_since(self.previous);
+        self.previous = now;
+        self.frame_ticks = elapsed.as_secs_f32() * 20.0;
+        self.update_world();
+        self.poll_ordinary_native_reads()?;
+        if let Some(error) = &self.error {
+            return Err(error.to_string().into());
+        }
+        self.spawn_player()?;
+        let paused = self.pauses_game();
+        if paused {
+            self.clear_ordinary_input();
+        } else {
+            let turn = |key| f32::from(u8::from(self.keys.contains(&key)));
+            self.yaw += (turn(KeyCode::ArrowRight) - turn(KeyCode::ArrowLeft))
+                * 90.0
+                * elapsed.as_secs_f32().min(0.1);
+            self.pitch = (self.pitch
+                + (turn(KeyCode::ArrowDown) - turn(KeyCode::ArrowUp))
+                    * 90.0
+                    * elapsed.as_secs_f32().min(0.1))
+            .clamp(-90.0, 90.0);
+            self.apply_mouse_look();
+            for _ in 0..self.clock.advance(elapsed) {
+                self.tick()?;
+                self.tick_fov();
+            }
+        }
+        let presented = self.render()?;
+        self.clock.end_frame(paused);
+        if presented {
+            self.frames += 1;
+            if self.player.is_some() {
+                self.world_frames += 1;
+            }
+        }
+        Ok(presented)
+    }
+    #[cfg(feature = "paired-packages")]
     fn retained_remote_device(&mut self, event: DeviceEvent) {
         if self.captured
             && self.focused
@@ -14651,7 +15252,10 @@ impl<'a> Game<'a> {
         let preloaded_cpu = prepared.is_some();
         #[cfg(feature = "paired-packages")]
         assert!(
-            !matches!(&initial, InitialGameWorld::RetainedRemote { .. }) || preloaded_cpu,
+            !matches!(
+                &initial,
+                InitialGameWorld::RetainedRemote { .. } | InitialGameWorld::OrdinaryRecoverySeed(_)
+            ) || preloaded_cpu,
             "an attached original remote Session requires preloaded CPU inputs"
         );
         // Finish fallible CPU loading before a retained Session can exist.
@@ -14662,6 +15266,38 @@ impl<'a> Game<'a> {
         let mut retained_initial = None;
         #[cfg(feature = "paired-packages")]
         let mut remote_initial = None;
+        #[cfg(feature = "paired-packages")]
+        let mut ordinary_initial = None;
+        #[cfg(feature = "paired-packages")]
+        let mut accept_native =
+            |parts: world_loading::PreparedWorld,
+             authority: world_loading::NativeCloseAuthority| {
+                let world_loading::PreparedWorld {
+                    save_root,
+                    level,
+                    world,
+                    streaming,
+                    save,
+                    session_lock,
+                    rand_sequences,
+                    locator,
+                    native_checkpoint_origin,
+                } = parts;
+                retained_initial = Some((
+                    save_root,
+                    session_lock,
+                    rand_sequences,
+                    locator,
+                    native_checkpoint_origin,
+                    authority,
+                ));
+                (
+                    world,
+                    streaming_owner::GameStreaming::from_existing(streaming),
+                    Some(save),
+                    level,
+                )
+            };
         let (world, streaming, save, level) = match initial {
             InitialGameWorld::Legacy => {
                 // Preserve ordinary construction; the explicit retained recipe
@@ -14681,6 +15317,22 @@ impl<'a> Game<'a> {
                     World::new(res.facts().air, 0),
                     streaming_owner::GameStreaming::from_existing(streaming),
                     Some(save),
+                    Level::default(),
+                )
+            }
+            #[cfg(feature = "paired-packages")]
+            InitialGameWorld::OrdinaryRecoverySeed(startup) => {
+                assert!(
+                    !options.execution_role.is_client()
+                        && !options.server_thread
+                        && startup.retains_startup(&options.mod_packages, pack.assets.registry),
+                    "headless recovery seed requires its actual final startup"
+                );
+                ordinary_initial = Some(startup);
+                (
+                    World::new(res.facts().air, 0),
+                    streaming_owner::GameStreaming::vacant(),
+                    None,
                     Level::default(),
                 )
             }
@@ -14732,31 +15384,17 @@ impl<'a> Game<'a> {
                     "retained construction requires preloaded CPU inputs"
                 );
                 let (parts, authority) = (*parts).into_parts();
-                let world_loading::PreparedWorld {
-                    save_root,
-                    level,
-                    world,
-                    streaming,
-                    save,
-                    session_lock,
-                    rand_sequences,
-                    locator,
-                    native_checkpoint_origin,
-                } = parts;
-                retained_initial = Some((
-                    save_root,
-                    session_lock,
-                    rand_sequences,
-                    locator,
-                    native_checkpoint_origin,
-                    authority,
-                ));
-                (
-                    world,
-                    streaming_owner::GameStreaming::from_existing(streaming),
-                    Some(save),
-                    level,
-                )
+                accept_native(parts, authority)
+            }
+            #[cfg(feature = "paired-packages")]
+            InitialGameWorld::Ordinary(parts) => {
+                assert!(
+                    preloaded_cpu,
+                    "ordinary constructor requires prepared CPU inputs"
+                );
+                let (parts, authority, startup) = (*parts).into_parts();
+                ordinary_initial = Some(startup);
+                accept_native(parts, authority)
             }
         };
         let creative = options.creative;
@@ -14886,6 +15524,8 @@ impl<'a> Game<'a> {
             native_checkpoint_origin: None,
             #[cfg(feature = "paired-packages")]
             native_close_authority: None,
+            #[cfg(feature = "paired-packages")]
+            ordinary_startup: None,
             #[cfg(feature = "paired-packages")]
             retained_server: None,
             #[cfg(feature = "paired-packages")]
@@ -15150,6 +15790,7 @@ impl<'a> Game<'a> {
         #[cfg(feature = "paired-packages")]
         let game = {
             let mut game = game;
+            game.ordinary_startup = ordinary_initial;
             if let Some((root, session, random, locator, origin, authority)) = retained_initial {
                 game.world_root = root;
                 game.session_lock = Some(session);
@@ -15157,8 +15798,13 @@ impl<'a> Game<'a> {
                 game.end.set_locator(locator);
                 game.native_checkpoint_origin = origin;
                 if let Some(profile) = authority.server_profile() {
-                    game.retained_server =
-                        Some(retained_server::ServerGameState::from_cold(profile));
+                    game.retained_server = Some(match &game.ordinary_startup {
+                        Some(startup) => retained_server::ServerGameState::from_ordinary(
+                            profile,
+                            startup.clone(),
+                        ),
+                        None => retained_server::ServerGameState::from_cold(profile),
+                    });
                 }
                 game.native_close_authority = Some(authority);
                 game.block_ticks = Ticks::new(game.level.seed as i32);
@@ -15815,6 +16461,8 @@ fn load_resources(
         let handle = std::thread::Builder::new()
             .name("world-rest-loader".into())
             .spawn(move || {
+                #[cfg(all(test, feature = "paired-packages"))]
+                window_close::hold_ordinary_rest_loader()?;
                 let rest = load_world_rest(
                     &root,
                     &resources,
@@ -15835,6 +16483,8 @@ fn load_resources(
                     "Horizon: rest-ready after {} ms",
                     started.elapsed().as_millis()
                 );
+                #[cfg(all(test, feature = "paired-packages"))]
+                eprintln!("ORDINARY_ORIGINAL_REST_COMPLETED");
                 Ok(())
             })?;
         Some(WorldRestLoader {
@@ -16296,7 +16946,21 @@ fn run_event_loop(mut game: Game<'_>) -> Result<()> {
 }
 
 /// The loading screen's state while the worker loads the resources.
+#[cfg(feature = "paired-packages")]
+#[derive(Default)]
+struct RetainedFrontendState {
+    closed_worlds: Vec<Arc<paired_close::OrdinaryClosedWorld>>,
+    close_requested: bool,
+    deadline: Option<Instant>,
+    attempt: u64,
+    generation_issued: bool,
+    preparing: bool,
+    entry_cancel: bool,
+    entry_retry: bool,
+}
 struct Loading {
+    #[cfg(feature = "paired-packages")]
+    retained: Option<RetainedFrontendState>,
     window: Option<Arc<Window>>,
     renderer: Option<Renderer>,
     gui: Option<UiResources>,
@@ -16316,6 +16980,160 @@ struct Loading {
     error: Option<Box<dyn std::error::Error>>,
 }
 impl Loading {
+    fn retained_menu_closing(&self) -> bool {
+        #[cfg(feature = "paired-packages")]
+        return self
+            .retained
+            .as_ref()
+            .is_some_and(|owner| owner.close_requested);
+        #[cfg(not(feature = "paired-packages"))]
+        false
+    }
+    fn retry_retained_menu_close(&mut self) {
+        #[cfg(feature = "paired-packages")]
+        if let Some(owner) = &mut self.retained
+            && owner.close_requested
+            && owner
+                .deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+            && let Some(attempt) = owner.attempt.checked_add(1)
+        {
+            owner.attempt = attempt;
+            owner.deadline = Some(Instant::now() + Duration::from_secs(10));
+        }
+    }
+    fn request_menu_close(&mut self, event_loop: &ActiveEventLoop) {
+        #[cfg(feature = "paired-packages")]
+        if let Some(owner) = &mut self.retained {
+            owner.close_requested = true;
+            #[cfg(test)]
+            eprintln!("ORDINARY_FRONTEND_CLOSE_REQUESTED");
+            if owner.deadline.is_none() {
+                owner.attempt = 1;
+                owner.deadline = Some(Instant::now() + Duration::from_secs(10));
+            }
+            return;
+        }
+        event_loop.exit();
+    }
+    fn retained_menu(&self) -> bool {
+        #[cfg(feature = "paired-packages")]
+        return self.retained.is_some();
+        #[cfg(not(feature = "paired-packages"))]
+        false
+    }
+    #[cfg(feature = "paired-packages")]
+    fn retain_frontend_failure(&mut self, message: impl Into<String>) {
+        if self.error.is_none() {
+            self.error = Some(message.into().into());
+        }
+        if let Some(owner) = &mut self.retained {
+            owner.close_requested = true;
+            if owner.deadline.is_none() {
+                owner.attempt = 1;
+                owner.deadline = Some(Instant::now() + Duration::from_secs(10));
+            }
+        }
+    }
+    #[cfg(feature = "paired-packages")]
+    fn poll_retained_menu_resources(&mut self) -> Result<()> {
+        if self
+            .retained
+            .as_ref()
+            .is_some_and(|owner| owner.generation_issued)
+        {
+            return Ok(());
+        }
+        if self.loaded.is_none() {
+            loop {
+                match self.receiver.try_recv() {
+                    Ok(LoaderMsg::Ui(gui, root)) => self.set_ui(gui, root),
+                    Ok(LoaderMsg::Done(result)) => {
+                        self.loaded = Some(result);
+                        break;
+                    }
+                    Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+                }
+            }
+        }
+        if self.handle.as_ref().is_some_and(JoinHandle::is_finished) {
+            let result = self
+                .handle
+                .take()
+                .expect("finished original resource loader")
+                .join();
+            if result.is_err() {
+                self.retain_frontend_failure("original resource loader panicked");
+            }
+            // Done may have been queued between the earlier Empty and observing
+            // is_finished. Harvest that original queue before declaring loss.
+            if self.loaded.is_none() {
+                while let Ok(message) = self.receiver.try_recv() {
+                    match message {
+                        LoaderMsg::Ui(gui, root) => self.set_ui(gui, root),
+                        LoaderMsg::Done(result) => {
+                            self.loaded = Some(result);
+                            break;
+                        }
+                    }
+                }
+            }
+            if self.loaded.is_none() {
+                self.retain_frontend_failure("resource loader ended without its complete output");
+            }
+        }
+        let rest = match self.loaded.as_mut() {
+            Some(Ok(loaded)) => loaded.rest_loader.take(),
+            Some(Err(message)) => {
+                let message = message.clone();
+                self.retain_frontend_failure(message);
+                None
+            }
+            None => None,
+        };
+        if let Some(rest) = rest {
+            match rest.try_harvest() {
+                Ok(Ok(())) => {}
+                Ok(Err(message)) => self.retain_frontend_failure(message),
+                Err(original) => {
+                    let Some(Ok(loaded)) = self.loaded.as_mut() else {
+                        unreachable!("original complete resource bundle retained");
+                    };
+                    loaded.rest_loader = Some(original);
+                }
+            }
+        }
+        Ok(())
+    }
+    #[cfg(feature = "paired-packages")]
+    fn retained_frontend_helpers_closed(&self) -> bool {
+        self.handle.is_none()
+            && self.loaded.as_ref().is_none_or(|loaded| match loaded {
+                Err(_) => true,
+                Ok(loaded) => loaded.rest_loader.is_none(),
+            })
+    }
+    #[cfg(feature = "paired-packages")]
+    fn take_retained_generation(&mut self) -> Result<Loaded> {
+        if self.retained_menu_closing()
+            || !self.retained_frontend_helpers_closed()
+            || self
+                .retained
+                .as_ref()
+                .is_none_or(|owner| owner.generation_issued)
+            || !matches!(self.loaded, Some(Ok(_)))
+        {
+            return Err("original frontend generation is not ready for transfer".into());
+        }
+        let Some(Ok(loaded)) = self.loaded.take() else {
+            unreachable!("checked complete original generation");
+        };
+        self.retained
+            .as_mut()
+            .expect("selected frontend")
+            .generation_issued = true;
+        Ok(loaded)
+    }
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
             return;
@@ -16344,7 +17162,7 @@ impl Loading {
             Ok(w) => Arc::new(w),
             Err(e) => {
                 self.error = Some(e.into());
-                event_loop.exit();
+                self.request_menu_close(event_loop);
                 return;
             }
         };
@@ -16360,7 +17178,7 @@ impl Loading {
             Ok(r) => self.renderer = Some(r),
             Err(e) => {
                 self.error = Some(e);
-                event_loop.exit();
+                self.request_menu_close(event_loop);
                 return;
             }
         }
@@ -16373,7 +17191,7 @@ impl Loading {
         }
         if let Err(error) = self.menu_event(event_loop, event) {
             self.error = Some(error);
-            event_loop.exit();
+            self.request_menu_close(event_loop);
         }
     }
     /// The menu bundle arrived: rebuild the loading screen with the real atlas
@@ -16405,19 +17223,30 @@ impl Loading {
                 horizon_client::hud::GUI_SCALE.store(self.settings.gui_scale, Ordering::Relaxed);
                 self.renderer = Some(r);
             }
-            Err(e) => self.error = Some(e),
+            Err(e) => {
+                #[cfg(feature = "paired-packages")]
+                if self.retained_menu() {
+                    self.retain_frontend_failure(e.to_string());
+                    return;
+                }
+                self.error = Some(e);
+            }
         }
     }
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         if horizon_threads::stop_requests() > 0 {
             // No world is open yet: nothing to save.
-            event_loop.exit();
-            return;
+            self.request_menu_close(event_loop);
+            if !self.retained_menu() {
+                return;
+            }
         }
         if let Err(error) = self.poll_menu_resources() {
             self.error = Some(error);
-            event_loop.exit();
-            return;
+            self.request_menu_close(event_loop);
+            if !self.retained_menu() {
+                return;
+            }
         }
         if let Some(w) = &self.window {
             if self.options.as_ref().is_some_and(|o| o.offscreen) {
@@ -16426,7 +17255,13 @@ impl Loading {
                 w.request_redraw();
             }
         }
-        event_loop.set_control_flow(ControlFlow::Poll);
+        if self.retained_menu() {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(
+                Instant::now() + Duration::from_millis(8),
+            ));
+        } else {
+            event_loop.set_control_flow(ControlFlow::Poll);
+        }
     }
     fn draw(&mut self) {
         let Some(size) = self
@@ -16449,7 +17284,13 @@ impl Loading {
                     self.menu.perf.title_shown()
                 }
                 Ok(_) => {}
-                Err(e) => log::warn!("Horizon: loading screen frame failed: {e}"),
+                Err(e) => {
+                    log::warn!("Horizon: loading screen frame failed: {e}");
+                    #[cfg(feature = "paired-packages")]
+                    if self.retained_menu() {
+                        self.retain_frontend_failure(e.to_string());
+                    }
+                }
             }
         }
         if !self.shown {
@@ -16540,6 +17381,26 @@ enum App {
     Loading(Box<Loading>),
     Ready(Box<Game<'static>>),
 }
+/// Selected paired startup pumps this same no-world frontend directly. It never
+/// enters App::Loading's legacy Game/title-world handoff.
+#[cfg(feature = "paired-packages")]
+impl ApplicationHandler for Loading {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        Loading::resumed(self, event_loop);
+    }
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        Loading::window_event(self, event_loop, id, event);
+    }
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        Loading::about_to_wait(self, event_loop);
+    }
+    fn exiting(&mut self, _: &ActiveEventLoop) {
+        if !self.retained_frontend_helpers_closed() {
+            eprintln!("fatal: original frontend resource helpers unresolved at OS exit");
+            std::process::abort();
+        }
+    }
+}
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         match self {
@@ -16624,6 +17485,8 @@ fn run_loading(
         startup_menu::spawn_loader(&options, &settings, &vanilla_root, started, &progress)?;
     let menu = startup_menu::StartupMenu::new(&options, pack_error.as_deref())?;
     let loading = Loading {
+        #[cfg(feature = "paired-packages")]
+        retained: None,
         window: None,
         renderer: None,
         gui: None,
@@ -16741,6 +17604,31 @@ pub fn run() -> Result<()> {
     if let Some(launch) = frozen {
         return run_managed_frozen(options, launch);
     }
+    // Discover once before dedicated preflight effects or ordinary helper
+    // acquisition. Selected pairs enter their owned frontend/server route.
+    let early_settings = Settings::load(&std::env::current_dir()?.join("options.txt"));
+    options.mod_packages =
+        mod_packages::Packages::read(&early_settings.mods.enabled, &options.dev_mods)?;
+    #[cfg(all(feature = "paired-packages", feature = "mods"))]
+    if options.mod_packages.has_pairs() {
+        if options.benchmark.is_some() {
+            return Err(
+                "paired packages are excluded from the unmodified-engine benchmark path".into(),
+            );
+        }
+        if options.execution_role == execution_role::ExecutionRole::DedicatedServer
+            && !dedicated::preflight(&mut options)?
+        {
+            return Ok(());
+        }
+        horizon_threads::put_helpers_behind();
+        if options.execution_role.is_client() {
+            horizon_threads::favour_current();
+        }
+        Behaviours::set_cache_dir(std::env::current_dir()?.join(".horizon-cache"));
+        let vanilla_root = options.resources.clone();
+        return window_close::run_ordinary(options, early_settings, vanilla_root, Instant::now());
+    }
     if options.execution_role == execution_role::ExecutionRole::DedicatedServer
         && !dedicated::preflight(&mut options)?
     {
@@ -16773,9 +17661,6 @@ pub fn run() -> Result<()> {
     let started = Instant::now();
     horizon_client::spans::enable(options.spikes.is_some());
     let vanilla_root = options.resources.clone();
-    let early_settings = Settings::load(&std::env::current_dir()?.join("options.txt"));
-    options.mod_packages =
-        mod_packages::Packages::read(&early_settings.mods.enabled, &options.dev_mods)?;
     if options.benchmark.is_some() && options.mod_packages.has_pairs() {
         return Err(
             "paired packages are excluded from the unmodified-engine benchmark path".into(),

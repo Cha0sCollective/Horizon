@@ -1289,23 +1289,58 @@ impl Game<'_> {
                         }
                     }
                 }
-                Event::PairedJoined(envelope) => {
-                    self.remote
-                        .as_mut()
-                        .unwrap()
-                        .io
-                        .fixed_mut()
-                        .unwrap()
-                        .pending
-                        .push_front(Event::PairedJoined(envelope));
-                    return Err("native Game configured installation is not enabled".into());
+                Event::PairedJoined(mut envelope) => {
+                    let expected = self.ordinary_startup.clone();
+                    let r = self.remote.as_mut().unwrap();
+                    let io = r.io.fixed_mut().unwrap();
+                    let valid = !r.joined
+                        && io.configured.is_none()
+                        && matches!((&expected, &io.startup), (Some(expected), Some(original)) if Arc::ptr_eq(expected, original));
+                    if !valid {
+                        io.pending.push_front(Event::PairedJoined(envelope));
+                        return Err(
+                            "configured client startup owner differs or was already consumed"
+                                .into(),
+                        );
+                    }
+                    let Some(session) = io.session.as_ref() else {
+                        io.pending.push_front(Event::PairedJoined(envelope));
+                        return Err("original Session missing before configured consumption".into());
+                    };
+                    let admission = match session.consume_paired(&mut envelope) {
+                        Ok(admission) => admission,
+                        Err(reason) => {
+                            io.pending.push_front(Event::PairedJoined(envelope));
+                            return Err(reason.into());
+                        }
+                    };
+                    let uuid = admission.profile().uuid;
+                    let name = admission.profile().name.clone();
+                    let registries = admission.registries().clone();
+                    io.configured = Some(admission);
+                    self.set_registries(registries);
+                    let r = self.remote.as_mut().unwrap();
+                    r.joined = true;
+                    r.profile = uuid;
+                    r.profile_name = name;
+                    r.status = "Loading terrain...".into();
                 }
                 Event::Joined {
                     registries,
                     name,
                     uuid,
                 } => {
-                    if self.remote.as_ref().unwrap().joined {
+                    if self.remote.as_ref().unwrap().joined
+                        || self
+                            .remote
+                            .as_ref()
+                            .unwrap()
+                            .io
+                            .fixed()
+                            .unwrap()
+                            .startup
+                            .is_some()
+                    {
                         self.remote
                             .as_mut()
                             .unwrap()
@@ -5190,6 +5225,12 @@ impl Game<'_> {
     }
     /// Minecraft.startUseItem: use one crosshair target, then the item itself.
     fn remote_use(&mut self) {
+        #[cfg(feature = "paired-packages")]
+        if self.ordinary_startup.is_some()
+            && (!self.ordinary_stone_use_admitted() || self.entity_targeted())
+        {
+            return;
+        }
         // Minecraft.startUseItem returns before resetting rightClickDelay
         // while a survival block break is active.
         if self.remote.as_ref().is_some_and(|r| r.destroying.is_some()) {

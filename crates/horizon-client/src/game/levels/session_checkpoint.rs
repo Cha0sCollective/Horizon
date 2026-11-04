@@ -254,6 +254,124 @@ pub(in crate::game) struct ManagedRecoveryRequest {
     pub destination: PathBuf,
     pub deadline: Instant,
 }
+/// Captured from the actual source Game while its constructor, native session,
+/// package generation and registered domain still exist. Not decoded authority.
+pub(in crate::game) struct OrdinaryRecoverySource {
+    context: SessionValidationContext,
+    startup: Arc<crate::game::mod_packages::FrozenHostInputs>,
+    namespace: crate::game::world_loading::host_identity::session_authority::AuthorityNamespace,
+    root: PathBuf,
+    archive: PathBuf,
+    continuation: PathBuf,
+    world: WorldId,
+    target: CounterTarget,
+    type_id: String,
+    guest: bool,
+    role: crate::game::execution_role::ExecutionRole,
+    native_player_uuid: Option<[i32; 4]>,
+}
+pub(in crate::game) struct OrdinaryRecoveryRequest {
+    source: OrdinaryRecoverySource,
+    _closed: crate::game::paired_close::OrdinaryClosedWorld,
+    managed: ManagedRecoveryRequest,
+}
+impl OrdinaryRecoverySource {
+    pub(in crate::game) fn capture(
+        game: &Game<'_>,
+        namespace: crate::game::world_loading::host_identity::session_authority::AuthorityNamespace,
+        archive: &Path,
+        continuation: &Path,
+    ) -> SResult<Self> {
+        let world = game.session_context_cpu()?;
+        require(
+            game.level.player_uuid.is_some() && game.level.world_spawn.is_some(),
+            "ordinary source requires its actual established native record UUID and spawn",
+        )?;
+        require(
+            game.native_close_authority
+                .as_ref()
+                .is_some_and(|authority| authority.retains_ordinary_source(game)),
+            "ordinary domain source requires its actual original native construction",
+        )?;
+        let counter = checked(SessionCounter::from_world(&game.world))?;
+        require(
+            checked(counter.binding_profile())? == NativeBindingProfile::RegisteredCube,
+            "ordinary recovery source requires the registered physical profile",
+        )?;
+        let _ = binding(game, &counter)?;
+        let archive = directory(archive)?;
+        let continuation = directory(continuation)?;
+        checked(namespace.check_new_world(&continuation))?;
+        require(
+            fs::read_dir(&continuation).map_err(fail)?.next().is_none()
+                && [&archive, &game.world_root].iter().all(|root| {
+                    !continuation.starts_with(root) && !root.starts_with(&continuation)
+                })
+                && !archive.starts_with(&game.world_root)
+                && !game.world_root.starts_with(&archive),
+            "ordinary source requires its fresh separate continuation/archive routes",
+        )?;
+        Ok(Self {
+            context: SessionValidationContext::from_game(game),
+            startup: game
+                .ordinary_startup
+                .as_ref()
+                .ok_or_else(|| fail("source startup absent"))?
+                .clone(),
+            namespace,
+            root: game.world_root.clone(),
+            archive,
+            continuation,
+            world,
+            target: checked(CounterTarget::new(&counter.dimension, counter.position))?,
+            type_id: counter.type_id.clone(),
+            guest: counter.is_guest(),
+            role: game.options.execution_role,
+            native_player_uuid: game.level.player_uuid,
+        })
+    }
+    #[allow(clippy::result_large_err)]
+    pub(in crate::game) fn into_request(
+        self,
+        closed: crate::game::paired_close::OrdinaryClosedWorld,
+        destination: PathBuf,
+        until: Instant,
+    ) -> std::result::Result<
+        OrdinaryRecoveryRequest,
+        (Self, crate::game::paired_close::OrdinaryClosedWorld, String),
+    > {
+        if !closed.is_coherent_source(&self.root, self.world, &self.startup)
+            || until <= Instant::now()
+        {
+            return Err((
+                self,
+                closed,
+                "actual source coherent completion/route association differs".into(),
+            ));
+        }
+        let managed = ManagedRecoveryRequest {
+            owner_root: self.root.clone(),
+            expected_target: self.target.clone(),
+            expected_type: self.type_id.clone(),
+            archive_root: self.archive.clone(),
+            destination,
+            deadline: until,
+        };
+        Ok(OrdinaryRecoveryRequest {
+            source: self,
+            _closed: closed,
+            managed,
+        })
+    }
+}
+impl OrdinaryRecoveryRequest {
+    pub(in crate::game) fn continuation_archive(&self) -> &Path {
+        &self.source.continuation
+    }
+    pub(in crate::game) fn deadline(&self) -> Instant {
+        self.managed.deadline
+    }
+}
 /// A decoder cannot grant player installation authority. Only `verify_image`,
 /// after complete physical/native/package/frame/player validation, constructs this.
 pub(in crate::game) struct CheckedSessionPlayers {
@@ -1371,6 +1489,15 @@ fn raid_metadata(root: &Path) -> SResult<Option<Tag>> {
     Ok(current)
 }
 fn sidecars(root: &Path, players: &[PlayerDescriptor]) -> SResult<()> {
+    sidecars_with_initial_owner(root, players, None)
+}
+// Only the first pre-final read can supply this captured original owner UUID.
+// Final images and recovery always enter through strict sidecars().
+fn sidecars_with_initial_owner(
+    root: &Path,
+    players: &[PlayerDescriptor],
+    initial_owner: Option<[i32; 4]>,
+) -> SResult<()> {
     let local_uuid = native_local_uuid(root)?;
     let inventory = tree(root, &["session.lock"])?;
     for row in inventory.files {
@@ -1394,14 +1521,18 @@ fn sidecars(root: &Path, players: &[PlayerDescriptor]) -> SResult<()> {
             validate_level(&compressed_nbt(&bytes)?)?;
             continue;
         }
-        if players
+        if let Some(player) = players
             .iter()
-            .any(|row| player_path(row, "data").strip_prefix("world/") == Some(name))
+            .find(|row| player_path(row, "data").strip_prefix("world/") == Some(name))
         {
             let tag = compressed_nbt(&bytes)?;
-            if !(row.path.ends_with("_old") && lan::session_empty_native_player(&tag)) {
-                checked(lan::validate_session_player_tag(&tag))?;
-            }
+            validate_player_sidecar(
+                &tag,
+                row.path.ends_with("_old"),
+                player,
+                local_uuid,
+                initial_owner,
+            )?;
             continue;
         }
         if players.iter().any(|row| {
@@ -1484,6 +1615,22 @@ fn sidecars(root: &Path, players: &[PlayerDescriptor]) -> SResult<()> {
         }
     }
     Ok(())
+}
+fn validate_player_sidecar(
+    tag: &Tag,
+    backup: bool,
+    player: &PlayerDescriptor,
+    local_uuid: [i32; 4],
+    initial_owner: Option<[i32; 4]>,
+) -> SResult<()> {
+    let initial = player.integrated_owner
+        && player.record_uuid == local_uuid
+        && initial_owner == Some(local_uuid)
+        && tag.get("UUID") == Some(&Tag::IntArray(local_uuid.to_vec()));
+    if (backup || initial) && lan::session_empty_native_player(tag) {
+        return Ok(());
+    }
+    checked(lan::validate_session_player_tag(tag))
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2495,6 +2642,7 @@ pub(in crate::game) struct CoherentImageContext {
     residents: Vec<(i32, i32)>,
     live_raids: Option<Tag>,
     local_uuid: Option<[i32; 4]>,
+    initial_integrated_record: Option<[i32; 4]>,
     clocks: (i64, i64),
     random: u64,
     entity_head: u32,
@@ -2643,7 +2791,14 @@ impl CoherentImageReadInput {
         let descriptors = context.players.iter().map(descriptor).collect::<Vec<_>>();
         // Validate every original sidecar, including native backups, before a
         // later final save can rotate a malformed predecessor out of view.
-        sidecars(&source, &descriptors)?;
+        let next_epoch = next_session_checkpoint_epoch(&archive)?;
+        sidecars_with_initial_owner(
+            &source,
+            &descriptors,
+            (next_epoch == 1)
+                .then_some(context.initial_integrated_record)
+                .flatten(),
+        )?;
         let local_uuid = validate_native_local_player(&source, &descriptors)?;
         require(
             context.local_uuid == Some(local_uuid),
@@ -2657,7 +2812,6 @@ impl CoherentImageReadInput {
             "old source changed during coherent read preflight",
         )?;
         deadline(self.until)?;
-        let next_epoch = next_session_checkpoint_epoch(&archive)?;
         Ok(CoherentImageReadPost {
             context: context.clone(),
             source,
@@ -3309,6 +3463,16 @@ impl Game<'_> {
             residents,
             live_raids: checked(self.session_checkpoint_raids())?,
             local_uuid: self.level.player_uuid,
+            initial_integrated_record: self
+                .native_close_authority
+                .as_ref()
+                .filter(|authority| authority.retains_ordinary_source(self))
+                .and_then(|_| {
+                    self.retained_server
+                        .as_ref()?
+                        .integrated_owner()
+                        .map(|(_, record)| record)
+                }),
             clocks: (self.world.game_time, self.world.day_time),
             random: self.world.random.state(),
             entity_head: self.next_entity,
@@ -3589,15 +3753,23 @@ impl Game<'_> {
         Ok(snapshot)
     }
     fn session_snapshot_cpu(&self, raids: Option<Tag>, local_uuid: [i32; 4]) -> SResult<Snapshot> {
-        let world = self.session_context_cpu()?;
-        let counter = checked(SessionCounter::from_world(&self.world))?;
-        let slot = checked(counter.slot_bytes(&self.world, self.res.items()))?;
-        let parsed = checked(counter.decode_slot(&slot, self.res.items()))?;
         let roster = checked(
             self.observe_checkpoint_participants()
                 .map_err(|e| format!("{e:?}")),
         )?;
         let players = checked(self.project_session_participant_rows(&roster))?;
+        self.session_snapshot_from_players(raids, local_uuid, players)
+    }
+    fn session_snapshot_from_players(
+        &self,
+        raids: Option<Tag>,
+        local_uuid: [i32; 4],
+        players: Vec<SessionPlayerRow>,
+    ) -> SResult<Snapshot> {
+        let world = self.session_context_cpu()?;
+        let counter = checked(SessionCounter::from_world(&self.world))?;
+        let slot = checked(counter.slot_bytes(&self.world, self.res.items()))?;
+        let parsed = checked(counter.decode_slot(&slot, self.res.items()))?;
         checked(self.inspect_session_checkpoint_owners())?;
         let items = self.project_session_checkpoint_items()?;
         check_item_player_identities(&items, &players)?;
@@ -4147,6 +4319,12 @@ struct SessionItemLoadTest {
 }
 impl<'a> Game<'a> {
     fn fresh_session_candidate(&self) -> SResult<()> {
+        if self.ordinary_startup.is_some() {
+            require(
+                self.save.is_none() && self.streaming.is_vacant(),
+                "ordinary recovery requires actual no-world/no-save/no-worker vacancy",
+            )?;
+        }
         self.session_warden_tracker()?;
         require(
             checked(self.session_checkpoint_raids())?.is_none(),
@@ -4375,17 +4553,177 @@ impl<'a> Game<'a> {
         })
     }
     fn prepare_session_checkpoint_profile_steps(
-        mut self: Box<Self>,
+        self: Box<Self>,
+        profile: NativeBindingProfile,
+        guest: bool,
+        request: RecoveryRequest,
+        before_items: impl FnOnce(&mut Game<'a>, &CheckedSessionItems) -> SResult<()>,
+        #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+        item_load_test: Option<&mut SessionItemLoadTest>,
+    ) -> SResult<PreparedSessionRecovery<'a>> {
+        // Legacy convenience callers retain their historical failure semantics.
+        // The ordinary owner below instead retains this SAME work on refusal.
+        let mut work = SessionRecoveryWork::legacy(self);
+        let data = work.prepare_steps(
+            profile,
+            guest,
+            request,
+            before_items,
+            #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+            item_load_test,
+        )?;
+        Ok(data.with_game(work.game.take().unwrap()))
+    }
+}
+
+/// Real partial recovery ownership. Ordinary callers must resolve its native
+/// workers and original preparation allocation before dropping a failed attempt.
+struct SessionRecoveryWork<'a> {
+    game: Option<Box<Game<'a>>>,
+    preparation: Option<RecoveryPreparation>,
+    ordinary: Option<(
+        crate::game::world_loading::RetainedEntryIdentity,
+        Arc<crate::game::mod_packages::FrozenHostInputs>,
+    )>,
+    unpublished: Option<crate::game::world_loading::UnpublishedRecoveryNative>,
+    armed: bool,
+}
+enum RecoveryPreparation {
+    Legacy(crate::game::world_loading::PreparedWorld),
+    Ordinary(crate::game::world_loading::OrdinaryPreparedWorld),
+    Failed(crate::game::world_loading::OrdinaryPreparation),
+}
+impl RecoveryPreparation {
+    fn prepared_mut(&mut self) -> &mut crate::game::world_loading::PreparedWorld {
+        match self {
+            Self::Legacy(prepared) => prepared,
+            Self::Ordinary(prepared) => prepared.prepared_mut(),
+            Self::Failed(_) => unreachable!("failed preparation cannot authorize recovery"),
+        }
+    }
+}
+impl Drop for SessionRecoveryWork<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            eprintln!("fatal: unresolved original ordinary recovery work");
+            std::process::abort();
+        }
+    }
+}
+struct RecoveryData {
+    request: RecoveryRequest,
+    verified: NativeRecoveryImage,
+    selected: PathBuf,
+    clocks: (i64, i64),
+    random: u64,
+    receipt: CoreRecoveryReceipt,
+}
+impl RecoveryData {
+    fn with_game<'a>(self, game: Box<Game<'a>>) -> PreparedSessionRecovery<'a> {
+        let Self {
+            request,
+            verified,
+            selected,
+            clocks,
+            random,
+            receipt,
+        } = self;
+        PreparedSessionRecovery {
+            game,
+            request,
+            verified,
+            selected,
+            clocks,
+            random,
+            receipt,
+        }
+    }
+}
+impl<'a> SessionRecoveryWork<'a> {
+    fn reconcile_ordinary_reads(
+        game: &Game<'_>,
+        prepared: &mut crate::game::world_loading::PreparedWorld,
+        columns: &BTreeMap<(i32, i32), Arc<Chunk>>,
+    ) -> SResult<()> {
+        let context = game.capture_native_validation_context();
+        let accepted = BTreeSet::new();
+        while let Some(view) = checked(prepared.streaming.poll_retained_open_load())? {
+            let load = view.load();
+            if let Some(error) = load.error() {
+                return Err(fail(error));
+            }
+            let chunk = load
+                .chunk()
+                .ok_or_else(|| fail("ordinary recovery read has no native column"))?;
+            let result = checked(
+                crate::game::world_loading::validate_retained_column_context(
+                    &context,
+                    &game.pack,
+                    &game.res,
+                    &game.persist.uuids,
+                    &prepared.save_root,
+                    Some(&prepared.level),
+                    Some(&prepared.world),
+                    Some(&prepared.session_lock),
+                    &prepared.save,
+                    prepared.native_checkpoint_origin.as_ref(),
+                    &accepted,
+                    chunk,
+                    load.evidence(),
+                ),
+            )?;
+            match result {
+                None => break,
+                Some((horizon_client::streaming::RetainedColumnDisposition::AlreadyStored, _)) => {}
+                Some(_) => {
+                    return Err(fail(
+                        "ordinary recovery cannot adopt freshly generated saved input",
+                    ));
+                }
+            }
+            let expected = columns.get(&(chunk.x, chunk.z)).ok_or_else(|| {
+                fail("ordinary recovered original read is outside verified native image")
+            })?;
+            let encoded = save::encode(expected, game.pack.assets.registry, game.res.biomes());
+            checked(crate::game::world_loading::validate_retained_projection(
+                chunk, &encoded, expected,
+            ))?;
+            let ticket = view.into_ticket();
+            if !checked(
+                prepared
+                    .streaming
+                    .accept_retained_open_load(ticket, &mut prepared.world),
+            )? {
+                break;
+            }
+        }
+        Ok(())
+    }
+    fn legacy(game: Box<Game<'a>>) -> Self {
+        Self {
+            game: Some(game),
+            preparation: None,
+            ordinary: None,
+            unpublished: None,
+            armed: false,
+        }
+    }
+    fn prepare_steps(
+        &mut self,
         profile: NativeBindingProfile,
         guest: bool,
         request: RecoveryRequest,
         before_items: impl FnOnce(&mut Game<'a>, &CheckedSessionItems) -> SResult<()>,
         #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
         mut item_load_test: Option<&mut SessionItemLoadTest>,
-    ) -> SResult<PreparedSessionRecovery<'a>> {
-        self.fresh_session_candidate()?;
+    ) -> SResult<RecoveryData> {
+        let game = self
+            .game
+            .as_mut()
+            .expect("same original recovery candidate");
+        game.fresh_session_candidate()?;
         deadline(request.deadline)?;
-        let _ = self.advancement_tree();
+        let _ = game.advancement_tree();
         let archive = directory(&request.archive_root)?;
         ancestors(&request.destination)?;
         require(
@@ -4408,7 +4746,7 @@ impl<'a> Game<'a> {
         // Newest complete name is authoritative: corrupt/incompatible successors
         // refuse. Never borrow older frames or silently fall back to an old epoch.
         let verified = verify_image(
-            &self,
+            game,
             &selected,
             epoch,
             request.expected_world,
@@ -4424,7 +4762,7 @@ impl<'a> Game<'a> {
             "recovery adapter execution profile mismatch",
         )?;
         if guest {
-            self.prepare_guest_image_evaluator(&verified.counter)?;
+            game.prepare_guest_image_evaluator(&verified.counter)?;
         }
         let mut centers = player_centers(verified.players.rows(), &request.expected_target)?;
         let coverage = required_coverage(&centers)?;
@@ -4460,10 +4798,41 @@ impl<'a> Game<'a> {
             None,
         ))?;
         open.save_root = request.destination.clone();
-        let mut prepared = checked(
-            open.with_expected_checkpoint_world(request.expected_world)
-                .prepare(&self.res, &self.pack, &self.options, &self.settings),
-        )?;
+        let open = open.with_expected_checkpoint_world(request.expected_world);
+        self.preparation = Some(if let Some((entry, startup)) = self.ordinary.as_ref() {
+            let preparation = crate::game::world_loading::OrdinaryPreparation::prepare(
+                open,
+                &game.res,
+                &game.pack,
+                &game.options,
+                &game.settings,
+                entry,
+                startup.clone(),
+            );
+            match preparation.into_prepared(entry) {
+                Ok(prepared) => RecoveryPreparation::Ordinary(prepared),
+                Err(preparation) => {
+                    let reason = preparation
+                        .original_error()
+                        .unwrap_or("ordinary recovery preparation transfer refused")
+                        .to_owned();
+                    self.preparation = Some(RecoveryPreparation::Failed(preparation));
+                    return Err(fail(reason));
+                }
+            }
+        } else {
+            RecoveryPreparation::Legacy(checked(open.prepare(
+                &game.res,
+                &game.pack,
+                &game.options,
+                &game.settings,
+            ))?)
+        });
+        let prepared = self
+            .preparation
+            .as_mut()
+            .expect("original acquired preparation")
+            .prepared_mut();
         // Retain the newly acquired native lock while rechecking complete bytes,
         // identity and packages; native APIs have no permission to regenerate.
         require(
@@ -4475,10 +4844,10 @@ impl<'a> Game<'a> {
             tree(&request.destination, &["session.lock"])? == world_inventory,
             "recovery copy changed under native lock",
         )?;
-        checked(self.options.mod_packages.check_world(&request.destination))?;
-        let under_lock = columns(&self, &request.destination, verified.manifest.saved_clock)?;
+        checked(game.options.mod_packages.check_world(&request.destination))?;
+        let under_lock = columns(game, &request.destination, verified.manifest.saved_clock)?;
         let locked_items = read_session_checkpoint_items(
-            &self,
+            game,
             &request.destination,
             &verified.manifest.resident.iter().copied().collect(),
             &under_lock,
@@ -4538,11 +4907,14 @@ impl<'a> Game<'a> {
             request.expected_target.position[0] >> 4,
             request.expected_target.position[2] >> 4,
         );
-        for center in centers {
+        for &center in &centers {
             prepared.streaming.center = center;
             loop {
                 deadline(request.deadline)?;
                 let _ = prepared.streaming.update(&mut prepared.world);
+                if self.ordinary.is_some() {
+                    Self::reconcile_ordinary_reads(game, prepared, &under_lock)?;
+                }
                 #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
                 if item_load_test.as_ref().is_some_and(|test| {
                     matches!(test.mode, SessionItemLoadTestMode::ReleaseAfterEntry)
@@ -4575,6 +4947,44 @@ impl<'a> Game<'a> {
         }
         // Return center to the machine while real arrivals may enlarge residency.
         prepared.streaming.center = target;
+        if self.ordinary.is_some() {
+            // Every outstanding original saved read must be consumed before the
+            // existing native fence; that fence intentionally never adopts reads.
+            loop {
+                deadline(request.deadline)?;
+                let _ = prepared.streaming.update(&mut prepared.world);
+                Self::reconcile_ordinary_reads(game, prepared, &under_lock)?;
+                let work = prepared.streaming.observe_native_work();
+                require(
+                    !work.accounting_fault
+                        && !work.receipt_mismatch
+                        && !work.worker_initialization_fault
+                        && !work.worker_exit_fault
+                        && !work.result_disconnected
+                        && !work.stopped,
+                    "ordinary recovery native read ownership fault",
+                )?;
+                let (_, generated) = work
+                    .origins
+                    .iter()
+                    .find(|(origin, _)| {
+                        *origin == horizon_client::streaming::NativeWorkOrigin::Generate
+                    })
+                    .unwrap();
+                require(
+                    generated.unresolved == 0,
+                    "ordinary recovery has unresolved original reads",
+                )?;
+                if generated.queued == 0
+                    && generated.worker_held == 0
+                    && generated.returned == 0
+                    && generated.reconciling == 0
+                {
+                    break;
+                }
+                std::thread::yield_now();
+            }
+        }
         let save = prepared.save.clone();
         checked(prepared.streaming.native_write_fence_until(
             &mut prepared.world,
@@ -4593,19 +5003,19 @@ impl<'a> Game<'a> {
             let expected = under_lock
                 .get(at)
                 .ok_or_else(|| fail("unexpected regenerated native arrival"))?;
-            let a = save::encode(chunk, self.pack.assets.registry, self.res.biomes());
-            let b = save::encode(expected, self.pack.assets.registry, self.res.biomes());
+            let a = save::encode(chunk, game.pack.assets.registry, game.res.biomes());
+            let b = save::encode(expected, game.pack.assets.registry, game.res.biomes());
             require(
                 lan::session_player_tags_equal(&a.tag, &b.tag),
                 "native arrival changed saved semantics",
             )?;
         }
         verified.items.check_arrivals(
-            &self,
+            game,
             &prepared.world.chunks.keys().copied().collect(),
             &prepared.world.loaded_entities,
         )?;
-        let binding = binding(&self, &verified.counter)?;
+        let binding = binding(game, &verified.counter)?;
         let state = if let SessionCounter::Guest(frame) = &verified.counter {
             checked(prepared.world.restore_guest_counter_frame(
                 &binding,
@@ -4617,7 +5027,7 @@ impl<'a> Game<'a> {
                 .world
                 .restore_guest_world_slot(
                     &binding,
-                    self.res.items(),
+                    game.res.items(),
                     request.expected_world,
                     &request.expected_target,
                     verified.slot,
@@ -4635,7 +5045,7 @@ impl<'a> Game<'a> {
                 .world
                 .restore_persistent_world_slot(
                     &binding,
-                    self.res.items(),
+                    game.res.items(),
                     request.expected_world,
                     &request.expected_target,
                     verified.slot,
@@ -4649,24 +5059,53 @@ impl<'a> Game<'a> {
                 _ => return Err(fail("restored counter/slot allocation mismatch")),
             })
         };
-        checked(self.finish_open_world(prepared))?;
-        let random = self.world.random.state();
+        // All candidate/preparation refusals precede taking original native parts.
+        // The working owner retains Game, failed preparation and unpublished
+        // constructor token across every fallible step below.
+        if self.ordinary.is_some() {
+            game.fresh_session_candidate()?;
+        }
+        let prepared = match self
+            .preparation
+            .take()
+            .expect("original native preparation")
+        {
+            RecoveryPreparation::Legacy(prepared) => prepared,
+            RecoveryPreparation::Ordinary(prepared) => {
+                let (prepared, original) = prepared.into_unpublished_recovery();
+                game.retained_server = Some(
+                    crate::game::retained_server::ServerGameState::from_ordinary(
+                        original.server_profile(),
+                        game.ordinary_startup
+                            .as_ref()
+                            .expect("same startup")
+                            .clone(),
+                    ),
+                );
+                self.unpublished = Some(original);
+                prepared
+            }
+            RecoveryPreparation::Failed(_) => {
+                unreachable!("failed preparation has no adopted native parts")
+            }
+        };
+        checked(game.finish_open_world(prepared))?;
+        let random = game.world.random.state();
         require(
             random == recovery_random,
             "native opening drew from world random",
         )?;
-        before_items(&mut self, &verified.items)?;
-        self.install_session_checkpoint_items(&verified.items)?;
-        checked(self.install_session_checkpoint_raids(verified.raids.as_ref()))?;
+        before_items(game, &verified.items)?;
+        game.install_session_checkpoint_items(&verified.items)?;
+        checked(game.install_session_checkpoint_raids(verified.raids.as_ref()))?;
         require(
-            self.world.random.state() == random,
+            game.world.random.state() == random,
             "native raid installation drew from world random",
         )?;
-        // Opening resets progress and starts a fresh native tree prefetch.
-        // Finish it before player restoration and its strict JSON re-projection.
-        let _ = self.advancement_tree();
-        Ok(PreparedSessionRecovery {
-            game: self,
+        // Legacy opening starts a native tree prefetch; ordinary recovery keeps
+        // its actual preloaded tree. Player restoration needs that exact tree.
+        let _ = game.advancement_tree();
+        Ok(RecoveryData {
             request,
             verified: NativeRecoveryImage {
                 manifest: verified.manifest,
@@ -4680,6 +5119,392 @@ impl<'a> Game<'a> {
             random: recovery_random,
             receipt: CoreRecoveryReceipt { epoch, state },
         })
+    }
+}
+
+/// Same ordinary worker owns this attempt from source exclusion through either
+/// verified activation or original transport/preparation closure. No error drops
+/// a partial candidate, body, native writer, producer or source lease.
+pub(in crate::game) struct OrdinaryRecoveryWork<'a> {
+    work: SessionRecoveryWork<'a>,
+    request: OrdinaryRecoveryRequest,
+    lease: Option<crate::game::world_loading::host_identity::session_authority::WorldAuthority>,
+    data: Option<RecoveryData>,
+    players: Option<lan::OrdinaryRecoveryPlayers>,
+    closed_host: Option<LanHost<horizon_client::lan::hub::ClosedHub>>,
+    closed_native: Option<crate::game::world_loading::PreparationClosed>,
+    failure: Option<String>,
+    close_deadline: Option<Instant>,
+    native_close_started: bool,
+}
+impl<'a> OrdinaryRecoveryWork<'a> {
+    pub(in crate::game) fn prepare(
+        game: Box<Game<'a>>,
+        entry: crate::game::world_loading::RetainedEntryIdentity,
+        request: OrdinaryRecoveryRequest,
+    ) -> Self {
+        let startup = game
+            .ordinary_startup
+            .as_ref()
+            .expect("actual ordinary recovery seed")
+            .clone();
+        let mut work = SessionRecoveryWork::legacy(game);
+        work.ordinary = Some((entry, startup));
+        work.armed = true;
+        let mut owner = Self {
+            work,
+            request,
+            lease: None,
+            data: None,
+            players: None,
+            closed_host: None,
+            closed_native: None,
+            failure: None,
+            close_deadline: None,
+            native_close_started: false,
+        };
+        if let Err(error) = owner.prepare_native() {
+            owner.fail(error.to_string());
+        }
+        owner
+    }
+    fn prepare_native(&mut self) -> SResult<()> {
+        let source = &self.request.source;
+        let game = self.work.game.as_ref().unwrap();
+        require(
+            source.context.same_owners(game)
+                && game
+                    .ordinary_startup
+                    .as_ref()
+                    .is_some_and(|startup| Arc::ptr_eq(startup, &source.startup))
+                && game.options.execution_role == source.role,
+            "ordinary recovery changed its actual captured source generation/role",
+        )?;
+        deadline(self.request.managed.deadline)?;
+        let continuation = directory(&source.continuation)?;
+        require(
+            fs::read_dir(&continuation).map_err(fail)?.next().is_none()
+                && [
+                    &source.root,
+                    &source.archive,
+                    &self.request.managed.destination,
+                ]
+                .iter()
+                .all(|root| !continuation.starts_with(root) && !root.starts_with(&continuation)),
+            "ordinary recovery continuation must remain fresh and separate",
+        )?;
+        self.lease = Some(checked(source.namespace.acquire_recovery(
+            &self.request.managed.owner_root,
+            &self.request.managed.archive_root,
+            &self.request.managed.destination,
+        ))?);
+        let world = self.lease.as_ref().unwrap().world();
+        require(
+            world == source.world,
+            "original source identity changed before managed recovery",
+        )?;
+        let request = RecoveryRequest {
+            expected_world: world,
+            expected_target: self.request.managed.expected_target.clone(),
+            expected_type: self.request.managed.expected_type.clone(),
+            archive_root: self.request.managed.archive_root.clone(),
+            destination: self.request.managed.destination.clone(),
+            deadline: self.request.managed.deadline,
+        };
+        self.data = Some(self.work.prepare_steps(
+            NativeBindingProfile::RegisteredCube,
+            source.guest,
+            request,
+            |_, _| Ok(()),
+            #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+            None,
+        )?);
+        require(
+            self.work.game.as_ref().unwrap().level.player_uuid == source.native_player_uuid
+                && source.native_player_uuid.is_some(),
+            "ordinary recovery changed or invented the original native record UUID",
+        )?;
+        let game = self.work.game.as_mut().unwrap();
+        checked(
+            game.session_lock
+                .as_mut()
+                .ok_or_else(|| fail("actual recovered session absent"))?
+                .install_authority(&mut self.lease),
+        )?;
+        Ok(())
+    }
+    pub(in crate::game) fn game_mut(&mut self) -> &mut Game<'a> {
+        self.work.game.as_mut().unwrap()
+    }
+    pub(in crate::game) fn original_error(&self) -> Option<&str> {
+        self.failure.as_deref()
+    }
+    pub(in crate::game) fn fail(&mut self, reason: String) {
+        self.failure.get_or_insert(reason);
+    }
+    pub(in crate::game) fn try_activate(&mut self) -> SResult<Option<Box<Game<'a>>>> {
+        require(
+            self.failure.is_none() && self.close_deadline.is_none(),
+            "refused recovery cannot activate",
+        )?;
+        let data = self
+            .data
+            .as_ref()
+            .ok_or_else(|| fail("actual recovered image absent"))?;
+        let game = self.work.game.as_mut().unwrap();
+        let expected_count = if game
+            .retained_server
+            .as_ref()
+            .and_then(|server| server.integrated_owner())
+            .is_some()
+        {
+            1
+        } else {
+            2
+        };
+        let count = game
+            .lan
+            .as_ref()
+            .ok_or_else(|| fail("original recovery Hub absent"))?
+            .hub
+            .guests
+            .len();
+        if count < expected_count {
+            return Ok(None);
+        }
+        require(count == expected_count, "extra actual recovery participant")?;
+        if self.players.is_none() {
+            self.players = Some(checked(lan::OrdinaryRecoveryPlayers::bind(
+                game,
+                &data.verified.players,
+            ))?);
+        }
+        let players = self.players.as_mut().unwrap();
+        checked(players.install(game))?;
+        match &data.receipt.state {
+            CoreRecoveryState::Native(RegisteredRecoveryState::Active { counter, slot }) => {
+                checked(game.world.read_persistent_counter(counter))?;
+                game.world
+                    .read_world_slot(slot)
+                    .map_err(|error| fail(format!("{error:?}")))?;
+            }
+            CoreRecoveryState::Native(RegisteredRecoveryState::Dormant) => {
+                require(
+                    checked(game.world.persistent_counter_key())?.is_none(),
+                    "ordinary dormant counter allocated",
+                )?;
+                let slot = checked(decode_slot_frame(
+                    &checked(
+                        game.world
+                            .slot_checkpoint_bytes(game.res.items(), game.world.game_time),
+                    )?,
+                    game.res.items(),
+                ))?;
+                require(
+                    matches!(slot.view().allocation, SlotFrameAllocation::Dormant),
+                    "ordinary dormant slot allocated",
+                )?;
+            }
+            CoreRecoveryState::Guest(state) => {
+                match state {
+                    GuestRuntimeState::ReadyActive { counter, slot } => {
+                        checked(game.world.read_persistent_counter(counter))?;
+                        game.world
+                            .read_world_slot(slot)
+                            .map_err(|error| fail(format!("{error:?}")))?;
+                    }
+                    GuestRuntimeState::FaultedActive { receipt } => {
+                        checked(game.world.validate_guest_storage_receipt(receipt))?
+                    }
+                    GuestRuntimeState::ReadyDormant => {
+                        let view = checked(game.world.guest_storage_view())?;
+                        require(
+                            view.counter().execution.status == GuestStatus::Ready
+                                && matches!(view.counter().fields.placement, Placement::Dormant),
+                            "ordinary Guest dormant state changed",
+                        )?;
+                    }
+                }
+                game.prepare_guest_image_evaluator(&data.verified.counter)?;
+            }
+        }
+        game.session_fence(data.request.deadline)?;
+        game.session_context()?;
+        let rows = checked(players.project(game))?;
+        let local_uuid = native_local_uuid(&game.world_root)?;
+        let snapshot =
+            game.session_snapshot_from_players(game.effective_session_raids()?, local_uuid, rows)?;
+        validate_native_local_player(
+            &game.world_root,
+            &snapshot.players.iter().map(descriptor).collect::<Vec<_>>(),
+        )?;
+        #[cfg(all(test, feature = "mods", target_os = "linux"))]
+        let observation = tests::ordinary_fixture_observation(&snapshot)?;
+        verify_recovery_snapshot(
+            game,
+            &data.request,
+            &data.verified,
+            &data.selected,
+            data.clocks,
+            data.random,
+            snapshot,
+        )?;
+        let original = self
+            .work
+            .unpublished
+            .take()
+            .ok_or_else(|| fail("original recovered construction transfer absent"))?;
+        if let Err(original) = original.publish(game) {
+            self.work.unpublished = Some(original);
+            return Err(fail(
+                "verified recovered native construction association changed",
+            ));
+        }
+        game.retained_server
+            .as_mut()
+            .unwrap()
+            .set_continuation_archive(self.request.source.continuation.clone());
+        #[cfg(all(test, feature = "mods", target_os = "linux"))]
+        if let Some(control) = game
+            .retained_server
+            .as_ref()
+            .unwrap()
+            .test
+            .ordinary
+            .as_ref()
+        {
+            let control: &crate::game::retained_server::OrdinaryControl = control;
+            control.record_recovered(observation);
+        }
+        self.work.armed = false;
+        Ok(self.work.game.take())
+    }
+    pub(in crate::game) fn begin_close(&mut self, until: Instant) {
+        self.close_deadline.get_or_insert(until);
+        if let Some(game) = self.work.game.as_mut() {
+            if let Some(server) = game.retained_server.as_mut() {
+                server.freeze();
+            }
+            if let Some(host) = game.lan.as_mut() {
+                host.hub
+                    .begin_retained_close(until.saturating_duration_since(Instant::now()));
+            }
+        }
+    }
+    pub(in crate::game) fn poll_close(
+        &mut self,
+    ) -> crate::game::world_loading::PreparationCloseStatus {
+        use crate::game::world_loading::PreparationCloseStatus as Status;
+        use horizon_client::lan::hub::RetainedHubPhase;
+        let Some(until) = self.close_deadline else {
+            return Status::Pending;
+        };
+        let game = self.work.game.as_mut().unwrap();
+        if let Some(host) = game.lan.as_mut() {
+            let Some(view) = host.hub.poll_retained_close() else {
+                return Status::Blocked("original recovery transport owner missing".into());
+            };
+            if view.phase == RetainedHubPhase::Blocked {
+                return Status::Blocked("original recovery transport close blocked".into());
+            }
+            if view.phase != RetainedHubPhase::Ready {
+                return Status::Pending;
+            }
+            let host = game.lan.take().unwrap();
+            match host.try_retained_closed() {
+                Ok(closed) => self.closed_host = Some(closed),
+                Err(host) => {
+                    game.lan = Some(host);
+                    return Status::Blocked("original recovery Hub consuming close refused".into());
+                }
+            }
+        }
+        if let Some(original) = self.work.unpublished.take() {
+            match original.refuse_game(
+                game,
+                self.failure
+                    .clone()
+                    .unwrap_or_else(|| "ordinary recovery cancelled before activation".into()),
+            ) {
+                Ok(preparation) => {
+                    self.work.preparation = Some(RecoveryPreparation::Failed(preparation))
+                }
+                Err(original) => {
+                    self.work.unpublished = Some(original);
+                    return Status::Blocked("original unpublished native parts cannot yet return to preparation custody".into());
+                }
+            }
+        }
+        if let Some(RecoveryPreparation::Ordinary(_)) = self.work.preparation.as_ref() {
+            let Some(RecoveryPreparation::Ordinary(prepared)) = self.work.preparation.take() else {
+                unreachable!()
+            };
+            self.work.preparation = Some(RecoveryPreparation::Failed(
+                prepared.refuse_unpublished(
+                    self.failure
+                        .clone()
+                        .unwrap_or_else(|| "ordinary recovery preparation refused".into()),
+                ),
+            ));
+        }
+        if let Some(preparation) = self.work.preparation.as_mut() {
+            let RecoveryPreparation::Failed(preparation) = preparation else {
+                return Status::Blocked("ordinary recovery acquired a legacy owner".into());
+            };
+            if !self.native_close_started {
+                preparation.begin_close(until);
+                self.native_close_started = true;
+            }
+            let status = preparation.poll_close_with_context(game);
+            if status != Status::Complete {
+                return status;
+            }
+            let Some(RecoveryPreparation::Failed(preparation)) = self.work.preparation.take()
+            else {
+                unreachable!()
+            };
+            match preparation.finish_close() {
+                Ok(closed) => self.closed_native = Some(closed),
+                Err(preparation) => {
+                    self.work.preparation = Some(RecoveryPreparation::Failed(preparation));
+                    return Status::Blocked("original recovery preparation finish refused".into());
+                }
+            }
+        }
+        if self.closed_native.is_none()
+            && (game.save.is_some()
+                || !game.streaming.is_vacant()
+                || game.session_lock.is_some()
+                || game.adv.pending_tree.is_some())
+        {
+            return Status::Blocked(
+                "unpublished candidate still owns unresolved native work".into(),
+            );
+        }
+        self.lease = None;
+        self.work.armed = false;
+        Status::Complete
+    }
+    pub(in crate::game) fn retry_close(&mut self, until: Instant) -> SResult<()> {
+        require(
+            self.close_deadline.is_some() && until > Instant::now(),
+            "original recovery close Retry requires a future deadline",
+        )?;
+        let game = self.work.game.as_mut().unwrap();
+        if let Some(host) = game.lan.as_mut()
+            && let Some(view) = host.hub.retained_close_view()
+            && view.phase == horizon_client::lan::hub::RetainedHubPhase::Blocked
+        {
+            host.hub.retry_retained_close(
+                view.attempt,
+                until.saturating_duration_since(Instant::now()),
+            );
+        }
+        if let Some(RecoveryPreparation::Failed(preparation)) = self.work.preparation.as_mut() {
+            checked(preparation.retry_close(until))?;
+        }
+        self.close_deadline = Some(until);
+        Ok(())
     }
 }
 
@@ -4860,6 +5685,18 @@ fn verify_recovery_final(
     random: u64,
 ) -> SResult<()> {
     game.session_fence(request.deadline)?;
+    let snapshot = game.session_snapshot()?;
+    verify_recovery_snapshot(game, request, verified, selected, clocks, random, snapshot)
+}
+fn verify_recovery_snapshot(
+    game: &Game<'_>,
+    request: &RecoveryRequest,
+    verified: &NativeRecoveryImage,
+    selected: &Path,
+    clocks: (i64, i64),
+    random: u64,
+    snapshot: Snapshot,
+) -> SResult<()> {
     require(
         (game.world.game_time, game.world.day_time) == clocks,
         "recovery advanced native clocks",
@@ -4868,7 +5705,6 @@ fn verify_recovery_final(
         game.world.random.state() == random,
         "recovery drew from world random",
     )?;
-    let snapshot = game.session_snapshot()?;
     require(
         snapshot.counter == verified.counter
             && same_players(&snapshot.players, verified.players.rows())

@@ -1,6 +1,8 @@
 //! Prepare local worlds without blocking the window's event loop.
 use super::*;
 pub(super) mod host_identity;
+#[cfg(feature = "paired-packages")]
+use horizon_client::gamerules::GameRules;
 use host_identity::{IdentityIntent, WorldSession};
 
 pub(super) struct WorldRequest {
@@ -15,6 +17,8 @@ pub(super) struct WorldRequest {
     authority_namespace: Option<host_identity::session_authority::AuthorityNamespace>,
     #[cfg(feature = "paired-packages")]
     expected_checkpoint_world: Option<horizon_client::world::counter_restore::WorldId>,
+    #[cfg(feature = "paired-packages")]
+    ordinary_reopen: Option<super::paired_close::NativeReopenClaim>,
 }
 
 pub(super) struct PreparedWorld {
@@ -67,7 +71,8 @@ impl NativeCheckpointOrigin {
 /// guest/domain authority. Neither observations nor a Game can mint this owner.
 #[cfg(feature = "paired-packages")]
 pub(super) struct NativeCloseAuthority {
-    profile: ColdProfile,
+    profile: NativeProfile,
+    ordinary: Option<Arc<super::mod_packages::FrozenHostInputs>>,
     save: std::sync::Weak<SaveDir>,
     world: horizon_client::world::counter_restore::WorldId,
     root: PathBuf,
@@ -78,7 +83,7 @@ pub(super) struct NativeCloseAuthority {
 }
 #[cfg(feature = "paired-packages")]
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum ColdProfile {
+enum NativeProfile {
     InFrameClient,
     HeadlessServer,
     IntegratedServer { owner: u128 },
@@ -86,14 +91,47 @@ enum ColdProfile {
 
 #[cfg(feature = "paired-packages")]
 impl NativeCloseAuthority {
+    pub(in crate::game) fn retains_ordinary_source(&self, game: &Game<'_>) -> bool {
+        self.ordinary.as_ref().is_some_and(|startup| {
+            game.ordinary_startup
+                .as_ref()
+                .is_some_and(|actual| Arc::ptr_eq(actual, startup))
+                && startup.retains_startup(&game.options.mod_packages, game.pack.assets.registry)
+        }) && self.server_profile() == game.retained_server.as_ref().map(|server| server.profile())
+            && self.root == game.world_root
+            && self.dimension == game.dim
+            && self.level_dimension == game.level.dimension
+            && self.native_player_uuid == game.level.player_uuid
+            && game
+                .session_lock
+                .as_ref()
+                .and_then(WorldSession::expected_world)
+                == Some(&self.world)
+            && game.save.as_ref().is_some_and(|save| {
+                self.save
+                    .upgrade()
+                    .is_some_and(|original| Arc::ptr_eq(save, &original))
+            })
+            && game
+                .native_checkpoint_origin
+                .as_ref()
+                .is_some_and(|origin| {
+                    self.origin
+                        .upgrade()
+                        .is_some_and(|identity| Arc::ptr_eq(&identity, &origin.identity))
+                        && game.save.as_ref().is_some_and(|save| {
+                            origin.validate(&game.world_root, game.dim, save).is_ok()
+                        })
+                })
+    }
     pub(super) fn is_server(&self) -> bool {
-        self.profile != ColdProfile::InFrameClient
+        self.profile != NativeProfile::InFrameClient
     }
     pub(super) fn server_profile(&self) -> Option<super::retained_server::ServerProfile> {
         match self.profile {
-            ColdProfile::InFrameClient => None,
-            ColdProfile::HeadlessServer => Some(super::retained_server::ServerProfile::Dedicated),
-            ColdProfile::IntegratedServer { owner } => {
+            NativeProfile::InFrameClient => None,
+            NativeProfile::HeadlessServer => Some(super::retained_server::ServerProfile::Dedicated),
+            NativeProfile::IntegratedServer { owner } => {
                 Some(super::retained_server::ServerProfile::Integrated {
                     owner,
                     record: self
@@ -108,24 +146,35 @@ impl NativeCloseAuthority {
             return false;
         };
         let profile = match self.profile {
-            ColdProfile::InFrameClient => {
+            NativeProfile::InFrameClient => {
                 game.options.execution_role.is_client()
                     && game.retained_server.is_none()
                     && game.lan.is_none()
             }
-            ColdProfile::HeadlessServer | ColdProfile::IntegratedServer { .. } => {
+            NativeProfile::HeadlessServer | NativeProfile::IntegratedServer { .. } => {
                 game.retained_server.as_ref().is_some_and(|server| {
                     Some(server.profile()) == self.server_profile() && server.authorizes_close(game)
                 })
             }
         };
+        let recipe = if let Some(startup) = &self.ordinary {
+            game.ordinary_startup
+                .as_ref()
+                .is_some_and(|original| Arc::ptr_eq(original, startup))
+                && startup.retains_startup(&game.options.mod_packages, game.pack.assets.registry)
+                && !game.options.server_thread
+        } else {
+            game.options.test_terrain && !game.options.server_thread
+        };
         profile
-            && game.options.test_terrain
-            && !game.options.server_thread
+            && recipe
             && game.options.server.is_none()
             && match self.profile {
-                ColdProfile::IntegratedServer { .. } => {
+                NativeProfile::IntegratedServer { .. } => {
                     game.options.dedicated.as_ref().is_some_and(Vec::is_empty)
+                }
+                NativeProfile::HeadlessServer if self.ordinary.is_some() => {
+                    game.options.dedicated.is_some()
                 }
                 _ => game.options.dedicated.is_none(),
             }
@@ -180,7 +229,528 @@ impl ColdPreparedWorld {
     }
 }
 
+/// Issued by the ordinary request factory, independently of the fixed Cold recipe.
+#[cfg(feature = "paired-packages")]
+pub(super) struct OrdinaryPreparedWorld {
+    prepared: PreparedWorld,
+    authority: NativeCloseAuthority,
+    startup: Arc<super::mod_packages::FrozenHostInputs>,
+    original: Box<PrepareOwner>,
+}
+#[cfg(feature = "paired-packages")]
+impl OrdinaryPreparedWorld {
+    pub(super) fn prepared(&self) -> &PreparedWorld {
+        &self.prepared
+    }
+    pub(in crate::game) fn prepared_mut(&mut self) -> &mut PreparedWorld {
+        &mut self.prepared
+    }
+    pub(super) fn into_parts(
+        mut self,
+    ) -> (
+        PreparedWorld,
+        NativeCloseAuthority,
+        Arc<super::mod_packages::FrozenHostInputs>,
+    ) {
+        if let Some(claim) = self.original.request.ordinary_reopen.as_mut() {
+            claim.spend_on_adoption();
+        }
+        (self.prepared, self.authority, self.startup)
+    }
+    pub(in crate::game) fn into_unpublished_recovery(
+        self,
+    ) -> (PreparedWorld, UnpublishedRecoveryNative) {
+        let Self {
+            prepared,
+            authority,
+            startup,
+            original,
+        } = self;
+        (
+            prepared,
+            UnpublishedRecoveryNative {
+                authority,
+                startup,
+                original,
+            },
+        )
+    }
+    /// Before editable exposure, return the actual parts to their SAME original
+    /// preparation allocation for checked failed/cancelled recovery closure.
+    pub(in crate::game) fn refuse_unpublished(self, reason: String) -> OrdinaryPreparation {
+        let Self {
+            prepared,
+            authority,
+            startup,
+            mut original,
+        } = self;
+        let PreparedWorld {
+            save_root,
+            level,
+            world,
+            streaming,
+            save,
+            session_lock,
+            rand_sequences,
+            locator,
+            native_checkpoint_origin,
+        } = prepared;
+        assert_eq!(
+            save_root, original.request.save_root,
+            "original preparation root"
+        );
+        original.level = Some(level);
+        original.world = Some(Box::new(world));
+        original.streaming = Some(streaming);
+        original.save = Some(save);
+        original.session = Some(session_lock);
+        original.rand_sequences = Some(rand_sequences);
+        original.locator = locator;
+        original.native_checkpoint_origin = native_checkpoint_origin;
+        original.original_error.get_or_insert(reason);
+        original.cancelled = true;
+        original.armed = true;
+        OrdinaryPreparation {
+            outcome: PreparedOutcome::Failed(PrepareFailure { owner: original }),
+            profile: authority.profile,
+            startup,
+        }
+    }
+}
+
+/// Keeps the constructor's original preparation allocation while a recovered
+/// Game is still unpublished. A verified image alone does not grant this token.
+#[cfg(feature = "paired-packages")]
+pub(in crate::game) struct UnpublishedRecoveryNative {
+    authority: NativeCloseAuthority,
+    startup: Arc<super::mod_packages::FrozenHostInputs>,
+    original: Box<PrepareOwner>,
+}
+#[cfg(feature = "paired-packages")]
+impl UnpublishedRecoveryNative {
+    pub(in crate::game) fn server_profile(&self) -> super::retained_server::ServerProfile {
+        self.authority
+            .server_profile()
+            .expect("headless ordinary recovery")
+    }
+    fn matches_game(&self, game: &Game<'_>) -> bool {
+        game.ordinary_startup
+            .as_ref()
+            .is_some_and(|startup| Arc::ptr_eq(startup, &self.startup))
+            && self
+                .startup
+                .retains_startup(&game.options.mod_packages, game.pack.assets.registry)
+            && game.native_close_authority.is_none()
+            && game.world_root == self.authority.root
+            && game.dim == self.authority.dimension
+            && game.level.dimension == self.authority.level_dimension
+            && game.level.player_uuid == self.authority.native_player_uuid
+            && game
+                .session_lock
+                .as_ref()
+                .and_then(WorldSession::expected_world)
+                == Some(&self.authority.world)
+            && game.save.as_ref().is_some_and(|save| {
+                self.authority
+                    .save
+                    .upgrade()
+                    .is_some_and(|original| Arc::ptr_eq(&original, save))
+            })
+            && game
+                .native_checkpoint_origin
+                .as_ref()
+                .is_some_and(|origin| {
+                    self.authority
+                        .origin
+                        .upgrade()
+                        .is_some_and(|identity| Arc::ptr_eq(&identity, &origin.identity))
+                        && game.save.as_ref().is_some_and(|save| {
+                            origin.validate(&game.world_root, game.dim, save).is_ok()
+                        })
+                })
+    }
+    /// Caller must first complete the actual recovered image/player correlation.
+    /// This only transfers the original constructor owner, never creates one.
+    #[allow(clippy::result_large_err)] // Refusal retains the complete original constructor token.
+    pub(in crate::game) fn publish(self, game: &mut Game<'_>) -> std::result::Result<(), Self> {
+        if !self.matches_game(game) {
+            return Err(self);
+        }
+        game.native_close_authority = Some(self.authority);
+        Ok(())
+    }
+    /// Transport and all auxiliary workers stay with the caller until checked
+    /// completion. Move only the original native parts back to their SAME owner.
+    #[allow(clippy::result_large_err)] // Refusal retains the same original preparation allocation.
+    pub(in crate::game) fn refuse_game(
+        self,
+        game: &mut Game<'_>,
+        reason: String,
+    ) -> std::result::Result<OrdinaryPreparation, Self> {
+        if !self.matches_game(game)
+            || game.lan.is_some()
+            || game.remote.is_some()
+            || game.integrated.is_some()
+            || game.serving.is_some()
+            || game.world_loader.is_some()
+            || game.rest_loader.is_some()
+            || game.pending_save.is_some()
+            || game.adv.pending_tree.is_some()
+            || game.streaming.as_existing().is_err()
+        {
+            return Err(self);
+        }
+        let streaming = match std::mem::replace(
+            &mut game.streaming,
+            super::streaming_owner::GameStreaming::vacant(),
+        )
+        .try_into_existing()
+        {
+            Ok(streaming) => streaming,
+            Err(_) => unreachable!("existing stream checked before native takes"),
+        };
+        let prepared = PreparedWorld {
+            save_root: std::mem::take(&mut game.world_root),
+            level: std::mem::take(&mut game.level),
+            world: std::mem::replace(&mut game.world, World::new(game.res.facts().air, 0)),
+            streaming,
+            save: game.save.take().expect("same recovered save"),
+            session_lock: game.session_lock.take().expect("same recovered session"),
+            rand_sequences: std::mem::take(&mut game.rand_sequences),
+            locator: game.end.locator(),
+            native_checkpoint_origin: game.native_checkpoint_origin.take(),
+        };
+        game.end.set_locator(None);
+        Ok(OrdinaryPreparedWorld {
+            prepared,
+            authority: self.authority,
+            startup: self.startup,
+            original: self.original,
+        }
+        .refuse_unpublished(reason))
+    }
+}
+
+/// Owns a real ordinary request and its complete PrepareOwner through failure or
+/// cancellation. No world/save authority is issued by its observations.
+#[cfg(feature = "paired-packages")]
+pub(super) struct OrdinaryPreparation {
+    outcome: PreparedOutcome,
+    profile: NativeProfile,
+    startup: Arc<super::mod_packages::FrozenHostInputs>,
+}
+#[cfg(feature = "paired-packages")]
+impl OrdinaryPreparation {
+    pub(super) fn prepare(
+        request: WorldRequest,
+        res: &Resources,
+        pack: &PackResources,
+        options: &Options,
+        settings: &Settings,
+        entry: &RetainedEntryIdentity,
+        startup: Arc<super::mod_packages::FrozenHostInputs>,
+    ) -> Self {
+        Self::prepare_inner(request, res, pack, options, settings, entry, startup, None)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_inner(
+        request: WorldRequest,
+        res: &Resources,
+        pack: &PackResources,
+        options: &Options,
+        settings: &Settings,
+        entry: &RetainedEntryIdentity,
+        startup: Arc<super::mod_packages::FrozenHostInputs>,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        use super::execution_role::ExecutionRole;
+        let profile = match options.execution_role {
+            ExecutionRole::Client => NativeProfile::InFrameClient,
+            ExecutionRole::DedicatedServer => NativeProfile::HeadlessServer,
+            ExecutionRole::IntegratedServer => NativeProfile::IntegratedServer {
+                owner: horizon_protocol::crypto::offline_uuid(
+                    options.player_name.as_deref().unwrap_or(""),
+                ),
+            },
+        };
+        let mut owner = PrepareOwner::new(request);
+        owner.entry_token = Some(entry.clone());
+        owner.ordinary_mob_free = true;
+        let result: Result<()> = (|| {
+            owner.request.check_ordinary_test_terrain(options)?;
+            if owner.request.identity_intent == IdentityIntent::Legacy
+                || options.server_thread
+                || options.server.is_some()
+                || options.dimension.is_some()
+                || !startup.retains_startup(&options.mod_packages, pack.assets.registry)
+                || !options.mod_packages.has_pairs()
+                || settings.horizon.lod_distance != 0
+                || cfg!(feature = "controllers")
+                || cfg!(feature = "audio")
+            {
+                return Err("ordinary retained request requires its selected startup owners and identified bounded Overworld profile".into());
+            }
+            if let NativeProfile::IntegratedServer { .. } = profile {
+                let name = options
+                    .player_name
+                    .as_deref()
+                    .ok_or("integrated owner name missing")?;
+                if name.is_empty()
+                    || name.len() > 16
+                    || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                {
+                    return Err("invalid integrated offline player name".into());
+                }
+            }
+            if owner.request.identity_intent == IdentityIntent::RequireExistingIdentity
+                && owner.request.expected_checkpoint_world.is_none()
+            {
+                return Err("unbound existing paired world requires its actual completed own-world or coherent recovery association".into());
+            }
+            if profile == NativeProfile::InFrameClient
+                && owner.request.expected_checkpoint_world.is_some()
+                && owner.request.ordinary_reopen.is_none()
+            {
+                return Err(
+                    "persistent in-frame recovery requires the local-player adapter".into(),
+                );
+            }
+            if cancel.is_some_and(|intent| intent.load(Ordering::Acquire)) {
+                return Err("ordinary preparation cancelled before native acquisition".into());
+            }
+            owner.prepare(res, pack, options, settings)?;
+            let level = owner
+                .level
+                .as_ref()
+                .ok_or("prepared native level missing")?;
+            if !level.dimension.is_empty() && level.dimension != Dim::Overworld.id() {
+                return Err(
+                    "ordinary paired request has an unsupported simulation dimension".into(),
+                );
+            }
+            if owner.request.expected_checkpoint_world.is_some() && level.player_uuid.is_none() {
+                return Err(
+                    "ordinary recovery/reopen cannot invent a missing native record UUID".into(),
+                );
+            }
+            Ok(())
+        })();
+        owner.cancelled = cancel.is_some_and(|intent| intent.load(Ordering::Acquire));
+        let outcome = match result {
+            Ok(()) => PreparedOutcome::Ready(RetainedPreparedWorld { owner }),
+            Err(error) => {
+                owner.original_error = Some(error.to_string());
+                PreparedOutcome::Failed(PrepareFailure { owner })
+            }
+        };
+        Self {
+            outcome,
+            profile,
+            startup,
+        }
+    }
+    pub(super) fn original_error(&self) -> Option<&str> {
+        self.outcome.owner().original_error.as_deref()
+    }
+    #[allow(clippy::result_large_err)]
+    pub(super) fn into_prepared(
+        self,
+        entry: &RetainedEntryIdentity,
+    ) -> std::result::Result<OrdinaryPreparedWorld, Self> {
+        let profile = self.profile;
+        let startup = self.startup;
+        let outcome = match self.outcome {
+            PreparedOutcome::Ready(ready) if ready.may_adopt(entry) => {
+                match ready.into_parts_with_original() {
+                    Ok((mut prepared, original)) => {
+                        if prepared.level.dimension.is_empty() {
+                            prepared.level.dimension = Dim::Overworld.id().into();
+                        }
+                        if original.request.identity_intent == IdentityIntent::CreateNewIdentity {
+                            prepared.level.ensure_player_uuid();
+                        }
+                        let authority = NativeCloseAuthority {
+                            profile,
+                            ordinary: Some(startup.clone()),
+                            save: Arc::downgrade(&prepared.save),
+                            world: *prepared
+                                .session_lock
+                                .expected_world()
+                                .expect("identified ordinary world"),
+                            root: prepared.save_root.clone(),
+                            dimension: Dim::Overworld,
+                            level_dimension: prepared.level.dimension.clone(),
+                            native_player_uuid: prepared.level.player_uuid,
+                            origin: Arc::downgrade(
+                                &prepared
+                                    .native_checkpoint_origin
+                                    .as_ref()
+                                    .expect("original native origin")
+                                    .identity,
+                            ),
+                        };
+                        return Ok(OrdinaryPreparedWorld {
+                            prepared,
+                            authority,
+                            startup,
+                            original,
+                        });
+                    }
+                    Err(ready) => PreparedOutcome::Ready(ready),
+                }
+            }
+            outcome => outcome,
+        };
+        Err(Self {
+            outcome,
+            profile,
+            startup,
+        })
+    }
+    pub(super) fn begin_close(&mut self, deadline: std::time::Instant) {
+        self.outcome.begin_close(deadline);
+    }
+    pub(super) fn poll_close(&mut self) -> PreparationCloseStatus {
+        self.outcome.owner_mut().poll_close_with_game(None)
+    }
+    pub(in crate::game) fn poll_close_with_context(
+        &mut self,
+        game: &Game<'_>,
+    ) -> PreparationCloseStatus {
+        self.outcome.owner_mut().poll_close_with_game(Some(game))
+    }
+    pub(super) fn retry_close(&mut self, deadline: std::time::Instant) -> Result<()> {
+        self.outcome.retry_close(deadline)
+    }
+    #[allow(clippy::result_large_err)]
+    pub(super) fn finish_close(self) -> std::result::Result<PreparationClosed, Self> {
+        let profile = self.profile;
+        let startup = self.startup;
+        self.outcome.finish_close().map_err(|outcome| Self {
+            outcome,
+            profile,
+            startup,
+        })
+    }
+}
+
+/// The frontend retains this actual worker until its finished-only join returns
+/// the complete preparation owner, including cancellation and failed acquisition.
+#[cfg(feature = "paired-packages")]
+pub(super) struct OrdinaryWorldLoader {
+    handle: Option<JoinHandle<OrdinaryPreparation>>,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+}
+#[cfg(feature = "paired-packages")]
+impl OrdinaryWorldLoader {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn start(
+        request: WorldRequest,
+        res: Arc<Resources>,
+        pack: PackResources,
+        options: Options,
+        settings: Settings,
+        entry: RetainedEntryIdentity,
+        startup: Arc<super::mod_packages::FrozenHostInputs>,
+    ) -> Result<Self> {
+        request.check_ordinary_native_entry()?;
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let intent = cancel.clone();
+        let handle = std::thread::Builder::new()
+            .name("Ordinary world preparation".into())
+            .spawn(move || {
+                OrdinaryPreparation::prepare_inner(
+                    request,
+                    &res,
+                    &pack,
+                    &options,
+                    &settings,
+                    &entry,
+                    startup,
+                    Some(&intent),
+                )
+            })?;
+        Ok(Self {
+            handle: Some(handle),
+            cancel,
+        })
+    }
+    pub(super) fn request_cancel(&mut self) {
+        self.cancel.store(true, Ordering::Release);
+    }
+    pub(super) fn poll(&mut self) -> Option<OrdinaryPreparation> {
+        if !self.handle.as_ref().is_some_and(JoinHandle::is_finished) {
+            return None;
+        }
+        let mut prepared = self
+            .handle
+            .take()
+            .expect("finished original preparation")
+            .join()
+            .unwrap_or_else(|_| {
+                eprintln!("fatal: ordinary preparation panicked with unknown native ownership");
+                std::process::abort();
+            });
+        prepared.outcome.owner_mut().cancelled |= self.cancel.load(Ordering::Acquire);
+        Some(prepared)
+    }
+}
+#[cfg(feature = "paired-packages")]
+impl Drop for OrdinaryWorldLoader {
+    fn drop(&mut self) {
+        if self.handle.is_some() {
+            eprintln!("fatal: unresolved original ordinary preparation worker");
+            std::process::abort();
+        }
+    }
+}
+
 impl WorldRequest {
+    #[cfg(feature = "paired-packages")]
+    pub(in crate::game) fn with_ordinary_reopen(
+        mut self,
+        original: Arc<super::paired_close::OrdinaryClosedWorld>,
+    ) -> Result<Self> {
+        let claim = original
+            .claim_native(&self.save_root)
+            .ok_or("actual completed native world association differs or is already claimed")?;
+        let world = claim
+            .world(&self.save_root)
+            .expect("same claimed native world");
+        self.identity_intent = IdentityIntent::RequireExistingIdentity;
+        self.expected_checkpoint_world = Some(world);
+        self.ordinary_reopen = Some(claim);
+        Ok(self)
+    }
+    #[cfg(feature = "paired-packages")]
+    pub(in crate::game) fn check_ordinary_native_entry(&self) -> Result<()> {
+        match self.identity_intent {
+            IdentityIntent::CreateNewIdentity if self.expected_checkpoint_world.is_none() && self.ordinary_reopen.is_none() => Ok(()),
+            IdentityIntent::RequireExistingIdentity if self.ordinary_reopen.as_ref().is_some_and(|original| {
+                original.world(&self.save_root) == self.expected_checkpoint_world && self.expected_checkpoint_world.is_some()
+            }) => Ok(()),
+            _ => Err("native entry refuses an unbound or known coherent existing world; actual own native completion is required".into()),
+        }
+    }
+    /// Read-only admission before the native lock or world-gen writes. Flat
+    /// settings take precedence over --test-terrain in the native provider.
+    #[cfg(feature = "paired-packages")]
+    fn check_ordinary_test_terrain(&self, options: &Options) -> Result<()> {
+        if !options.test_terrain {
+            return Err("selected paired S1 entry requires explicit --test-terrain; ordinary terrain support is deferred".into());
+        }
+        if self.create.as_ref().is_some_and(|create| {
+            create.flat
+                || create.flat_settings.is_some()
+                || create.bonus_chest
+                || !create.structures
+        }) || horizon_client::save::WorldGen::read(&self.save_root)
+            .is_some_and(|saved| saved.flat || saved.bonus_chest || !saved.structures)
+        {
+            return Err("selected paired S1 entry refuses flat, custom generation and bonus-chest settings before acquisition".into());
+        }
+        Ok(())
+    }
     pub fn new(
         folder: &str,
         name: Option<&str>,
@@ -200,6 +770,8 @@ impl WorldRequest {
             authority_namespace: None,
             #[cfg(feature = "paired-packages")]
             expected_checkpoint_world: None,
+            #[cfg(feature = "paired-packages")]
+            ordinary_reopen: None,
         })
     }
 
@@ -237,6 +809,12 @@ impl WorldRequest {
         settings: &Settings,
     ) -> Result<PreparedWorld> {
         #[cfg(feature = "paired-packages")]
+        if self.ordinary_reopen.is_some() {
+            return Err(
+                "ordinary reopen claim must stay with its retained preparation owner".into(),
+            );
+        }
+        #[cfg(feature = "paired-packages")]
         if let Some(namespace) = &self.authority_namespace {
             if self.identity_intent != IdentityIntent::CreateNewIdentity {
                 return Err("managed reopen requires authoritative archive recovery".into());
@@ -269,6 +847,8 @@ impl WorldRequest {
             authority_namespace,
             #[cfg(feature = "paired-packages")]
             expected_checkpoint_world,
+            #[cfg(feature = "paired-packages")]
+                ordinary_reopen: _,
         } = self;
         let name = name.as_deref();
         let create = create.as_ref();
@@ -475,6 +1055,7 @@ impl WorldLoader {
 pub(super) struct PrepareOwner {
     armed: bool,
     request: WorldRequest,
+    ordinary_mob_free: bool,
     native_acquisition: Option<horizon_client::save::RetainedSessionLock>,
     preflight: Option<host_identity::IdentityPreflight>,
     authority_acquisition: Option<host_identity::session_authority::RetainedAuthorityAcquisition>,
@@ -537,7 +1118,13 @@ impl RetainedPreparedWorld {
     }
     /// Complete original-owner transfer shared by the fixed production cold
     /// constructor and its fixture. Neither caller replaces an existing Game.
-    fn into_cold_parts(mut self) -> std::result::Result<PreparedWorld, Self> {
+    fn into_cold_parts(self) -> std::result::Result<PreparedWorld, Self> {
+        self.into_parts_with_original()
+            .map(|(prepared, _original)| prepared)
+    }
+    fn into_parts_with_original(
+        mut self,
+    ) -> std::result::Result<(PreparedWorld, Box<PrepareOwner>), Self> {
         let owner = &self.owner;
         if !owner.armed
             || owner.cancelled
@@ -592,7 +1179,7 @@ impl RetainedPreparedWorld {
             native_checkpoint_origin: self.owner.native_checkpoint_origin.take(),
         };
         self.owner.armed = false;
-        Ok(prepared)
+        Ok((prepared, self.owner))
     }
 
     /// Existing fixture compatibility; production uses ColdPreparation instead.
@@ -626,7 +1213,7 @@ pub(super) enum PreparedOutcome {
 #[cfg(feature = "paired-packages")]
 pub(super) struct ColdPreparation {
     outcome: PreparedOutcome,
-    profile: ColdProfile,
+    profile: NativeProfile,
 }
 
 #[cfg(feature = "paired-packages")]
@@ -646,7 +1233,7 @@ impl ColdPreparation {
             options,
             settings,
             entry,
-            ColdProfile::InFrameClient,
+            NativeProfile::InFrameClient,
             #[cfg(test)]
             None,
         )
@@ -667,8 +1254,8 @@ impl ColdPreparation {
             options,
             settings,
             entry,
-            owner.map_or(ColdProfile::HeadlessServer, |owner| {
-                ColdProfile::IntegratedServer { owner }
+            owner.map_or(NativeProfile::HeadlessServer, |owner| {
+                NativeProfile::IntegratedServer { owner }
             }),
             #[cfg(test)]
             None,
@@ -703,7 +1290,7 @@ impl ColdPreparation {
             options,
             settings,
             entry,
-            ColdProfile::HeadlessServer,
+            NativeProfile::HeadlessServer,
             Some(control),
         )
     }
@@ -715,7 +1302,7 @@ impl ColdPreparation {
         options: &Options,
         settings: &Settings,
         entry: &RetainedEntryIdentity,
-        profile: ColdProfile,
+        profile: NativeProfile,
         #[cfg(test)] control: Option<RetainedPrepareControl>,
     ) -> Self {
         let mut owner = PrepareOwner::new(request);
@@ -736,15 +1323,15 @@ impl ColdPreparation {
             || !options.test_terrain
             || options.dimension.is_some()
             || !match profile {
-                ColdProfile::InFrameClient => options.execution_role.is_client(),
-                ColdProfile::HeadlessServer | ColdProfile::IntegratedServer { .. } => {
+                NativeProfile::InFrameClient => options.execution_role.is_client(),
+                NativeProfile::HeadlessServer | NativeProfile::IntegratedServer { .. } => {
                     (match profile {
-                        ColdProfile::HeadlessServer => {
+                        NativeProfile::HeadlessServer => {
                             options.execution_role
                                 == super::execution_role::ExecutionRole::DedicatedServer
                                 && options.dedicated.is_none()
                         }
-                        ColdProfile::IntegratedServer { owner } => {
+                        NativeProfile::IntegratedServer { owner } => {
                             options.execution_role
                                 == super::execution_role::ExecutionRole::IntegratedServer
                                 && options.dedicated.as_ref().is_some_and(Vec::is_empty)
@@ -752,7 +1339,7 @@ impl ColdPreparation {
                                     horizon_protocol::crypto::offline_uuid(name) == owner
                                 })
                         }
-                        ColdProfile::InFrameClient => false,
+                        NativeProfile::InFrameClient => false,
                     }) && options.server.is_none()
                         && options.dev_mods.is_empty()
                         && options.mod_packages.catalog().is_none()
@@ -768,9 +1355,9 @@ impl ColdPreparation {
             || options.server_thread
         {
             Err(match profile {
-                ColdProfile::InFrameClient => "cold retained preparation requires a new identified in-frame native TestTerrain world",
-                ColdProfile::HeadlessServer => "cold retained preparation requires its exact new identified headless native TestTerrain profile",
-                ColdProfile::IntegratedServer { .. } => "cold retained preparation requires its exact new identified integrated native owner profile",
+                NativeProfile::InFrameClient => "cold retained preparation requires a new identified in-frame native TestTerrain world",
+                NativeProfile::HeadlessServer => "cold retained preparation requires its exact new identified headless native TestTerrain profile",
+                NativeProfile::IntegratedServer { .. } => "cold retained preparation requires its exact new identified integrated native owner profile",
             }.into())
         } else {
             owner.prepare(res, pack, options, settings)
@@ -804,12 +1391,12 @@ impl ColdPreparation {
                         // before issuing authority, preserving exact equality
                         // across native metadata commit. Client recipes retain
                         // their existing representation and gates.
-                        if profile != ColdProfile::InFrameClient
+                        if profile != NativeProfile::InFrameClient
                             && prepared.level.dimension.is_empty()
                         {
                             prepared.level.dimension = Dim::Overworld.id().into();
                         }
-                        if matches!(profile, ColdProfile::IntegratedServer { .. }) {
+                        if matches!(profile, NativeProfile::IntegratedServer { .. }) {
                             prepared.level.ensure_player_uuid();
                         }
                         // The complete original cold transfer and exact entry
@@ -817,6 +1404,7 @@ impl ColdPreparation {
                         // this capability, including the raw fixture transfer.
                         let authority = NativeCloseAuthority {
                             profile,
+                            ordinary: None,
                             save: Arc::downgrade(&prepared.save),
                             world: *prepared.session_lock.expected_world().unwrap(),
                             root: prepared.save_root.clone(),
@@ -888,6 +1476,7 @@ impl PreparationClosed {
     }
 }
 #[cfg(feature = "paired-packages")]
+#[derive(Clone)]
 pub(super) struct RetainedEntryIdentity {
     pub token: u64,
     pub owner: Arc<()>,
@@ -961,6 +1550,7 @@ impl PrepareOwner {
         Box::new(Self {
             armed: true,
             request,
+            ordinary_mob_free: false,
             native_acquisition: None,
             preflight: None,
             authority_acquisition: None,
@@ -1109,6 +1699,15 @@ impl PrepareOwner {
             )?;
             level.game_rules = create.rules.by_name();
         }
+        if self.ordinary_mob_free {
+            if created {
+                // This opt-in S1 profile must be on disk before Game loads its
+                // rules or either fresh-chunk or natural spawning can run.
+                level.game_rules.insert("spawn_mobs".into(), 0);
+            } else if level.game_rules.get("spawn_mobs") != Some(&0) {
+                return Err("ordinary paired S1 requires saved spawn_mobs=false; existing worlds are not converted".into());
+            }
+        }
         if created {
             level.allow_commands.get_or_insert(request.creative);
         }
@@ -1156,6 +1755,9 @@ impl PrepareOwner {
                 .as_mut()
                 .unwrap()
                 .write(&self.request.save_root)?;
+        }
+        if self.ordinary_mob_free && GameRules::load(&self.request.save_root).bool("spawn_mobs") {
+            return Err("ordinary paired S1 native rule readback requires spawn_mobs=false".into());
         }
         Ok(())
     }
@@ -1534,6 +2136,7 @@ impl RetainedParkedConstruction {
             identity_intent: IdentityIntent::Legacy,
             authority_namespace: None,
             expected_checkpoint_world: None,
+            ordinary_reopen: None,
         };
         let mut owner = PrepareOwner::new(request);
         owner.save = Some(Arc::new(SaveDir::new_retained(
@@ -1749,7 +2352,7 @@ fn validate_retained_column(
     save: &Arc<SaveDir>,
     origin: Option<&NativeCheckpointOrigin>,
     accepted: &std::collections::BTreeSet<[i32; 4]>,
-    chunk: &Arc<horizon_client::chunk::Chunk>,
+    chunk: &horizon_client::chunk::Chunk,
     evidence: Option<&horizon_client::save::RetainedLoadedRecords>,
 ) -> Result<
     Option<(
@@ -1788,7 +2391,7 @@ pub(in crate::game) fn validate_retained_column_context(
     save: &Arc<SaveDir>,
     origin: Option<&NativeCheckpointOrigin>,
     accepted: &std::collections::BTreeSet<[i32; 4]>,
-    chunk: &Arc<horizon_client::chunk::Chunk>,
+    chunk: &horizon_client::chunk::Chunk,
     evidence: Option<&horizon_client::save::RetainedLoadedRecords>,
 ) -> Result<
     Option<(
@@ -1954,7 +2557,7 @@ pub(in crate::game) fn validate_retained_column_context(
 }
 
 #[cfg(feature = "paired-packages")]
-fn validate_retained_projection(
+pub(in crate::game) fn validate_retained_projection(
     original: &horizon_client::chunk::Chunk,
     encoded: &horizon_world::nbt::NamedTag,
     decoded: &horizon_client::chunk::Chunk,

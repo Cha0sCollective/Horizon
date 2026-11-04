@@ -46,9 +46,92 @@ pub(super) struct FrozenHostInputs {
     expectation:
         std::sync::OnceLock<Arc<horizon_client::lan::login_negotiation::NegotiationExpectation>>,
 }
+#[cfg(all(feature = "paired-packages", feature = "mods"))]
+pub(super) struct ActivatedStartup {
+    pub(super) original: Arc<FrozenHostInputs>,
+    pub(super) role: super::execution_role::ExecutionRole,
+    pub(super) server_thread: bool,
+    pub(super) remote: bool,
+    pub(super) runtime: horizon_mods::Mods,
+}
+#[cfg(all(feature = "paired-packages", feature = "mods"))]
+pub(super) struct ActivationRefusal {
+    pub(super) _input: ActivatedStartup,
+    pub(super) reason: String,
+}
 
 #[allow(dead_code)]
 impl FrozenHostInputs {
+    /// Instantiate from captured executable owners before native world acquisition.
+    /// The actual instance is transferred to Game; no throwaway preflight/reload.
+    #[cfg(all(feature = "paired-packages", feature = "mods"))]
+    pub(super) fn activate(
+        self: &Arc<Self>,
+        role: super::execution_role::ExecutionRole,
+        server_thread: bool,
+        remote: bool,
+        settings: &horizon_client::settings::Settings,
+    ) -> std::result::Result<ActivatedStartup, Box<ActivationRefusal>> {
+        use super::execution_role::ExecutionRole;
+        let runs = match role {
+            ExecutionRole::Client if remote => horizon_mods::Runs::Client,
+            ExecutionRole::Client => horizon_mods::Runs::Both,
+            ExecutionRole::IntegratedServer | ExecutionRole::DedicatedServer => {
+                horizon_mods::Runs::Server
+            }
+        };
+        let catalog = self
+            .packages
+            .catalog
+            .as_ref()
+            .expect("captured selected package catalog");
+        let paths: Vec<_> = catalog
+            .entries()
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect();
+        let mut runtime = horizon_mods::Mods::load_for_with_prepared(
+            runs,
+            &paths,
+            catalog.prepared(),
+            |id| {
+                catalog.entries().iter().any(|entry| {
+                    entry.enabled
+                        && entry
+                            .manifest
+                            .as_ref()
+                            .is_some_and(|manifest| manifest.id == id)
+                })
+            },
+            |name| {
+                let dispatcher = horizon_client::command::vanilla::game_dispatcher();
+                dispatcher.nodes[0]
+                    .children
+                    .iter()
+                    .any(|&child| dispatcher.nodes[child].name() == name)
+            },
+        );
+        runtime.set_bindings(|id| settings.mods.keys_of(id));
+        let reason = self
+            .packages
+            .check_running(&runtime)
+            .err()
+            .map(|error| error.to_string());
+        let input = ActivatedStartup {
+            original: self.clone(),
+            role,
+            server_thread,
+            remote,
+            runtime,
+        };
+        match reason {
+            Some(reason) => Err(Box::new(ActivationRefusal {
+                _input: input,
+                reason,
+            })),
+            None => Ok(input),
+        }
+    }
     /// Cache the one transport instance from this holder's actual retained owners.
     #[cfg(feature = "paired-packages")]
     pub(super) fn negotiation_expectation(
@@ -100,6 +183,22 @@ impl FrozenHostInputs {
     }
     pub(super) fn blocks(&self) -> &'static BlockRegistry {
         self.blocks
+    }
+    #[cfg(feature = "paired-packages")]
+    pub(super) fn retained_sync(&self) -> Arc<SyncData> {
+        self.sync.clone()
+    }
+    /// Local constructor association, not peer claims or a writable-world lease.
+    #[cfg(feature = "paired-packages")]
+    pub(super) fn retains_startup(
+        &self,
+        packages: &Packages,
+        blocks: &'static BlockRegistry,
+    ) -> bool {
+        std::ptr::eq(self.blocks, blocks)
+            && self.packages.build == packages.build
+            && self.packages.identities == packages.identities
+            && matches!((&self.packages.catalog, &packages.catalog), (Some(original), Some(current)) if Arc::ptr_eq(original, current))
     }
 }
 

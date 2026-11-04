@@ -1,6 +1,8 @@
 //! Fixed original Game/worker fixtures. The caller supplies pinned resources
 //! and isolated cwd/home/temp; no test borrows player installations or saves.
 use super::*;
+#[cfg(all(feature = "mods", target_os = "linux"))]
+use horizon_client::gamerules::GameRules;
 use horizon_client::{
     items::ItemStack,
     net::{Event, RetainedClose, RetainedSession, RetainedSettings, RetainedTarget, SendAdmission},
@@ -24,6 +26,1530 @@ use std::{
 const OWNER_STATS_JSON: &str = "{\"stats\":{\"minecraft:custom\":{\"minecraft:jump\":7}}}";
 const OWNER_ADVANCEMENTS_JSON: &str = "{\"DataVersion\":5023,\"test:owner_keep\":{\"criteria\":{\"test:keep\":\"2026-01-01 00:00:00 +0000\"},\"done\":false}}";
 
+#[cfg(all(
+    feature = "mods",
+    target_os = "linux",
+    feature = "native-writer-test-control",
+    debug_assertions
+))]
+#[derive(Default)]
+pub(in crate::game) struct OrdinaryRecoveryWriter {
+    control: Mutex<Option<horizon_client::save::NativeWriterTestControl>>,
+    original: Mutex<Option<std::sync::Weak<horizon_client::save::SaveDir>>>,
+}
+#[cfg(all(
+    feature = "mods",
+    target_os = "linux",
+    feature = "native-writer-test-control",
+    debug_assertions
+))]
+impl OrdinaryRecoveryWriter {
+    pub(super) fn arm(&self, game: &Game<'_>) -> std::result::Result<(), String> {
+        let save = game
+            .save
+            .as_ref()
+            .ok_or("actual recovered SaveDir absent")?;
+        let far = (4096, 4096);
+        let record = save.root.join("entities/r.128.128.mca");
+        match fs::symlink_metadata(&record) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            _ => return Err("actual distant entity region must be absent".into()),
+        }
+        let control = save
+            .arm_native_writer_test_control(horizon_client::save::NativeWriterTestAction::Block)
+            .map_err(|error| error.to_string())?;
+        save.save_entities_later(vec![(far, Vec::new())])
+            .map_err(|error| error.to_string())?;
+        *self.original.lock().unwrap() = Some(Arc::downgrade(save));
+        *self.control.lock().unwrap() = Some(control);
+        Ok(())
+    }
+}
+#[cfg(all(
+    feature = "mods",
+    target_os = "linux",
+    feature = "native-writer-test-control",
+    debug_assertions
+))]
+struct OrdinaryWriterRelease {
+    writer: Arc<OrdinaryRecoveryWriter>,
+    commands: mpsc::Sender<Command>,
+    view: Arc<Mutex<View>>,
+}
+#[cfg(all(
+    feature = "mods",
+    target_os = "linux",
+    feature = "native-writer-test-control",
+    debug_assertions
+))]
+impl Drop for OrdinaryWriterRelease {
+    fn drop(&mut self) {
+        // The worker also holds the shared fixture. Root cancellation must not
+        // wait for that worker to drop its own blocked writer command.
+        drop(
+            self.writer
+                .control
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take(),
+        );
+        let view = self
+            .view
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        if view.blocked.is_some() {
+            let _ = self.commands.send(Command::Retry(view.attempt));
+        }
+    }
+}
+
+#[cfg(all(feature = "mods", target_os = "linux"))]
+#[derive(Clone, Copy)]
+enum OrdinaryDomainKind {
+    Native,
+    Guest,
+}
+#[cfg(all(feature = "mods", target_os = "linux"))]
+pub(in crate::game) struct OrdinaryControl {
+    kind: OrdinaryDomainKind,
+    position: [i32; 3],
+    namespace: world_loading::host_identity::session_authority::AuthorityNamespace,
+    archive: PathBuf,
+    continuation: PathBuf,
+    slot: Mutex<Option<horizon_client::world_slot_trial::SlotKey>>,
+    capture_requested: AtomicBool,
+    captured_once: AtomicBool,
+    source: Mutex<Option<super::super::levels::session_checkpoint::tests::OrdinaryFixtureCapture>>,
+    recovered:
+        Mutex<Option<super::super::levels::session_checkpoint::tests::OrdinaryFixtureObservation>>,
+}
+#[cfg(all(feature = "mods", target_os = "linux"))]
+impl OrdinaryControl {
+    pub(super) fn bootstrap(&self, game: &mut Game<'_>) -> std::result::Result<(), String> {
+        use horizon_client::world::counter_restore::{CounterTarget, NativeBinding};
+        let catalog = game
+            .options
+            .mod_packages
+            .catalog()
+            .ok_or("actual fixture catalog absent")?;
+        let mut types = catalog.prepared().values().flat_map(|prepared| {
+            prepared
+                .content()
+                .machine_types()
+                .types()
+                .iter()
+                .map(move |kind| (prepared.clone(), kind.id().to_owned()))
+        });
+        let (pair, type_id) = types
+            .next()
+            .ok_or("actual registered fixture type absent")?;
+        if types.next().is_some() {
+            return Err("ordinary fixture requires exactly one captured machine type".into());
+        }
+        let binding = match self.kind {
+            OrdinaryDomainKind::Native => {
+                NativeBinding::from_registered_prepared(&pair, &type_id, game.pack.assets.registry)
+            }
+            OrdinaryDomainKind::Guest => NativeBinding::from_registered_guest_prepared(
+                &pair,
+                &type_id,
+                game.pack.assets.registry,
+            ),
+        }
+        .map_err(|error| error.to_string())?;
+        if game.world.counter_domain_snapshot().is_some()
+            || self.slot.lock().unwrap().is_some()
+            || !game
+                .world
+                .chunks
+                .contains_key(&(self.position[0] >> 4, self.position[2] >> 4))
+        {
+            return Err(
+                "ordinary fixture requires unused actual bootstrap and resident target".into(),
+            );
+        }
+        game.world
+            .set(
+                self.position[0],
+                self.position[1],
+                self.position[2],
+                binding.state_id(),
+            )
+            .map_err(|error| error.to_string())?;
+        let slot = match self.kind {
+            OrdinaryDomainKind::Native => {
+                game.bootstrap_registered_host_counter(&type_id, self.position)
+                    .map_err(|error| error.to_string())?;
+                game.world
+                    .initialize_persistent_world_slot(
+                        &binding,
+                        &CounterTarget::new(Dim::Overworld.id(), self.position)
+                            .map_err(|error| error.to_string())?,
+                    )
+                    .map_err(|error| format!("{error:?}"))?
+                    .ok_or("actual fixture slot was not allocated")?
+            }
+            OrdinaryDomainKind::Guest => {
+                game.bootstrap_registered_guest_counter(&type_id, self.position)
+                    .map_err(|error| error.to_string())?
+                    .1
+            }
+        };
+        *self.slot.lock().unwrap() = Some(slot);
+        Ok(())
+    }
+    pub(super) fn capture(&self, game: &mut Game<'_>) -> std::result::Result<(), String> {
+        if !self.capture_requested.load(Ordering::SeqCst)
+            || self.captured_once.load(Ordering::SeqCst)
+        {
+            return Ok(());
+        }
+        let expected = if game
+            .retained_server
+            .as_ref()
+            .unwrap()
+            .integrated_owner()
+            .is_some()
+        {
+            1
+        } else {
+            2
+        };
+        let host = game.lan.as_ref().ok_or("actual fixture host absent")?;
+        if host.hub.guests.len() != expected
+            || host
+                .hub
+                .guests
+                .iter()
+                .any(|guest| !guest.placed || !guest.loaded || guest.motion.is_none())
+        {
+            return Ok(());
+        }
+        let slot = self
+            .slot
+            .lock()
+            .unwrap()
+            .as_ref()
+            .ok_or("actual fixture slot absent")?
+            .clone();
+        let mut host = game.lan.take().unwrap();
+        let conn = host.hub.guests[0].conn;
+        if host
+            .hub
+            .guests
+            .iter()
+            .any(|guest| guest.inventory.iter().any(Option::is_some))
+        {
+            game.lan = Some(host);
+            return Err("fixture gift requires genuinely empty original inventories".into());
+        }
+        // Authored fixture setup, never ordinary machine ingress. Transfer uses
+        // the real inventory-cell lend and slot transaction on the actual Guest.
+        host.hub.guests[0].inventory[0] = Some(ItemStack::new("minecraft:stone", 9));
+        if expected == 2 {
+            host.hub.guests[1].inventory[0] = Some(ItemStack::new("minecraft:stone", 4));
+        }
+        let transfer = game.as_guest(&mut host, conn, |game| {
+            game.transfer_world_slot_inventory_cell(
+                &slot,
+                0,
+                horizon_client::slot_transfer::Direction::IntoMachine,
+                7,
+            )
+        });
+        game.lan = Some(host);
+        let transfer = transfer
+            .ok_or("actual fixture Guest was not lent")?
+            .map_err(|error| format!("{error:?}"))?;
+        if !matches!(transfer, super::super::slot_player::TransferOutcome::Committed(row) if row.moved == 7)
+        {
+            return Err("fixture transfer did not commit exactly seven original items".into());
+        }
+        let machine = game
+            .world
+            .read_world_slot(&slot)
+            .map_err(|error| format!("{error:?}"))?;
+        let host = game.lan.as_ref().unwrap();
+        let counts = host
+            .hub
+            .guests
+            .iter()
+            .map(|guest| {
+                guest
+                    .inventory
+                    .iter()
+                    .flatten()
+                    .map(|stack| stack.count)
+                    .sum::<u32>()
+            })
+            .collect::<Vec<_>>();
+        if !machine.slot.stack().is_some_and(|stack| {
+            &*stack.item == "minecraft:stone"
+                && stack.count == 7
+                && stack.damage == 0
+                && stack.extra.is_none()
+        }) || counts[0] != 2
+            || (expected == 2 && counts[1] != 4)
+            || host.hub.guests.iter().any(|guest| {
+                guest
+                    .armor
+                    .iter()
+                    .chain(std::iter::once(&guest.offhand))
+                    .chain(guest.ender_items.iter())
+                    .any(Option::is_some)
+            })
+            || !game.dropped.is_empty()
+        {
+            return Err("authored fixture must own exactly machine7/player2[/player4] with no additional item owners".into());
+        }
+        let captured = super::super::levels::session_checkpoint::tests::capture_ordinary_fixture(
+            game,
+            &self.namespace,
+            &self.archive,
+            &self.continuation,
+        )
+        .map_err(|error| error.to_string())?;
+        *self.source.lock().unwrap() = Some(captured);
+        self.captured_once.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+    pub(in crate::game) fn record_recovered(
+        &self,
+        observation: super::super::levels::session_checkpoint::tests::OrdinaryFixtureObservation,
+    ) {
+        let mut recovered = self.recovered.lock().unwrap();
+        assert!(
+            recovered.is_none(),
+            "one actual verified recovery observation"
+        );
+        *recovered = Some(observation);
+    }
+}
+
+#[cfg(all(feature = "mods", target_os = "linux"))]
+struct OrdinaryBundle {
+    scratch: PathBuf,
+    base: PathBuf,
+    root: PathBuf,
+    resources: Arc<Resources>,
+    pack: PackResources,
+    packages: mod_packages::Packages,
+    startup: Arc<mod_packages::FrozenHostInputs>,
+    tree: Arc<horizon_client::advancements::Tree>,
+}
+#[cfg(all(feature = "mods", target_os = "linux"))]
+impl OrdinaryBundle {
+    fn new(label: &str) -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let scratch = std::env::temp_dir().join(format!(
+            "horizon-ordinary-{}-{}-{label}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&scratch).unwrap();
+        let base = PathBuf::from(
+            std::env::var_os("HORIZON_TEST_RESOURCES").expect("pinned resources required"),
+        );
+        let pair = PathBuf::from(
+            std::env::var_os("HORIZON_COUNTER_PAIR_FIXTURE")
+                .expect("prebuilt captured pair required"),
+        );
+        let packages = mod_packages::Packages::read(
+            &std::collections::BTreeSet::new(),
+            std::slice::from_ref(&pair),
+        )
+        .unwrap();
+        let settings = Self::settings();
+        let root = mods::content_root(&base, &settings.mods.enabled, &[pair], &packages).unwrap();
+        assert_ne!(root, base, "genuine selected materialization");
+        let loaded = load_resources(
+            root.clone(),
+            &base,
+            &settings,
+            Instant::now(),
+            false,
+            &Progress::new(),
+            &mut |_, _| {},
+        )
+        .unwrap();
+        assert_eq!(loaded.root, root);
+        assert!(loaded.pack_error.is_none() && loaded.rest_loader.is_none());
+        let sync = Arc::new(horizon_client::lan::data::SyncData::load(&root).unwrap());
+        let startup = Arc::new(
+            packages
+                .freeze_peer_inputs(sync, loaded.pack.assets.registry)
+                .unwrap()
+                .unwrap(),
+        );
+        let tree = Arc::new(horizon_client::advancements::Tree::load(&root.join("data")));
+        assert!(!tree.list.is_empty());
+        Self {
+            scratch,
+            base,
+            root,
+            resources: loaded.resources,
+            pack: loaded.pack,
+            packages,
+            startup,
+            tree,
+        }
+    }
+    fn settings() -> Settings {
+        let mut settings = Settings {
+            render_distance: 2,
+            simulation_distance: 2,
+            ..Default::default()
+        };
+        settings.horizon.lod_distance = 0;
+        settings.controller.enabled = false;
+        settings
+    }
+    fn input(
+        &self,
+        role: execution_role::ExecutionRole,
+        request: OrdinaryRequest,
+        control: Option<Arc<OrdinaryControl>>,
+        archive: Option<PathBuf>,
+    ) -> OrdinaryServerInput {
+        let mut options = Options::read_from(vec![
+            "--resources".into(),
+            self.root.to_string_lossy().into_owned(),
+            "--in-frame".into(),
+            "--test-terrain".into(),
+            "--creative".into(),
+            "--name".into(),
+            "OrdinaryOwner".into(),
+        ])
+        .unwrap()
+        .unwrap()
+        .options;
+        options.execution_role = role;
+        options.dedicated = Some(Vec::new());
+        options.server_thread = false;
+        options.mod_packages = self.packages.clone();
+        OrdinaryServerInput {
+            options,
+            settings: Self::settings(),
+            request,
+            entry: RetainedEntryIdentity {
+                token: 1,
+                owner: Arc::new(()),
+            },
+            resources: self.resources.clone(),
+            pack: self.pack.clone(),
+            gui: UiResources::load(&self.root, &self.base).unwrap(),
+            cpu: GameCpuResources::load(&self.root).unwrap(),
+            tree: self.tree.clone(),
+            startup: self.startup.clone(),
+            offline: RetainedOfflineConfig {
+                bind: (!matches!(role, execution_role::ExecutionRole::IntegratedServer))
+                    .then_some(std::net::Ipv4Addr::LOCALHOST.into()),
+                port: 0,
+                motd: "Ordinary fixture".into(),
+                max_players: if role == execution_role::ExecutionRole::IntegratedServer {
+                    1
+                } else {
+                    2
+                },
+                compression_threshold: -1,
+                enable_status: false,
+                hide_online_players: true,
+                announce: false,
+            },
+            dedicated_setup: None,
+            continuation_archive: archive,
+            test: Startup {
+                ordinary: control,
+                ..Default::default()
+            },
+        }
+    }
+    fn control(&self, label: &str, kind: OrdinaryDomainKind) -> Arc<OrdinaryControl> {
+        let directory = self.scratch.join(label);
+        fs::create_dir(&directory).unwrap();
+        for child in ["authority", "source-archive", "continuation"] {
+            fs::create_dir(directory.join(child)).unwrap();
+        }
+        Arc::new(OrdinaryControl {
+            kind,
+            position: [2, 120, 2],
+            namespace: world_loading::host_identity::session_authority::AuthorityNamespace::new(
+                &directory.join("authority"),
+            )
+            .unwrap(),
+            archive: directory.join("source-archive"),
+            continuation: directory.join("continuation"),
+            slot: Mutex::new(None),
+            capture_requested: AtomicBool::new(false),
+            captured_once: AtomicBool::new(false),
+            source: Mutex::new(None),
+            recovered: Mutex::new(None),
+        })
+    }
+}
+
+#[cfg(all(feature = "mods", target_os = "linux"))]
+struct OrdinaryClient {
+    session: RetainedSession,
+    admission: Option<horizon_client::lan::login_negotiation::ConfiguredAdmission>,
+    closed_envelope: Option<horizon_client::lan::login_negotiation::ConfiguredEnvelope>,
+    login: bool,
+    terrain: bool,
+}
+#[cfg(all(feature = "mods", target_os = "linux"))]
+struct OrdinaryRun {
+    supervisor: Supervisor,
+    clients: Vec<OrdinaryClient>,
+    closing: bool,
+    publication_seen: bool,
+}
+#[cfg(all(feature = "mods", target_os = "linux"))]
+impl OrdinaryRun {
+    fn start(input: OrdinaryServerInput) -> Self {
+        let supervisor = Supervisor::prepare_ordinary(input)
+            .unwrap_or_else(|refused| panic!("ordinary original input: {}", refused.reason));
+        Self {
+            supervisor,
+            clients: Vec::new(),
+            closing: false,
+            publication_seen: false,
+        }
+    }
+    fn until(&mut self, mut condition: impl FnMut(&mut Self) -> bool) -> bool {
+        let until = Instant::now() + Duration::from_secs(120);
+        loop {
+            self.pump();
+            if condition(self) {
+                return true;
+            }
+            if Instant::now() >= until || (self.supervisor.finished() && !self.closing) {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+    fn connect(&mut self, bundle: &OrdinaryBundle, tcp: bool, name: &str) {
+        let target = if tcp {
+            RetainedTarget::Address(format!("127.0.0.1:{}", self.supervisor.snapshot().port))
+        } else {
+            let offer = self.supervisor.offer().unwrap();
+            RetainedTarget::Memory(
+                offer
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap()
+                    .unwrap(),
+            )
+        };
+        let required = horizon_client::lan::login_negotiation::RequiredNegotiation::new(
+            bundle.startup.negotiation_expectation().unwrap(),
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        let mut session = RetainedSession::new_offline_paired(
+            target,
+            RetainedSettings::offline(name.into(), 2, Arc::default()),
+            required,
+        )
+        .unwrap_or_else(|refused| panic!("actual paired fixture client: {}", refused.reason));
+        session.start().expect("actual paired fixture actors");
+        self.clients.push(OrdinaryClient {
+            session,
+            admission: None,
+            closed_envelope: None,
+            login: false,
+            terrain: false,
+        });
+    }
+    fn pump(&mut self) {
+        for client in &mut self.clients {
+            for event in client.session.poll_events(128) {
+                match event {
+                    Event::PairedJoined(mut envelope) => {
+                        assert!(client.admission.is_none() && client.closed_envelope.is_none());
+                        match client.session.consume_paired(&mut envelope) {
+                            Ok(admission) => client.admission = Some(admission),
+                            Err(horizon_client::lan::login_negotiation::Refusal::Closed)
+                                if self.closing =>
+                            {
+                                // Server refusal can close the genuine Session
+                                // before its queued callback is consumed. Keep
+                                // that refused envelope until native teardown;
+                                // never turn it into admission or ignore play.
+                                client.closed_envelope = Some(envelope);
+                            }
+                            Err(error) => panic!("same actual configured Session: {error:?}"),
+                        }
+                    }
+                    Event::Joined { .. } => {
+                        panic!("ordinary fixture received generic Joined bypass")
+                    }
+                    Event::Packet(packet) => {
+                        if self.closing {
+                            // Negative tests must still observe forbidden late
+                            // publication; only follow-up sends are suppressed.
+                            match *packet {
+                                C::Login(_) => client.login = true,
+                                C::LevelChunkWithLight(_) => client.terrain = true,
+                                _ => {}
+                            }
+                            continue;
+                        }
+                        assert!(
+                            client
+                                .admission
+                                .as_ref()
+                                .is_some_and(|admission| admission.is_live())
+                        );
+                        match *packet {
+                            C::Login(_) => client.login = true,
+                            C::PlayerPosition(position) => {
+                                send(
+                                    &client.session,
+                                    S::AcceptTeleportation(play::AcceptTeleportation {
+                                        id: position.teleport,
+                                        x: position.position[0],
+                                        y: position.position[1],
+                                        z: position.position[2],
+                                        yaw: position.yaw,
+                                        pitch: position.pitch,
+                                    }),
+                                );
+                                send(&client.session, S::PlayerLoaded(Empty {}));
+                            }
+                            C::LevelChunkWithLight(packet) => {
+                                assert!(client.login && !packet.chunk.buffer.is_empty());
+                                client.terrain = true;
+                            }
+                            C::ChunkBatchFinished(_) => send(
+                                &client.session,
+                                S::ChunkBatchReceived(play::ChunkBatchReceived {
+                                    chunks_per_tick: 9.0,
+                                }),
+                            ),
+                            C::KeepAlive(packet) => send(&client.session, S::KeepAlive(packet)),
+                            _ => {}
+                        }
+                    }
+                    Event::DecodeError(error) if !self.closing => {
+                        panic!("ordinary fixture decode: {error}")
+                    }
+                    Event::Disconnected { reason, .. } if !self.closing => {
+                        panic!("ordinary fixture disconnected before requested close: {reason}")
+                    }
+                    _ => {}
+                }
+            }
+            self.publication_seen |= client.login || client.terrain;
+        }
+    }
+    fn finish(&mut self) -> Option<super::super::paired_close::OrdinaryClosedWorld> {
+        self.closing = true;
+        self.supervisor.request_close();
+        assert!(
+            self.until(
+                |run| run.supervisor.finished() || run.supervisor.snapshot().blocked.is_some()
+            ) && self.supervisor.finished(),
+            "ordinary original close: {:?}",
+            self.supervisor.snapshot()
+        );
+        let result = self
+            .supervisor
+            .join()
+            .expect("original finished-only ordinary join");
+        let view = self.supervisor.snapshot();
+        assert_eq!(view.phase, "NativeDisposed", "{view:?}");
+        if let Err(reason) = result {
+            assert_eq!(
+                view.transport
+                    .as_ref()
+                    .and_then(transport_failure)
+                    .as_deref(),
+                Some(reason.as_str()),
+                "unrelated failure is not transport completion"
+            );
+        }
+        self.close_clients();
+        self.supervisor.take_ordinary_closed_world()
+    }
+    fn close_clients(&mut self) {
+        let until = Instant::now() + Duration::from_secs(15);
+        for client in &mut self.clients {
+            client.session.begin_close(until);
+        }
+        while !self
+            .clients
+            .iter_mut()
+            .all(|client| client.session.poll_close() == RetainedClose::Quiescent)
+        {
+            if Instant::now() >= until {
+                eprintln!("fatal: original ordinary fixture clients unresolved");
+                std::process::abort();
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        for client in self.clients.drain(..) {
+            if client.session.try_closed().is_err() {
+                std::process::abort();
+            }
+            drop(client.admission);
+        }
+    }
+    fn finish_refusal(
+        &mut self,
+        phase: &str,
+    ) -> (
+        String,
+        Option<super::super::paired_close::OrdinaryClosedWorld>,
+    ) {
+        self.closing = true;
+        assert!(
+            self.until(
+                |run| run.supervisor.finished() || run.supervisor.snapshot().blocked.is_some()
+            ) && self.supervisor.finished(),
+            "original refusal cleanup: {:?}",
+            self.supervisor.snapshot()
+        );
+        let error = self
+            .supervisor
+            .join()
+            .expect("original finished-only refusal join")
+            .expect_err("expected original refusal");
+        let view = self.supervisor.snapshot();
+        assert!(view.worker_joined && view.blocked.is_none(), "{view:?}");
+        assert_eq!(view.phase, phase);
+        assert_eq!(view.original_error.as_deref(), Some(error.as_str()));
+        assert!(
+            self.until(|run| run.clients.iter().all(|client| client
+                .session
+                .observe()
+                .terminals
+                .iter()
+                .any(|terminal| terminal.actor == horizon_client::net::RetainedActor::Reader))),
+            "original refused peer readers did not finish"
+        );
+        self.pump();
+        self.close_clients();
+        (error, self.supervisor.take_ordinary_closed_world())
+    }
+}
+#[cfg(all(feature = "mods", target_os = "linux"))]
+impl Drop for OrdinaryRun {
+    fn drop(&mut self) {
+        self.closing = true;
+        self.supervisor.request_close();
+        let until = Instant::now() + Duration::from_secs(30);
+        while self.supervisor.thread.is_some() && !self.supervisor.finished() {
+            self.pump();
+            if Instant::now() >= until {
+                eprintln!(
+                    "fatal: original ordinary fixture remains owned: {:?}",
+                    self.supervisor.snapshot()
+                );
+                std::process::abort();
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        if self.supervisor.finished() {
+            self.supervisor.join();
+        }
+        self.close_clients();
+    }
+}
+
+#[cfg(all(feature = "mods", target_os = "linux"))]
+#[test]
+#[ignore = "isolated pinned resources and prepared pair: same ordinary worker, real configured participants, coherent source and verified recovery"]
+fn ordinary_registered_domain_recovers_through_original_worker_memory_and_two_client_tcp() {
+    use super::super::levels::session_checkpoint::tests::ordinary_fixture_observations_match;
+    let bundle = OrdinaryBundle::new("coherent");
+    for (label, role, kind) in [
+        (
+            "native-memory",
+            execution_role::ExecutionRole::IntegratedServer,
+            OrdinaryDomainKind::Native,
+        ),
+        (
+            "guest-memory",
+            execution_role::ExecutionRole::IntegratedServer,
+            OrdinaryDomainKind::Guest,
+        ),
+        (
+            "native-tcp",
+            execution_role::ExecutionRole::DedicatedServer,
+            OrdinaryDomainKind::Native,
+        ),
+        (
+            "guest-tcp",
+            execution_role::ExecutionRole::DedicatedServer,
+            OrdinaryDomainKind::Guest,
+        ),
+    ] {
+        let control = bundle.control(label, kind);
+        let root = control.archive.parent().unwrap().join("source-world");
+        let mut request =
+            world_loading::WorldRequest::new("unused", Some(label), Some(17), true, None)
+                .unwrap()
+                .with_identity_intent(
+                    world_loading::host_identity::IdentityIntent::CreateNewIdentity,
+                )
+                .with_session_authority(control.namespace.clone());
+        request.save_root = root.clone();
+        let mut source = OrdinaryRun::start(bundle.input(
+            role,
+            OrdinaryRequest::Native(request),
+            Some(control.clone()),
+            Some(control.archive.clone()),
+        ));
+        assert!(
+            source.until(|run| run.supervisor.snapshot().ready),
+            "source startup {label}: {:?}",
+            source.supervisor.snapshot()
+        );
+        let tcp = role == execution_role::ExecutionRole::DedicatedServer;
+        source.connect(
+            &bundle,
+            tcp,
+            if tcp { "OrdinaryA" } else { "OrdinaryOwner" },
+        );
+        if tcp {
+            source.connect(&bundle, true, "OrdinaryB");
+        }
+        assert!(
+            source.until(|run| run
+                .clients
+                .iter()
+                .all(|client| client.login && client.terrain)
+                && run
+                    .supervisor
+                    .snapshot()
+                    .players
+                    .iter()
+                    .all(|player| player["loaded"] == true)
+                && run.supervisor.snapshot().installed == if tcp { 2 } else { 1 }),
+            "actual source participants {label}"
+        );
+        control.capture_requested.store(true, Ordering::SeqCst);
+        assert!(
+            source.until(|_| control.captured_once.load(Ordering::SeqCst)),
+            "actual domain capture {label}"
+        );
+        let captured = control
+            .source
+            .lock()
+            .unwrap()
+            .take()
+            .expect("actual captured source owner");
+        let closed = source.finish().expect("actual coherent source completion");
+        assert!(!GameRules::load(&root).bool("spawn_mobs"));
+        super::super::levels::session_checkpoint::tests::verify_ordinary_fixture_final_players(
+            &root,
+            &captured.observation,
+        )
+        .unwrap();
+        assert!(control.archive.join(format!("epoch-{:020}", 1)).is_dir());
+        let destination = root.parent().unwrap().join("recovered");
+        let recovery = captured
+            .source
+            .into_request(
+                closed,
+                destination.clone(),
+                Instant::now() + Duration::from_secs(120),
+            )
+            .unwrap_or_else(|(_, _, reason)| panic!("actual coherent association: {reason}"));
+        let mut recovered = OrdinaryRun::start(bundle.input(
+            role,
+            OrdinaryRequest::Recover(Box::new(recovery)),
+            Some(control.clone()),
+            None,
+        ));
+        assert!(
+            recovered.until(|run| run.supervisor.snapshot().ready),
+            "recovery admission {label}: {:?}",
+            recovered.supervisor.snapshot()
+        );
+        recovered.connect(
+            &bundle,
+            tcp,
+            if tcp { "OrdinaryA" } else { "OrdinaryOwner" },
+        );
+        if tcp {
+            recovered.connect(&bundle, true, "OrdinaryB");
+        }
+        assert!(
+            recovered.until(|run| run
+                .clients
+                .iter()
+                .all(|client| client.login && client.terrain)
+                && run.supervisor.snapshot().installed == if tcp { 2 } else { 1 }),
+            "actual recovered participants {label}"
+        );
+        let observation = control
+            .recovered
+            .lock()
+            .unwrap()
+            .take()
+            .expect("observed only after actual checked recovery and publication");
+        assert!(
+            ordinary_fixture_observations_match(&captured.observation, &observation),
+            "exact counter/slot/player/clock recovery {label}"
+        );
+        assert!(
+            recovered.finish().is_some(),
+            "actual recovered continuation completion {label}"
+        );
+        assert!(!GameRules::load(&destination).bool("spawn_mobs"));
+        assert!(
+            control
+                .continuation
+                .join(format!("epoch-{:020}", 1))
+                .is_dir()
+        );
+        let lease = control
+            .namespace
+            .acquire_recovery(
+                &destination,
+                &control.continuation,
+                &root.parent().unwrap().join("released-check"),
+            )
+            .unwrap();
+        drop(lease);
+        eprintln!(
+            "ORDINARY_COHERENT_CASE={label} actual_configured_players={} exact_native_and_domain_recovery=true",
+            if tcp { 2 } else { 1 }
+        );
+    }
+}
+
+#[cfg(all(feature = "mods", target_os = "linux"))]
+#[test]
+#[ignore = "isolated pinned resources and prepared pair: actual native completion claim, original refused preparation and checked adoption"]
+fn ordinary_native_reopen_claim_is_unique_retained_on_refusal_and_spent_on_adoption() {
+    use world_loading::host_identity::IdentityIntent;
+    let bundle = OrdinaryBundle::new("native-claim");
+    let root = bundle.scratch.join("native-world");
+    let mut fresh =
+        world_loading::WorldRequest::new("unused", Some("Native own world"), Some(17), true, None)
+            .unwrap()
+            .with_identity_intent(IdentityIntent::CreateNewIdentity);
+    fresh.save_root = root.clone();
+    let role = execution_role::ExecutionRole::DedicatedServer;
+    let source_input = bundle.input(role, OrdinaryRequest::Native(fresh), None, None);
+    // Exercise the actual native properties parser and captured ordinary
+    // dedicated projection; the internal worker fixture does not run preflight.
+    let preflight = bundle.scratch.join("native-dedicated-preflight");
+    let universe = preflight.join("universe");
+    fs::create_dir_all(&universe).unwrap();
+    for (disabled, accepted) in [("", true), (" , ", true), ("example:disabled", false)] {
+        let properties = preflight.join("server.properties");
+        fs::write(
+            &properties,
+            format!(
+                "online-mode=false\ngamemode=creative\nmax-players=2\nview-distance=2\nsimulation-distance=2\nspawn-protection=0\nwhite-list=false\npause-when-empty-seconds=0\nserver-ip=127.0.0.1\nlevel-seed=17\ninitial-disabled-packs={disabled}\n"
+            ),
+        )
+        .unwrap();
+        let props = horizon_client::server::properties::ServerProperties::from_file(
+            &properties,
+            &mut horizon_client::server::properties::SystemEntropy::default(),
+        )
+        .unwrap();
+        if disabled.is_empty() {
+            assert_eq!(props.initial_disabled_packs, [String::new()]);
+        }
+        let setup = super::super::dedicated::RetainedSetup {
+            props,
+            universe: universe.clone(),
+            level_name: "fresh".into(),
+            port: Some(0),
+            started: Instant::now(),
+            working_directory: preflight.clone(),
+        };
+        let projected = setup.retained_world_inputs(&source_input.options);
+        if accepted {
+            let (request, offline) = projected.expect("native empty disabled-pack selection");
+            assert_eq!(request.save_root, universe.join("fresh"));
+            assert_eq!(offline.max_players, 2);
+        } else {
+            assert!(
+                projected.is_err(),
+                "named disabled pack must remain refused"
+            );
+        }
+        assert!(
+            !universe.join("fresh").exists(),
+            "projection cannot acquire a world"
+        );
+    }
+    let mut source = OrdinaryRun::start(source_input);
+    assert!(source.until(|run| run.supervisor.snapshot().ready));
+    let original = Arc::new(
+        source
+            .finish()
+            .expect("actual original NativeReady disposal"),
+    );
+    let rules_path = root.join("data/minecraft/game_rules.dat");
+    let rules_before = fs::read(&rules_path).unwrap();
+    let level_before = fs::read(root.join("level.dat")).unwrap();
+    assert!(!GameRules::load(&root).bool("spawn_mobs"));
+    assert_eq!(Level::read(&root).unwrap().game_rules["spawn_mobs"], 0);
+    let request = || {
+        let mut request = world_loading::WorldRequest::new("unused", None, None, true, None)
+            .unwrap()
+            .with_identity_intent(IdentityIntent::RequireExistingIdentity);
+        request.save_root = root.clone();
+        request
+    };
+    for missing in [false, true] {
+        let mut conflicting = GameRules::load(&root);
+        assert!(conflicting.set_string("spawn_mobs", "true"));
+        let mut tag = conflicting.to_nbt().tag;
+        if missing {
+            let horizon_world::nbt::Tag::Compound(values) = &mut tag else {
+                panic!("native rule compound");
+            };
+            let Some(horizon_world::nbt::Tag::Compound(data)) = values.get_mut(&"data".into())
+            else {
+                panic!("native rule data compound");
+            };
+            assert!(data.remove(&"minecraft:spawn_mobs".into()).is_some());
+        }
+        write_dat(&rules_path, tag).unwrap();
+        let conflicting_bytes = fs::read(&rules_path).unwrap();
+        assert!(GameRules::load(&root).bool("spawn_mobs"));
+        let invalid = request().with_ordinary_reopen(original.clone()).unwrap();
+        let OrdinaryServerInput {
+            options,
+            settings,
+            request: invalid,
+            entry,
+            resources,
+            pack,
+            startup,
+            ..
+        } = bundle.input(role, OrdinaryRequest::Native(invalid), None, None);
+        let OrdinaryRequest::Native(invalid) = invalid else {
+            unreachable!()
+        };
+        let mut refused = world_loading::OrdinaryPreparation::prepare(
+            invalid, &resources, &pack, &options, &settings, &entry, startup,
+        );
+        assert!(
+            refused
+                .original_error()
+                .unwrap()
+                .contains("spawn_mobs=false")
+        );
+        assert!(request().with_ordinary_reopen(original.clone()).is_err());
+        refused.begin_close(Instant::now() + Duration::from_secs(120));
+        loop {
+            match refused.poll_close() {
+                PreparationCloseStatus::Pending => std::thread::yield_now(),
+                PreparationCloseStatus::Complete => break,
+                PreparationCloseStatus::Blocked(reason) => {
+                    panic!("conflicting-rule original close blocked: {reason}")
+                }
+            }
+        }
+        refused
+            .finish_close()
+            .unwrap_or_else(|_| panic!("conflicting-rule checked close refused"));
+        assert_eq!(fs::read(&rules_path).unwrap(), conflicting_bytes);
+        assert_eq!(fs::read(root.join("level.dat")).unwrap(), level_before);
+        drop(request().with_ordinary_reopen(original.clone()).unwrap());
+        fs::write(&rules_path, &rules_before).unwrap();
+    }
+    assert!(
+        request().check_ordinary_native_entry().is_err(),
+        "an identity file is not an own-world completion"
+    );
+    let first = request().with_ordinary_reopen(original.clone()).unwrap();
+    first.check_ordinary_native_entry().unwrap();
+    first.check_ordinary_native_entry().unwrap();
+    assert!(
+        request().with_ordinary_reopen(original.clone()).is_err(),
+        "old Arc aliases cannot issue a second request"
+    );
+    let OrdinaryServerInput {
+        options,
+        settings,
+        request: first,
+        entry,
+        resources,
+        pack,
+        gui,
+        cpu,
+        tree,
+        startup,
+        ..
+    } = bundle.input(role, OrdinaryRequest::Native(first), None, None);
+    let activated = bundle
+        .startup
+        .activate(role, false, false, &settings)
+        .unwrap_or_else(|refused| panic!("original runtime activation: {}", refused.reason));
+    let OrdinaryRequest::Native(first) = first else {
+        unreachable!()
+    };
+    let prepared = world_loading::OrdinaryPreparation::prepare(
+        first,
+        &resources,
+        &pack,
+        &options,
+        &settings,
+        &entry,
+        startup.clone(),
+    );
+    let wrong = RetainedEntryIdentity {
+        token: entry.token,
+        owner: Arc::new(()),
+    };
+    let mut refused = match prepared.into_prepared(&wrong) {
+        Err(original) => original,
+        Ok(_) => panic!("different entry allocation adopted the original preparation"),
+    };
+    assert!(
+        request().with_ordinary_reopen(original.clone()).is_err(),
+        "same original claim stays with refused native acquisition"
+    );
+    refused.begin_close(Instant::now() + Duration::from_secs(120));
+    loop {
+        match refused.poll_close() {
+            PreparationCloseStatus::Pending => std::thread::yield_now(),
+            PreparationCloseStatus::Complete => break,
+            PreparationCloseStatus::Blocked(reason) => {
+                panic!("original preparation close blocked: {reason}")
+            }
+        }
+    }
+    assert!(
+        request().with_ordinary_reopen(original.clone()).is_err(),
+        "status is not consuming completion"
+    );
+    let _closed = refused
+        .finish_close()
+        .unwrap_or_else(|_| panic!("actual closed preparation refused finish"));
+    let second = request()
+        .with_ordinary_reopen(original.clone())
+        .expect("same claim returned only after original checked close");
+    let prepared = world_loading::OrdinaryPreparation::prepare(
+        second,
+        &resources,
+        &pack,
+        &options,
+        &settings,
+        &entry,
+        startup.clone(),
+    );
+    let prepared = prepared
+        .into_prepared(&entry)
+        .unwrap_or_else(|_| panic!("original entry association refused"));
+    assert_eq!(prepared.prepared().level.game_rules["spawn_mobs"], 0);
+    assert_eq!(fs::read(&rules_path).unwrap(), rules_before);
+    let mut game = Box::new(
+        Game::new_with_world(
+            &bundle.resources,
+            pack,
+            gui,
+            options,
+            settings,
+            Audio::silent(&bundle.root),
+            Some(cpu),
+            InitialGameWorld::Ordinary(Box::new(prepared)),
+        )
+        .unwrap(),
+    );
+    game.adopt_activated_startup(activated)
+        .unwrap_or_else(|original| panic!("same original runtime transfer: {}", original.1));
+    game.load_world_state();
+    assert!(!game.ui.rules.bool("spawn_mobs"));
+    game.adv.tree = tree;
+    assert!(
+        request().with_ordinary_reopen(original.clone()).is_err(),
+        "adoption spends old aliases permanently"
+    );
+    game.retained_server.as_mut().unwrap().freeze();
+    let mut owner = CloseOwner::begin(
+        game,
+        CloseProfile::NativeWorld,
+        Instant::now() + Duration::from_secs(120),
+    );
+    loop {
+        match owner.poll() {
+            CloseStatus::Pending(_) => std::thread::yield_now(),
+            CloseStatus::NativeReady => break,
+            CloseStatus::Blocked(reason) => panic!("actual reopened native close: {reason}"),
+        }
+    }
+    let ready = owner
+        .try_native_ready()
+        .unwrap_or_else(|_| panic!("actual NativeReady transfer refused"));
+    let mut disposed = ready
+        .try_dispose_server()
+        .unwrap_or_else(|(_, reason)| panic!("actual native disposal: {reason}"));
+    let next = Arc::new(
+        disposed
+            .take_ordinary_world()
+            .expect("new actual completion"),
+    );
+    assert!(!GameRules::load(&root).bool("spawn_mobs"));
+    assert!(
+        request().with_ordinary_reopen(original).is_err(),
+        "later completion cannot revive spent aliases"
+    );
+    assert!(
+        request().with_ordinary_reopen(next).is_ok(),
+        "only the newly completed owner can reopen again"
+    );
+}
+
+#[cfg(all(
+    feature = "mods",
+    target_os = "linux",
+    feature = "native-writer-test-control",
+    debug_assertions
+))]
+fn ordinary_tree(root: &std::path::Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+    fn visit(
+        root: &std::path::Path,
+        at: &std::path::Path,
+        files: &mut std::collections::BTreeMap<PathBuf, Vec<u8>>,
+    ) {
+        for entry in fs::read_dir(at).unwrap() {
+            let path = entry.unwrap().path();
+            let metadata = fs::symlink_metadata(&path).unwrap();
+            assert!(!metadata.is_symlink());
+            if metadata.is_dir() {
+                visit(root, &path, files);
+            } else {
+                assert!(metadata.is_file());
+                files.insert(
+                    path.strip_prefix(root).unwrap().to_path_buf(),
+                    fs::read(path).unwrap(),
+                );
+            }
+        }
+    }
+    let mut files = std::collections::BTreeMap::new();
+    visit(root, root, &mut files);
+    files
+}
+
+#[cfg(all(
+    feature = "mods",
+    target_os = "linux",
+    feature = "native-writer-test-control",
+    debug_assertions
+))]
+fn ordinary_refusal_source(
+    bundle: &OrdinaryBundle,
+    label: &str,
+) -> (Arc<OrdinaryControl>, OrdinaryRequest, PathBuf, PathBuf) {
+    let control = bundle.control(label, OrdinaryDomainKind::Native);
+    let root = control.archive.parent().unwrap().join("source-world");
+    let mut request = world_loading::WorldRequest::new("unused", Some(label), Some(17), true, None)
+        .unwrap()
+        .with_identity_intent(world_loading::host_identity::IdentityIntent::CreateNewIdentity)
+        .with_session_authority(control.namespace.clone());
+    request.save_root = root.clone();
+    let role = execution_role::ExecutionRole::DedicatedServer;
+    let mut source = OrdinaryRun::start(bundle.input(
+        role,
+        OrdinaryRequest::Native(request),
+        Some(control.clone()),
+        Some(control.archive.clone()),
+    ));
+    assert!(source.until(|run| run.supervisor.snapshot().ready));
+    source.connect(bundle, true, "OrdinaryA");
+    source.connect(bundle, true, "OrdinaryB");
+    assert!(source.until(|run| {
+        run.clients
+            .iter()
+            .all(|client| client.login && client.terrain)
+            && run.supervisor.snapshot().installed == 2
+            && run
+                .supervisor
+                .snapshot()
+                .players
+                .iter()
+                .all(|player| player["loaded"] == true)
+    }));
+    control.capture_requested.store(true, Ordering::SeqCst);
+    assert!(source.until(|_| control.captured_once.load(Ordering::SeqCst)));
+    let captured = control.source.lock().unwrap().take().unwrap();
+    let closed = source
+        .finish()
+        .expect("actual coherent source native completion");
+    super::super::levels::session_checkpoint::tests::verify_ordinary_fixture_final_players(
+        &root,
+        &captured.observation,
+    )
+    .unwrap();
+    let destination = root.parent().unwrap().join("recovered");
+    let request = captured
+        .source
+        .into_request(
+            closed,
+            destination.clone(),
+            Instant::now() + Duration::from_secs(120),
+        )
+        .unwrap_or_else(|(_, _, error)| panic!("actual refusal source association: {error}"));
+    (
+        control,
+        OrdinaryRequest::Recover(Box::new(request)),
+        root,
+        destination,
+    )
+}
+
+#[cfg(all(
+    feature = "mods",
+    target_os = "linux",
+    feature = "native-writer-test-control",
+    debug_assertions
+))]
+#[test]
+#[ignore = "isolated pinned resources and prepared pair: actual partial recovery cancel/wrong participant, original writer deadline and exact Retry without publication"]
+fn ordinary_recovery_refusals_and_original_writer_retry_preserve_unpublished_owners() {
+    let bundle = OrdinaryBundle::new("recovery-refusals");
+    for (label, wrong, blocked) in [
+        ("cancel", false, false),
+        ("wrong", true, false),
+        ("writer-cancel", false, true),
+    ] {
+        let (control, request, source, destination) = ordinary_refusal_source(&bundle, label);
+        let source_before = ordinary_tree(&source);
+        let archive_before = ordinary_tree(&control.archive);
+        let writer = Arc::new(OrdinaryRecoveryWriter::default());
+        let mut input = bundle.input(
+            execution_role::ExecutionRole::DedicatedServer,
+            request,
+            Some(control.clone()),
+            None,
+        );
+        if blocked {
+            input.test.ordinary_recovery_writer = Some(writer.clone());
+        }
+        let mut recovered = OrdinaryRun::start(input);
+        // Declared after the original run: root releases the actual batch and
+        // retries an already-blocked attempt before the run's fatal-drop guard.
+        let _release = OrdinaryWriterRelease {
+            writer: writer.clone(),
+            commands: recovered.supervisor.commands.clone(),
+            view: recovered.supervisor.view.clone(),
+        };
+        assert!(
+            recovered.until(|run| run.supervisor.snapshot().phase == "RecoveryJoining"
+                && run.supervisor.snapshot().ready)
+        );
+        recovered.connect(&bundle, true, "OrdinaryA");
+        assert!(recovered.until(|run| run.supervisor.snapshot().guests == 1
+            && run.clients[0].admission.is_some()
+            && !run.publication_seen));
+        assert!(control.recovered.lock().unwrap().is_none());
+        if blocked {
+            let entered = {
+                let mut owned = writer.control.lock().unwrap();
+                owned
+                    .as_mut()
+                    .map(|control| control.wait_entered(Duration::from_secs(10)))
+            };
+            entered.expect("original writer receipt").unwrap();
+        }
+        recovered.closing = true;
+        let expected = if wrong {
+            recovered.connect(&bundle, true, "WrongRecoveryB");
+            "session checkpoint NotPublished (0 item identities assigned): checked recovery profile missing from original Guests"
+        } else {
+            recovered.supervisor.request_close();
+            "ordinary recovery cancelled before verified activation"
+        };
+        if blocked {
+            assert!(recovered.until(|run| run.supervisor.snapshot().blocked.is_some()));
+            let view = recovered.supervisor.snapshot();
+            assert_eq!(view.phase, "RecoveryClosing");
+            assert_eq!(view.original_error.as_deref(), Some(expected));
+            assert!(
+                view.blocked.as_deref().unwrap().contains("writer"),
+                "{view:?}"
+            );
+            assert!(!view.worker_joined && !recovered.supervisor.finished());
+            assert!(
+                writer
+                    .original
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .upgrade()
+                    .is_some()
+            );
+            assert!(
+                control
+                    .namespace
+                    .acquire_recovery(
+                        &source,
+                        &control.archive,
+                        &source.parent().unwrap().join("still-owned")
+                    )
+                    .is_err()
+            );
+            recovered
+                .supervisor
+                .commands
+                .send(Command::Retry(view.attempt + 1))
+                .unwrap();
+            // The close loop handles at most16 commands before publishing its
+            // next View. These ordered refused offers prove the stale command
+            // was consumed and its effect published, without a timing guess.
+            for _ in 0..17 {
+                let (reply, receive) = mpsc::channel();
+                recovered
+                    .supervisor
+                    .commands
+                    .send(Command::Offer(reply))
+                    .unwrap();
+                match receive.recv_timeout(Duration::from_secs(10)).unwrap() {
+                    Err(reason) => assert_eq!(reason, "original recovery is closing"),
+                    Ok(pipe) => {
+                        pipe.shutdown();
+                        panic!("closing recovery unexpectedly published a Memory offer");
+                    }
+                }
+            }
+            recovered.pump();
+            let stale = recovered.supervisor.snapshot();
+            assert_eq!(stale.attempt, view.attempt);
+            assert_eq!(stale.original_error, view.original_error);
+            assert_eq!(stale.blocked, view.blocked);
+            let triggered = {
+                let mut owned = writer.control.lock().unwrap();
+                owned.as_mut().map(|control| control.trigger())
+            };
+            triggered.expect("same original writer receipt").unwrap();
+            drop(writer.control.lock().unwrap().take());
+            recovered
+                .supervisor
+                .commands
+                .send(Command::Retry(view.attempt))
+                .unwrap();
+            assert!(
+                recovered.until(|run| run.supervisor.finished()),
+                "exact original retry: {:?}",
+                recovered.supervisor.snapshot()
+            );
+            assert_eq!(recovered.supervisor.snapshot().attempt, view.attempt + 1);
+        }
+        let (error, completion) = recovered.finish_refusal("RecoveryClosing");
+        assert_eq!(error, expected);
+        assert!(completion.is_none() && !recovered.publication_seen);
+        assert!(control.recovered.lock().unwrap().is_none());
+        assert!(
+            fs::read_dir(&control.continuation)
+                .unwrap()
+                .next()
+                .is_none()
+        );
+        assert_eq!(ordinary_tree(&source), source_before);
+        assert_eq!(ordinary_tree(&control.archive), archive_before);
+        if blocked {
+            assert!(
+                writer
+                    .original
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .upgrade()
+                    .is_none()
+            );
+        }
+        let lease = control
+            .namespace
+            .acquire_recovery(
+                &source,
+                &control.archive,
+                &source.parent().unwrap().join("released-check"),
+            )
+            .unwrap();
+        drop(lease);
+        assert!(!GameRules::load(&destination).bool("spawn_mobs"));
+        eprintln!(
+            "ORDINARY_RECOVERY_REFUSAL={label} original_error_preserved=true unpublished=true actual_writer_block={blocked}"
+        );
+    }
+}
+
+#[cfg(all(feature = "mods", target_os = "linux"))]
+#[test]
+#[ignore = "isolated pinned resources and prepared pair: actual ordinary pending/untouched integrated native owner preserves original no-position record"]
+fn ordinary_initial_pending_and_untouched_owner_keep_original_native_record() {
+    let bundle = OrdinaryBundle::new("initial-owners");
+    for untouched in [false, true] {
+        let label = if untouched { "untouched" } else { "pending" };
+        let control = bundle.control(label, OrdinaryDomainKind::Native);
+        let root = control.archive.parent().unwrap().join("world");
+        let mut request =
+            world_loading::WorldRequest::new("unused", Some(label), Some(17), true, None)
+                .unwrap()
+                .with_identity_intent(
+                    world_loading::host_identity::IdentityIntent::CreateNewIdentity,
+                )
+                .with_session_authority(control.namespace.clone());
+        request.save_root = root.clone();
+        let mut input = bundle.input(
+            execution_role::ExecutionRole::IntegratedServer,
+            OrdinaryRequest::Native(request),
+            None,
+            None,
+        );
+        input.test.stop_on_untouched_join = untouched;
+        let mut run = OrdinaryRun::start(input);
+        assert!(run.until(|run| run.supervisor.snapshot().ready));
+        let record = Level::read(&root).unwrap().player_uuid.unwrap();
+        let uuid = record
+            .iter()
+            .fold(0u128, |id, part| (id << 32) | u128::from(*part as u32));
+        let path = horizon_client::lan::playerdata::path(&root, uuid);
+        let original = fs::read(&path).unwrap();
+        assert!(
+            read_dat_checked(&path)
+                .unwrap()
+                .unwrap()
+                .get("Pos")
+                .is_none()
+        );
+        if untouched {
+            run.closing = true;
+            run.connect(&bundle, false, "OrdinaryOwner");
+            let (error, completion) = run.finish_refusal("NativeDisposed");
+            assert_eq!(error, "controlled untouched original Joined stop");
+            assert!(completion.is_some());
+            assert!(run.supervisor.snapshot().pending_events > 0);
+        } else {
+            assert!(run.finish().is_some());
+        }
+        let view = run.supervisor.snapshot();
+        assert!(view.worker_joined && view.owner_saved && view.installed == 0);
+        assert!(!run.publication_seen);
+        assert!(view.players.iter().all(|player| player["body"] == false
+            && player["loaded"] == false
+            && player["placed"] == false));
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert!(
+            read_dat_checked(&path)
+                .unwrap()
+                .unwrap()
+                .get("Pos")
+                .is_none()
+        );
+        assert!(fs::read_dir(&control.archive).unwrap().next().is_none());
+        assert!(!GameRules::load(&root).bool("spawn_mobs"));
+        eprintln!(
+            "ORDINARY_INITIAL_OWNER={label} original_no_position_bytes_retained=true installed=0"
+        );
+    }
+}
+
 #[derive(Default)]
 pub(super) struct Gate {
     entered: AtomicBool,
@@ -42,6 +1568,15 @@ impl Gate {
 
 #[derive(Clone, Default)]
 pub(in crate::game) struct Startup {
+    #[cfg(all(feature = "mods", target_os = "linux"))]
+    pub(in crate::game) ordinary: Option<Arc<OrdinaryControl>>,
+    #[cfg(all(
+        feature = "mods",
+        target_os = "linux",
+        feature = "native-writer-test-control",
+        debug_assertions
+    ))]
+    pub(in crate::game) ordinary_recovery_writer: Option<Arc<OrdinaryRecoveryWriter>>,
     pub(super) fail_after_streaming: bool,
     pub(in crate::game) stop_on_untouched_join: bool,
     staging: Option<PathBuf>,

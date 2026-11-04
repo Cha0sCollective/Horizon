@@ -56,8 +56,198 @@ struct Setup {
     level_name: String,
     port: Option<u16>,
     started: Instant,
+    #[cfg(feature = "paired-packages")]
+    working_directory: PathBuf,
 }
 static SETUP: OnceLock<Mutex<Option<Setup>>> = OnceLock::new();
+
+fn take_setup() -> Result<Setup> {
+    SETUP
+        .get()
+        .and_then(|slot| slot.lock().unwrap().take())
+        .ok_or_else(|| "dedicated server not prepared".into())
+}
+
+/// Owned projection of the actual one-shot preflight snapshot. Configuration
+/// custody only; native world and player authority still come from preparation.
+#[cfg(feature = "paired-packages")]
+pub(super) struct RetainedSetup {
+    pub(super) props: ServerProperties,
+    pub(super) universe: PathBuf,
+    pub(super) level_name: String,
+    pub(super) port: Option<u16>,
+    pub(super) started: Instant,
+    pub(super) working_directory: PathBuf,
+}
+#[cfg(feature = "paired-packages")]
+pub(super) fn take_retained_setup() -> Result<RetainedSetup> {
+    let Setup {
+        props,
+        universe,
+        level_name,
+        port,
+        started,
+        working_directory,
+    } = take_setup()?;
+    Ok(RetainedSetup {
+        props,
+        universe,
+        level_name,
+        port,
+        started,
+        working_directory,
+    })
+}
+#[cfg(feature = "paired-packages")]
+impl RetainedSetup {
+    /// Project the original parsed snapshot; never reload server.properties or
+    /// run the legacy console/authentication/world-generation startup.
+    pub(super) fn retained_world_inputs(
+        &self,
+        options: &Options,
+    ) -> Result<(WorldRequest, horizon_client::lan::RetainedOfflineConfig)> {
+        use super::{execution_role::ExecutionRole, world_loading::host_identity::IdentityIntent};
+        let props = &self.props;
+        if options.execution_role != ExecutionRole::DedicatedServer
+            || options.dedicated.is_none()
+            || !options.test_terrain
+            || !options.mod_packages.has_pairs()
+            || props.online_mode
+            || props.game_mode != 1
+            || props.hardcore
+            || props.max_players != 2
+            || props.view_distance != 2
+            || props.simulation_distance != 2
+            || props.spawn_protection != 0
+            || props.white_list
+            || props.enforce_whitelist
+            || props.enable_query
+            || props.enable_rcon
+            || props.management_server_enabled
+            || props.enable_jmx_monitoring
+            || props.code_of_conduct
+            || props.accepts_transfers
+            || props.resource_pack.is_some()
+            || !props.bug_report_link.is_empty()
+            || !props.text_filtering_config.is_empty()
+            || props.initial_enabled_packs != ["vanilla"]
+            // Native CSV parsing represents a blank disabled-pack list with an
+            // empty entry. Refuse named packs rather than the parser's wrapper.
+            || props.initial_disabled_packs.iter().any(|id| !id.is_empty())
+            || !matches!(props.level_type.as_str(), "normal" | "minecraft:normal")
+            || !matches!(&props.generator_settings, horizon_client::server::json::Json::Object(settings) if settings.is_empty())
+            || !props.generate_structures
+            || props.player_idle_timeout != 0
+            || props.pause_when_empty_seconds != 0
+            || props.rate_limit != 0
+        {
+            return Err("selected paired dedicated S1 requires explicit offline creative two-player test terrain, distances 2/2, zero spawn protection/idle/pause, and no additional services or policies".into());
+        }
+        for file in [
+            "ops.json",
+            "whitelist.json",
+            "banned-players.json",
+            "banned-ips.json",
+        ] {
+            match std::fs::symlink_metadata(self.working_directory.join(file)) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+                Ok(_) => {
+                    return Err(format!(
+                        "selected paired dedicated S1 refuses unsupported access-list file {file}"
+                    )
+                    .into());
+                }
+            }
+        }
+        let name = std::path::Path::new(&self.level_name);
+        if name.components().count() != 1
+            || !matches!(
+                name.components().next(),
+                Some(std::path::Component::Normal(_))
+            )
+            || self
+                .universe
+                .components()
+                .any(|part| matches!(part, std::path::Component::ParentDir))
+        {
+            return Err(
+                "selected paired dedicated world requires one name within its explicit universe"
+                    .into(),
+            );
+        }
+        let parent = std::fs::canonicalize(self.working_directory.join(&self.universe))?;
+        let root = parent.join(&self.level_name);
+        let intent = match std::fs::symlink_metadata(&root) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                IdentityIntent::CreateNewIdentity
+            }
+            Err(error) => return Err(error.into()),
+            Ok(_) => IdentityIntent::RequireExistingIdentity,
+        };
+        let mut request = WorldRequest::new(
+            &self.level_name,
+            Some(&self.level_name),
+            Some(props.seed),
+            true,
+            None,
+        )?
+        .with_identity_intent(intent);
+        request.save_root = root;
+        let port = match self.port {
+            Some(port) => port,
+            None => {
+                u16::try_from(props.server_port).map_err(|_| "dedicated port is out of range")?
+            }
+        };
+        let bind = if props.server_ip.is_empty() {
+            None
+        } else {
+            Some(
+                props
+                    .server_ip
+                    .parse()
+                    .map_err(|_| "invalid captured dedicated bind address")?,
+            )
+        };
+        if !(-1..=2_097_152).contains(&props.network_compression_threshold) {
+            return Err("dedicated compression threshold exceeds retained bounds".into());
+        }
+        Ok((
+            request,
+            horizon_client::lan::RetainedOfflineConfig {
+                bind,
+                port,
+                motd: props.motd.clone(),
+                max_players: 2,
+                compression_threshold: props.network_compression_threshold,
+                enable_status: props.enable_status,
+                hide_online_players: props.hide_online_players,
+                announce: false,
+            },
+        ))
+    }
+}
+
+#[cfg(feature = "paired-packages")]
+fn retained_args_supported(args: &[String]) -> Result<()> {
+    let mut input = args.iter();
+    while let Some(arg) = input.next() {
+        match arg.trim_start_matches('-') {
+            "nogui" | "help" | "initSettings" => {}
+            "world" | "universe" | "port" => {
+                input.next().ok_or("missing dedicated option value")?;
+            }
+            _ => {
+                return Err(format!(
+                    "selected paired S1 dedicated startup refuses {arg} before preflight effects"
+                )
+                .into());
+            }
+        }
+    }
+    Ok(())
+}
 /// usercache.json (Services.nameToIdCache): used by the server thread only.
 static USER_CACHE: Mutex<Option<UserCache>> = Mutex::new(None);
 
@@ -114,6 +304,10 @@ fn capture_log(f: impl FnOnce()) -> Vec<String> {
 /// back at once), eula.txt. False when the process should stop here.
 pub(super) fn preflight(options: &mut Options) -> Result<bool> {
     let args = options.dedicated.clone().unwrap_or_default();
+    #[cfg(feature = "paired-packages")]
+    if options.mod_packages.has_pairs() {
+        retained_args_supported(&args)?;
+    }
     let mut universe = PathBuf::from(".");
     let mut world = None;
     let mut port = None;
@@ -205,6 +399,8 @@ pub(super) fn preflight(options: &mut Options) -> Result<bool> {
             level_name,
             port,
             started,
+            #[cfg(feature = "paired-packages")]
+            working_directory: std::env::current_dir()?,
         });
     Ok(true)
 }
@@ -450,10 +646,8 @@ impl Game<'_> {
             level_name,
             port,
             started,
-        } = SETUP
-            .get()
-            .and_then(|m| m.lock().unwrap().take())
-            .ok_or("dedicated server not prepared")?;
+            ..
+        } = take_setup()?;
         // Main's WorldLoader: a new world's dimensions come from
         // server.properties before the server starts.
         let world_dir = std::env::current_dir()?.join(&universe).join(&level_name);

@@ -1317,6 +1317,23 @@ impl Title {
     /// The action and whether to play `AbstractWidget.playButtonClickSound`.
     /// Navigation buttons can return `Action::None` while still sounding.
     pub fn click(&mut self, x: f32, y: f32, size: (f32, f32)) -> (Action, bool) {
+        self.click_inner(x, y, size, false)
+    }
+    /// Fixed local entry surface. Refuse discovery and world management BEFORE
+    /// click_action can acquire helpers or mutate files; legacy click is intact.
+    pub fn click_local_world_entry(&mut self, x: f32, y: f32, size: (f32, f32)) -> (Action, bool) {
+        self.click_inner(x, y, size, true)
+    }
+    fn click_inner(
+        &mut self,
+        x: f32,
+        y: f32,
+        size: (f32, f32),
+        local_entry: bool,
+    ) -> (Action, bool) {
+        if local_entry && !self.local_world_entry_mode() {
+            return (Action::None, false);
+        }
         self.remember_direct_address();
         // The game rules take the press in `press_rules`, which has the atlas.
         if self.rules.get_mut().is_some() {
@@ -1339,6 +1356,16 @@ impl Title {
             .into_iter()
             .find(|b| b.enabled && x >= b.x && x < b.x + b.w && y >= b.y && y < b.y + 20.0)
             .map(|b| b.id);
+        if local_entry
+            && matches!(
+                (&self.mode, hit),
+                (Mode::Main, Some(4 | 5))
+                    | (Mode::Select { .. }, Some(13..=15))
+                    | (Mode::Create { .. }, Some(25..=28))
+            )
+        {
+            return (Action::None, false);
+        }
         if matches!(self.mode, Mode::CreateFlat { .. }) {
             self.flat_click(x, y, (w, h), hit);
             return (Action::None, hit.is_some());
@@ -1347,6 +1374,13 @@ impl Title {
         // World list selection is silent; launching its selected entry sounds.
         let sound = hit.is_some() || matches!(action, Action::Play { .. });
         (action, sound)
+    }
+    /// Keyboard entry uses the same fixed mode boundary as mouse entry.
+    pub fn local_world_entry_mode(&self) -> bool {
+        matches!(
+            self.mode,
+            Mode::Main | Mode::Select { .. } | Mode::Create { .. } | Mode::Error { .. }
+        )
     }
     fn click_action(&mut self, x: f32, y: f32, (w, h): (f32, f32), hit: Option<u8>) -> Action {
         match (&mut self.mode, hit) {
@@ -1819,6 +1853,86 @@ fn wrapped(atlas: &HudAtlas, text: &str, width: f32) -> Vec<String> {
         .map(|t| t.plain())
         .collect()
 }
+#[cfg(test)]
+mod local_world_entry_tests {
+    use super::*;
+    fn press(title: &mut Title, id: u8) -> (Action, bool) {
+        let button = title
+            .buttons(480.0, 300.0)
+            .into_iter()
+            .find(|b| b.id == id)
+            .expect("real title button");
+        assert!(button.enabled);
+        title.click_local_world_entry(button.x + 1.0, button.y + 1.0, (480.0, 300.0))
+    }
+    #[test]
+    fn local_entry_fences_effects_before_real_button_dispatch() {
+        let root = std::env::temp_dir().join(format!("horizon-local-title-{}", std::process::id()));
+        let mut title = Title::new(root.join("saves"), &root);
+        for id in [4, 5] {
+            assert_eq!(press(&mut title, id), (Action::None, false));
+            assert!(
+                matches!(title.mode, Mode::Main),
+                "no discovery/friends transition"
+            );
+            assert!(title.backup.is_none());
+        }
+        assert_eq!(press(&mut title, 2).0, Action::Quit);
+        press(&mut title, 1);
+        // Horizon opens creation directly when the real world list is empty.
+        assert!(matches!(title.mode, Mode::Create { .. }));
+        assert!(title.local_world_entry_mode());
+        assert!(matches!(title.create_action(), Action::Create { .. }));
+        let world = WorldEntry {
+            folder: "owned".into(),
+            name: "Owned".into(),
+            creative: true,
+            modified: std::time::SystemTime::UNIX_EPOCH,
+            commands: false,
+            version: "26.3".into(),
+        };
+        title.mode = Mode::Select {
+            worlds: vec![world.clone()],
+            selected: Some(0),
+        };
+        press(&mut title, 11);
+        assert!(matches!(title.mode, Mode::Create { .. }));
+        title.mode = Mode::Select {
+            worlds: vec![world.clone()],
+            selected: Some(0),
+        };
+        for id in [13, 14, 15] {
+            assert_eq!(press(&mut title, id), (Action::None, false));
+            assert!(matches!(
+                title.mode,
+                Mode::Select {
+                    selected: Some(0),
+                    ..
+                }
+            ));
+            assert!(title.backup.is_none(), "no detached backup worker");
+        }
+        assert_eq!(
+            press(&mut title, 10).0,
+            Action::Play {
+                folder: "owned".into()
+            }
+        );
+        title.mode = Mode::Edit {
+            world,
+            name: "Owned".into(),
+            focused: true,
+        };
+        assert!(
+            !title.local_world_entry_mode(),
+            "keyboard must not enter metadata editing"
+        );
+        assert_eq!(press(&mut title, 32), (Action::None, false));
+        assert!(matches!(title.mode, Mode::Edit { .. }));
+        assert!(title.backup.is_none());
+    }
+}
+
 const SEARCH: crate::clipboard::FieldId = ("world.search", 0);
 const EDIT_NAME: crate::clipboard::FieldId = ("world.edit-name", 0);
 const WORLD_NAME: crate::clipboard::FieldId = ("world.name", 0);

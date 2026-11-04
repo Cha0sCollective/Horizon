@@ -11,6 +11,8 @@ use horizon_client::streaming::{
 };
 
 pub(super) enum GameStreaming {
+    #[cfg(feature = "paired-packages")]
+    Vacant,
     Existing(Box<Streaming>),
     #[cfg(feature = "paired-packages")]
     RetainedRemote {
@@ -23,6 +25,25 @@ pub(super) enum GameStreaming {
 pub(super) struct ExistingUnavailable;
 
 impl GameStreaming {
+    #[cfg(feature = "paired-packages")]
+    pub(super) fn vacant() -> Self {
+        Self::Vacant
+    }
+    #[cfg(feature = "paired-packages")]
+    pub(super) fn is_vacant(&self) -> bool {
+        matches!(self, Self::Vacant)
+    }
+    /// No old owner is fabricated. Refusal leaves this destination untouched
+    /// and returns the exact original incoming stream.
+    #[cfg(feature = "paired-packages")]
+    #[allow(clippy::result_large_err)] // Refusal returns the SAME complete incoming pool.
+    pub(super) fn try_install_vacant(&mut self, incoming: Streaming) -> Result<(), Streaming> {
+        if !self.is_vacant() {
+            return Err(incoming);
+        }
+        *self = Self::from_existing(incoming);
+        Ok(())
+    }
     pub(super) fn from_existing(streaming: Streaming) -> Self {
         Self::Existing(Box::new(streaming))
     }
@@ -31,7 +52,7 @@ impl GameStreaming {
         match self {
             Self::Existing(streaming) => Ok(streaming),
             #[cfg(feature = "paired-packages")]
-            Self::RetainedRemote { .. } => Err(ExistingUnavailable),
+            Self::RetainedRemote { .. } | Self::Vacant => Err(ExistingUnavailable),
         }
     }
 
@@ -39,7 +60,7 @@ impl GameStreaming {
         match self {
             Self::Existing(streaming) => Ok(streaming),
             #[cfg(feature = "paired-packages")]
-            Self::RetainedRemote { .. } => Err(ExistingUnavailable),
+            Self::RetainedRemote { .. } | Self::Vacant => Err(ExistingUnavailable),
         }
     }
 
@@ -59,6 +80,8 @@ impl GameStreaming {
             Self::Existing(streaming) => Ok(*streaming),
             #[cfg(feature = "paired-packages")]
             original @ Self::RetainedRemote { .. } => Err(original),
+            #[cfg(feature = "paired-packages")]
+            original @ Self::Vacant => Err(original),
         }
     }
 
@@ -71,7 +94,7 @@ impl GameStreaming {
         match self {
             Self::Existing(current) => Ok(*std::mem::replace(current, Box::new(incoming))),
             #[cfg(feature = "paired-packages")]
-            Self::RetainedRemote { .. } => Err(incoming),
+            Self::RetainedRemote { .. } | Self::Vacant => Err(incoming),
         }
     }
 
@@ -170,6 +193,44 @@ mod tests {
             game.pack.context.clone(),
             1,
         )
+    }
+
+    #[test]
+    #[ignore = "pinned Game-bin resources: actual incoming stream and one-shot vacant installation"]
+    fn vacant_has_no_worker_and_installs_the_original_incoming_stream_once() {
+        let fixture = Fixture::new("stream-owner-vacant");
+        let game = fixture.game();
+        let mut slot = GameStreaming::vacant();
+        assert!(slot.is_vacant());
+        assert!(slot.as_existing().is_err());
+        assert!(slot.remote_observation().is_none());
+        slot.begin_remote_close(Instant::now() + Duration::from_secs(1));
+        assert!(!slot.poll_remote_close());
+        let incoming = original(&game);
+        let source = incoming.lod_source();
+        let observations = incoming.observe_native_work().origins;
+        let incoming = match slot.try_replace_existing(incoming) {
+            Err(incoming) => incoming,
+            Ok(_) => panic!("vacancy falsely replaced an old owner"),
+        };
+        assert!(slot.is_vacant());
+        assert!(slot.try_install_vacant(incoming).is_ok());
+        assert!(!slot.is_vacant());
+        assert!(Arc::ptr_eq(&source, &slot.expect_existing().lod_source()));
+        assert_eq!(
+            slot.expect_existing().observe_native_work().origins,
+            observations
+        );
+        let second = original(&game);
+        let second_source = second.lod_source();
+        let second = match slot.try_install_vacant(second) {
+            Err(second) => second,
+            Ok(()) => panic!("second vacant installation replaced the actual original stream"),
+        };
+        assert!(Arc::ptr_eq(&second_source, &second.lod_source()));
+        assert!(Arc::ptr_eq(&source, &slot.expect_existing().lod_source()));
+        drop(second);
+        drop(slot);
     }
 
     #[test]

@@ -2,6 +2,74 @@
 //! a real display and complete pinned resources; absent inputs are failures.
 use super::*;
 
+pub(super) fn hold_ordinary_rest_loader() -> std::result::Result<(), String> {
+    if std::env::var("HORIZON_INTEGRATED_WINDOW_GATE")
+        .ok()
+        .as_deref()
+        != Some("ordinary-rest")
+    {
+        return Ok(());
+    }
+    let root = PathBuf::from(
+        std::env::var_os("HORIZON_RETAINED_CLIENT_ROOT").ok_or("missing ordinary gate root")?,
+    );
+    if !root.is_dir() {
+        return Err("missing original ordinary gate directory".into());
+    }
+    eprintln!("ORDINARY_ORIGINAL_REST_HELD");
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while !root.join("release-ordinary-rest").exists() {
+        if Instant::now() >= deadline {
+            return Err("ordinary original resource gate timed out".into());
+        }
+        std::thread::sleep(Duration::from_millis(8));
+    }
+    eprintln!("ORDINARY_ORIGINAL_REST_RELEASED");
+    Ok(())
+}
+
+#[test]
+#[cfg(feature = "mods")]
+#[ignore = "requires isolated real X11, paired resources, and actual title/WM close input"]
+fn ordinary_frontend_actual_held_loader_window_child() {
+    let root = PathBuf::from(std::env::var_os("HORIZON_RETAINED_CLIENT_ROOT").expect("fresh root"));
+    assert_eq!(std::env::current_dir().unwrap(), root);
+    assert!(!root.join("release-ordinary-rest").exists());
+    assert_eq!(
+        std::env::var("HORIZON_INTEGRATED_WINDOW_GATE").unwrap(),
+        "ordinary-rest"
+    );
+    let resources = PathBuf::from(
+        std::env::var_os("HORIZON_RETAINED_CLIENT_RESOURCES").expect("pinned resources"),
+    );
+    let pair = std::env::var("HORIZON_TEST_PAIR_FIXTURE").expect("selected package pair");
+    let mut options = Options::read_from(vec![
+        "--resources".into(),
+        resources.to_string_lossy().into_owned(),
+        "--dev-mod".into(),
+        pair,
+        "--test-terrain".into(),
+        "--width".into(),
+        "960".into(),
+        "--height".into(),
+        "600".into(),
+    ])
+    .unwrap()
+    .unwrap()
+    .options;
+    let mut settings = Settings::load(&root.join("options.txt"));
+    settings.horizon.lod_distance = 0;
+    settings.controller.enabled = false;
+    options.mod_packages =
+        mod_packages::Packages::read(&settings.mods.enabled, &options.dev_mods).unwrap();
+    assert!(options.mod_packages.has_pairs());
+    run_ordinary(options, settings, resources, Instant::now()).unwrap();
+    assert!(root.join("release-ordinary-rest").is_file());
+    assert!(!root.join("saves").exists());
+    assert!(!root.join(".horizon-title").exists());
+    eprintln!("ORDINARY_ORIGINAL_FRONTEND_COMPLETED_WITHOUT_WORLD");
+}
+
 pub(super) fn hold_integrated_stage(stage: &str) -> bool {
     std::env::var("HORIZON_INTEGRATED_WINDOW_GATE")
         .ok()

@@ -834,6 +834,29 @@ pub struct RetainedColumnTicket {
     serial: u64,
 }
 
+/// Correlation for one original saved read while its native producer is open.
+/// This type cannot be used as a close-column or completion ticket.
+#[cfg(feature = "paired-packages")]
+pub struct RetainedOpenLoadTicket {
+    allocation: Arc<Shared>,
+    serial: u64,
+}
+#[cfg(feature = "paired-packages")]
+pub struct RetainedOpenLoad<'a> {
+    load: &'a crate::save::RetainedNativeLoad,
+    ticket: RetainedOpenLoadTicket,
+}
+#[cfg(feature = "paired-packages")]
+impl<'a> RetainedOpenLoad<'a> {
+    pub fn load(&self) -> &'a crate::save::RetainedNativeLoad {
+        self.load
+    }
+    /// The caller must validate the original records and decoded projection.
+    pub fn into_ticket(self) -> RetainedOpenLoadTicket {
+        self.ticket
+    }
+}
+
 #[cfg(feature = "paired-packages")]
 pub struct RetainedFinishedColumn<'a> {
     chunk: &'a Arc<Chunk>,
@@ -911,6 +934,8 @@ struct RetainedStream {
     armed: bool,
     workers: usize,
     close: Option<RetainedProducerClose>,
+    open_load: Option<ReceivedWork>,
+    open_serial: u64,
     startup_error: Option<String>,
     finished_backlog: Vec<(Arc<Chunk>, Option<WorkLease>)>,
     proto_batches: Vec<RetainedProtoBatch>,
@@ -1479,6 +1504,8 @@ impl Streaming {
                     armed: true,
                     workers: 0,
                     close: None,
+                    open_load: None,
+                    open_serial: 0,
                     startup_error: None,
                     finished_backlog: Vec::new(),
                     proto_batches: Vec::new(),
@@ -1495,6 +1522,8 @@ impl Streaming {
                     armed: true,
                     workers: 0,
                     close: None,
+                    open_load: None,
+                    open_serial: 0,
                     startup_error: None,
                     finished_backlog: Vec::new(),
                     proto_batches: Vec::new(),
@@ -3322,6 +3351,130 @@ impl RetainedProducerClose {
 
 #[cfg(feature = "paired-packages")]
 impl Streaming {
+    /// After update collects results, borrow one original saved read without
+    /// sealing the producer. Pending/refused input remains owned here for close.
+    pub fn poll_retained_open_load(&mut self) -> Result<Option<RetainedOpenLoad<'_>>, String> {
+        let retained = self
+            .retained
+            .as_ref()
+            .ok_or("streaming was not started retained")?;
+        if retained.close.is_some() {
+            return Err("open saved-load handoff after close began".into());
+        }
+        if retained.open_load.is_none() {
+            let serial = retained
+                .open_serial
+                .checked_add(1)
+                .ok_or("open saved-load serial exhausted")?;
+            let mut selected = None;
+            for work in self.take_deferred() {
+                if selected.is_none() && matches!(&work.done, Done::RetainedLoad(..)) {
+                    selected = Some(work);
+                } else {
+                    self.defer(work);
+                }
+            }
+            if let Some(work) = selected {
+                let retained = self.retained.as_mut().unwrap();
+                retained.open_serial = serial;
+                retained.open_load = Some(work);
+            }
+        }
+        let retained = self.retained.as_ref().unwrap();
+        let Some(work) = &retained.open_load else {
+            return Ok(None);
+        };
+        let Done::RetainedLoad(x, z, load) = &work.done else {
+            unreachable!()
+        };
+        if !work.owner.as_ref().is_some_and(|owner| {
+            owner.origin == NativeWorkOrigin::Generate
+                && Arc::ptr_eq(&owner.book, &self.shared.ownership)
+        }) || load.position() != (*x, *z)
+        {
+            return Err("open saved-load original work allocation/coordinate mismatch".into());
+        }
+        Ok(Some(RetainedOpenLoad {
+            load,
+            ticket: RetainedOpenLoadTicket {
+                allocation: self.shared.clone(),
+                serial: retained.open_serial,
+            },
+        }))
+    }
+
+    /// Consume only the saved read that the caller just validated. Normal
+    /// loaded-column insertion retains native entity/light/residency behavior.
+    pub fn accept_retained_open_load(
+        &mut self,
+        ticket: RetainedOpenLoadTicket,
+        world: &mut World,
+    ) -> Result<bool, String> {
+        let retained = self
+            .retained
+            .as_ref()
+            .ok_or("streaming was not started retained")?;
+        if retained.close.is_some()
+            || !Arc::ptr_eq(&ticket.allocation, &self.shared)
+            || ticket.serial != retained.open_serial
+        {
+            return Err("foreign, stale or closing open saved-load ticket".into());
+        }
+        let work = retained
+            .open_load
+            .as_ref()
+            .ok_or("open saved-load ticket already consumed")?;
+        let Done::RetainedLoad(x, z, load) = &work.done else {
+            unreachable!()
+        };
+        let chunk = load
+            .chunk()
+            .ok_or("open saved-load has no validated native column")?;
+        let evidence = load
+            .evidence()
+            .ok_or("open saved-load has no original record evidence")?;
+        if load.error().is_some()
+            || load.is_absent()
+            || chunk.fresh
+            || (chunk.x, chunk.z) != (*x, *z)
+            || load.position() != (*x, *z)
+            || evidence.position() != (*x, *z)
+            || !Arc::ptr_eq(evidence.save(), &retained.save)
+            || evidence.dimension_root() != retained.save.root.as_path()
+            || world.chunks.contains_key(&(*x, *z))
+            || !work.owner.as_ref().is_some_and(|owner| {
+                owner.origin == NativeWorkOrigin::Generate
+                    && Arc::ptr_eq(&owner.book, &self.shared.ownership)
+            })
+        {
+            return Err("open saved-load provenance or resident collision".into());
+        }
+        match evidence.poll_current().map_err(|error| error.to_string())? {
+            None => return Ok(false),
+            Some(false) => return Err("open saved-load source was superseded".into()),
+            Some(true) => {}
+        }
+        let ReceivedWork { done, mut owner } =
+            self.retained.as_mut().unwrap().open_load.take().unwrap();
+        let Done::RetainedLoad(x, z, load) = done else {
+            unreachable!()
+        };
+        let (chunk, _records) = match load.into_parts() {
+            Ok(parts) => parts,
+            Err(load) => {
+                self.retained.as_mut().unwrap().open_load = Some(ReceivedWork {
+                    done: Done::RetainedLoad(x, z, load),
+                    owner,
+                });
+                return Err("open saved-load consuming projection refused".into());
+            }
+        };
+        owner.as_mut().unwrap().advance(WorkPhase::Reconciling);
+        let _reconciliation = Reconciliation(owner);
+        self.receive_generated(chunk, world);
+        Ok(true)
+    }
+
     pub fn begin_retained_close(
         &mut self,
         world: Option<&World>,
@@ -3339,6 +3492,11 @@ impl Streaming {
                 Err("retained close world changed".into())
             };
         }
+        let pending = retained.open_load.take();
+        if let Some(pending) = pending {
+            self.defer(pending);
+        }
+        let retained = self.retained.as_mut().unwrap();
         retained.close = Some(RetainedProducerClose {
             world: identity,
             membership: world.map(|w| w.chunks.membership_revision()),
@@ -10227,6 +10385,166 @@ mod native_work_tests {
             control,
         );
         (streaming, save, generator, receipt, root)
+    }
+
+    #[cfg(all(feature = "native-writer-test-control", debug_assertions))]
+    #[test]
+    #[ignore = "isolated pinned resources: original saved native load, open ticket and real producer/writer close"]
+    fn retained_open_saved_load_preserves_native_payload_and_close_custody() {
+        let (started, save, generator, mut initialization, _root) =
+            retained_native_fixture("open-saved", Some(0), None, 1);
+        let mut streaming = started.unwrap();
+        streaming.radius = 2;
+        streaming.mesh = false;
+        let mut world = Box::new(world());
+        let mut columns = Vec::new();
+        for x in [0, 1] {
+            columns.push(Arc::new(generator.inner.finish(generator.inner.proto(
+                &mut (),
+                x,
+                0,
+            ))));
+        }
+        let entity = horizon_world::nbt::Tag::compound([
+            (
+                "id",
+                horizon_world::nbt::Tag::String("test:opaque_native_entity".into()),
+            ),
+            ("marker", horizon_world::nbt::Tag::Long(731)),
+        ]);
+        // This codec/custody fixture preserves an opaque saved entity. It does
+        // not assert that Game's stricter item-only profile accepts that entity.
+        save.save_later(&columns, generator.registry.registry, &generator.biomes)
+            .unwrap();
+        save.save_entities_later(vec![((0, 0), vec![entity.clone()])])
+            .unwrap();
+        let until = Instant::now() + WAIT;
+        while !save.writes_finished().unwrap() {
+            assert!(Instant::now() < until);
+            std::thread::yield_now();
+        }
+        streaming.generating.insert((0, 0));
+        streaming.submit(None, 0, Job::Generate(0, 0));
+        assert!(
+            streaming.poll_retained_open_load().unwrap().is_none(),
+            "original queued read has not arrived"
+        );
+        assert_eq!(counts(&streaming, NativeWorkOrigin::Generate).queued, 1);
+        initialization.release();
+        streaming.wait(WAIT);
+        let view = streaming
+            .poll_retained_open_load()
+            .unwrap()
+            .expect("actual original saved read");
+        let load = view.load();
+        assert!(load.error().is_none() && !load.is_absent());
+        let original_section = Arc::as_ptr(&load.chunk().unwrap().sections[0]);
+        let originally_lit = load.chunk().unwrap().light_loaded;
+        assert!(Arc::ptr_eq(load.evidence().unwrap().save(), &save));
+        assert_eq!(
+            load.chunk().unwrap().entities.as_slice(),
+            std::slice::from_ref(&entity)
+        );
+        let ticket = view.into_ticket();
+        let replay = RetainedOpenLoadTicket {
+            allocation: ticket.allocation.clone(),
+            serial: ticket.serial,
+        };
+        let stale = RetainedOpenLoadTicket {
+            allocation: ticket.allocation.clone(),
+            serial: ticket.serial,
+        };
+        let before = streaming.observe_native_work();
+        world.insert_streamed_chunk((*columns[0]).clone());
+        assert!(
+            streaming
+                .accept_retained_open_load(ticket, &mut world)
+                .is_err(),
+            "resident collision retains original read"
+        );
+        assert_eq!(streaming.observe_native_work(), before);
+        assert_eq!(
+            Arc::as_ptr(
+                &streaming
+                    .poll_retained_open_load()
+                    .unwrap()
+                    .unwrap()
+                    .load()
+                    .chunk()
+                    .unwrap()
+                    .sections[0]
+            ),
+            original_section
+        );
+        world.remove_streamed_chunk(&(0, 0));
+        let foreign = Streaming::new(generator.inner.clone(), context(), 1);
+        let wrong = RetainedOpenLoadTicket {
+            allocation: foreign.shared.clone(),
+            serial: replay.serial,
+        };
+        assert!(
+            streaming
+                .accept_retained_open_load(wrong, &mut world)
+                .is_err()
+        );
+        drop(foreign);
+        let ticket = streaming
+            .poll_retained_open_load()
+            .unwrap()
+            .unwrap()
+            .into_ticket();
+        assert!(
+            streaming
+                .accept_retained_open_load(ticket, &mut world)
+                .unwrap()
+        );
+        assert_eq!(
+            Arc::as_ptr(&world.chunks[&(0, 0)].sections[0]),
+            original_section
+        );
+        assert_eq!(world.loaded_entities, [((0, 0), vec![entity])]);
+        assert_eq!(streaming.is_lit(0, 0), originally_lit);
+        assert!(
+            streaming
+                .accept_retained_open_load(replay, &mut world)
+                .is_err()
+        );
+        assert!(!streaming.retained_sealed());
+        assert_eq!(counts(&streaming, NativeWorkOrigin::Generate).disposed, 1);
+        streaming.generating.insert((1, 0));
+        streaming.submit(None, 0, Job::Generate(1, 0));
+        streaming.wait(WAIT);
+        let outstanding = streaming
+            .poll_retained_open_load()
+            .unwrap()
+            .unwrap()
+            .into_ticket();
+        assert!(
+            streaming
+                .accept_retained_open_load(stale, &mut world)
+                .is_err(),
+            "old serial cannot consume the next actual read"
+        );
+        assert_eq!(counts(&streaming, NativeWorkOrigin::Generate).disposed, 1);
+        streaming
+            .begin_retained_close(Some(&world), Instant::now() + Duration::from_secs(30))
+            .unwrap();
+        assert!(
+            streaming
+                .accept_retained_open_load(outstanding, &mut world)
+                .is_err()
+        );
+        assert!(streaming.poll_retained_open_load().is_err());
+        let (observation, failed) = reap_retained(&mut streaming, Some(&mut world), &save);
+        assert!(!failed);
+        let (_, generated) = observation.origins[NativeWorkOrigin::Generate as usize];
+        assert_eq!(generated.submitted, 2);
+        assert_eq!(generated.disposed, 2);
+        assert_eq!(generated.unresolved, 0);
+        assert!(
+            world.chunks.contains_key(&(0, 0)) && !world.chunks.contains_key(&(1, 0)),
+            "outstanding saved read closed without fake residency"
+        );
     }
 
     #[cfg(all(feature = "native-writer-test-control", debug_assertions))]

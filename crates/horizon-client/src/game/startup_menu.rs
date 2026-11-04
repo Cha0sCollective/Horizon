@@ -80,6 +80,30 @@ impl StartupMenu {
         }
     }
 
+    #[cfg(feature = "paired-packages")]
+    pub(super) fn reset_retained_entry(&mut self) {
+        self.pending = None;
+        self.modifiers = ModifiersState::empty();
+        self.physical_keys.clear();
+        self.dragging = false;
+        self.options_open = false;
+        self.win = None;
+        self.selection = Default::default();
+        if let Some(title) = &mut self.title {
+            title.release();
+            title.release_field();
+            title.worlds_changed();
+        }
+        self.perf.cancel_world_opening();
+    }
+
+    #[cfg(feature = "paired-packages")]
+    pub(super) fn retained_entry_error(&mut self, message: &str) {
+        if let Some(title) = &mut self.title {
+            title.failed(message);
+        }
+    }
+
     pub(super) fn handoff(&mut self, game: &mut Game<'_>) {
         game.title = self.title.take();
         game.pending_entry = self.pending.take();
@@ -254,6 +278,10 @@ pub(super) fn spawn_loader(
 
 impl Loading {
     pub(super) fn poll_menu_resources(&mut self) -> Result<()> {
+        #[cfg(feature = "paired-packages")]
+        if self.retained_menu() {
+            return self.poll_retained_menu_resources();
+        }
         if self.loaded.is_none() {
             loop {
                 match self.receiver.try_recv() {
@@ -338,6 +366,14 @@ impl Loading {
 
     fn menu_option_events(&mut self, events: Vec<Event>) {
         for event in events {
+            if self.retained_menu()
+                && matches!(
+                    &event,
+                    Event::OpenPackFolder | Event::OpenModFolder | Event::OpenShaderPackFolder
+                )
+            {
+                continue;
+            }
             match event {
                 Event::Changed => {
                     self.save_menu_settings();
@@ -422,7 +458,7 @@ impl Loading {
 
     fn menu_action(&mut self, event_loop: &ActiveEventLoop, action: Action) {
         match action {
-            Action::Quit => event_loop.exit(),
+            Action::Quit => self.request_menu_close(event_loop),
             Action::Options => self.open_menu_options(Page::Main),
             Action::Accessibility => self.open_menu_options(Page::Accessibility),
             Action::Language => self.open_menu_options(Page::Language),
@@ -442,6 +478,54 @@ impl Loading {
         event_loop: &ActiveEventLoop,
         event: WindowEvent,
     ) -> Result<()> {
+        let retained_menu = self.retained_menu();
+        #[cfg(feature = "paired-packages")]
+        if self.retained.as_ref().is_some_and(|owner| owner.preparing) {
+            match event {
+                WindowEvent::CloseRequested => self.request_menu_close(event_loop),
+                WindowEvent::RedrawRequested => self.draw(),
+                WindowEvent::Resized(size) => {
+                    if let Some(renderer) = &mut self.renderer {
+                        renderer.resize(size.width, size.height);
+                    }
+                }
+                WindowEvent::KeyboardInput {
+                    event,
+                    is_synthetic: false,
+                    ..
+                } if event.state == ElementState::Pressed && !event.repeat => {
+                    let owner = self.retained.as_mut().expect("original retained frontend");
+                    match event.physical_key {
+                        PhysicalKey::Code(KeyCode::Escape) => owner.entry_cancel = true,
+                        PhysicalKey::Code(KeyCode::KeyR) => owner.entry_retry = true,
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
+        if self.retained_menu_closing() {
+            match event {
+                WindowEvent::RedrawRequested => self.draw(),
+                WindowEvent::Resized(size) => {
+                    if let Some(renderer) = &mut self.renderer {
+                        renderer.resize(size.width, size.height);
+                    }
+                    self.apply_menu_settings();
+                }
+                WindowEvent::KeyboardInput { event, .. }
+                    if event.state == ElementState::Pressed
+                        && !event.repeat
+                        && event.physical_key == PhysicalKey::Code(KeyCode::KeyR) =>
+                {
+                    self.retry_retained_menu_close()
+                }
+                WindowEvent::CloseRequested => self.request_menu_close(event_loop),
+                _ => {}
+            }
+            return Ok(());
+        }
         if let WindowEvent::KeyboardInput { event, .. } = &event
             && let PhysicalKey::Code(key) = event.physical_key
         {
@@ -454,7 +538,7 @@ impl Loading {
         match event {
             WindowEvent::CloseRequested => {
                 self.save_menu_settings();
-                event_loop.exit();
+                self.request_menu_close(event_loop);
             }
             WindowEvent::Resized(size) => {
                 if let Some(r) = &mut self.renderer {
@@ -539,11 +623,19 @@ impl Loading {
                         title.release();
                         title.release_field();
                     } else {
-                        let (action, _) = title.click(
-                            self.menu.cursor.0,
-                            self.menu.cursor.1,
-                            (batch.width, batch.height),
-                        );
+                        let (action, _) = if retained_menu {
+                            title.click_local_world_entry(
+                                self.menu.cursor.0,
+                                self.menu.cursor.1,
+                                (batch.width, batch.height),
+                            )
+                        } else {
+                            title.click(
+                                self.menu.cursor.0,
+                                self.menu.cursor.1,
+                                (batch.width, batch.height),
+                            )
+                        };
                         title.press_field(
                             &gui.atlas,
                             self.menu.cursor,
@@ -604,7 +696,15 @@ impl Loading {
                         self.menu_option_events(events);
                     }
                 } else {
-                    self.menu.title_key(&event);
+                    if !retained_menu
+                        || self
+                            .menu
+                            .title
+                            .as_ref()
+                            .is_some_and(Title::local_world_entry_mode)
+                    {
+                        self.menu.title_key(&event);
+                    }
                     self.save_menu_address();
                 }
             }
@@ -615,6 +715,16 @@ impl Loading {
 
     pub(super) fn draw_menu(&mut self, batch: &mut HudBatch) {
         let Some(gui) = &self.gui else { return };
+        #[cfg(feature = "paired-packages")]
+        if self.retained.as_ref().is_some_and(|owner| owner.preparing) {
+            horizon_client::level_loading::draw_progress(
+                batch,
+                &gui.atlas,
+                "Preparing paired world; Escape cancels, R retries blocked closure",
+                0.0,
+            );
+            return;
+        }
         if self.menu.pending.is_some() {
             horizon_client::level_loading::draw_progress(
                 batch,
@@ -687,6 +797,96 @@ impl Loading {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "paired-packages")]
+    #[test]
+    fn retained_menu_keeps_original_loader_after_done_until_actual_return() {
+        let (send, receive) = std::sync::mpsc::channel();
+        let (published, observed) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            send.send(LoaderMsg::Done(Err(
+                "controlled original resource refusal".into()
+            )))
+            .unwrap();
+            published.send(()).unwrap();
+            let _ = released.recv();
+        });
+        observed.recv().unwrap();
+        let mut frontend = loading(receive);
+        frontend.retained = Some(RetainedFrontendState::default());
+        frontend.handle = Some(handle);
+        frontend.poll_menu_resources().unwrap();
+        assert!(frontend.retained_menu_closing());
+        assert!(
+            frontend
+                .handle
+                .as_ref()
+                .is_some_and(|original| !original.is_finished())
+        );
+        assert!(
+            !frontend.retained_frontend_helpers_closed(),
+            "Done is not native completion"
+        );
+        assert!(frontend.take_retained_generation().is_err());
+        release.send(()).unwrap();
+        while frontend.handle.is_some() {
+            frontend.poll_menu_resources().unwrap();
+            std::thread::yield_now();
+        }
+        assert!(frontend.retained_frontend_helpers_closed());
+        assert!(
+            matches!(frontend.loaded, Some(Err(ref reason)) if reason == "controlled original resource refusal")
+        );
+        assert!(
+            frontend
+                .error
+                .as_ref()
+                .unwrap()
+                .to_string()
+                .contains("controlled original resource refusal")
+        );
+    }
+
+    #[cfg(feature = "paired-packages")]
+    #[test]
+    fn retained_menu_disconnected_channel_keeps_active_original_handle() {
+        let (send, receive) = std::sync::mpsc::channel();
+        let (published, observed) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            drop(send);
+            published.send(()).unwrap();
+            let _ = released.recv();
+        });
+        observed.recv().unwrap();
+        let mut frontend = loading(receive);
+        frontend.retained = Some(RetainedFrontendState::default());
+        frontend.handle = Some(handle);
+        frontend.poll_menu_resources().unwrap();
+        assert!(
+            frontend
+                .handle
+                .as_ref()
+                .is_some_and(|original| !original.is_finished())
+        );
+        assert!(!frontend.retained_frontend_helpers_closed());
+        release.send(()).unwrap();
+        while frontend.handle.is_some() {
+            frontend.poll_menu_resources().unwrap();
+            std::thread::yield_now();
+        }
+        assert!(frontend.retained_menu_closing());
+        assert!(frontend.retained_frontend_helpers_closed());
+        assert!(
+            frontend
+                .error
+                .as_ref()
+                .unwrap()
+                .to_string()
+                .contains("without its complete output")
+        );
+    }
+
     fn gui(root: &std::path::Path) -> UiResources {
         UiResources {
             atlas: HudAtlas::fonts(root).unwrap(),
@@ -699,6 +899,8 @@ mod tests {
 
     fn loading(receiver: Receiver<LoaderMsg>) -> Loading {
         Loading {
+            #[cfg(feature = "paired-packages")]
+            retained: None,
             window: None,
             renderer: None,
             gui: None,

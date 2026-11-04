@@ -10,7 +10,7 @@ use horizon_client::{
         chunks::ChunkEncoder,
         hub::{
             HostEvent, Hub, HubConfig, RetainedHubCloseView, RetainedHubIdentity, RetainedHubPhase,
-            RetainedHubRefusal,
+            RetainedHubRefusal, RetainedPairedHubRefusal,
         },
     },
 };
@@ -28,6 +28,8 @@ use std::{
 #[cfg(test)]
 #[path = "retained_server_tests.rs"]
 mod tests;
+#[cfg(all(test, feature = "mods", target_os = "linux"))]
+pub(in crate::game) use tests::OrdinaryControl;
 
 const CLOSE_WAIT: Duration = Duration::from_secs(10);
 
@@ -125,12 +127,17 @@ impl Launch {
 struct NativeInstallation {
     construction: Arc<()>,
     uuid: u128,
+    initial_placement: Option<(i32, [f64; 3])>,
 }
 pub(super) struct ServerGameState {
     profile: ServerProfile,
+    startup: Option<Arc<mod_packages::FrozenHostInputs>>,
     construction: Arc<()>,
     identity: Option<RetainedHubIdentity>,
     hub_refusal: Option<Box<RetainedHubRefusal>>,
+    paired_hub_refusal: Option<Box<RetainedPairedHubRefusal>>,
+    checkpoint_roster: Option<super::lan::ParticipantRoster>,
+    continuation_archive: Option<PathBuf>,
     frozen: bool,
     failure: Option<String>,
     pub(super) pending: VecDeque<HostEvent>,
@@ -146,9 +153,13 @@ impl ServerGameState {
     pub(super) fn from_cold(profile: ServerProfile) -> Self {
         Self {
             profile,
+            startup: None,
             construction: Arc::new(()),
             identity: None,
             hub_refusal: None,
+            paired_hub_refusal: None,
+            checkpoint_roster: None,
+            continuation_archive: None,
             frozen: false,
             failure: None,
             pending: VecDeque::new(),
@@ -162,7 +173,30 @@ impl ServerGameState {
         }
     }
     pub(super) fn can_bind_hub(&self) -> bool {
-        self.identity.is_none() && self.hub_refusal.is_none() && !self.frozen
+        self.identity.is_none()
+            && self.hub_refusal.is_none()
+            && self.paired_hub_refusal.is_none()
+            && !self.frozen
+    }
+    pub(super) fn from_ordinary(
+        profile: ServerProfile,
+        startup: Arc<mod_packages::FrozenHostInputs>,
+    ) -> Self {
+        let mut state = Self::from_cold(profile);
+        state.startup = Some(startup);
+        state
+    }
+    pub(super) fn startup(&self) -> Option<&Arc<mod_packages::FrozenHostInputs>> {
+        self.startup.as_ref()
+    }
+    pub(super) fn checkpoint_roster(&self) -> Option<&super::lan::ParticipantRoster> {
+        self.checkpoint_roster.as_ref()
+    }
+    pub(in crate::game) fn set_continuation_archive(&mut self, archive: PathBuf) {
+        self.continuation_archive = Some(archive);
+    }
+    pub(super) fn hold_paired_hub_refusal(&mut self, input: Box<RetainedPairedHubRefusal>) {
+        self.paired_hub_refusal = Some(input);
     }
     pub(super) fn bind_hub(&mut self, identity: RetainedHubIdentity) {
         assert!(
@@ -184,7 +218,7 @@ impl ServerGameState {
         self.failure.get_or_insert(detail);
         self.frozen = true;
     }
-    fn freeze(&mut self) {
+    pub(super) fn freeze(&mut self) {
         self.frozen = true;
     }
     pub(super) fn check_hub(&mut self, hub: &Hub) {
@@ -214,11 +248,12 @@ impl ServerGameState {
         }
     }
     pub(super) fn check_inboxes(&mut self, hub: &Hub) {
-        if hub
-            .guests
-            .iter()
-            .any(|guest| guest.inbox.iter().any(|packet| !supported_packet(packet)))
-        {
+        if hub.guests.iter().any(|guest| {
+            guest.inbox.iter().any(|packet| {
+                !supported_packet(packet)
+                    && !(self.startup.is_some() && ordinary_stone_candidate(packet))
+            })
+        }) {
             self.fail(
                 "fixed retained server refuses an unsupported play transition before dispatch"
                     .into(),
@@ -235,12 +270,54 @@ impl ServerGameState {
             NativeInstallation {
                 construction: self.construction.clone(),
                 uuid,
+                initial_placement: None,
             },
         );
     }
     pub(super) fn native_installed(&self, conn: u32, uuid: u128) -> bool {
         self.installations.get(&conn).is_some_and(|receipt| {
             receipt.uuid == uuid && Arc::ptr_eq(&receipt.construction, &self.construction)
+        })
+    }
+    pub(super) fn record_initial_native_placement(
+        &mut self,
+        guest: &horizon_client::lan::guest::Guest,
+    ) {
+        // The original transport may terminate between admission and placement.
+        // A refused native placement issues no receipt and retains that Guest.
+        if !guest.placed || guest.awaiting_teleport.is_none() {
+            return;
+        }
+        let original = self
+            .installations
+            .get_mut(&guest.conn)
+            .expect("actual installed native player");
+        assert!(
+            original.uuid == guest.uuid && original.initial_placement.is_none(),
+            "original initial placement is one-shot"
+        );
+        original.initial_placement = Some(
+            guest
+                .awaiting_teleport
+                .expect("native initial placement teleport"),
+        );
+    }
+    pub(super) fn retains_initial_native_custody(
+        &self,
+        guest: &horizon_client::lan::guest::Guest,
+    ) -> bool {
+        if self.startup.is_none() || !self.frozen || !self.native_installed(guest.conn, guest.uuid)
+        {
+            return false;
+        }
+        let original = &self.installations[&guest.conn];
+        if !guest.placed {
+            return guest.awaiting_teleport.is_none() && original.initial_placement.is_none();
+        }
+        original.initial_placement.is_some_and(|(id, at)| {
+            guest.position == at
+                && (guest.awaiting_teleport == Some((id, at))
+                    || (!guest.loaded && guest.awaiting_teleport.is_none()))
         })
     }
     pub(super) fn is_untouched(&self, conn: u32) -> bool {
@@ -290,11 +367,22 @@ impl ServerGameState {
                     })
             }
         };
+        let startup_matches = match &self.startup {
+            Some(original) => {
+                game.ordinary_startup
+                    .as_ref()
+                    .is_some_and(|startup| Arc::ptr_eq(original, startup))
+                    && original
+                        .retains_startup(&game.options.mod_packages, game.pack.assets.registry)
+            }
+            None => true,
+        };
         self.frozen
             && !self.incomplete()
             && profile_matches
-            && game.settings.render_distance == 2
-            && game.settings.simulation_distance == 2
+            && startup_matches
+            && (self.startup.is_some()
+                || (game.settings.render_distance == 2 && game.settings.simulation_distance == 2))
             && game.settings.horizon.lod_distance == 0
             && game.player.is_none()
             && game.levels.parked_dims().is_empty()
@@ -336,7 +424,274 @@ fn supported_packet(packet: &Serverbound) -> bool {
     }
 }
 
+fn ordinary_stone_candidate(packet: &Serverbound) -> bool {
+    match packet {
+        Serverbound::SetCarriedItem(packet) => (0..9).contains(&packet.slot),
+        Serverbound::SetCreativeModeSlot(packet) => {
+            (9..=44).contains(&packet.slot)
+                && packet.item.as_ref().is_none_or(|stack| {
+                    (1..=64).contains(&stack.count)
+                        && stack.added.is_empty()
+                        && stack.removed.is_empty()
+                })
+        }
+        Serverbound::UseItemOn(packet) => {
+            packet.hand == 0
+                && (0..6).contains(&packet.face)
+                && packet.sequence >= 0
+                && !packet.inside
+                && !packet.world_border
+                && packet
+                    .cursor
+                    .iter()
+                    .all(|value| value.is_finite() && (0.0..=1.0).contains(value))
+        }
+        _ => false,
+    }
+}
+
 impl Game<'_> {
+    pub(super) fn freeze_ordinary_checkpoint_participants(
+        &mut self,
+    ) -> std::result::Result<(), String> {
+        if self.world.counter_domain_snapshot().is_none() {
+            return Ok(());
+        }
+        let server = self
+            .retained_server
+            .as_ref()
+            .ok_or("ordinary domain requires actual authoritative retained server")?;
+        if server.startup.is_none() || server.continuation_archive.is_none() {
+            return Err("ordinary persistent domain lacks its captured continuation route".into());
+        }
+        if let Some(original) = server.checkpoint_roster.as_ref() {
+            // Retry may finish the original admission; it cannot replace a
+            // census already captured from different owners.
+            return self
+                .preflight_checkpoint_participants(original)
+                .map_err(|error| {
+                    format!("original retained participant census changed: {error:?}")
+                });
+        }
+        let roster = self
+            .observe_checkpoint_participants()
+            .map_err(|error| format!("original retained participant census: {error:?}"))?;
+        self.preflight_checkpoint_participants(&roster)
+            .map_err(|error| format!("original retained participant idle custody: {error:?}"))?;
+        self.retained_server.as_mut().unwrap().checkpoint_roster = Some(roster);
+        Ok(())
+    }
+    pub(super) fn preflight_ordinary_coherent_owner(&self) -> std::result::Result<(), String> {
+        let server = self
+            .retained_server
+            .as_ref()
+            .ok_or("original ordinary server missing")?;
+        let roster = server
+            .checkpoint_roster
+            .as_ref()
+            .ok_or("original frozen participant census absent")?;
+        if server.startup.is_none()
+            || !server.frozen()
+            || server.continuation_archive.is_none()
+            || self.world.counter_domain_snapshot().is_none()
+            || !self
+                .native_close_authority
+                .as_ref()
+                .is_some_and(|authority| authority.is_server() && authority.authorizes(self))
+        {
+            return Err("ordinary coherent close lacks original native constructor/session/participant custody".into());
+        }
+        self.preflight_checkpoint_participants(roster)
+            .map_err(|error| format!("original coherent participant custody changed: {error:?}"))
+    }
+    pub(super) fn ordinary_server_close_profile(
+        &self,
+    ) -> std::result::Result<CloseProfile, String> {
+        if self.world.counter_domain_snapshot().is_some() {
+            let archive = self
+                .retained_server
+                .as_ref()
+                .and_then(|server| server.continuation_archive.clone())
+                .ok_or("ordinary domain cannot fall back to native-only close")?;
+            return Ok(CloseProfile::CoherentSession { archive });
+        }
+        if self.world.counter_trial_snapshot().is_some() || self.world.has_world_slot_trial() {
+            return Err(
+                "ordinary close refuses unsupported transient item/domain ownership".into(),
+            );
+        }
+        Ok(CloseProfile::NativeWorld)
+    }
+    pub(super) fn ordinary_plain_stone(&self, stack: &ItemStack) -> bool {
+        &*stack.item == "minecraft:stone"
+            && stack.damage == 0
+            && stack.extra.is_none()
+            && self.res.items().get("minecraft:stone").is_some_and(|info| {
+                stack.count > 0
+                    && stack.count <= info.max_stack.min(64)
+                    && info.block.is_some()
+                    && info.block == self.pack.assets.registry.default_state("minecraft:stone")
+            })
+    }
+    pub(super) fn ordinary_stone_use_admitted(&self) -> bool {
+        if !self.creative
+            || self.hand != Hand::Main
+            || !self
+                .held()
+                .is_some_and(|stack| self.ordinary_plain_stone(stack))
+        {
+            return false;
+        }
+        let Some(hit) = self.pick() else {
+            return false;
+        };
+        let face = match hit.face {
+            [0, -1, 0] => 0,
+            [0, 1, 0] => 1,
+            [0, 0, -1] => 2,
+            [0, 0, 1] => 3,
+            [-1, 0, 0] => 4,
+            [1, 0, 0] => 5,
+            _ => return false,
+        };
+        self.eye_position().is_some_and(|eye| {
+            horizon_client::lan::guest::within_block_range(eye, self.reach(), hit.pos)
+        }) && self.validate_ordinary_stone_target(hit.pos, face).is_ok()
+    }
+    /// Called on the ORIGINAL event immediately before its native handler. The
+    /// Hub has already applied preceding movement, and earlier native events
+    /// have applied hotbar/slot edits, so validation uses current player state.
+    pub(super) fn validate_ordinary_stone_packet(
+        &self,
+        host: &super::lan::LanHost,
+        conn: u32,
+        packet: &Serverbound,
+    ) -> std::result::Result<(), String> {
+        let Some(server) = self.retained_server.as_ref() else {
+            return Ok(());
+        };
+        if server.startup.is_none() || supported_packet(packet) {
+            return Ok(());
+        }
+        let guest = host.hub.guest(conn).ok_or("original guest absent")?;
+        let identity = server
+            .hub_identity()
+            .ok_or("original paired Hub association absent")?;
+        if !ordinary_stone_candidate(packet)
+            || server.frozen()
+            || !server.native_installed(conn, guest.uuid)
+            || !identity.matches_configured_guest(&host.hub, conn, guest.uuid)
+            || !guest.placed
+            || !guest.loaded
+            || guest.motion.is_none()
+            || !guest.creative()
+            || guest.dead
+            || guest.awaiting_teleport.is_some()
+            || guest.dimension != Dim::Overworld.id()
+            || self.dim != Dim::Overworld
+            || guest.selected >= 9
+            || guest.inventory.len() != 36
+            || guest.menu.is_some()
+            || guest.carried.is_some()
+            || guest.vehicle.is_some()
+        {
+            return Err(
+                "ordinary stone operation lacks its live configured native creative owner".into(),
+            );
+        }
+        match packet {
+            Serverbound::SetCarriedItem(_) => Ok(()),
+            Serverbound::SetCreativeModeSlot(packet) => {
+                if guest
+                    .menu_slot(packet.slot as usize)
+                    .as_ref()
+                    .is_some_and(|stack| !self.ordinary_plain_stone(stack))
+                {
+                    return Err(
+                        "ordinary creative edit would replace an unsupported native item owner"
+                            .into(),
+                    );
+                }
+                if let Some(stack) = &packet.item {
+                    let startup = server.startup.as_ref().unwrap();
+                    let stone = startup
+                        .sync()
+                        .builtin
+                        .get("minecraft:item")
+                        .and_then(|ids| ids.id("minecraft:stone"));
+                    let decoded = host.hub.stack_from_network(stack);
+                    if stone != Some(stack.item)
+                        || !self.ordinary_plain_stone(&decoded)
+                        || decoded.count != stack.count as u32
+                    {
+                        return Err("ordinary creative edit requires exact native stone identity/count/components".into());
+                    }
+                }
+                Ok(())
+            }
+            Serverbound::UseItemOn(packet) => {
+                if !guest.inventory[guest.selected]
+                    .as_ref()
+                    .is_some_and(|stack| self.ordinary_plain_stone(stack))
+                    || !guest.within_block_range(packet.pos, 0.0)
+                {
+                    return Err("ordinary placement requires native stone in the actual main hand within native reach".into());
+                }
+                self.validate_ordinary_stone_target(packet.pos, packet.face)
+            }
+            _ => Err(
+                "unsupported original ordinary play packet retained before native dispatch".into(),
+            ),
+        }
+    }
+    pub(super) fn validate_ordinary_stone_target(
+        &self,
+        pos: [i32; 3],
+        face: i32,
+    ) -> std::result::Result<(), String> {
+        let direction = match face {
+            0 => [0, -1, 0],
+            1 => [0, 1, 0],
+            2 => [0, 0, -1],
+            3 => [0, 0, 1],
+            4 => [-1, 0, 0],
+            5 => [1, 0, 0],
+            _ => return Err("unsupported stone face".into()),
+        };
+        let mut destination = pos;
+        for axis in 0..3 {
+            destination[axis] = pos[axis]
+                .checked_add(direction[axis])
+                .ok_or("stone destination overflow")?;
+        }
+        if [pos, destination].iter().any(|at| {
+            !(-64..320).contains(&at[1])
+                || !self
+                    .world
+                    .chunks
+                    .contains_key(&(at[0].div_euclid(16), at[2].div_euclid(16)))
+        }) {
+            return Err(
+                "ordinary stone target and destination must be actual loaded Overworld columns"
+                    .into(),
+            );
+        }
+        let target = self
+            .res
+            .facts()
+            .get(self.world.block(pos[0], pos[1], pos[2]));
+        if !matches!(
+            &*target.name,
+            "minecraft:stone" | "minecraft:dirt" | "minecraft:grass_block" | "minecraft:bedrock"
+        ) || self
+            .world
+            .block(destination[0], destination[1], destination[2])
+            != self.res.facts().air
+        {
+            return Err("ordinary stone placement refuses unsupported native interaction or occupied destination".into());
+        }
+        Ok(())
+    }
     pub(super) fn retained_server_check_running(&self) -> Result<()> {
         if let Some(server) = &self.retained_server
             && server.frozen
@@ -352,6 +707,7 @@ impl Game<'_> {
     fn retained_server_settle_step(&mut self) -> Result<bool> {
         self.retained_server_check_running()?;
         self.update_world();
+        self.poll_ordinary_native_reads()?;
         self.retained_server_check_running()?;
         self.postprocess_chunks()?;
         if self.spawn.is_none() {
@@ -376,6 +732,7 @@ impl Game<'_> {
 
 #[derive(Clone, Debug)]
 pub(super) struct View {
+    ordinary_closed_world: Arc<Mutex<Option<super::paired_close::OrdinaryClosedWorld>>>,
     phase: &'static str,
     pub(super) attempt: u64,
     pub(super) ready: bool,
@@ -399,6 +756,7 @@ pub(super) struct View {
 impl Default for View {
     fn default() -> Self {
         Self {
+            ordinary_closed_world: Arc::new(Mutex::new(None)),
             phase: "Preparing",
             attempt: 0,
             ready: false,
@@ -499,11 +857,50 @@ impl Input {
         Ok(self)
     }
 }
+enum WorkerInput {
+    Cold(Input),
+    #[cfg(feature = "mods")]
+    Ordinary(Box<OrdinaryServerInput>),
+}
+/// The ordinary caller moves its actual final generation into the original
+/// server worker. No renderer, window, replacement package scan or fixed Launch.
+#[cfg(feature = "mods")]
+pub(super) struct OrdinaryServerInput {
+    pub(super) options: Options,
+    pub(super) settings: Settings,
+    pub(super) request: OrdinaryRequest,
+    pub(super) entry: RetainedEntryIdentity,
+    pub(super) resources: Arc<Resources>,
+    pub(super) pack: PackResources,
+    pub(super) gui: UiResources,
+    pub(super) cpu: GameCpuResources,
+    pub(super) tree: Arc<horizon_client::advancements::Tree>,
+    pub(super) startup: Arc<mod_packages::FrozenHostInputs>,
+    pub(super) offline: RetainedOfflineConfig,
+    pub(super) dedicated_setup: Option<dedicated::RetainedSetup>,
+    pub(super) continuation_archive: Option<PathBuf>,
+    #[cfg(test)]
+    pub(super) test: tests::Startup,
+}
+#[cfg(feature = "mods")]
+pub(super) enum OrdinaryRequest {
+    Native(world_loading::WorldRequest),
+    #[allow(dead_code)] // Typed actual fixture route; ordinary machine ingress stays closed.
+    Recover(Box<super::levels::session_checkpoint::OrdinaryRecoveryRequest>),
+}
+#[cfg(feature = "mods")]
+pub(super) struct OrdinaryStartRefusal {
+    _input: Box<OrdinaryServerInput>,
+    _activation: Option<Box<mod_packages::ActivationRefusal>>,
+    pub(super) reason: String,
+}
 pub(super) struct Supervisor {
     thread: Option<JoinHandle<std::result::Result<(), String>>>,
     commands: mpsc::Sender<Command>,
     view: Arc<Mutex<View>>,
-    _inert: Arc<Mutex<Option<Input>>>,
+    _inert: Arc<Mutex<Option<WorkerInput>>>,
+    #[cfg(feature = "mods")]
+    _ordinary_refusal: Arc<Mutex<Option<Box<OrdinaryStartRefusal>>>>,
     paused: Arc<AtomicBool>,
 }
 pub(super) struct IntegratedStartRefusal {
@@ -511,6 +908,21 @@ pub(super) struct IntegratedStartRefusal {
     pub(super) reason: String,
 }
 impl Supervisor {
+    #[cfg(feature = "mods")]
+    pub(super) fn prepare_ordinary(
+        input: OrdinaryServerInput,
+    ) -> std::result::Result<Self, Box<OrdinaryStartRefusal>> {
+        Self::prepare_original(WorkerInput::Ordinary(Box::new(input))).map_err(|(input, reason)| {
+            let WorkerInput::Ordinary(input) = input else {
+                unreachable!("same original ordinary input");
+            };
+            Box::new(OrdinaryStartRefusal {
+                _input: input,
+                _activation: None,
+                reason,
+            })
+        })
+    }
     pub(super) fn prepare_integrated(
         mut options: Options,
         mut settings: Settings,
@@ -582,12 +994,24 @@ impl Supervisor {
     /// The handle is registered before the worker can acquire native owners.
     #[allow(clippy::result_large_err)] // Refusal returns the exact original inert inputs.
     fn prepare(input: Input) -> std::result::Result<Self, (Input, String)> {
+        Self::prepare_original(WorkerInput::Cold(input)).map_err(|(input, reason)| match input {
+            WorkerInput::Cold(input) => (input, reason),
+            #[cfg(feature = "mods")]
+            WorkerInput::Ordinary(_) => unreachable!("same original cold input"),
+        })
+    }
+    #[allow(clippy::result_large_err)]
+    fn prepare_original(input: WorkerInput) -> std::result::Result<Self, (WorkerInput, String)> {
         let inert = Arc::new(Mutex::new(Some(input)));
         let worker_input = inert.clone();
         let view = Arc::new(Mutex::new(View::default()));
         let worker_view = view.clone();
         let paused = Arc::new(AtomicBool::new(false));
         let worker_paused = paused.clone();
+        #[cfg(feature = "mods")]
+        let ordinary_refusal = Arc::new(Mutex::new(None));
+        #[cfg(feature = "mods")]
+        let worker_refusal = ordinary_refusal.clone();
         let (commands, receive) = mpsc::channel();
         let (release, acquire) = mpsc::sync_channel(0);
         let handle = std::thread::Builder::new()
@@ -601,7 +1025,17 @@ impl Supervisor {
                     .unwrap_or_else(|e| e.into_inner())
                     .take()
                     .expect("original inert input");
-                worker(input, receive, worker_view, worker_paused)
+                match input {
+                    WorkerInput::Cold(input) => worker(input, receive, worker_view, worker_paused),
+                    #[cfg(feature = "mods")]
+                    WorkerInput::Ordinary(input) => worker_ordinary(
+                        *input,
+                        receive,
+                        worker_view,
+                        worker_paused,
+                        &worker_refusal,
+                    ),
+                }
             });
         match handle {
             Err(error) => Err((
@@ -618,6 +1052,8 @@ impl Supervisor {
                     commands,
                     view,
                     _inert: inert,
+                    #[cfg(feature = "mods")]
+                    _ordinary_refusal: ordinary_refusal,
                     paused,
                 };
                 // A refused latch is an original finished worker result, joined
@@ -649,6 +1085,20 @@ impl Supervisor {
             .worker_joined = true;
         Some(result)
     }
+    pub(super) fn take_ordinary_closed_world(
+        &mut self,
+    ) -> Option<super::paired_close::OrdinaryClosedWorld> {
+        if self.thread.is_some() {
+            return None;
+        }
+        self.view
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .ordinary_closed_world
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+    }
 }
 impl Drop for Supervisor {
     fn drop(&mut self) {
@@ -671,6 +1121,13 @@ fn hub_inputs(
     root: &std::path::Path,
 ) -> Result<HubInputs> {
     let sync = super::lan::sync_data(root)?;
+    hub_inputs_with_sync(resources, pack, sync)
+}
+fn hub_inputs_with_sync(
+    resources: &Resources,
+    pack: &PackResources,
+    sync: Arc<horizon_client::lan::data::SyncData>,
+) -> Result<HubInputs> {
     let biomes = resources
         .biomes()
         .list
@@ -726,6 +1183,549 @@ fn hub_inputs(
             announce: false,
         },
     })
+}
+
+#[cfg(feature = "mods")]
+fn worker_ordinary(
+    input: OrdinaryServerInput,
+    commands: mpsc::Receiver<Command>,
+    view: Arc<Mutex<View>>,
+    paused: Arc<AtomicBool>,
+    refusal: &Mutex<Option<Box<OrdinaryStartRefusal>>>,
+) -> std::result::Result<(), String> {
+    let validate: Result<HubInputs> = (|| {
+        if let OrdinaryRequest::Native(request) = &input.request {
+            request.check_ordinary_native_entry()?;
+        }
+        if input.options.server_thread
+            || input.options.server.is_some()
+            || input.options.dedicated.is_none()
+            || !input.options.test_terrain
+            || input.options.dimension.is_some()
+            || input.options.execution_role.is_client()
+            || !input
+                .startup
+                .retains_startup(&input.options.mod_packages, input.pack.assets.registry)
+            || input.settings.render_distance != 2
+            || input.settings.simulation_distance != 2
+            || input.settings.horizon.lod_distance != 0
+            || input.tree.list.is_empty()
+        {
+            return Err("ordinary server requires its actual bounded final startup inputs".into());
+        }
+        if input.options.execution_role == execution_role::ExecutionRole::IntegratedServer {
+            let name = input
+                .options
+                .player_name
+                .as_deref()
+                .ok_or("integrated owner name missing")?;
+            if !input.options.dedicated.as_ref().is_some_and(Vec::is_empty)
+                || name.is_empty()
+                || name.len() > 16
+                || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                || input.offline.bind.is_some()
+                || input.offline.max_players != 1
+            {
+                return Err(
+                    "ordinary integrated server requires its actual single Memory owner".into(),
+                );
+            }
+        } else if input.offline.max_players != 2 {
+            return Err(
+                "ordinary dedicated server requires the explicit two-player profile".into(),
+            );
+        }
+        hub_inputs_with_sync(&input.resources, &input.pack, input.startup.retained_sync())
+    })();
+    let mut inputs = match validate {
+        Ok(inputs) => inputs,
+        Err(error) => {
+            let reason = error.to_string();
+            *refusal.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some(Box::new(OrdinaryStartRefusal {
+                    _input: Box::new(input),
+                    _activation: None,
+                    reason: reason.clone(),
+                }));
+            return Err(reason);
+        }
+    };
+    let activated = match input.startup.activate(
+        input.options.execution_role,
+        input.options.server_thread,
+        false,
+        &input.settings,
+    ) {
+        Ok(activated) => activated,
+        Err(activation) => {
+            let reason = activation.reason.clone();
+            *refusal.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some(Box::new(OrdinaryStartRefusal {
+                    _input: Box::new(input),
+                    _activation: Some(activation),
+                    reason: reason.clone(),
+                }));
+            return Err(reason);
+        }
+    };
+    let mut cancelled = horizon_threads::stop_requests() > 0;
+    for command in commands.try_iter().take(16) {
+        match command {
+            Command::Close => cancelled = true,
+            Command::Offer(reply) => {
+                let _ = reply.send(Err("ordinary world not yet acquired".into()));
+            }
+            Command::Retry(_) => {}
+        }
+    }
+    if cancelled {
+        view.lock().unwrap_or_else(|e| e.into_inner()).phase = "UnacquiredClosed";
+        return Ok(());
+    }
+    if matches!(&input.request, OrdinaryRequest::Recover(_)) {
+        return worker_ordinary_recovery(input, activated, inputs, commands, &view, &paused);
+    }
+    let OrdinaryServerInput {
+        options,
+        settings,
+        request,
+        entry,
+        resources,
+        pack,
+        gui,
+        cpu,
+        tree,
+        startup,
+        offline,
+        dedicated_setup,
+        continuation_archive,
+        #[cfg(test)]
+        test,
+    } = input;
+    let OrdinaryRequest::Native(request) = request else {
+        unreachable!()
+    };
+    let prepared = world_loading::OrdinaryPreparation::prepare(
+        request, &resources, &pack, &options, &settings, &entry, startup,
+    );
+    let prepared = match prepared.into_prepared(&entry) {
+        Ok(prepared) => prepared,
+        Err(prepared) => {
+            return close_preparation(
+                ServerPreparation::Ordinary(prepared),
+                commands,
+                &view,
+                (resources, pack, gui, cpu, tree, inputs, activated),
+            );
+        }
+    };
+    let root = options.resources.clone();
+    let audio = Audio::silent(&root);
+    let mut game = Box::new(
+        Game::new_with_world(
+            &resources,
+            pack,
+            gui,
+            options,
+            settings,
+            audio,
+            Some(cpu),
+            InitialGameWorld::Ordinary(Box::new(prepared)),
+        )
+        .unwrap_or_else(|error| {
+            eprintln!("fatal: preloaded ordinary native transfer failed: {error}");
+            std::process::abort();
+        }),
+    );
+    if let Err(original) = game.adopt_activated_startup(activated) {
+        eprintln!(
+            "fatal: original ordinary runtime association refused: {}",
+            original.1
+        );
+        std::process::abort();
+    }
+    game.title = None;
+    game.retained_server.as_mut().unwrap().continuation_archive = continuation_archive;
+    #[cfg(test)]
+    {
+        game.retained_server.as_mut().unwrap().test = test;
+    }
+    #[cfg(all(test, feature = "mods", target_os = "linux"))]
+    if game
+        .retained_server
+        .as_ref()
+        .unwrap()
+        .test
+        .ordinary
+        .is_some()
+    {
+        paused.store(true, Ordering::SeqCst);
+    }
+    game.screen = Screen::Playing;
+    game.adv.tree = tree;
+    game.skin_profiles = RefCell::new(horizon_client::skins::Resolver::without_fetch());
+    game.skin_downloads = RefCell::new(horizon_client::skins::Downloader::without_fetch(
+        root.join("assets/skins"),
+    ));
+    game.streaming.expect_existing_mut().radius = 2;
+    game.streaming.expect_existing_mut().center = game.level.position.map_or((0, 0), |position| {
+        (
+            (position[0].floor() as i32).div_euclid(16),
+            (position[2].floor() as i32).div_euclid(16),
+        )
+    });
+    game.load_world_state();
+    if let Some(setup) = &dedicated_setup {
+        game.level.creative = true;
+        game.level.game_mode = 1;
+        game.level.hardcore = false;
+        game.ui.difficulty = setup.props.difficulty as u8;
+        inputs.config.force_game_mode = setup.props.force_game_mode;
+    }
+    inputs.config.default_game_mode = if game.level.creative { 1 } else { 0 };
+    inputs.config.hardcore = game.level.hardcore;
+    inputs.config.seed = game.level.seed;
+    inputs.config.integrated =
+        game.options.execution_role == execution_role::ExecutionRole::IntegratedServer;
+    inputs.config.max_players = offline.max_players;
+    inputs.config.view_distance = game.settings.render_distance;
+    inputs.config.simulation_distance = game.settings.simulation_distance;
+    let startup_error = game
+        .install_original_retained_host(inputs.sync, inputs.encoder, inputs.config, offline)
+        .err();
+    if let Some(setup) = &dedicated_setup
+        && let Some(host) = &mut game.lan
+    {
+        host.hub.spawn_protection = setup.props.spawn_protection;
+    }
+    run_game(game, commands, &view, startup_error, &paused)
+}
+
+#[cfg(feature = "mods")]
+fn worker_ordinary_recovery(
+    input: OrdinaryServerInput,
+    activated: mod_packages::ActivatedStartup,
+    mut inputs: HubInputs,
+    commands: mpsc::Receiver<Command>,
+    view: &Mutex<View>,
+    paused: &AtomicBool,
+) -> std::result::Result<(), String> {
+    use super::levels::session_checkpoint::OrdinaryRecoveryWork;
+    let OrdinaryServerInput {
+        options,
+        settings,
+        request,
+        entry,
+        resources,
+        pack,
+        gui,
+        cpu,
+        tree,
+        startup,
+        offline,
+        dedicated_setup,
+        continuation_archive: _,
+        #[cfg(test)]
+        test,
+    } = input;
+    let OrdinaryRequest::Recover(request) = request else {
+        unreachable!()
+    };
+    let until = request.deadline();
+    let root = options.resources.clone();
+    let mut game = Box::new(
+        Game::new_with_world(
+            &resources,
+            pack,
+            gui,
+            options,
+            settings,
+            Audio::silent(&root),
+            Some(cpu),
+            InitialGameWorld::OrdinaryRecoverySeed(startup),
+        )
+        .unwrap_or_else(|error| {
+            eprintln!("fatal: preloaded no-world recovery candidate refused: {error}");
+            std::process::abort();
+        }),
+    );
+    game.adv.tree = tree;
+    game.skin_profiles = RefCell::new(horizon_client::skins::Resolver::without_fetch());
+    game.skin_downloads = RefCell::new(horizon_client::skins::Downloader::without_fetch(
+        root.join("assets/skins"),
+    ));
+    if let Err(original) = game.adopt_activated_startup(activated) {
+        eprintln!(
+            "fatal: original recovery runtime association refused: {}",
+            original.1
+        );
+        std::process::abort();
+    }
+    let mut recovery = OrdinaryRecoveryWork::prepare(game, entry, *request);
+    #[cfg(test)]
+    if let Some(server) = recovery.game_mut().retained_server.as_mut() {
+        server.test = test;
+    }
+    #[cfg(all(
+        test,
+        target_os = "linux",
+        feature = "native-writer-test-control",
+        debug_assertions
+    ))]
+    if recovery.original_error().is_none() {
+        let fixture = recovery
+            .game_mut()
+            .retained_server
+            .as_ref()
+            .and_then(|server| server.test.ordinary_recovery_writer.clone());
+        if let Some(fixture) = fixture
+            && let Err(error) = fixture.arm(recovery.game_mut())
+        {
+            recovery.fail(error);
+        }
+    }
+    #[cfg(all(test, feature = "mods", target_os = "linux"))]
+    if recovery
+        .game_mut()
+        .retained_server
+        .as_ref()
+        .is_some_and(|server| server.test.ordinary.is_some())
+    {
+        paused.store(true, Ordering::SeqCst);
+    }
+    if recovery.original_error().is_none() {
+        let game = recovery.game_mut();
+        inputs.config.default_game_mode = game.level.mode();
+        inputs.config.hardcore = game.level.hardcore;
+        inputs.config.seed = game.level.seed;
+        inputs.config.integrated =
+            game.options.execution_role == execution_role::ExecutionRole::IntegratedServer;
+        inputs.config.max_players = offline.max_players;
+        inputs.config.view_distance = game.settings.render_distance;
+        inputs.config.simulation_distance = game.settings.simulation_distance;
+        if let Some(setup) = &dedicated_setup {
+            inputs.config.force_game_mode = setup.props.force_game_mode;
+        }
+        let result = game.install_original_retained_host(
+            inputs.sync,
+            inputs.encoder,
+            inputs.config,
+            offline,
+        );
+        if let Err(reason) = result {
+            recovery.fail(reason);
+        }
+        if let Some(setup) = &dedicated_setup
+            && let Some(host) = recovery.game_mut().lan.as_mut()
+        {
+            host.hub.spawn_protection = setup.props.spawn_protection;
+        }
+    }
+    let mut state = View::default();
+    let mut listener_started = false;
+    loop {
+        if horizon_threads::stop_requests() > 0 {
+            recovery.fail("ordinary recovery cancelled by stop request".into());
+        }
+        if Instant::now() >= until {
+            recovery.fail("ordinary recovery admission deadline expired".into());
+        }
+        for command in commands.try_iter().take(16) {
+            match command {
+                Command::Close => {
+                    recovery.fail("ordinary recovery cancelled before verified activation".into())
+                }
+                Command::Offer(reply) => {
+                    let offered = if listener_started && recovery.original_error().is_none() {
+                        recovery
+                            .game_mut()
+                            .lan
+                            .as_mut()
+                            .unwrap()
+                            .hub
+                            .retained_connect_local()
+                            .map_err(|error| error.to_string())
+                    } else {
+                        Err("original recovery is not admitting Memory offers".into())
+                    };
+                    if let Err(mpsc::SendError(Ok(pipe))) = reply.send(offered) {
+                        pipe.shutdown();
+                        recovery
+                            .game_mut()
+                            .retained_server
+                            .as_mut()
+                            .unwrap()
+                            .unsent_pipes
+                            .push(pipe);
+                        recovery.fail("original recovery Memory offer reply was lost".into());
+                    }
+                }
+                Command::Retry(_) => {}
+            }
+        }
+        if recovery.original_error().is_some() {
+            return close_ordinary_recovery(recovery, commands, view);
+        }
+        if !listener_started {
+            let game = recovery.game_mut();
+            let listening = if game
+                .retained_server
+                .as_ref()
+                .unwrap()
+                .integrated_owner()
+                .is_some()
+            {
+                Ok(0)
+            } else {
+                game.lan
+                    .as_mut()
+                    .unwrap()
+                    .hub
+                    .retained_listen()
+                    .map_err(|error| error.to_string())
+            };
+            match listening {
+                Ok(port) => {
+                    state.port = port;
+                    listener_started = true;
+                }
+                Err(reason) => {
+                    recovery.fail(reason);
+                    continue;
+                }
+            }
+        }
+        if let Err(reason) = recovery.game_mut().poll_ordinary_recovery_admission() {
+            recovery.fail(reason);
+            continue;
+        }
+        match recovery.try_activate() {
+            Ok(Some(game)) => {
+                // The exact listener/Memory Hub is already acquired. First
+                // gameplay occurs only after consuming verified recovery.
+                return run_game_from(game, commands, view, None, paused, true, true);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                recovery.fail(error.to_string());
+                continue;
+            }
+        }
+        let game = recovery.game_mut();
+        state.phase = "RecoveryJoining";
+        state.ready = true; // Offer eligibility only; no native/player activation.
+        state.world_time = game.world.game_time;
+        state.guests = game.lan.as_ref().unwrap().hub.guests.len();
+        state.pending_events = game.retained_server.as_ref().unwrap().pending.len();
+        *view.lock().unwrap_or_else(|e| e.into_inner()) = state.clone();
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+#[cfg(feature = "mods")]
+fn close_ordinary_recovery(
+    mut recovery: super::levels::session_checkpoint::OrdinaryRecoveryWork<'_>,
+    commands: mpsc::Receiver<Command>,
+    view: &Mutex<View>,
+) -> std::result::Result<(), String> {
+    let original = recovery
+        .original_error()
+        .unwrap_or("ordinary recovery cancelled")
+        .to_owned();
+    recovery.begin_close(Instant::now() + CLOSE_WAIT);
+    let mut attempt = 1;
+    loop {
+        let status = recovery.poll_close();
+        let blocked = match &status {
+            PreparationCloseStatus::Blocked(reason) => Some(reason.clone()),
+            _ => None,
+        };
+        *view.lock().unwrap_or_else(|e| e.into_inner()) = View {
+            phase: "RecoveryClosing",
+            attempt,
+            original_error: Some(original.clone()),
+            blocked: blocked.clone(),
+            ..Default::default()
+        };
+        for command in commands.try_iter().take(16) {
+            match command {
+                Command::Retry(expected) if expected == attempt && blocked.is_some() => {
+                    if recovery.retry_close(Instant::now() + CLOSE_WAIT).is_ok() {
+                        attempt += 1;
+                    }
+                }
+                Command::Offer(reply) => {
+                    let _ = reply.send(Err("original recovery is closing".into()));
+                }
+                _ => {}
+            }
+        }
+        if status == PreparationCloseStatus::Complete {
+            return Err(original);
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+#[cfg(feature = "mods")]
+impl Game<'_> {
+    fn poll_ordinary_recovery_admission(&mut self) -> std::result::Result<(), String> {
+        let clocks = (
+            self.world.game_time,
+            self.world.day_time,
+            self.world.random.state(),
+        );
+        let spawn = self
+            .level
+            .world_spawn
+            .ok_or("checked recovery world spawn absent")?;
+        self.spawn = Some(Vec3::new(
+            f64::from(spawn[0]) + 0.5,
+            f64::from(spawn[1]),
+            f64::from(spawn[2]) + 0.5,
+        ));
+        let clock_rate = self.network_clock_rate();
+        let host = self.lan.as_mut().ok_or("original recovery Hub absent")?;
+        let mut ctx = horizon_client::lan::hub::TickCtx {
+            world: &mut self.world,
+            host: None,
+            entities: &[],
+            next_entity: &mut self.next_entity,
+            spawn: [
+                f64::from(spawn[0]) + 0.5,
+                f64::from(spawn[1]),
+                f64::from(spawn[2]) + 0.5,
+            ],
+            difficulty: i32::from(self.ui.difficulty),
+            difficulty_locked: self.level.difficulty_locked,
+            clock_rate,
+            tick_rate: self.clock.rate(),
+            tick_frozen: self.clock.frozen(),
+            tick_steps: self.clock.step_state(),
+            collision: Some(self.collision),
+            border: &self.border,
+        };
+        let events = host.hub.poll_retained(&mut ctx, 16);
+        let server = self
+            .retained_server
+            .as_mut()
+            .ok_or("original recovery construction absent")?;
+        server.pending.extend(events);
+        server.check_hub(&host.hub);
+        server.check_inboxes(&host.hub);
+        if let Some(reason) = &server.failure {
+            return Err(reason.clone());
+        }
+        if (
+            self.world.game_time,
+            self.world.day_time,
+            self.world.random.state(),
+        ) != clocks
+        {
+            return Err("recovery admission changed native clocks/random".into());
+        }
+        Ok(())
+    }
 }
 
 fn worker(
@@ -840,8 +1840,8 @@ fn worker(
     let prepared = match cold.into_prepared(&entry) {
         Ok(prepared) => prepared,
         Err(cold) => {
-            return close_cold(
-                cold,
+            return close_preparation(
+                ServerPreparation::Cold(cold),
                 commands,
                 &view,
                 (loaded.pack, gui, inputs, resources, cpu),
@@ -911,8 +1911,51 @@ fn worker(
     run_game(game, commands, &view, startup.err(), &paused)
 }
 
-fn close_cold<T>(
-    mut cold: ColdPreparation,
+enum ServerPreparation {
+    Cold(ColdPreparation),
+    #[cfg(feature = "mods")]
+    Ordinary(world_loading::OrdinaryPreparation),
+}
+impl ServerPreparation {
+    fn original_error(&self) -> Option<&str> {
+        match self {
+            Self::Cold(owner) => owner.original_error(),
+            #[cfg(feature = "mods")]
+            Self::Ordinary(owner) => owner.original_error(),
+        }
+    }
+    fn begin_close(&mut self, deadline: Instant) {
+        match self {
+            Self::Cold(owner) => owner.begin_close(deadline),
+            #[cfg(feature = "mods")]
+            Self::Ordinary(owner) => owner.begin_close(deadline),
+        }
+    }
+    fn poll_close(&mut self) -> PreparationCloseStatus {
+        match self {
+            Self::Cold(owner) => owner.poll_close(),
+            #[cfg(feature = "mods")]
+            Self::Ordinary(owner) => owner.poll_close(),
+        }
+    }
+    fn retry_close(&mut self, deadline: Instant) -> Result<()> {
+        match self {
+            Self::Cold(owner) => owner.retry_close(deadline),
+            #[cfg(feature = "mods")]
+            Self::Ordinary(owner) => owner.retry_close(deadline),
+        }
+    }
+    fn finish_close(self) -> std::result::Result<world_loading::PreparationClosed, Self> {
+        match self {
+            Self::Cold(owner) => owner.finish_close().map_err(Self::Cold),
+            #[cfg(feature = "mods")]
+            Self::Ordinary(owner) => owner.finish_close().map_err(Self::Ordinary),
+        }
+    }
+}
+
+fn close_preparation<T>(
+    mut cold: ServerPreparation,
     commands: mpsc::Receiver<Command>,
     view: &Mutex<View>,
     _resources: T,
@@ -986,14 +2029,23 @@ fn run_game<'a>(
     startup_error: Option<String>,
     paused: &AtomicBool,
 ) -> std::result::Result<(), String> {
+    run_game_from(game, commands, shared, startup_error, paused, false, false)
+}
+fn run_game_from<'a>(
+    game: Box<Game<'a>>,
+    commands: mpsc::Receiver<Command>,
+    shared: &Mutex<View>,
+    startup_error: Option<String>,
+    paused: &AtomicBool,
+    mut settled: bool,
+    mut listen_started: bool,
+) -> std::result::Result<(), String> {
     let mut phase = Some(Phase::Running(game));
     let mut view = View::default();
     let mut original_error = startup_error;
     let mut attempt = 0u64;
     let mut close = original_error.is_some();
     let mut retry = false;
-    let mut settled = false;
-    let mut listen_started = false;
     let mut admission_error = None;
     let mut close_deadline = None;
     let mut transport_started = false;
@@ -1043,8 +2095,27 @@ fn run_game<'a>(
                     let result = if !settled {
                         match game.retained_server_settle_step() {
                             Ok(true) => {
-                                settled = true;
-                                Ok(())
+                                #[cfg(all(test, feature = "mods", target_os = "linux"))]
+                                let bootstrap = game
+                                    .retained_server
+                                    .as_ref()
+                                    .unwrap()
+                                    .test
+                                    .ordinary
+                                    .clone()
+                                    .map_or(Ok(()), |control| control.bootstrap(game));
+                                #[cfg(not(all(test, feature = "mods", target_os = "linux")))]
+                                let bootstrap: std::result::Result<
+                                    (),
+                                    String,
+                                > = Ok(());
+                                match bootstrap {
+                                    Ok(()) => {
+                                        settled = true;
+                                        Ok(())
+                                    }
+                                    Err(error) => Err(error.into()),
+                                }
                             }
                             Ok(false) if Instant::now() < settle_deadline => Ok(()),
                             Ok(false) => Err("original native server spawn did not settle".into()),
@@ -1074,6 +2145,7 @@ fn run_game<'a>(
                     } else if Instant::now() >= next_tick {
                         next_tick = Instant::now() + Duration::from_millis(50);
                         game.tick_server_timed(pause)
+                            .and_then(|()| game.poll_ordinary_native_reads())
                     } else {
                         Ok(())
                     };
@@ -1085,6 +2157,18 @@ fn run_game<'a>(
                     }
                 }
                 view.ready = settled && listen_started && !close;
+                #[cfg(all(test, feature = "mods", target_os = "linux"))]
+                if !close
+                    && settled
+                    && pause
+                    && let Some(control) =
+                        game.retained_server.as_ref().unwrap().test.ordinary.clone()
+                    && let Err(error) = control.capture(game)
+                {
+                    original_error.get_or_insert(error.clone());
+                    game.retained_server.as_mut().unwrap().fail(error);
+                    close = true;
+                }
                 view.paused = pause;
                 view.ticks = game.ticks;
                 view.world_time = game.world.game_time;
@@ -1138,6 +2222,10 @@ fn run_game<'a>(
                     if let Err(error) = game.fence_retained_native_motion() {
                         original_error.get_or_insert(error.to_string());
                     }
+                    if let Err(error) = game.freeze_ordinary_checkpoint_participants() {
+                        original_error.get_or_insert(error.clone());
+                        admission_error = Some(error);
+                    }
                     next = Some(1);
                 }
             }
@@ -1178,6 +2266,9 @@ fn run_game<'a>(
                             .retry_retained_admissions()
                             .err()
                             .map(|e| e.to_string());
+                        if admission_error.is_none() {
+                            admission_error = game.freeze_ordinary_checkpoint_participants().err();
+                        }
                         retry = false;
                     }
                     view.guests = game.lan.as_ref().map_or(0, |h| h.hub.guests.len());
@@ -1261,23 +2352,39 @@ fn run_game<'a>(
         if let Some(transition) = next {
             phase = Some(match (transition, phase.take().unwrap()) {
                 (1, Phase::Running(game)) => Phase::Transport(game),
-                (2, Phase::Transport(game)) => Phase::Native(CloseOwner::begin(
-                    game,
-                    CloseProfile::NativeWorld,
-                    close_deadline.unwrap(),
-                )),
+                (2, Phase::Transport(game)) => {
+                    let profile = if game.ordinary_startup.is_some() {
+                        game.ordinary_server_close_profile()
+                    } else {
+                        Ok(CloseProfile::NativeWorld)
+                    };
+                    match profile {
+                        Ok(profile) => {
+                            Phase::Native(CloseOwner::begin(game, profile, close_deadline.unwrap()))
+                        }
+                        Err(reason) => {
+                            original_error.get_or_insert(reason.clone());
+                            view.blocked = Some(reason);
+                            Phase::Transport(game)
+                        }
+                    }
+                }
                 (3, Phase::Native(owner)) => match owner.try_native_ready() {
                     Ok(ready) => Phase::Ready(ready),
                     Err(owner) => Phase::Native(owner),
                 },
                 (4, Phase::Ready(ready)) => match ready.try_dispose_server() {
-                    Ok(disposed) => {
+                    Ok(mut disposed) => {
                         if let Some(transport) = disposed.server_transport() {
                             if let Some(error) = transport_failure(transport) {
                                 original_error.get_or_insert(error);
                             }
                             view.transport = Some(transport.clone());
                         }
+                        *view
+                            .ordinary_closed_world
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner()) = disposed.take_ordinary_world();
                         drop(disposed);
                         view.phase = "NativeDisposed";
                         view.blocked = None;
@@ -1308,6 +2415,119 @@ pub(super) fn run(options: Options, launch: Launch) -> Result<()> {
         #[cfg(test)]
         tests::Startup::default(),
     )
+}
+
+#[cfg(feature = "mods")]
+pub(super) fn run_ordinary_dedicated(
+    mut options: Options,
+    mut settings: Settings,
+    vanilla_root: PathBuf,
+    started: Instant,
+) -> Result<()> {
+    let setup = dedicated::take_retained_setup()?;
+    let started = started.min(setup.started);
+    let (request, offline) = setup.retained_world_inputs(&options)?;
+    let root = packs::startup_root(&vanilla_root, &settings.resource_packs, &[])?;
+    let root = mods::content_root(
+        &root,
+        &settings.mods.enabled,
+        &options.dev_mods,
+        &options.mod_packages,
+    )?;
+    let loaded = load_resources(
+        root,
+        &vanilla_root,
+        &settings,
+        started,
+        false,
+        &Progress::new(),
+        &mut |_, _| {},
+    )?;
+    if loaded.rest_loader.is_some() {
+        eprintln!("fatal: synchronous dedicated generation acquired an unexpected helper");
+        std::process::abort();
+    }
+    if loaded.pack_error.is_some() {
+        return Err("paired dedicated startup refuses resource fallback".into());
+    }
+    options.resources = loaded.root.clone();
+    options.server_thread = false;
+    let cpu = GameCpuResources::load(&loaded.root)?;
+    let tree = Arc::new(horizon_client::advancements::Tree::load(
+        &loaded.root.join("data"),
+    ));
+    let startup = Arc::new(
+        options
+            .mod_packages
+            .freeze_peer_inputs(
+                Arc::new(horizon_client::lan::data::SyncData::load(&loaded.root)?),
+                loaded.pack.assets.registry,
+            )?
+            .ok_or("dedicated startup lost selected pair")?,
+    );
+    settings.render_distance = setup.props.view_distance;
+    settings.simulation_distance = setup.props.simulation_distance;
+    let endpoint = options.control.clone();
+    let timeout = if options.frames.is_some() {
+        options.timeout
+    } else {
+        Duration::MAX
+    };
+    let input = OrdinaryServerInput {
+        options,
+        settings,
+        request: OrdinaryRequest::Native(request),
+        entry: RetainedEntryIdentity {
+            token: 1,
+            owner: Arc::new(()),
+        },
+        resources: loaded.resources,
+        pack: loaded.pack,
+        gui: loaded.gui.ok_or("dedicated GUI/font bundle missing")?,
+        cpu,
+        tree,
+        startup,
+        offline,
+        dedicated_setup: Some(setup),
+        continuation_archive: None,
+        #[cfg(test)]
+        test: tests::Startup::default(),
+    };
+    let mut supervisor = match Supervisor::prepare_ordinary(input) {
+        Ok(supervisor) => supervisor,
+        Err(original) => return Err(original.reason.clone().into()),
+    };
+    if let Some(endpoint) = endpoint {
+        return run_parent(
+            supervisor,
+            RetainedControl::prepare(&endpoint),
+            timeout,
+            #[cfg(test)]
+            tests::Startup::default(),
+        );
+    }
+    let mut stop_sent = false;
+    let mut last_blocked = None;
+    loop {
+        if !stop_sent && horizon_threads::stop_requests() > 0 {
+            supervisor.request_close();
+            stop_sent = true;
+        }
+        let state = supervisor.snapshot();
+        if state.blocked != last_blocked {
+            if let Some(reason) = &state.blocked {
+                log::error!(
+                    "ordinary dedicated closure retains attempt {}: {reason}",
+                    state.attempt
+                );
+            }
+            last_blocked = state.blocked;
+        }
+        if let Some(result) = supervisor.join() {
+            return result.map_err(Into::into);
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
 }
 
 fn run_configured(
@@ -1360,7 +2580,7 @@ fn run_configured(
     let mut control = Some(RetainedControl::prepare(&control_path));
     #[cfg(test)]
     let final_test = test.clone();
-    let mut supervisor = match Supervisor::prepare(Input {
+    let supervisor = match Supervisor::prepare(Input {
         options,
         settings,
         launch,
@@ -1384,6 +2604,22 @@ fn run_configured(
             return Err(error.into());
         }
     };
+    run_parent(
+        supervisor,
+        control.take().unwrap(),
+        timeout,
+        #[cfg(test)]
+        final_test,
+    )
+}
+
+fn run_parent(
+    mut supervisor: Supervisor,
+    controller: RetainedControl,
+    timeout: Duration,
+    #[cfg(test)] final_test: tests::Startup,
+) -> Result<()> {
+    let mut control = Some(controller);
     let mut original_error = control.as_mut().unwrap().start().err();
     if original_error.is_some() {
         let _ = supervisor.commands.send(Command::Close);

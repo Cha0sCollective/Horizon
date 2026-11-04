@@ -29,8 +29,143 @@ const WAIT: Duration = Duration::from_secs(120);
 const POSITION: [i32; 3] = [2, 120, 2];
 const OWNER: u128 = 0x55;
 const EXTERNAL: u128 = 0x66;
+
+/// Read-only observations for the actual ordinary-worker fixture. These bytes
+/// and rows never construct a recovery source, roster or native authority.
+#[derive(Clone, Debug)]
+pub(in crate::game) struct OrdinaryFixtureObservation {
+    counter: Vec<u8>,
+    slot: Vec<u8>,
+    players: Vec<SessionPlayerRow>,
+    clocks: (i64, i64),
+}
+pub(in crate::game) struct OrdinaryFixtureCapture {
+    pub(in crate::game) source: OrdinaryRecoverySource,
+    pub(in crate::game) observation: OrdinaryFixtureObservation,
+}
+pub(super) fn ordinary_fixture_observation(
+    snapshot: &Snapshot,
+) -> SResult<OrdinaryFixtureObservation> {
+    Ok(OrdinaryFixtureObservation {
+        counter: checked(snapshot.counter.encode())?,
+        slot: snapshot.slot.clone(),
+        players: snapshot.players.clone(),
+        clocks: snapshot.clocks,
+    })
+}
+pub(in crate::game) fn capture_ordinary_fixture(
+    game: &Game<'_>,
+    namespace: &crate::game::world_loading::host_identity::session_authority::AuthorityNamespace,
+    archive: &Path,
+    continuation: &Path,
+) -> SResult<OrdinaryFixtureCapture> {
+    let snapshot = game.session_snapshot()?;
+    let local_uuid = native_local_uuid(&game.world_root)?;
+    let initial = compressed_nbt(&read(
+        &game
+            .world_root
+            .join(format!("players/data/{}.dat", uuid_text(local_uuid))),
+        STRUCTURED_LIMIT,
+    )?)?;
+    require(
+        initial.get("Pos").is_none() && lan::session_empty_native_player(&initial),
+        "actual fresh native record must be canonical inert input without a position",
+    )?;
+    if snapshot.players.iter().any(|row| row.integrated_owner) {
+        require(
+            sidecars(
+                &game.world_root,
+                &snapshot.players.iter().map(descriptor).collect::<Vec<_>>(),
+            )
+            .is_err(),
+            "strict final/recovery validation must refuse the actual initial integrated record",
+        )?;
+    }
+    let observation = ordinary_fixture_observation(&snapshot)?;
+    let source = OrdinaryRecoverySource::capture(game, namespace.clone(), archive, continuation)?;
+    Ok(OrdinaryFixtureCapture {
+        source,
+        observation,
+    })
+}
+pub(in crate::game) fn verify_ordinary_fixture_final_players(
+    root: &Path,
+    observation: &OrdinaryFixtureObservation,
+) -> SResult<()> {
+    sidecars(
+        root,
+        &observation
+            .players
+            .iter()
+            .map(descriptor)
+            .collect::<Vec<_>>(),
+    )
+}
+pub(in crate::game) fn ordinary_fixture_observations_match(
+    a: &OrdinaryFixtureObservation,
+    b: &OrdinaryFixtureObservation,
+) -> bool {
+    a.counter == b.counter
+        && a.slot == b.slot
+        && a.clocks == b.clocks
+        && same_players(&a.players, &b.players)
+}
 #[path = "session_checkpoint_registered_tests.rs"]
 mod registered;
+
+#[test]
+fn initial_integrated_player_input_never_waives_final_or_item_projection() {
+    let uuid = [1, 2, 3, 4];
+    let level = save::Level {
+        player_uuid: Some(uuid),
+        health: 20.0,
+        food: 20,
+        saturation: 5.0,
+        ..Default::default()
+    };
+    let inert = level.player_tag();
+    assert!(lan::session_empty_native_player(&inert) && inert.get("Pos").is_none());
+    let mut owner = PlayerDescriptor {
+        profile_uuid: uuid_text(uuid),
+        record_uuid: uuid,
+        integrated_owner: true,
+        dimension: "minecraft:overworld".into(),
+    };
+    assert!(validate_player_sidecar(&inert, false, &owner, uuid, Some(uuid)).is_ok());
+    assert!(
+        validate_player_sidecar(&inert, false, &owner, uuid, None).is_err(),
+        "final/recovery current records remain strict"
+    );
+    assert!(
+        validate_player_sidecar(&inert, true, &owner, uuid, None).is_ok(),
+        "existing canonical backup remains supported"
+    );
+    assert!(validate_player_sidecar(&inert, false, &owner, uuid, Some([9; 4])).is_err());
+    owner.integrated_owner = false;
+    assert!(validate_player_sidecar(&inert, false, &owner, uuid, Some(uuid)).is_err());
+    owner.integrated_owner = true;
+    owner.record_uuid = [9; 4];
+    assert!(validate_player_sidecar(&inert, false, &owner, uuid, Some(uuid)).is_err());
+    owner.record_uuid = uuid;
+    let mut carrying = level.clone();
+    carrying.inventory.push((0, "minecraft:stone".into(), 2, 0));
+    assert!(
+        validate_player_sidecar(&carrying.player_tag(), false, &owner, uuid, Some(uuid)).is_err(),
+        "no-position input with items is never inert"
+    );
+    let mut malformed = inert.clone();
+    let Tag::Compound(fields) = &mut malformed else {
+        unreachable!()
+    };
+    fields.insert("unexpected_authority".into(), Tag::Int(1));
+    assert!(validate_player_sidecar(&malformed, false, &owner, uuid, Some(uuid)).is_err());
+    let mut placed = level;
+    placed.position = Some([8.5, 80.0, 8.5]);
+    assert!(
+        validate_player_sidecar(&placed.player_tag(), false, &owner, uuid, None).is_ok(),
+        "actual supported final position remains valid"
+    );
+}
 
 #[test]
 #[ignore = "isolated pinned resources + prebuilt pair: managed new Game holds UUID authority"]

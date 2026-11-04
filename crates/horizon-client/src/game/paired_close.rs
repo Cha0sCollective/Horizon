@@ -905,8 +905,108 @@ pub(super) struct NativeReady<'window> {
 pub(super) struct NativeDisposed {
     _native_only: (),
     server_transport: Option<horizon_client::lan::hub::RetainedHubCloseView>,
+    ordinary_world: Option<OrdinaryClosedWorld>,
+}
+/// One actual completed ordinary world, issued only by NativeReady consuming
+/// disposal. A path, UUID file or empty runtime cannot construct this record.
+pub(in crate::game) struct OrdinaryClosedWorld {
+    root: std::path::PathBuf,
+    world: horizon_client::world::counter_restore::WorldId,
+    startup: std::sync::Arc<super::mod_packages::FrozenHostInputs>,
+    coherent: bool,
+    original: std::sync::Mutex<Option<super::world_loading::NativeCloseAuthority>>,
+}
+impl std::fmt::Debug for OrdinaryClosedWorld {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OrdinaryClosedWorld")
+            .finish_non_exhaustive()
+    }
+}
+impl OrdinaryClosedWorld {
+    fn from_completed(game: &mut Game<'_>, profile: &CloseProfile) -> Option<Self> {
+        let startup = game.ordinary_startup.as_ref()?.clone();
+        let world = *game.session_lock.as_ref()?.expected_world()?;
+        Some(Self {
+            root: game.world_root.clone(),
+            world,
+            startup,
+            coherent: matches!(profile, CloseProfile::CoherentSession { .. }),
+            original: std::sync::Mutex::new(Some(game.native_close_authority.take()?)),
+        })
+    }
+    pub(in crate::game) fn claim_native(
+        self: &std::sync::Arc<Self>,
+        root: &std::path::Path,
+    ) -> Option<NativeReopenClaim> {
+        if self.coherent || self.root != root {
+            return None;
+        }
+        let original = self
+            .original
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()?;
+        Some(NativeReopenClaim {
+            source: self.clone(),
+            original: Some(original),
+        })
+    }
+    pub(in crate::game) fn is_coherent_source(
+        &self,
+        root: &std::path::Path,
+        world: horizon_client::world::counter_restore::WorldId,
+        startup: &std::sync::Arc<super::mod_packages::FrozenHostInputs>,
+    ) -> bool {
+        self.coherent
+            && self.root == root
+            && self.world == world
+            && std::sync::Arc::ptr_eq(&self.startup, startup)
+            && self
+                .original
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .is_some()
+    }
+    pub(in crate::game) fn root(&self) -> &std::path::Path {
+        &self.root
+    }
+}
+/// The one original completion claim moves with the request and its actual
+/// PrepareOwner. Arc aliases cannot obtain a second claim. A failed preparation
+/// returns the SAME claim only after its checked owner is allowed to drop.
+pub(in crate::game) struct NativeReopenClaim {
+    source: std::sync::Arc<OrdinaryClosedWorld>,
+    original: Option<super::world_loading::NativeCloseAuthority>,
+}
+impl NativeReopenClaim {
+    pub(in crate::game) fn world(
+        &self,
+        root: &std::path::Path,
+    ) -> Option<horizon_client::world::counter_restore::WorldId> {
+        (self.original.is_some() && self.source.root == root && !self.source.coherent)
+            .then_some(self.source.world)
+    }
+    pub(in crate::game) fn spend_on_adoption(&mut self) {
+        self.original = None;
+    }
+}
+impl Drop for NativeReopenClaim {
+    fn drop(&mut self) {
+        if let Some(original) = self.original.take() {
+            let mut slot = self
+                .source
+                .original
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            assert!(slot.is_none(), "original native completion claim is unique");
+            *slot = Some(original);
+        }
+    }
 }
 impl NativeDisposed {
+    pub(super) fn take_ordinary_world(&mut self) -> Option<OrdinaryClosedWorld> {
+        self.ordinary_world.take()
+    }
     pub(super) fn server_transport(
         &self,
     ) -> Option<&horizon_client::lan::hub::RetainedHubCloseView> {
@@ -914,6 +1014,13 @@ impl NativeDisposed {
     }
 }
 fn dormant_async_owners_absent(game: &Game<'_>, allow_constructor_lan: bool) -> bool {
+    remaining_async_owners_absent(game, allow_constructor_lan, false)
+}
+fn remaining_async_owners_absent(
+    game: &Game<'_>,
+    allow_constructor_lan: bool,
+    retain_presentation: bool,
+) -> bool {
     (allow_constructor_lan || game.lan.is_none())
         && game.remote.is_none()
         && game.integrated.is_none()
@@ -929,16 +1036,57 @@ fn dormant_async_owners_absent(game: &Game<'_>, allow_constructor_lan: bool) -> 
         && game.pending_save.is_none()
         && game.adv.pending_tree.is_none()
         && game.lod.is_none()
-        && game.window.is_none()
-        && game.renderer.is_none()
+        && (retain_presentation || (game.window.is_none() && game.renderer.is_none()))
 }
 impl NativeReady<'_> {
+    /// Return real presentation only after the original ordinary world and all
+    /// its relevant children completed. Old world/save authority never escapes.
+    pub(super) fn try_return_window(
+        mut self,
+        completion: super::window_close::OrdinaryClientCompletion,
+    ) -> Result<
+        super::window_close::ReturnedFrontend,
+        (Self, super::window_close::OrdinaryClientCompletion, String),
+    > {
+        let game = self.owner.game.as_ref().unwrap();
+        if !self.owner.native_ready_proven()
+            || !remaining_async_owners_absent(game, false, true)
+            || !completion.matches(game)
+            || !game
+                .native_close_authority
+                .as_ref()
+                .is_some_and(|authority| !authority.is_server() && authority.authorizes(game))
+        {
+            return Err((
+                self,
+                completion,
+                "ordinary window/world completion is not original or remains active".into(),
+            ));
+        }
+        // Completion validates the retained original presentation; all other
+        // asynchronous/world owners have completed before their remainder drops.
+        self.owner.armed = false;
+        let closed_world = OrdinaryClosedWorld::from_completed(
+            self.owner.game.as_mut().unwrap(),
+            &self.owner.profile,
+        );
+        let game = self
+            .owner
+            .game
+            .take()
+            .expect("original completed ordinary Game");
+        let mut returned = super::window_close::ReturnedFrontend::from_completed_game(game);
+        returned.closed_world = closed_world;
+        drop(completion);
+        Ok(returned)
+    }
     /// This server path keeps the original Ready Hub in Game until native
     /// projection, metadata acknowledgment and all writers have completed.
     pub(super) fn try_dispose_server(mut self) -> Result<NativeDisposed, (Self, String)> {
         let game = self.owner.game.as_ref().unwrap();
         if !self.owner.native_ready_proven()
-            || !matches!(self.owner.profile, CloseProfile::NativeWorld)
+            || (!matches!(self.owner.profile, CloseProfile::NativeWorld)
+                && game.preflight_ordinary_coherent_owner().is_err())
             || !dormant_async_owners_absent(game, true)
             || !game
                 .native_close_authority
@@ -964,6 +1112,10 @@ impl NativeReady<'_> {
             },
             None => None,
         };
+        let ordinary_world = OrdinaryClosedWorld::from_completed(
+            self.owner.game.as_mut().unwrap(),
+            &self.owner.profile,
+        );
         self.owner.armed = false;
         let server_transport = closed.as_ref().map(|host| host.hub.view());
         drop(self.owner.game.take());
@@ -971,6 +1123,7 @@ impl NativeReady<'_> {
         Ok(NativeDisposed {
             _native_only: (),
             server_transport,
+            ordinary_world,
         })
     }
     pub(super) fn observe(&self) -> CloseObservation {
@@ -1026,6 +1179,7 @@ impl NativeReady<'_> {
         Ok(NativeDisposed {
             _native_only: (),
             server_transport: None,
+            ordinary_world: None,
         })
     }
     pub(super) fn try_dispose_dormant(mut self) -> Result<NativeDisposed, (Self, String)> {
@@ -1045,6 +1199,7 @@ impl NativeReady<'_> {
         Ok(NativeDisposed {
             _native_only: (),
             server_transport: None,
+            ordinary_world: None,
         })
     }
 }
@@ -1544,7 +1699,7 @@ impl<'window> CloseOwner<'window> {
     fn advance(&mut self) -> Result<Option<CloseIoJob>, String> {
         let game = self.game.as_mut().ok_or("original close Game absent")?;
         if game.retained_server.is_some() && !matches!(self.profile, CloseProfile::NativeWorld) {
-            return Err("retained headless server has no coherent-session admission".into());
+            game.preflight_ordinary_coherent_owner()?;
         }
         match self.phase {
             ClosePhase::Resources => {
@@ -2137,6 +2292,7 @@ impl<'window> TestCloseCustody<'window> {
         Ok(NativeDisposed {
             _native_only: (),
             server_transport: None,
+            ordinary_world: None,
         })
     }
 }

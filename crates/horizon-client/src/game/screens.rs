@@ -93,6 +93,34 @@ fn pause_buttons(
 /// `FRIENDS_ICON` (vanilla's `CommonButtons.friends`) opens Horizon's
 /// Play with Friends; the others stay inactive.
 const FRIENDS_ICON: usize = 2;
+fn pause_surface_admits(ordinary: bool, id: u8) -> bool {
+    !ordinary || matches!(id, 0 | 2)
+}
+fn pause_hit(
+    size: (f32, f32),
+    cursor: (f32, f32),
+    remote: bool,
+    links: bool,
+    friends: bool,
+    ordinary: bool,
+) -> Option<u8> {
+    let (w, h) = size;
+    pause_buttons(w, h, remote, links)
+        .into_iter()
+        .find(|button| {
+            button.5
+                && pause_surface_admits(ordinary, button.4)
+                && ui::hovered(cursor, button.0, button.1, button.2, 20.0)
+        })
+        .map(|button| button.4)
+        .or_else(|| {
+            let icon = pause_icons(w, h, links)[FRIENDS_ICON];
+            (friends
+                && pause_surface_admits(ordinary, 10)
+                && ui::hovered(cursor, icon.0, icon.1, 20.0, 20.0))
+            .then_some(10)
+        })
+}
 fn pause_icons(w: f32, h: f32, links: bool) -> [(f32, f32, &'static str); 4] {
     let x0 = ((w - 212.0) * 0.5).floor() + 60.0;
     let y = ((h - 166.0 - if links { 24.0 } else { 0.0 }) * 0.25).floor() + 98.0;
@@ -129,6 +157,12 @@ fn death_buttons(w: f32, h: f32, hardcore: bool) -> [(f32, f32, &'static str, u8
     ]
 }
 impl Game<'_> {
+    fn ordinary_pause_surface(&self) -> bool {
+        #[cfg(feature = "paired-packages")]
+        return self.ordinary_startup.is_some();
+        #[cfg(not(feature = "paired-packages"))]
+        false
+    }
     /// Singleplayer also has a connection, backed by the integrated server.
     pub(super) fn external_server(&self) -> bool {
         self.remote.is_some() && self.integrated.is_none()
@@ -151,6 +185,7 @@ impl Game<'_> {
         let links = !self.server_links().is_empty();
         let mut tooltip = None;
         for (x, y, bw, key, id, active) in pause_buttons(w, h, self.external_server(), links) {
+            let active = active && pause_surface_admits(self.ordinary_pause_surface(), id);
             let hover = active && ui::hovered(self.cursor, x, y, bw, 20.0);
             ui::button(
                 batch,
@@ -169,7 +204,9 @@ impl Game<'_> {
             }
         }
         for (i, (x, y, sprite)) in pause_icons(w, h, links).into_iter().enumerate() {
-            let active = i == FRIENDS_ICON && friends;
+            let active = i == FRIENDS_ICON
+                && friends
+                && pause_surface_admits(self.ordinary_pause_surface(), 10);
             let hover = ui::hovered(self.cursor, x, y, 20.0, 20.0);
             // The icon has no label: name it for controller focus and the
             // control socket's widget tree.
@@ -220,16 +257,14 @@ impl Game<'_> {
             (b.width, b.height)
         };
         let links = !self.server_links().is_empty();
-        let friends = pause_icons(w, h, links)[FRIENDS_ICON];
-        let hit = pause_buttons(w, h, self.external_server(), links)
-            .into_iter()
-            .find(|b| b.5 && ui::hovered(self.cursor, b.0, b.1, b.2, 20.0))
-            .map(|b| b.4)
-            .or_else(|| {
-                (self.friends_view().shown
-                    && ui::hovered(self.cursor, friends.0, friends.1, 20.0, 20.0))
-                .then_some(10)
-            });
+        let hit = pause_hit(
+            (w, h),
+            self.cursor,
+            self.external_server(),
+            links,
+            self.friends_view().shown,
+            self.ordinary_pause_surface(),
+        );
         match hit {
             Some(0) => {
                 self.screen = Screen::Playing;
@@ -466,6 +501,37 @@ impl Game<'_> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ordinary_pause_uses_real_geometry_and_fences_every_unsupported_button() {
+        for remote in [false, true] {
+            for links in [false, true] {
+                let size = (427.0, 240.0);
+                for (x, y, width, _, id, active) in
+                    super::pause_buttons(size.0, size.1, remote, links)
+                {
+                    let cursor = (x + width / 2.0, y + 10.0);
+                    assert_eq!(
+                        super::pause_hit(size, cursor, remote, links, true, true),
+                        matches!(id, 0 | 2).then_some(id)
+                    );
+                    assert_eq!(
+                        super::pause_hit(size, cursor, remote, links, true, false),
+                        active.then_some(id)
+                    );
+                }
+                let icon = super::pause_icons(size.0, size.1, links)[super::FRIENDS_ICON];
+                let cursor = (icon.0 + 10.0, icon.1 + 10.0);
+                assert_eq!(
+                    super::pause_hit(size, cursor, remote, links, true, true),
+                    None
+                );
+                assert_eq!(
+                    super::pause_hit(size, cursor, remote, links, true, false),
+                    Some(10)
+                );
+            }
+        }
+    }
     use super::{Screen, pause_buttons, pause_icons};
 
     #[test]

@@ -169,6 +169,8 @@ pub(super) struct RefusedSend {
 
 #[cfg(feature = "paired-packages")]
 pub(super) struct RetainedIo {
+    pub(super) startup: Option<std::sync::Arc<super::mod_packages::FrozenHostInputs>>,
+    pub(super) configured: Option<horizon_client::lan::login_negotiation::ConfiguredAdmission>,
     pub(super) session: Option<RetainedSession>,
     pub(super) closed_session: Option<ClosedSession>,
     pub(super) decoder: Option<RetainedChunkDecoder>,
@@ -203,6 +205,8 @@ pub(super) struct RetainedIo {
 impl RetainedIo {
     pub(super) fn new(session: RetainedSession, address: String, name: String) -> Self {
         Self {
+            startup: None,
+            configured: None,
             session: Some(session),
             closed_session: None,
             decoder: Some(RetainedChunkDecoder::prepare()),
@@ -247,6 +251,14 @@ impl RetainedIo {
                 })
             })
             .or_else(|| self.session_terminal_failure())
+            .or_else(|| {
+                (!self.sealed
+                    && self
+                        .configured
+                        .as_ref()
+                        .is_some_and(|configured| !configured.is_live()))
+                .then(|| "original paired connection is no longer live".into())
+            })
     }
     fn session_terminals(&self) -> Vec<horizon_client::net::RetainedTerminal> {
         self.session

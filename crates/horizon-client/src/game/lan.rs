@@ -244,15 +244,61 @@ impl Game<'_> {
             // This fixed call is made once by the cold factory, before offers.
             return Err("original retained host is already bound".into());
         }
-        let mut hub = match Hub::new_retained(sync, encoder, config, offline) {
-            Ok(hub) => hub,
-            Err(refusal) => {
-                let detail = refusal.reason.clone();
-                self.retained_server
-                    .as_mut()
-                    .unwrap()
-                    .hold_hub_refusal(refusal);
-                return Err(detail);
+        let startup = self
+            .retained_server
+            .as_ref()
+            .and_then(|server| server.startup())
+            .cloned();
+        let mut hub = if let Some(startup) = startup {
+            let preflight = (|| {
+                if !Arc::ptr_eq(&startup.retained_sync(), &sync) {
+                    return Err("ordinary Hub does not retain its startup SyncData".to_owned());
+                }
+                let expected = startup.negotiation_expectation()?;
+                lan::login_negotiation::RequiredNegotiation::new(
+                    expected,
+                    std::time::Duration::from_secs(30),
+                )
+                .map_err(|reason| reason.to_string())
+            })();
+            let required = match preflight {
+                Ok(required) => required,
+                Err(reason) => {
+                    self.retained_server
+                        .as_mut()
+                        .unwrap()
+                        .hold_hub_refusal(Box::new(lan::hub::RetainedHubRefusal {
+                            sync,
+                            encoder,
+                            config,
+                            offline,
+                            reason: reason.clone(),
+                        }));
+                    return Err(reason);
+                }
+            };
+            match Hub::new_retained_paired(sync, encoder, config, offline, required) {
+                Ok(hub) => hub,
+                Err(refusal) => {
+                    let detail = refusal.inputs.reason.clone();
+                    self.retained_server
+                        .as_mut()
+                        .unwrap()
+                        .hold_paired_hub_refusal(refusal);
+                    return Err(detail);
+                }
+            }
+        } else {
+            match Hub::new_retained(sync, encoder, config, offline) {
+                Ok(hub) => hub,
+                Err(refusal) => {
+                    let detail = refusal.reason.clone();
+                    self.retained_server
+                        .as_mut()
+                        .unwrap()
+                        .hold_hub_refusal(refusal);
+                    return Err(detail);
+                }
             }
         };
         hub.flat_world = self.world_flat;
@@ -319,10 +365,13 @@ impl Game<'_> {
             .hub
             .guest(conn)
             .ok_or("original admitted Guest missing")?;
-        if !server
-            .hub_identity()
-            .is_some_and(|id| id.matches_guest(&host.hub, conn, g.uuid))
-        {
+        if !server.hub_identity().is_some_and(|id| {
+            if server.startup().is_some() {
+                id.matches_configured_guest(&host.hub, conn, g.uuid)
+            } else {
+                id.matches_guest(&host.hub, conn, g.uuid)
+            }
+        }) {
             return Err("original admitted connection identity differs".into());
         }
         if server.native_installed(conn, g.uuid) {
@@ -521,6 +570,12 @@ impl Game<'_> {
             border: &self.border,
         };
         host.hub.place_new_player(conn, &mut ctx);
+        if let Some(guest) = host.hub.guest(conn) {
+            self.retained_server
+                .as_mut()
+                .expect("original retained placement owner")
+                .record_initial_native_placement(guest);
+        }
     }
 
     /// Only explicit close Retry invokes this. It finishes already-started
@@ -829,6 +884,22 @@ pub(in crate::game) enum ParticipantPreflightError {
 #[cfg(feature = "paired-packages")]
 #[allow(dead_code)]
 impl ParticipantRoster {
+    pub(super) fn same_owners(&self, other: &Self, host: &LanHost) -> bool {
+        self.host_identity.matches(host)
+            && other.host_identity.matches(host)
+            && self.owner_uuid == other.owner_uuid
+            && self.level_player_uuid == other.level_player_uuid
+            && self.identities.len() == other.identities.len()
+            && self.identities.iter().all(|row| {
+                other.identities.iter().any(|original| {
+                    row.conn == original.conn
+                        && row.uuid == original.uuid
+                        && row.dimension == original.dimension
+                        && row.storage == original.storage
+                        && Arc::ptr_eq(&row.sender_identity, &original.sender_identity)
+                })
+            })
+    }
     fn validate(&self) -> ParticipantCheck<()> {
         use ParticipantPreflightError as E;
         for (index, p) in self.identities.iter().enumerate() {
@@ -1053,6 +1124,14 @@ impl Game<'_> {
         &self,
     ) -> ParticipantCheck<ParticipantRoster> {
         use ParticipantPreflightError as E;
+        if let Some(server) = &self.retained_server {
+            if server.startup().is_none() {
+                return Err(E::NotAuthoritative);
+            }
+            // Original admitted native custody survives transport Live ending.
+            // This binds the installed body, record UUID, Hub and sender owners.
+            return self.observe_retained_native_participants();
+        }
         let host = self.checkpoint_participant_host()?;
         let owner_uuid = host.owner.as_ref().map(|owner| owner.uuid);
         if let Some(serving) = &self.serving
@@ -1121,6 +1200,12 @@ impl Game<'_> {
         self.checkpoint_participant_host()?;
         expected.validate()?;
         let current = self.observe_checkpoint_participants()?;
+        if let Some(server) = &self.retained_server
+            && let Some(original) = server.checkpoint_roster()
+            && !original.same_owners(expected, self.checkpoint_participant_host()?)
+        {
+            return Err(E::RosterMismatch);
+        }
         if !expected
             .host_identity
             .matches(self.checkpoint_participant_host()?)
@@ -1170,12 +1255,19 @@ impl Game<'_> {
             }
         }
         for g in &host.hub.guests {
-            if !g.loaded
+            // Include an original close-only body or the exact constructor-bound
+            // initial placement while its acknowledgments are still owned.
+            // Frozen capture does not replay packets or fabricate readiness.
+            let original_initial_custody = self
+                .retained_server
+                .as_ref()
+                .is_some_and(|server| server.retains_initial_native_custody(g));
+            if (!g.loaded && !original_initial_custody)
                 || g.motion.is_none()
-                || !g.left_reason.is_empty()
+                || (self.retained_server.is_none() && !g.left_reason.is_empty())
                 || g.dead
                 || g.death_time != 0
-                || g.awaiting_teleport.is_some()
+                || (g.awaiting_teleport.is_some() && !original_initial_custody)
                 || g.carried.is_some()
                 || g.craft_grid.iter().any(Option::is_some)
                 || g.craft_result.is_some()
@@ -1187,7 +1279,7 @@ impl Game<'_> {
                 || g.sleep_timer != 0
                 || g.sent_bed.is_some()
                 || g.loaded_body.is_some()
-                || !g.inbox.is_empty()
+                || (self.retained_server.is_none() && !g.inbox.is_empty())
                 || !host
                     .play
                     .get(&g.conn)
@@ -1329,6 +1421,305 @@ pub(in crate::game) struct SessionPlayerRow {
     pub(in crate::game) player: horizon_world::nbt::Tag,
     pub(in crate::game) advancements: serde_json::Value,
     pub(in crate::game) stats: serde_json::Value,
+}
+
+/// Actual configured, unplaced recovery custody. Historical row connection
+/// numbers are observations; the bindings below use the ORIGINAL new Guests.
+#[cfg(feature = "paired-packages")]
+pub(in crate::game) struct OrdinaryRecoveryPlayers {
+    identity: horizon_client::lan::hub::RetainedHubIdentity,
+    rows: Vec<OrdinaryRecoveryPlayer>,
+    roster: Option<ParticipantRoster>,
+    saved_owner: Option<Box<horizon_client::save::Level>>,
+    cache_cleared: bool,
+}
+#[cfg(feature = "paired-packages")]
+struct OrdinaryRecoveryPlayer {
+    row: SessionPlayerRow,
+    conn: u32,
+    sender: Arc<std::sync::atomic::AtomicUsize>,
+    level: Option<horizon_client::save::Level>,
+    body: Option<Box<horizon_client::motion::PlayerMotion>>,
+    progress: Option<horizon_client::advancements::Progress>,
+    stats: Option<super::stats::Stats>,
+    installed: bool,
+}
+#[cfg(feature = "paired-packages")]
+impl OrdinaryRecoveryPlayers {
+    pub(in crate::game) fn bind(
+        game: &Game<'_>,
+        checked: &super::levels::session_checkpoint::CheckedSessionPlayers,
+    ) -> Result<Self> {
+        let server = game
+            .retained_server
+            .as_ref()
+            .ok_or("original recovery construction absent")?;
+        let host = game.lan.as_ref().ok_or("original recovery host absent")?;
+        let identity = server
+            .hub_identity()
+            .ok_or("original recovery Hub identity absent")?;
+        let expected = checked.rows();
+        let integrated = server.integrated_owner();
+        let count = if integrated.is_some() { 1 } else { 2 };
+        if server.startup().is_none()
+            || server.frozen()
+            || !identity.matches(&host.hub)
+            || expected.len() != count
+            || host.hub.guests.len() != count
+            || expected.iter().filter(|row| row.integrated_owner).count()
+                != usize::from(integrated.is_some())
+            || host.hub.config.integrated != integrated.is_some()
+        {
+            return Err(
+                "checked recovery requires the exact original one-owner or two-external roster"
+                    .into(),
+            );
+        }
+        let mut rows = Vec::new();
+        for row in expected {
+            let guest = host
+                .hub
+                .guests
+                .iter()
+                .find(|guest| guest.uuid == row.profile_uuid)
+                .ok_or("checked recovery profile missing from original Guests")?;
+            if rows.iter().any(|bound: &OrdinaryRecoveryPlayer| {
+                bound.conn == guest.conn || bound.row.profile_uuid == row.profile_uuid
+            }) || !identity.matches_configured_guest(&host.hub, guest.conn, guest.uuid)
+                || !server.is_untouched(guest.conn)
+                || !retained_guest_untouched(host, guest)
+                || row.dimension != super::Dim::Overworld.id()
+                || row.integrated_owner
+                    != integrated.is_some_and(|(owner, _)| owner == row.profile_uuid)
+                || record_uuid(
+                    integrated.map(|(owner, _)| owner),
+                    game.level.player_uuid,
+                    row.profile_uuid,
+                ) != Some(row.record_uuid)
+            {
+                return Err("original configured recovery Guest/storage binding differs".into());
+            }
+            rows.push(OrdinaryRecoveryPlayer {
+                row: row.clone(),
+                conn: guest.conn,
+                sender: guest.sender.pending.clone(),
+                level: None,
+                body: None,
+                progress: None,
+                stats: None,
+                installed: false,
+            });
+        }
+        if let Some((owner, _)) = integrated {
+            let saved = host
+                .owner
+                .as_ref()
+                .filter(|saved| saved.uuid == owner)
+                .and_then(|owner| owner.saved.as_ref())
+                .ok_or("original integrated recovery cache absent")?;
+            let row = expected
+                .iter()
+                .find(|row| row.integrated_owner)
+                .ok_or("checked owner row absent")?;
+            if !session_player_tags_equal(&saved.player_tag(), &row.player) {
+                return Err("original integrated native cache differs from checked owner".into());
+            }
+        } else if host.owner.is_some() {
+            return Err("dedicated recovery cannot own an integrated cache".into());
+        }
+        Ok(Self {
+            identity: identity.clone(),
+            rows,
+            roster: None,
+            saved_owner: None,
+            cache_cleared: false,
+        })
+    }
+    /// Every partial body and installed row remains in this work or the same
+    /// actual Guest. There is no consuming error-returning host wrapper.
+    pub(in crate::game) fn install(&mut self, game: &mut Game<'_>) -> Result<()> {
+        for work in &mut self.rows {
+            if work.installed {
+                continue;
+            }
+            let host = game.lan.as_ref().ok_or("original recovery host absent")?;
+            let guest = host
+                .hub
+                .guest(work.conn)
+                .ok_or("bound recovery Guest absent")?;
+            if !self
+                .identity
+                .matches_configured_guest(&host.hub, work.conn, work.row.profile_uuid)
+                || !Arc::ptr_eq(&work.sender, &guest.sender.pending)
+                || !retained_guest_untouched(host, guest)
+            {
+                return Err(
+                    "original configured recovery owner changed before installation".into(),
+                );
+            }
+            validate_session_player_tag(&work.row.player)?;
+            if work.level.is_none() {
+                let mut level = horizon_client::save::Level {
+                    player_uuid: Some(work.row.record_uuid),
+                    ..Default::default()
+                };
+                level.read_player(&work.row.player);
+                level.player_extra = Some(work.row.player.clone());
+                work.level = Some(level);
+            }
+            let level = work.level.as_ref().unwrap();
+            if work.body.is_none() {
+                let p = level.position.ok_or("checked recovery position absent")?;
+                work.body = Some(Box::new(horizon_client::motion::PlayerMotion::new(
+                    game.motion,
+                    Vec3::new(p[0], p[1], p[2]),
+                )?));
+            }
+            let body = work.body.as_mut().unwrap();
+            let mut pending = true;
+            body.load_saved_state_once(&mut pending, level)?;
+            body.internal_set_absorption(level.absorption)?;
+            let short = |key| {
+                horizon_client::save::number(work.row.player.get(key))
+                    .ok_or("checked saved body scalar absent")
+            };
+            body.fire_ticks = i32::try_from(short("Fire")?)?;
+            body.air = i32::try_from(short("Air")?)?;
+            body.fall_distance = level.fall_distance;
+            body.velocity = Vec3::new(level.motion[0], level.motion[1], level.motion[2]);
+            body.health.food.exhaustion = level.food_exhaustion;
+            body.health.food.timer = level.food_tick_timer;
+            body.yaw = level.rotation[0];
+            body.head_yaw = body.yaw;
+            body.pitch = level.rotation[1];
+            body.ground.on_ground = level.on_ground;
+            body.server_copy = true;
+            body.may_fly = matches!(level.mode(), 1 | 3);
+            body.invulnerable = body.may_fly;
+            body.spectator = level.mode() == 3;
+            body.flying = level.flying;
+            if pending || !session_body_matches_level(body, level) {
+                return Err("original staged recovery body differs from checked native row".into());
+            }
+            work.progress = Some(horizon_client::advancements::Progress::from_json(
+                &work.row.advancements,
+            ));
+            work.stats = Some(super::stats::Stats::from_saved_json(Some(&work.row.stats)));
+            if game.adv.pending_tree.is_some()
+                || game.adv.tree.list.is_empty()
+                || work
+                    .progress
+                    .as_ref()
+                    .unwrap()
+                    .to_json(&game.adv.tree, horizon_world::DATA_VERSION)
+                    != work.row.advancements
+                || work.stats.as_ref().unwrap().to_json() != work.row.stats
+            {
+                return Err(
+                    "checked recovery progress/statistics would change on installation".into(),
+                );
+            }
+            let host = game.lan.as_mut().unwrap();
+            let guest = host.hub.guest_mut(work.conn).unwrap();
+            playerdata::apply(guest, level);
+            let mut body = work.body.take().unwrap();
+            guest
+                .loaded_body
+                .take()
+                .expect("native checked apply body")
+                .apply(&mut body);
+            guest
+                .saved_absorption
+                .take()
+                .expect("native checked apply absorption");
+            guest.motion = Some(body);
+            guest.advancements = work.progress.take().unwrap();
+            guest.advancements_loaded = true;
+            host.play.entry(work.conn).or_default().stats = work.stats.take().unwrap();
+            game.retained_server
+                .as_mut()
+                .unwrap()
+                .record_installation(work.conn, work.row.profile_uuid);
+            work.installed = true;
+        }
+        if !self.cache_cleared {
+            let local_tag = game.level.player_tag();
+            let host = game.lan.as_mut().unwrap();
+            let dedicated = host.owner.is_none();
+            if let Some(owner) = host.owner.as_mut() {
+                self.saved_owner = owner.saved.take();
+            }
+            game.clear_session_local_cache(dedicated, local_tag);
+            self.cache_cleared = true;
+        }
+        if self.roster.is_none() {
+            self.roster = Some(
+                game.observe_retained_native_participants()
+                    .map_err(|error| format!("restored original census: {error:?}"))?,
+            );
+        }
+        let _ = self.project(game)?;
+        Ok(())
+    }
+    /// Distinct unpublished projection. No loaded/placed flag or general
+    /// coherent capture readiness predicate is fabricated or relaxed here.
+    pub(in crate::game) fn project(&self, game: &Game<'_>) -> Result<Vec<SessionPlayerRow>> {
+        let host = game.lan.as_ref().ok_or("original recovery host absent")?;
+        let roster = self
+            .roster
+            .as_ref()
+            .ok_or("original restored recovery census absent")?;
+        if !self.cache_cleared
+            || host.hub.guests.len() != self.rows.len()
+            || !self.identity.matches(&host.hub)
+            || !roster.host_identity.matches(host)
+        {
+            return Err("original recovery census changed".into());
+        }
+        for work in &self.rows {
+            let guest = host
+                .hub
+                .guest(work.conn)
+                .ok_or("original recovery Guest disappeared")?;
+            if !work.installed
+                || guest.placed
+                || guest.loaded
+                || guest.awaiting_teleport.is_some()
+                || !self.identity.matches_configured_guest(
+                    &host.hub,
+                    work.conn,
+                    work.row.profile_uuid,
+                )
+                || !Arc::ptr_eq(&work.sender, &guest.sender.pending)
+                || !game.retained_server.as_ref().is_some_and(|server| {
+                    server.native_installed(work.conn, work.row.profile_uuid) && !server.frozen()
+                })
+            {
+                return Err(
+                    "unpublished recovery participant lost original configured/native custody"
+                        .into(),
+                );
+            }
+        }
+        let actual = game.project_native_participant_rows(roster)?;
+        if actual.len() != self.rows.len()
+            || actual.iter().any(|actual| {
+                !self.rows.iter().any(|work| {
+                    let row = &work.row;
+                    actual.profile_uuid == row.profile_uuid
+                        && actual.record_uuid == row.record_uuid
+                        && actual.integrated_owner == row.integrated_owner
+                        && actual.dimension == row.dimension
+                        && session_player_tags_equal(&actual.player, &row.player)
+                        && actual.advancements == row.advancements
+                        && actual.stats == row.stats
+                })
+            })
+        {
+            return Err("actual restored participants differ from checked image rows".into());
+        }
+        Ok(actual)
+    }
 }
 
 /// Native NBT reading normalizes signed zero. All other finite values and types
@@ -2195,6 +2586,15 @@ impl Game<'_> {
             }
         }
         let dedicated_cache = host.owner.is_none();
+        self.clear_session_local_cache(dedicated_cache, local_tag);
+        Ok(())
+    }
+
+    fn clear_session_local_cache(
+        &mut self,
+        dedicated_cache: bool,
+        local_tag: horizon_world::nbt::Tag,
+    ) {
         self.inventory.fill(None);
         self.armor.fill(None);
         self.offhand = None;
@@ -2238,7 +2638,6 @@ impl Game<'_> {
         self.stats = Default::default();
         self.spawn = None;
         self.respawn_config = None;
-        Ok(())
     }
 
     fn install_staged_session_participants(
@@ -4135,6 +4534,16 @@ impl Game<'_> {
             };
             let mut events = events.into_iter();
             while let Some(event) = events.next() {
+                #[cfg(feature = "paired-packages")]
+                if let HostEvent::Packet(conn, packet) = &event
+                    && let Err(reason) = self.validate_ordinary_stone_packet(&host, *conn, packet)
+                {
+                    let server = self.retained_server.as_mut().expect("retained event guard");
+                    server.fail(reason);
+                    server.pending.push_back(event);
+                    server.pending.extend(events);
+                    break;
+                }
                 #[cfg(feature = "paired-packages")]
                 if let Some(server) = &mut self.retained_server {
                     server.check_hub(&host.hub);
