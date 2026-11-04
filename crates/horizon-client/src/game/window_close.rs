@@ -16,6 +16,15 @@ use world_loading::{
 
 const CLOSE_WAIT: Duration = Duration::from_secs(10);
 
+#[cfg(all(test, feature = "mods", target_os = "linux"))]
+pub(in crate::game) fn ordinary_owned_dispatch_refusal_controls(
+    working: &std::path::Path,
+    anchor: &std::path::Path,
+    original: Arc<paired_close::OrdinaryClosedWorld>,
+) {
+    tests::ordinary_owned_dispatch_refusal_controls(working, anchor, original);
+}
+
 #[cfg(test)]
 pub(super) fn hold_ordinary_rest_loader() -> std::result::Result<(), String> {
     tests::hold_ordinary_rest_loader()
@@ -263,18 +272,20 @@ fn ordinary_generation(
                     }
                     local => {
                         let mut request = ordinary_local_request(local)?;
-                        if let Some(original) = frontend
+                        let original = frontend
                             .retained
                             .as_ref()
                             .unwrap()
                             .closed_worlds
                             .iter()
                             .find(|original| original.root() == request.save_root)
-                        {
-                            request = request.with_ordinary_reopen(original.clone())?;
-                        }
-                        request.check_ordinary_native_entry()?;
+                            .cloned();
                         if options.server_thread {
+                            let selection = request.into_ordinary_network(
+                                &std::env::current_dir()?,
+                                original,
+                                Instant::now() + Duration::from_secs(120),
+                            )?;
                             let backend_cpu = GameCpuResources::load(&root)?;
                             let tree = Arc::new(horizon_client::advancements::Tree::load(
                                 &root.join("data"),
@@ -307,11 +318,11 @@ fn ordinary_generation(
                             let mut backend_settings = settings;
                             backend_settings.render_distance = 2;
                             backend_settings.simulation_distance = 2;
-                            let server_root = request.save_root.clone();
+                            let server_root = selection.anchor;
                             let backend = retained_server::OrdinaryServerInput {
                                 options: backend_options,
                                 settings: backend_settings,
-                                request: retained_server::OrdinaryRequest::Native(request),
+                                request: selection.request,
                                 entry: association,
                                 resources: resources.clone(),
                                 pack: pack.as_ref().unwrap().clone(),
@@ -356,6 +367,12 @@ fn ordinary_generation(
                                 frontend,
                             )
                         } else {
+                            // LOCAL keeps its existing process-owned native
+                            // route until the responsive OWN adapter is ready.
+                            if let Some(original) = original {
+                                request = request.with_ordinary_reopen(original)?;
+                            }
+                            request.check_ordinary_native_entry()?;
                             let activated = startup
                                 .activate(
                                     options.execution_role,

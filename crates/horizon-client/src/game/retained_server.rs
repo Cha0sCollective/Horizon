@@ -451,10 +451,145 @@ fn ordinary_stone_candidate(packet: &Serverbound) -> bool {
 }
 
 impl Game<'_> {
+    /// Publish the fixed actual native population once. The retained opaque
+    /// roster is monotonic: losing a player can block close, never make an OWN
+    /// world eligible for original-new native cancellation again.
+    fn publish_ordinary_owned_roster(&mut self) -> std::result::Result<bool, String> {
+        let Some(owned) = self
+            .session_lock
+            .as_ref()
+            .and_then(|session| session.owned())
+        else {
+            return Ok(true);
+        };
+        let server = self
+            .retained_server
+            .as_ref()
+            .ok_or("OWN requires its actual native server")?;
+        if server.startup.is_none()
+            || server.continuation_archive.as_deref() != Some(owned.archive())
+        {
+            return Err("OWN server lost its actual startup/archive route".into());
+        }
+        if let Some(roster) = &server.checkpoint_roster {
+            return self
+                .preflight_checkpoint_participants(roster)
+                .map(|()| true)
+                .map_err(|error| format!("published OWN native population changed: {error:?}"));
+        }
+        let expected = if server.integrated_owner().is_some() {
+            1
+        } else {
+            2
+        };
+        let host = self.lan.as_ref().ok_or("OWN original Hub absent")?;
+        if host.hub.guests.len() > expected {
+            return Err("OWN has extra actual native participants".into());
+        }
+        let identity = server
+            .hub_identity()
+            .ok_or("OWN original Hub identity absent")?;
+        if host.hub.guests.len() < expected
+            || host.hub.guests.iter().any(|guest| {
+                !identity.matches_configured_guest(&host.hub, guest.conn, guest.uuid)
+                    || !server.native_installed(guest.conn, guest.uuid)
+                    || !guest.placed
+                    || !guest.loaded
+                    || guest.motion.is_none()
+                    || guest.awaiting_teleport.is_some()
+                    || !guest.left_reason.is_empty()
+            })
+        {
+            return Ok(false);
+        }
+        let roster = match self.observe_checkpoint_participants() {
+            Ok(roster) => roster,
+            Err(_) => return Ok(false),
+        };
+        if self.preflight_checkpoint_participants(&roster).is_err() {
+            return Ok(false);
+        }
+        let binding = world_loading::owned_guest_binding(
+            &self.options.mod_packages,
+            self.pack.assets.registry,
+        )
+        .map_err(|error| error.to_string())?;
+        owned
+            .check_binding(&binding)
+            .map_err(|error| error.to_string())?;
+        if self.world.counter_domain_snapshot().is_none() {
+            self.session_lock
+                .as_ref()
+                .unwrap()
+                .validate_owned_unplaced(&self.world, &binding)
+                .map_err(|error| error.to_string())?;
+        }
+        self.retained_server.as_mut().unwrap().checkpoint_roster = Some(roster);
+        Ok(true)
+    }
+    /// Only the actual never-editable NEW constructor may use the existing
+    /// native-only cancellation close. This neither publishes a complete image
+    /// nor reconstructs an unused admission for a later launch.
+    fn preflight_new_owned_cancellation(&self) -> std::result::Result<(), String> {
+        let session = self
+            .session_lock
+            .as_ref()
+            .ok_or("new OWN native session absent")?;
+        let owned = session
+            .original_new_owned(&self.world_root)
+            .ok_or("OWN cancellation is not the actual original NEW constructor")?;
+        let server = self
+            .retained_server
+            .as_ref()
+            .ok_or("OWN native server absent")?;
+        if server.startup.is_none()
+            || server.checkpoint_roster.is_some()
+            || server.continuation_archive.as_deref() != Some(owned.archive())
+            || !self
+                .native_close_authority
+                .as_ref()
+                .is_some_and(|authority| {
+                    authority.is_server() && authority.retains_ordinary_source(self)
+                })
+        {
+            return Err(
+                "OWN native cancellation cannot replace published participant custody".into(),
+            );
+        }
+        let binding = world_loading::owned_guest_binding(
+            &self.options.mod_packages,
+            self.pack.assets.registry,
+        )
+        .map_err(|error| error.to_string())?;
+        session
+            .validate_owned_unplaced(&self.world, &binding)
+            .map_err(|error| error.to_string())?;
+        self.inspect_session_checkpoint_owners()
+            .map_err(|error| format!("OWN cancellation item owners: {error:?}"))?;
+        Ok(())
+    }
     pub(super) fn freeze_ordinary_checkpoint_participants(
         &mut self,
     ) -> std::result::Result<(), String> {
-        if self.world.counter_domain_snapshot().is_none() {
+        let owned = self
+            .session_lock
+            .as_ref()
+            .and_then(|session| session.owned())
+            .is_some();
+        if self.world.counter_domain_snapshot().is_none() && !owned {
+            return Ok(());
+        }
+        if owned
+            && self
+                .retained_server
+                .as_ref()
+                .is_some_and(|server| server.checkpoint_roster.is_none())
+            && self
+                .session_lock
+                .as_ref()
+                .is_some_and(|session| session.original_new_owned(&self.world_root).is_some())
+        {
+            self.preflight_new_owned_cancellation()?;
             return Ok(());
         }
         let server = self
@@ -463,6 +598,27 @@ impl Game<'_> {
             .ok_or("ordinary domain requires actual authoritative retained server")?;
         if server.startup.is_none() || server.continuation_archive.is_none() {
             return Err("ordinary persistent domain lacks its captured continuation route".into());
+        }
+        if owned {
+            // Published recovery already owns the complete checked population,
+            // even before its normal initial placement acknowledgments. Frozen
+            // original-native preflight can close those exact installed bodies;
+            // it cannot invent an absent or partially installed participant.
+            let expected = if server.integrated_owner().is_some() {
+                1
+            } else {
+                2
+            };
+            let host = self.lan.as_ref().ok_or("OWN original population absent")?;
+            if host.hub.guests.len() != expected
+                || host.hub.guests.iter().any(|guest| {
+                    !server.native_installed(guest.conn, guest.uuid) || guest.motion.is_none()
+                })
+            {
+                return Err(
+                    "OWN coherent close requires its complete original native population".into(),
+                );
+            }
         }
         if let Some(original) = server.checkpoint_roster.as_ref() {
             // Retry may finish the original admission; it cannot replace a
@@ -493,7 +649,12 @@ impl Game<'_> {
         if server.startup.is_none()
             || !server.frozen()
             || server.continuation_archive.is_none()
-            || self.world.counter_domain_snapshot().is_none()
+            || (self.world.counter_domain_snapshot().is_none()
+                && self
+                    .session_lock
+                    .as_ref()
+                    .and_then(|session| session.owned())
+                    .is_none())
             || !self
                 .native_close_authority
                 .as_ref()
@@ -507,6 +668,26 @@ impl Game<'_> {
     pub(super) fn ordinary_server_close_profile(
         &self,
     ) -> std::result::Result<CloseProfile, String> {
+        if let Some(owned) = self
+            .session_lock
+            .as_ref()
+            .and_then(|session| session.owned())
+        {
+            let server = self
+                .retained_server
+                .as_ref()
+                .ok_or("OWN native server absent")?;
+            if server.checkpoint_roster.is_none() {
+                self.preflight_new_owned_cancellation()?;
+                return Ok(CloseProfile::NativeWorld);
+            }
+            if server.continuation_archive.as_deref() != Some(owned.archive()) {
+                return Err("OWN cannot change or lose its bound coherent archive".into());
+            }
+            return Ok(CloseProfile::CoherentSession {
+                archive: owned.archive().to_owned(),
+            });
+        }
         if self.world.counter_domain_snapshot().is_some() {
             let archive = self
                 .retained_server
@@ -534,6 +715,18 @@ impl Game<'_> {
             })
     }
     pub(super) fn ordinary_stone_use_admitted(&self) -> bool {
+        if self
+            .session_lock
+            .as_ref()
+            .and_then(|session| session.owned())
+            .is_some()
+            && self
+                .retained_server
+                .as_ref()
+                .is_none_or(|server| server.checkpoint_roster.is_none())
+        {
+            return false;
+        }
         if !self.creative
             || self.hand != Hand::Main
             || !self
@@ -602,6 +795,18 @@ impl Game<'_> {
         match packet {
             Serverbound::SetCarriedItem(_) => Ok(()),
             Serverbound::SetCreativeModeSlot(packet) => {
+                if self
+                    .session_lock
+                    .as_ref()
+                    .and_then(|session| session.owned())
+                    .is_some()
+                    && server.checkpoint_roster.is_none()
+                {
+                    return Err(
+                        "OWN item creation waits for its complete configured native population"
+                            .into(),
+                    );
+                }
                 if guest
                     .menu_slot(packet.slot as usize)
                     .as_ref()
@@ -630,6 +835,17 @@ impl Game<'_> {
                 Ok(())
             }
             Serverbound::UseItemOn(packet) => {
+                if self
+                    .session_lock
+                    .as_ref()
+                    .and_then(|session| session.owned())
+                    .is_some()
+                    && server.checkpoint_roster.is_none()
+                {
+                    return Err(
+                        "OWN placement waits for its complete configured native population".into(),
+                    );
+                }
                 if !guest.inventory[guest.selected]
                     .as_ref()
                     .is_some_and(|stack| self.ordinary_plain_stone(stack))
@@ -736,6 +952,8 @@ pub(super) struct View {
     phase: &'static str,
     pub(super) attempt: u64,
     pub(super) ready: bool,
+    /// Observation only. `ready` remains transport-offer eligibility.
+    owned_editable: bool,
     port: u16,
     ticks: u64,
     world_time: i64,
@@ -760,6 +978,7 @@ impl Default for View {
             phase: "Preparing",
             attempt: 0,
             ready: false,
+            owned_editable: false,
             port: 0,
             ticks: 0,
             world_time: 0,
@@ -781,7 +1000,7 @@ impl Default for View {
 }
 impl View {
     pub(super) fn json(&self) -> serde_json::Value {
-        serde_json::json!({"phase":self.phase,"attempt":self.attempt,"ready":self.ready,"port":self.port,
+        serde_json::json!({"phase":self.phase,"attempt":self.attempt,"ready":self.ready,"owned_editable":self.owned_editable,"port":self.port,
         "ticks":self.ticks,"world_time":self.world_time,"guests":self.guests,"installed":self.installed,
         "pending_events":self.pending_events,"original_error":self.original_error,"blocked":self.blocked,
         "owner_record":self.owner_record,"owner_saved":self.owner_saved,"paused":self.paused,
@@ -887,6 +1106,7 @@ pub(super) enum OrdinaryRequest {
     Native(world_loading::WorldRequest),
     #[allow(dead_code)] // Typed actual fixture route; ordinary machine ingress stays closed.
     Recover(Box<super::levels::session_checkpoint::OrdinaryRecoveryRequest>),
+    RecoverOwned(Box<super::levels::session_checkpoint::OwnedRecoveryRequest>),
 }
 #[cfg(feature = "mods")]
 pub(super) struct OrdinaryStartRefusal {
@@ -1282,7 +1502,10 @@ fn worker_ordinary(
         view.lock().unwrap_or_else(|e| e.into_inner()).phase = "UnacquiredClosed";
         return Ok(());
     }
-    if matches!(&input.request, OrdinaryRequest::Recover(_)) {
+    if matches!(
+        &input.request,
+        OrdinaryRequest::Recover(_) | OrdinaryRequest::RecoverOwned(_)
+    ) {
         return worker_ordinary_recovery(input, activated, inputs, commands, &view, &paused);
     }
     let OrdinaryServerInput {
@@ -1345,7 +1568,12 @@ fn worker_ordinary(
         std::process::abort();
     }
     game.title = None;
-    game.retained_server.as_mut().unwrap().continuation_archive = continuation_archive;
+    game.retained_server.as_mut().unwrap().continuation_archive = game
+        .session_lock
+        .as_ref()
+        .and_then(|session| session.owned())
+        .map(|owned| owned.archive().to_owned())
+        .or(continuation_archive);
     #[cfg(test)]
     {
         game.retained_server.as_mut().unwrap().test = test;
@@ -1428,10 +1656,11 @@ fn worker_ordinary_recovery(
         #[cfg(test)]
         test,
     } = input;
-    let OrdinaryRequest::Recover(request) = request else {
-        unreachable!()
+    let until = match &request {
+        OrdinaryRequest::Recover(request) => request.deadline(),
+        OrdinaryRequest::RecoverOwned(request) => request.deadline,
+        OrdinaryRequest::Native(_) => unreachable!(),
     };
-    let until = request.deadline();
     let root = options.resources.clone();
     let mut game = Box::new(
         Game::new_with_world(
@@ -1461,7 +1690,13 @@ fn worker_ordinary_recovery(
         );
         std::process::abort();
     }
-    let mut recovery = OrdinaryRecoveryWork::prepare(game, entry, *request);
+    let mut recovery = match request {
+        OrdinaryRequest::Recover(request) => OrdinaryRecoveryWork::prepare(game, entry, *request),
+        OrdinaryRequest::RecoverOwned(request) => {
+            OrdinaryRecoveryWork::prepare_owned(game, entry, *request)
+        }
+        OrdinaryRequest::Native(_) => unreachable!(),
+    };
     #[cfg(test)]
     if let Some(server) = recovery.game_mut().retained_server.as_mut() {
         server.test = test;
@@ -1600,10 +1835,18 @@ fn worker_ordinary_recovery(
             continue;
         }
         match recovery.try_activate() {
-            Ok(Some(game)) => {
+            Ok(Some(mut game)) => {
                 // The exact listener/Memory Hub is already acquired. First
                 // gameplay occurs only after consuming verified recovery.
-                return run_game_from(game, commands, view, None, paused, true, true);
+                let error = match game.publish_ordinary_owned_roster() {
+                    Ok(true) => None,
+                    // Installation and original publication precede normal
+                    // native placement/loaded acknowledgment. No NEW native-only
+                    // cancellation right is acquired by waiting for that step.
+                    Ok(false) => None,
+                    Err(error) => Some(error),
+                };
+                return run_game_from(game, commands, view, error, paused, true, true);
             }
             Ok(None) => {}
             Err(error) => {
@@ -2040,11 +2283,41 @@ fn run_game_from<'a>(
     mut settled: bool,
     mut listen_started: bool,
 ) -> std::result::Result<(), String> {
+    #[cfg(test)]
+    let controlled_published_close = game
+        .retained_server
+        .as_ref()
+        .is_some_and(|server| server.test.close_owned_before_placement);
+    #[cfg(not(test))]
+    let controlled_published_close = false;
+    #[cfg(test)]
+    if controlled_published_close {
+        assert!(
+            game.session_lock
+                .as_ref()
+                .is_some_and(|session| session.owned().is_some()
+                    && session.original_new_owned(&game.world_root).is_none())
+        );
+        assert!(game.native_close_authority.is_some());
+        assert!(
+            game.lan
+                .as_ref()
+                .unwrap()
+                .hub
+                .guests
+                .iter()
+                .all(|guest| guest.motion.is_some()
+                    && !guest.placed
+                    && !guest.loaded
+                    && guest.awaiting_teleport.is_none())
+        );
+        eprintln!("ORDINARY_OWN_PUBLISHED_RECOVERY_CLOSE_BEFORE_PLACEMENT");
+    }
     let mut phase = Some(Phase::Running(game));
     let mut view = View::default();
     let mut original_error = startup_error;
     let mut attempt = 0u64;
-    let mut close = original_error.is_some();
+    let mut close = original_error.is_some() || controlled_published_close;
     let mut retry = false;
     let mut admission_error = None;
     let mut close_deadline = None;
@@ -2156,7 +2429,28 @@ fn run_game_from<'a>(
                         close = true;
                     }
                 }
+                if settled
+                    && game
+                        .session_lock
+                        .as_ref()
+                        .and_then(|session| session.owned())
+                        .is_some()
+                    && let Err(error) = game.publish_ordinary_owned_roster()
+                {
+                    original_error.get_or_insert(error.clone());
+                    game.retained_server.as_mut().unwrap().fail(error);
+                    close = true;
+                }
                 view.ready = settled && listen_started && !close;
+                view.owned_editable = game
+                    .session_lock
+                    .as_ref()
+                    .and_then(|session| session.owned())
+                    .is_some()
+                    && game
+                        .retained_server
+                        .as_ref()
+                        .is_some_and(|server| server.checkpoint_roster.is_some());
                 #[cfg(all(test, feature = "mods", target_os = "linux"))]
                 if !close
                     && settled
@@ -2473,10 +2767,15 @@ pub(super) fn run_ordinary_dedicated(
     } else {
         Duration::MAX
     };
+    let selection = request.into_ordinary_network(
+        &std::env::current_dir()?,
+        None,
+        Instant::now() + Duration::from_secs(120),
+    )?;
     let input = OrdinaryServerInput {
         options,
         settings,
-        request: OrdinaryRequest::Native(request),
+        request: selection.request,
         entry: RetainedEntryIdentity {
             token: 1,
             owner: Arc::new(()),

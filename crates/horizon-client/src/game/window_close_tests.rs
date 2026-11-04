@@ -2,6 +2,76 @@
 //! a real display and complete pinned resources; absent inputs are failures.
 use super::*;
 
+#[cfg(all(feature = "mods", target_os = "linux"))]
+pub(super) fn ordinary_owned_dispatch_refusal_controls(
+    working: &std::path::Path,
+    anchor: &std::path::Path,
+    original: Arc<paired_close::OrdinaryClosedWorld>,
+) {
+    use std::fs;
+    let request = || {
+        let mut request = world_loading::WorldRequest::new("unused", None, None, true, None)
+            .unwrap()
+            .with_identity_intent(
+                world_loading::host_identity::IdentityIntent::RequireExistingIdentity,
+            );
+        request.save_root = anchor.to_owned();
+        request
+    };
+    let select = || {
+        request().into_ordinary_network(
+            working,
+            Some(original.clone()),
+            Instant::now() + Duration::from_secs(120),
+        )
+    };
+    let selected = select().unwrap();
+    assert_eq!(selected.anchor, anchor);
+    assert!(
+        matches!(
+            selected.request,
+            retained_server::OrdinaryRequest::RecoverOwned(_)
+        ),
+        "OWN must precede an available same-process native claim"
+    );
+    let identity: serde_json::Value =
+        serde_json::from_slice(&fs::read(anchor.join("horizon-world-identity.json")).unwrap())
+            .unwrap();
+    let key = working
+        .join("backups/horizon-owned/authority")
+        .join(identity["world_uuid"].as_str().unwrap());
+    let record = key.join("owned.json");
+    let bytes = fs::read(&record).unwrap();
+    let controls = working.join("negative-inputs");
+    fs::create_dir(&controls).unwrap();
+    let malformed = br#"{"unexpected":true}"#;
+    fs::write(controls.join("owned-malformed.json"), malformed).unwrap();
+    fs::write(&record, malformed).unwrap();
+    assert!(
+        select().is_err(),
+        "malformed OWN cannot fall through to the still-unspent native claim"
+    );
+    fs::write(&record, &bytes).unwrap();
+    fs::write(key.join("refusal-source.json"), &bytes).unwrap();
+    fs::rename(&record, controls.join("owned-before-link.json")).unwrap();
+    std::os::unix::fs::symlink("refusal-source.json", &record).unwrap();
+    assert!(
+        select().is_err(),
+        "linked OWN cannot fall through to the still-unspent native claim"
+    );
+    // Keep the actual bad link and its relative target as authored evidence.
+    // The bounded retention tool copies this named link without following it.
+    fs::rename(&record, controls.join("linked-owned.json")).unwrap();
+    fs::write(controls.join("refusal-source.json"), &bytes).unwrap();
+    fs::write(&record, &bytes).unwrap();
+    assert_eq!(fs::read(&record).unwrap(), bytes);
+    assert!(
+        request().with_ordinary_reopen(original).is_ok(),
+        "the refused dispatcher must not consume the genuine native-only completion claim"
+    );
+    eprintln!("ORDINARY_OWN_DISPATCH_MALFORMED_LINKED_NO_LEGACY_FALLBACK_PASS");
+}
+
 pub(super) fn hold_ordinary_rest_loader() -> std::result::Result<(), String> {
     if std::env::var("HORIZON_INTEGRATED_WINDOW_GATE")
         .ok()

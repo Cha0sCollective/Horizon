@@ -503,6 +503,7 @@ struct OrdinaryRun {
     clients: Vec<OrdinaryClient>,
     closing: bool,
     publication_seen: bool,
+    expected_server_close: bool,
 }
 #[cfg(all(feature = "mods", target_os = "linux"))]
 impl OrdinaryRun {
@@ -514,6 +515,7 @@ impl OrdinaryRun {
             clients: Vec::new(),
             closing: false,
             publication_seen: false,
+            expected_server_close: false,
         }
     }
     fn until(&mut self, mut condition: impl FnMut(&mut Self) -> bool) -> bool {
@@ -570,7 +572,7 @@ impl OrdinaryRun {
                         match client.session.consume_paired(&mut envelope) {
                             Ok(admission) => client.admission = Some(admission),
                             Err(horizon_client::lan::login_negotiation::Refusal::Closed)
-                                if self.closing =>
+                                if self.closing || self.expected_server_close =>
                             {
                                 // Server refusal can close the genuine Session
                                 // before its queued callback is consumed. Keep
@@ -585,7 +587,13 @@ impl OrdinaryRun {
                         panic!("ordinary fixture received generic Joined bypass")
                     }
                     Event::Packet(packet) => {
-                        if self.closing {
+                        if self.closing
+                            || (self.expected_server_close
+                                && !client
+                                    .admission
+                                    .as_ref()
+                                    .is_some_and(|admission| admission.is_live()))
+                        {
                             // Negative tests must still observe forbidden late
                             // publication; only follow-up sends are suppressed.
                             match *packet {
@@ -634,7 +642,9 @@ impl OrdinaryRun {
                     Event::DecodeError(error) if !self.closing => {
                         panic!("ordinary fixture decode: {error}")
                     }
-                    Event::Disconnected { reason, .. } if !self.closing => {
+                    Event::Disconnected { reason, .. }
+                        if !self.closing && !self.expected_server_close =>
+                    {
                         panic!("ordinary fixture disconnected before requested close: {reason}")
                     }
                     _ => {}
@@ -755,6 +765,387 @@ impl Drop for OrdinaryRun {
         }
         self.close_clients();
     }
+}
+
+#[cfg(all(feature = "mods", target_os = "linux"))]
+fn ordinary_own_selection(
+    case: &std::path::Path,
+    new: bool,
+) -> world_loading::OrdinaryNetworkSelection {
+    let mut request = world_loading::WorldRequest::new(
+        "unused",
+        new.then_some("Ordinary OWN"),
+        new.then_some(17),
+        true,
+        None,
+    )
+    .unwrap()
+    .with_identity_intent(if new {
+        world_loading::host_identity::IdentityIntent::CreateNewIdentity
+    } else {
+        world_loading::host_identity::IdentityIntent::RequireExistingIdentity
+    });
+    request.save_root = case.join("saves/Owned");
+    request
+        .into_ordinary_network(case, None, Instant::now() + Duration::from_secs(120))
+        .unwrap()
+}
+#[cfg(all(feature = "mods", target_os = "linux"))]
+fn ordinary_own_archive(case: &std::path::Path) -> PathBuf {
+    let identity: serde_json::Value = serde_json::from_slice(
+        &fs::read(case.join("saves/Owned/horizon-world-identity.json")).unwrap(),
+    )
+    .unwrap();
+    let record: serde_json::Value = serde_json::from_slice(
+        &fs::read(
+            case.join("backups/horizon-owned/authority")
+                .join(identity["world_uuid"].as_str().unwrap())
+                .join("owned.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let archive = PathBuf::from(record["archive"].as_str().unwrap());
+    assert_eq!(
+        archive.parent(),
+        Some(case.join("backups/horizon-owned/archives").as_path())
+    );
+    archive
+}
+#[cfg(all(feature = "mods", target_os = "linux"))]
+fn ordinary_own_observation(view: &View) -> serde_json::Value {
+    let mut players=view.players.iter().map(|player|serde_json::json!({
+        "uuid":player["uuid"],"position":player["position"],"yaw":player["yaw"],"items":player["items"],
+    })).collect::<Vec<_>>();
+    players.sort_by(|a, b| a["uuid"].as_str().unwrap().cmp(b["uuid"].as_str().unwrap()));
+    serde_json::json!({"clock":view.world_time,"players":players})
+}
+#[cfg(all(feature = "mods", target_os = "linux"))]
+#[test]
+#[ignore = "isolated captured resources: ordinary network factories and original workers, serial fresh-process Memory/TCP OWN Unplaced reopen"]
+fn ordinary_owned_network_new_close_reopen_memory_and_tcp() {
+    use sha2::{Digest, Sha256};
+    let root = std::env::temp_dir().join(format!(
+        "horizon-ordinary-own-restart-{}",
+        std::process::id()
+    ));
+    fs::create_dir(&root).unwrap();
+    eprintln!("ORDINARY_OWN_NATIVE_EVIDENCE_ROOT={}", root.display());
+    let exe = std::env::current_exe().unwrap();
+    let digest = Sha256::digest(fs::read(&exe).unwrap());
+    for phase in ["A", "B"] {
+        let home = root.join(format!("process-{phase}"));
+        fs::create_dir(&home).unwrap();
+        let temp = home.join("temp");
+        fs::create_dir(&temp).unwrap();
+        let mut child = std::process::Command::new(&exe)
+            .args([
+                "--exact",
+                "game::retained_server::tests::ordinary_owned_network_process_child",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("HORIZON_ORDINARY_OWN_PHASE", phase)
+            .env("HORIZON_ORDINARY_OWN_ROOT", &root)
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .env("XDG_CONFIG_HOME", &home)
+            .env("XDG_DATA_HOME", &home)
+            .env("XDG_CACHE_HOME", &home)
+            .env("TMPDIR", &temp)
+            .env("TMP", &temp)
+            .env("TEMP", &temp)
+            .current_dir(&home)
+            .spawn()
+            .unwrap();
+        let until = Instant::now() + Duration::from_secs(600);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= until {
+                child.kill().unwrap();
+                let _ = child.wait();
+                panic!(
+                    "ordinary OWN child {phase} deadline; retained {}",
+                    root.display()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(
+            status.success(),
+            "ordinary OWN child {phase} failed; retained {}",
+            root.display()
+        );
+        assert_eq!(Sha256::digest(fs::read(&exe).unwrap()), digest);
+    }
+    let a: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join("A.json")).unwrap()).unwrap();
+    let b: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join("B.json")).unwrap()).unwrap();
+    assert_ne!(a["pid"], b["pid"]);
+    assert_eq!(a["executable"], b["executable"]);
+    assert_eq!(b["completed"], true);
+    eprintln!("ORDINARY_OWN_FRESH_PROCESS_MEMORY_TWO_TCP_UNPLACED_PASS");
+}
+#[cfg(all(feature = "mods", target_os = "linux"))]
+#[test]
+#[ignore = "child only, selected by exact same-executable ordinary OWN parent"]
+fn ordinary_owned_network_process_child() {
+    use sha2::{Digest, Sha256};
+    let phase = std::env::var("HORIZON_ORDINARY_OWN_PHASE").expect("explicit child phase");
+    assert!(matches!(phase.as_str(), "A" | "B"));
+    let root = PathBuf::from(
+        std::env::var_os("HORIZON_ORDINARY_OWN_ROOT").expect("explicit native case root"),
+    );
+    let bundle = OrdinaryBundle::new(&format!("own-network-{phase}"));
+    for (label, role) in [
+        ("memory", execution_role::ExecutionRole::IntegratedServer),
+        ("tcp", execution_role::ExecutionRole::DedicatedServer),
+    ] {
+        let case = root.join(label);
+        if phase == "A" {
+            fs::create_dir(&case).unwrap();
+        }
+        if phase == "B" && label == "memory" {
+            let selected = ordinary_own_selection(&case, false);
+            let mut input = bundle.input(role, selected.request, None, None);
+            input.test.close_owned_before_placement = true;
+            let mut early = OrdinaryRun::start(input);
+            early.expected_server_close = true;
+            early.supervisor.paused.store(true, Ordering::SeqCst);
+            assert!(
+                early.until(|run| run.supervisor.snapshot().ready),
+                "original recovery offer before placement"
+            );
+            early.connect(&bundle, false, "OrdinaryOwner");
+            assert!(
+                early
+                    .until(|run| run.supervisor.finished()
+                        || run.supervisor.snapshot().blocked.is_some())
+                    && early.supervisor.finished(),
+                "published recovery must close coherently before placement: {:?}",
+                early.supervisor.snapshot()
+            );
+            assert!(early.finish().is_some());
+            let manifest: serde_json::Value = serde_json::from_slice(
+                &fs::read(
+                    ordinary_own_archive(&case).join("epoch-00000000000000000002/manifest.json"),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                manifest["kind"],
+                "horizon-owned-unplaced-session-checkpoint"
+            );
+            eprintln!("ORDINARY_OWN_PUBLISHED_PRE_PLACEMENT_COHERENT_CLOSE_PASS");
+        }
+        let selection = ordinary_own_selection(&case, phase == "A");
+        assert_eq!(selection.anchor, case.join("saves/Owned"));
+        if phase == "A" {
+            assert!(matches!(&selection.request, OrdinaryRequest::Native(_)));
+        } else {
+            assert!(
+                matches!(&selection.request, OrdinaryRequest::RecoverOwned(_)),
+                "cold OWN has no old completion/claim"
+            );
+        }
+        let mut run = OrdinaryRun::start(bundle.input(role, selection.request, None, None));
+        run.supervisor.paused.store(true, Ordering::SeqCst);
+        assert!(
+            run.until(|run| run.supervisor.snapshot().ready),
+            "ordinary OWN {phase}/{label} startup: {:?}",
+            run.supervisor.snapshot()
+        );
+        let tcp = role == execution_role::ExecutionRole::DedicatedServer;
+        run.connect(
+            &bundle,
+            tcp,
+            if tcp { "OrdinaryA" } else { "OrdinaryOwner" },
+        );
+        if tcp {
+            run.connect(&bundle, true, "OrdinaryB");
+        }
+        assert!(
+            run.until(|run| run
+                .clients
+                .iter()
+                .all(|client| client.login && client.terrain)
+                && run.supervisor.snapshot().owned_editable),
+            "actual OWN native population {phase}/{label}: {:?}",
+            run.supervisor.snapshot()
+        );
+        if phase == "A" {
+            let stone = bundle
+                .startup
+                .sync()
+                .builtin
+                .get("minecraft:item")
+                .unwrap()
+                .id("minecraft:stone")
+                .unwrap();
+            for (index, client) in run.clients.iter().enumerate() {
+                send(
+                    &client.session,
+                    S::SetCreativeModeSlot(play::SetCreativeModeSlot {
+                        slot: 36,
+                        item: Some(horizon_protocol::item::Stack::new(
+                            stone,
+                            if index == 0 { 9 } else { 4 },
+                        )),
+                    }),
+                );
+            }
+            assert!(
+                run.until(|run| {
+                    let view = run.supervisor.snapshot();
+                    view.players.len() == (if tcp { 2 } else { 1 })
+                        && view.players.iter().all(|player| {
+                            let expected = if player["uuid"]
+                                == format!(
+                                    "{:032x}",
+                                    offline_uuid(if tcp { "OrdinaryA" } else { "OrdinaryOwner" })
+                                ) {
+                                9
+                            } else {
+                                4
+                            };
+                            player["items"] == expected
+                        })
+                }),
+                "legal actual configured stone item creation {label}"
+            );
+        }
+        let observed = ordinary_own_observation(&run.supervisor.snapshot());
+        if phase == "B" {
+            let expected: serde_json::Value =
+                serde_json::from_slice(&fs::read(case.join("A-observation.json")).unwrap())
+                    .unwrap();
+            assert_eq!(
+                observed, expected,
+                "complete native player/world state after real OWN dispatch {label}"
+            );
+        }
+        let _closed = run
+            .finish()
+            .expect("actual ordinary coherent consuming close");
+        let archive = ordinary_own_archive(&case);
+        let epoch = if phase == "A" {
+            1
+        } else if label == "memory" {
+            3
+        } else {
+            2
+        };
+        let image = archive.join(format!("epoch-{epoch:020}"));
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(image.join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(
+            manifest["kind"],
+            "horizon-owned-unplaced-session-checkpoint"
+        );
+        assert_eq!(manifest["saved_clock"], observed["clock"]);
+        assert_eq!(
+            manifest["players"].as_array().unwrap().len(),
+            if tcp { 2 } else { 1 }
+        );
+        assert!(
+            manifest.get("counter").is_none()
+                && manifest.get("slot").is_none()
+                && manifest.get("target").is_none()
+                && !image.join("host").exists()
+        );
+        if phase == "A" {
+            fs::write(
+                case.join("A-observation.json"),
+                serde_json::to_vec_pretty(&observed).unwrap(),
+            )
+            .unwrap();
+        } else {
+            assert!(
+                archive
+                    .join("epoch-00000000000000000001/manifest.json")
+                    .is_file()
+            );
+        }
+        eprintln!(
+            "ORDINARY_OWN_{phase}_CASE={label} complete_epoch={epoch} real_native_players={}",
+            if tcp { 2 } else { 1 }
+        );
+    }
+    let partial = root.join("partial");
+    if phase == "A" {
+        fs::create_dir(&partial).unwrap();
+        let selection = ordinary_own_selection(&partial, true);
+        let anchor = selection.anchor;
+        let mut run = OrdinaryRun::start(bundle.input(
+            execution_role::ExecutionRole::DedicatedServer,
+            selection.request,
+            None,
+            None,
+        ));
+        run.supervisor.paused.store(true, Ordering::SeqCst);
+        assert!(run.until(|run| run.supervisor.snapshot().ready));
+        run.connect(&bundle, true, "OrdinaryA");
+        assert!(run.until(|run| run.clients[0].login
+            && run.clients[0].terrain
+            && run.supervisor.snapshot().players.len() == 1
+            && run.supervisor.snapshot().players[0]["loaded"] == true));
+        assert!(
+            !run.supervisor.snapshot().owned_editable,
+            "one of two required players is not editable OWN publication"
+        );
+        let original = Arc::new(
+            run.finish()
+                .expect("actual original-new partial native cancellation"),
+        );
+        assert!(
+            fs::read_dir(ordinary_own_archive(&partial))
+                .unwrap()
+                .next()
+                .is_none(),
+            "native cancellation did not invent a partial complete image"
+        );
+        super::super::window_close::ordinary_owned_dispatch_refusal_controls(
+            &partial, &anchor, original,
+        );
+        eprintln!("ORDINARY_OWN_PARTIAL_NATIVE_CANCEL_AND_DISPATCH_REFUSALS_PASS");
+    } else {
+        let before = ordinary_tree(&partial.join("saves/Owned"));
+        let selection = ordinary_own_selection(&partial, false);
+        assert!(matches!(
+            &selection.request,
+            OrdinaryRequest::RecoverOwned(_)
+        ));
+        let mut refused = OrdinaryRun::start(bundle.input(
+            execution_role::ExecutionRole::DedicatedServer,
+            selection.request,
+            None,
+            None,
+        ));
+        let (error, closed) = refused.finish_refusal("RecoveryClosing");
+        assert!(error.contains("no complete owned epoch"), "{error}");
+        assert!(closed.is_none());
+        assert_eq!(
+            ordinary_tree(&partial.join("saves/Owned")),
+            before,
+            "zero complete epochs preserve original native partial world"
+        );
+        assert!(
+            fs::read_dir(ordinary_own_archive(&partial))
+                .unwrap()
+                .next()
+                .is_none()
+        );
+        eprintln!("ORDINARY_OWN_PARTIAL_ZERO_EPOCH_REFUSAL_PRESERVED_PASS");
+    }
+    let exe = std::env::current_exe().unwrap();
+    fs::write(root.join(format!("{phase}.json")),serde_json::to_vec_pretty(&serde_json::json!({"pid":std::process::id(),"executable":format!("{:x}",Sha256::digest(fs::read(exe).unwrap())),"completed":true})).unwrap()).unwrap();
+    eprintln!("ORDINARY_OWN_CHILD_{phase}_PASS");
+    std::mem::forget(bundle);
 }
 
 #[cfg(all(feature = "mods", target_os = "linux"))]
@@ -1568,6 +1959,7 @@ impl Gate {
 
 #[derive(Clone, Default)]
 pub(in crate::game) struct Startup {
+    pub(super) close_owned_before_placement: bool,
     #[cfg(all(feature = "mods", target_os = "linux"))]
     pub(in crate::game) ordinary: Option<Arc<OrdinaryControl>>,
     #[cfg(all(

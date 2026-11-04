@@ -68,6 +68,124 @@ pub(in crate::game) struct NewOwnedRoute {
     destination_parent: PathBuf,
 }
 
+/// Ordinary host configuration only. These paths neither own a world nor
+/// replace the original constructor/acquired recovery authority.
+pub(in crate::game) struct OrdinaryOwnedLayout {
+    directories: Vec<PathBuf>,
+    namespace: PathBuf,
+    archives: PathBuf,
+    recovery: PathBuf,
+}
+impl OrdinaryOwnedLayout {
+    pub(in crate::game) fn checked(working: &Path, world: &Path) -> Result<Self> {
+        let working = own_route(working, true)?;
+        let world = own_route(
+            &if world.is_absolute() {
+                world.to_owned()
+            } else {
+                working.join(world)
+            },
+            false,
+        )?;
+        let backups = own_route(&working.join("backups"), false)?;
+        let base = own_route(&backups.join("horizon-owned"), false)?;
+        let namespace = own_route(&base.join("authority"), false)?;
+        let archives = own_route(&base.join("archives"), false)?;
+        let recovery = own_route(&base.join("recovery"), false)?;
+        separate(&world, &base)?;
+        for path in [&namespace, &archives, &recovery] {
+            separate(&world, path)?;
+        }
+        separate(&namespace, &archives)?;
+        separate(&namespace, &recovery)?;
+        separate(&archives, &recovery)?;
+        Ok(Self {
+            directories: vec![
+                backups,
+                base,
+                namespace.clone(),
+                archives.clone(),
+                recovery.clone(),
+            ],
+            namespace,
+            archives,
+            recovery,
+        })
+    }
+    pub(in crate::game) fn new_route(&self) -> Result<NewOwnedRoute> {
+        for path in &self.directories {
+            own_route(path, false)?;
+            match fs::create_dir(path) {
+                Ok(()) => {
+                    own_sync_directory(path)?;
+                    own_sync_directory(path.parent().ok_or("ordinary layout parent absent")?)?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    own_route(path, true)?;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        AuthorityNamespace::new(&self.namespace)?.new_owned_route(&self.archives, &self.recovery)
+    }
+    /// Absence is distinct from malformed/partial ownership. This observation
+    /// only selects the recovery worker; that worker reacquires/rechecks OWN.
+    pub(in crate::game) fn recovery_request(
+        &self,
+        anchor: &Path,
+        until: std::time::Instant,
+    ) -> Result<Option<crate::game::levels::session_checkpoint::OwnedRecoveryRequest>> {
+        if until <= std::time::Instant::now() {
+            return Err("ordinary owned recovery deadline expired".into());
+        }
+        match fs::symlink_metadata(&self.namespace) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+            Ok(_) => {}
+        }
+        let namespace = AuthorityNamespace::new(&self.namespace)?;
+        let anchor = own_route(anchor, true)?;
+        let identity = IdentityAnchor::read(&anchor)?;
+        let key = namespace.checked_key(identity.world)?;
+        match fs::symlink_metadata(&key) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+            Ok(_) => {}
+        }
+        // A partial key/record is not a legacy route. In particular, a linked
+        // or malformed OWN must never spend an otherwise valid native claim.
+        let owned = namespace.read_owned(&anchor)?;
+        if owned.archive().parent() != Some(self.archives.as_path())
+            || owned.destination_parent() != self.recovery.as_path()
+        {
+            return Err("ordinary OWN differs from its trusted configured layout".into());
+        }
+        for _ in 0..16 {
+            let mut nonce = [0u8; 16];
+            horizon_protocol::crypto::random_bytes(&mut nonce)?;
+            let name = nonce
+                .iter()
+                .fold(String::from("working-"), |mut name, byte| {
+                    use std::fmt::Write;
+                    write!(&mut name, "{byte:02x}").expect("String formatting");
+                    name
+                });
+            let destination = own_route(&self.recovery.join(name), false)?;
+            if !destination.try_exists()? {
+                return Ok(Some(
+                    crate::game::levels::session_checkpoint::OwnedRecoveryRequest {
+                        namespace,
+                        anchor,
+                        destination,
+                        deadline: until,
+                    },
+                ));
+            }
+        }
+        Err("ordinary fresh recovery destination exhausted".into())
+    }
+}
+
 fn own_digest(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
         .iter()
@@ -768,6 +886,19 @@ impl WorldSession {
     }
     pub(in crate::game) fn owned(&self) -> Option<&OwnedAssociation> {
         self.authority.as_ref()?.owned()
+    }
+    /// Observation of the original NEW native/namespace owner, never decoded
+    /// from a route or image. Unused admission is checked separately on World.
+    pub(in crate::game) fn original_new_owned(&self, root: &Path) -> Option<&OwnedAssociation> {
+        let authority = self.authority.as_ref()?;
+        let owned = authority.owned()?;
+        (authority._anchor_lock.is_none()
+            && self.world == Some(authority.world)
+            && owned.world() == authority.world
+            && owned.namespace.root == authority.namespace
+            && root == owned.anchor()
+            && self.counter_bootstrap.is_some())
+        .then_some(owned)
     }
     /// Borrowing the option preserves the caller's lease until its unpublished
     /// Game has dropped on error. No failing consuming attachment can release it early.

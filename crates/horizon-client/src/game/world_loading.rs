@@ -23,6 +23,13 @@ pub(super) struct WorldRequest {
     new_owned: Option<host_identity::session_authority::NewOwnedRoute>,
 }
 
+#[cfg(all(feature = "mods", feature = "paired-packages"))]
+pub(in crate::game) struct OrdinaryNetworkSelection {
+    pub(in crate::game) request: super::retained_server::OrdinaryRequest,
+    /// Original selection, never a recovered working-directory pointer.
+    pub(in crate::game) anchor: PathBuf,
+}
+
 #[cfg(feature = "paired-packages")]
 pub(in crate::game) fn owned_guest_binding(
     packages: &super::mod_packages::Packages,
@@ -912,6 +919,68 @@ impl Drop for OrdinaryWorldLoader {
 }
 
 impl WorldRequest {
+    #[cfg(all(feature = "mods", feature = "paired-packages"))]
+    pub(in crate::game) fn into_ordinary_network(
+        self,
+        working: &std::path::Path,
+        original: Option<Arc<super::paired_close::OrdinaryClosedWorld>>,
+        until: std::time::Instant,
+    ) -> Result<OrdinaryNetworkSelection> {
+        use super::retained_server::OrdinaryRequest;
+        use host_identity::session_authority::OrdinaryOwnedLayout;
+        if self.expected_checkpoint_world.is_some()
+            || self.ordinary_reopen.is_some()
+            || self.new_owned.is_some()
+        {
+            return Err(
+                "ordinary network selection requires its original unacquired request".into(),
+            );
+        }
+        let layout = OrdinaryOwnedLayout::checked(working, &self.save_root)?;
+        match self.identity_intent {
+            IdentityIntent::CreateNewIdentity => {
+                if !self.creative {
+                    return Err("paired OWN startup requires a new Creative test world".into());
+                }
+                let request = self.with_new_owned_route(layout.new_route()?)?;
+                let anchor = request.save_root.clone();
+                Ok(OrdinaryNetworkSelection {
+                    request: OrdinaryRequest::Native(request),
+                    anchor,
+                })
+            }
+            IdentityIntent::RequireExistingIdentity => {
+                let anchor = if self.save_root.is_absolute() {
+                    self.save_root.clone()
+                } else {
+                    working.join(&self.save_root)
+                };
+                if let Some(request) = layout.recovery_request(&anchor, until)? {
+                    let anchor = request.anchor.clone();
+                    return Ok(OrdinaryNetworkSelection {
+                        request: OrdinaryRequest::RecoverOwned(Box::new(request)),
+                        anchor,
+                    });
+                }
+                // Metadata absence alone grants nothing. Keep the existing
+                // native claim's literal source route and single-use checks.
+                let request = if let Some(original) = original {
+                    self.with_ordinary_reopen(original)?
+                } else {
+                    self
+                };
+                request.check_ordinary_native_entry()?;
+                let anchor = request.save_root.clone();
+                Ok(OrdinaryNetworkSelection {
+                    request: OrdinaryRequest::Native(request),
+                    anchor,
+                })
+            }
+            IdentityIntent::Legacy => {
+                Err("paired ordinary network selection requires identified native intent".into())
+            }
+        }
+    }
     #[cfg(feature = "paired-packages")]
     #[allow(dead_code)] // Explicit owned core entry; ordinary dispatch follows separately.
     pub(in crate::game) fn with_new_owned_route(
