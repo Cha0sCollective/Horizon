@@ -1157,3 +1157,299 @@ fn registered_actual_bootstrap_refusals_leave_real_grant_unused() {
 #[cfg(feature = "mods")]
 #[path = "../persistent_guest_counter_tests.rs"]
 mod persistent_guest;
+
+#[cfg(feature = "mods")]
+mod placement_tests {
+    use super::*;
+    use horizon_client::world::counter_restore::GuestRuntimeState;
+
+    fn use_alias(game: &mut Game<'_>, position: [i32; 3], alias: &str) -> (u32, i32) {
+        let mut host = game.lan.take().unwrap();
+        let result = game
+            .as_guest(&mut host, 10, |game| {
+                game.selected = 0;
+                let before = game.stats.get("used", alias);
+                let hit = crate::game::Hit {
+                    pos: [position[0], position[1] - 1, position[2]],
+                    face: [0, 1, 0],
+                    point: [
+                        f64::from(position[0]) + 0.5,
+                        f64::from(position[1]),
+                        f64::from(position[2]) + 0.5,
+                    ],
+                };
+                game.use_hand(Some(&hit)).unwrap();
+                (
+                    game.inventory[0].as_ref().unwrap().count,
+                    game.stats.get("used", alias) - before,
+                )
+            })
+            .unwrap();
+        game.lan = Some(host);
+        result
+    }
+
+    #[test]
+    #[ignore = "isolated real resources/captured pair: native BlockItem, original grant, actual Guest callback and retirement both server roles"]
+    fn registered_guest_actual_placement_refusal_callback_custody_and_reload_both_roles() {
+        let f = Materialized::new("placement");
+        for owner in [true, false] {
+            let mut game = f.fresh(owner);
+            open_native(
+                &mut game,
+                &f.scratch.join(format!("placement-world-{owner}")),
+            );
+            residency(&mut game, 2, (0, 0));
+            let state = f.binding().state_id();
+            let stone = game
+                .pack
+                .assets
+                .registry
+                .default_state("minecraft:stone")
+                .unwrap();
+            assert_eq!(
+                game.world.block(POSITION[0], POSITION[1], POSITION[2]),
+                game.world.air
+            );
+            game.arm_registered_guest_placement(&f.type_id).unwrap();
+            game.arm_registered_guest_placement(&f.type_id).unwrap();
+            assert!(game.world.counter_domain_snapshot().is_none());
+            assert!(game.world.world_slot_snapshot().is_none());
+            game.world
+                .set(POSITION[0], POSITION[1] - 1, POSITION[2], stone)
+                .unwrap();
+            let second = [POSITION[0] + 2, POSITION[1], POSITION[2]];
+            game.world
+                .set(second[0], second[1] - 1, second[2], stone)
+                .unwrap();
+            let (mut host, _receivers) = make_host(&mut game, owner, [10, 20], true);
+            let actor = &mut host.hub.guests[0];
+            actor.position = [2.5, 120.0, 0.5];
+            actor.motion.as_mut().unwrap().position = Vec3::new(2.5, 120.0, 0.5);
+            actor.motion.as_mut().unwrap().velocity = Vec3::new(0.0, 0.0, 0.0);
+            actor.game_mode = if owner { 0 } else { 1 };
+            actor.inventory[0] = Some(ItemStack::new(f.alias.as_str(), 3));
+            actor.inventory[1] = Some(session_items_rich());
+            game.lan = Some(host);
+
+            // The original native session is kept alive, not dropped. Missing
+            // host context must fail through actual BlockItem/set_raw without
+            // successful usage statistics, held consumption or an unowned alias.
+            let session = game.session_lock.take().unwrap();
+            assert_eq!(use_alias(&mut game, POSITION, &f.alias), (3, 0));
+            assert_eq!(
+                game.world.block(POSITION[0], POSITION[1], POSITION[2]),
+                game.world.air
+            );
+            assert!(game.world.counter_domain_snapshot().is_none());
+            assert!(game.world.world_slot_snapshot().is_none());
+            game.session_lock = Some(session);
+            let retained_count = if owner { 2 } else { 3 };
+            assert_eq!(
+                use_alias(&mut game, POSITION, &f.alias),
+                (retained_count, 1)
+            );
+            assert_eq!(
+                game.world.block(POSITION[0], POSITION[1], POSITION[2]),
+                state
+            );
+            let GuestRuntimeState::ReadyActive { counter, slot } =
+                game.world.guest_runtime_state().unwrap()
+            else {
+                panic!("actual paired Guest placement required");
+            };
+            assert_eq!(
+                game.world
+                    .read_persistent_counter(&counter)
+                    .unwrap()
+                    .counter(),
+                0
+            );
+            assert!(
+                game.world
+                    .read_world_slot(&slot)
+                    .unwrap()
+                    .slot
+                    .stack()
+                    .is_none()
+            );
+            let before = game.world.counter_trial_snapshot().unwrap();
+            assert_eq!(use_alias(&mut game, second, &f.alias), (retained_count, 0));
+            assert_eq!(
+                game.world.block(second[0], second[1], second[2]),
+                game.world.air
+            );
+            assert_eq!(game.world.counter_trial_snapshot().unwrap(), before);
+            assert_eq!(game.world.counter_domain_snapshot().unwrap().high_water, 1);
+            assert_eq!(
+                game.world
+                    .persistent_world_slot_metadata()
+                    .unwrap()
+                    .high_water,
+                1
+            );
+
+            game.tickets.update(Some(Sources {
+                players: vec![(0, 0)],
+                forced: Vec::new(),
+                view_distance: 2,
+                simulation_distance: 2,
+            }));
+            let calls = crate::game::counter_control::guest_evaluation_calls();
+            game.world.game_time += 1;
+            game.tick_counter_trial(true);
+            assert_eq!(
+                game.world
+                    .read_persistent_counter(&counter)
+                    .unwrap()
+                    .counter(),
+                1
+            );
+            assert_eq!(
+                crate::game::counter_control::guest_evaluation_calls(),
+                calls + 1
+            );
+            game.tick_counter_trial(true);
+            assert_eq!(
+                crate::game::counter_control::guest_evaluation_calls(),
+                calls + 1
+            );
+
+            // Explicit existing H06d cell transfer is fixture setup, not an
+            // ordinary authorized ingress/admission or new client-wire claim.
+            let mut host = game.lan.take().unwrap();
+            let transferred = game
+                .as_guest(&mut host, 10, |game| {
+                    game.transfer_world_slot_inventory_cell(&slot, 1, Direction::IntoMachine, 3)
+                })
+                .unwrap()
+                .unwrap();
+            assert!(matches!(transferred, TransferOutcome::Committed(row) if row.moved==3));
+            game.lan = Some(host);
+            let original = game
+                .world
+                .read_world_slot(&slot)
+                .unwrap()
+                .slot
+                .stack()
+                .unwrap()
+                .clone();
+            let mut expected = session_items_rich();
+            expected.count = 3;
+            retirement_raw_equal(&original, &expected);
+            // This is the native resident mutation seam. Ordinary destruction
+            // and its physical block drops remain separate native gameplay.
+            game.world
+                .set(POSITION[0], POSITION[1], POSITION[2], game.world.air)
+                .unwrap();
+            assert!(game.world.world_slot_snapshot().unwrap().pending.is_some());
+            assert_eq!(
+                use_alias(&mut game, POSITION, &f.alias),
+                (retained_count, 0)
+            );
+            let retired = game
+                .world
+                .counter_trial_snapshot()
+                .unwrap()
+                .last_retirement();
+            assert!(
+                game.world
+                    .counter_trial_snapshot()
+                    .unwrap()
+                    .record()
+                    .is_none()
+            );
+            let old_drops = game.dropped.len();
+            let calls = crate::game::counter_control::guest_evaluation_calls();
+            game.service_registered_guest_lifecycle().unwrap(); // explicit paused custody service
+            assert_eq!(
+                crate::game::counter_control::guest_evaluation_calls(),
+                calls
+            );
+            assert_eq!(game.dropped.len(), old_drops + 1);
+            retirement_raw_equal(&game.dropped.last().unwrap().stack, &expected);
+            let next_entity = game.next_entity;
+            game.service_registered_guest_lifecycle().unwrap();
+            assert_eq!(game.next_entity, next_entity);
+            assert_eq!(game.dropped.len(), old_drops + 1);
+            assert!(game.world.world_slot_snapshot().unwrap().pending.is_none());
+            assert_eq!(
+                use_alias(&mut game, POSITION, &f.alias),
+                (if owner { 1 } else { 3 }, 1)
+            );
+            let GuestRuntimeState::ReadyActive {
+                counter: next_counter,
+                slot: next_slot,
+            } = game.world.guest_runtime_state().unwrap()
+            else {
+                panic!("actual paired readmission required");
+            };
+            assert_ne!(counter, next_counter);
+            assert_ne!(slot, next_slot);
+            assert_eq!(game.world.counter_domain_snapshot().unwrap().high_water, 2);
+            assert_eq!(
+                game.world
+                    .persistent_world_slot_metadata()
+                    .unwrap()
+                    .high_water,
+                2
+            );
+            assert_eq!(
+                game.world
+                    .counter_trial_snapshot()
+                    .unwrap()
+                    .last_retirement(),
+                retired
+            );
+            assert!(game.world.read_persistent_counter(&counter).is_err());
+            assert!(game.world.read_world_slot(&slot).is_err());
+
+            let before = game.world.read_persistent_counter(&next_counter).unwrap();
+            residency(&mut game, 0, (80, 80));
+            game.world.game_time += 10;
+            game.tick_counter_trial(true);
+            let unloaded = game
+                .world
+                .counter_trial_snapshot()
+                .unwrap()
+                .record()
+                .unwrap();
+            assert_eq!(unloaded.counter(), before.counter());
+            assert!(!unloaded.resident());
+            residency(&mut game, 2, (0, 0));
+            game.tick_counter_trial(true);
+            assert_eq!(
+                game.world
+                    .read_persistent_counter(&next_counter)
+                    .unwrap()
+                    .counter(),
+                before.counter() + 1
+            );
+            assert_eq!(game.world.counter_domain_snapshot().unwrap().high_water, 2);
+            assert_eq!(
+                game.world
+                    .persistent_world_slot_metadata()
+                    .unwrap()
+                    .high_water,
+                2
+            );
+            retirement_raw_equal(&game.dropped.last().unwrap().stack, &expected);
+            // Matching native reload and existing coherent Guest publication use
+            // this actual placed allocation, original participants and D item.
+            game.save_game_with(false).unwrap();
+            game.session_fence(until()).unwrap();
+            let archive = f.scratch.join(format!("placement-archive-{owner}"));
+            fs::create_dir(&archive).unwrap();
+            game.checkpoint_registered_guest_session(&archive, 1, until())
+                .unwrap();
+            expected.count = 4;
+            retirement_raw_equal(
+                game.lan.as_ref().unwrap().hub.guests[0].inventory[1]
+                    .as_ref()
+                    .unwrap(),
+                &expected,
+            );
+            eprintln!("REGISTERED_PLACEMENT_NATIVE_ROLE_PASS={owner}");
+        }
+    }
+}

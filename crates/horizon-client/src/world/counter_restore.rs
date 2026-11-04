@@ -738,7 +738,7 @@ impl World {
         target: &CounterTarget,
         grant: &mut HostCounterBootstrap,
     ) -> Result<RuntimeCounterKey> {
-        if grant.spent {
+        if grant.spent || self.registered_guest_placement.is_some() {
             return Err(RestoreError::Occupied);
         }
         let marker = self
@@ -1156,6 +1156,11 @@ impl World {
         if domain.active_key.is_some() {
             trial.retire(RetirementReason::BlockChanged, self.game_time);
             domain.retired_key = domain.active_key.take();
+        }
+        // Armed Guest placement publishes counter and slot together through its
+        // immediate stage. A changed write must not readmit only the counter.
+        if self.registered_guest_placement.is_some() {
+            return;
         }
         if state == domain.binding.state_id {
             let Some(next) = domain.high_water.checked_add(1) else {
@@ -2242,15 +2247,18 @@ mod tests {
     mod persistent_guest_host_tests {
         use super::*;
         use crate::counter_trial::{Completion, Fault, GuestFailure, PhaseError, Proposal};
-        fn host_guest() -> World {
+        fn guest_binding() -> NativeBinding {
             let prepared = Arc::new(prepared_with_block(br#"{"template":"minecraft:iron_block","machine-type":"counter_demo:counter_type"}"#));
             let registry = Box::leak(Box::new(BlockRegistry::from_facts_json(&br#"{"defaults":{"minecraft:air":0,"minecraft:iron_block":1,"counter_demo:counter":2},"states":[["air",true,false,"","minecraft:air"],["iron",false,false,"","minecraft:iron_block"],["alias",false,false,"","counter_demo:counter"]]}"#[..]).unwrap()));
-            let binding = NativeBinding::from_registered_guest_prepared(
+            NativeBinding::from_registered_guest_prepared(
                 &prepared,
                 "counter_demo:counter_type",
                 registry,
             )
-            .unwrap();
+            .unwrap()
+        }
+        fn host_guest() -> World {
+            let binding = guest_binding();
             let mut world = bare(2, 0);
             let mut grant = host_grant();
             world
@@ -2260,6 +2268,201 @@ mod tests {
                 .initialize_registered_guest_pair_from_host(&binding, &target(), &mut grant)
                 .unwrap();
             world
+        }
+        #[test]
+        fn registered_guest_placement_stages_grant_pair_and_independent_heads_before_storage() {
+            use super::super::super::slot_restore::{SlotAllocation, SlotStatus};
+            let binding = guest_binding();
+            let mut world = bare(0, 0);
+            let mut grant = host_grant();
+            let id = grant.world;
+            world
+                .bind_host_counter_bootstrap(&mut grant, "minecraft:overworld")
+                .unwrap();
+            world
+                .install_registered_guest_placement_policy(&binding)
+                .unwrap();
+            let before = host_state(&world);
+            assert!(
+                world
+                    .set(POSITION[0], POSITION[1], POSITION[2], binding.state_id())
+                    .is_err()
+            );
+            let mut other = host_grant();
+            assert!(
+                world
+                    .set_from_registered_guest_host_level(
+                        POSITION,
+                        binding.state_id(),
+                        "minecraft:overworld",
+                        Some(id),
+                        Some(&mut other),
+                    )
+                    .is_err()
+            );
+            assert!(
+                world
+                    .set_from_registered_guest_host_level(
+                        POSITION,
+                        binding.state_id(),
+                        "minecraft:overworld",
+                        None,
+                        Some(&mut grant),
+                    )
+                    .is_err()
+            );
+            assert_eq!(host_state(&world), before);
+            assert!(!grant.spent && !other.spent);
+            world
+                .set_from_registered_guest_host_level(
+                    POSITION,
+                    binding.state_id(),
+                    "minecraft:overworld",
+                    Some(id),
+                    Some(&mut grant),
+                )
+                .unwrap();
+            assert!(grant.spent);
+            assert_eq!(
+                world.block(POSITION[0], POSITION[1], POSITION[2]),
+                binding.state_id()
+            );
+            assert_eq!(world.counter_domain_snapshot().unwrap().high_water, 1);
+            let metadata = world.persistent_world_slot_metadata().unwrap();
+            assert_eq!(metadata.high_water, 1);
+            assert_eq!(metadata.status, SlotStatus::Healthy);
+            assert_eq!(
+                metadata.allocation,
+                SlotAllocation::Active {
+                    slot_generation: 1,
+                    machine_generation: 1
+                }
+            );
+            let first = world.counter_trial_snapshot().unwrap().record().unwrap();
+            let after = host_state(&world);
+            assert!(
+                world
+                    .set_from_registered_guest_host_level(
+                        [POSITION[0] + 1, POSITION[1], POSITION[2]],
+                        binding.state_id(),
+                        "minecraft:overworld",
+                        Some(id),
+                        Some(&mut grant),
+                    )
+                    .is_err()
+            );
+            assert_eq!(host_state(&world), after);
+            world
+                .set(POSITION[0], POSITION[1], POSITION[2], world.air)
+                .unwrap();
+            let pending = world
+                .world_slot_snapshot()
+                .unwrap()
+                .pending
+                .unwrap()
+                .allocation
+                .key;
+            let retired = world.counter_trial_snapshot().unwrap().last_retirement();
+            let before = host_state(&world);
+            let slot_before = world.persistent_world_slot_metadata();
+            assert!(
+                world
+                    .set_from_registered_guest_host_level(
+                        POSITION,
+                        binding.state_id(),
+                        "minecraft:overworld",
+                        Some(id),
+                        None,
+                    )
+                    .is_err()
+            );
+            assert_eq!(host_state(&world), before);
+            assert_eq!(world.persistent_world_slot_metadata(), slot_before);
+            let original = world
+                .take_persistent_world_slot_retirement(&pending)
+                .unwrap();
+            assert!(
+                original
+                    .into_parts()
+                    .0
+                    .into_parts()
+                    .1
+                    .into_stack()
+                    .is_none()
+            );
+            world
+                .set_from_registered_guest_host_level(
+                    POSITION,
+                    binding.state_id(),
+                    "minecraft:overworld",
+                    Some(id),
+                    None,
+                )
+                .unwrap();
+            assert_eq!(world.counter_domain_snapshot().unwrap().high_water, 2);
+            assert_eq!(
+                world.persistent_world_slot_metadata().unwrap().high_water,
+                2
+            );
+            let current = world.counter_trial_snapshot().unwrap();
+            assert_ne!(current.record().unwrap().instance(), first.instance());
+            assert_eq!(current.last_retirement(), retired);
+
+            // A consistent, independently exhausted slot head must refuse before
+            // either head, its retained retirement or native storage changes.
+            world
+                .set(POSITION[0], POSITION[1], POSITION[2], world.air)
+                .unwrap();
+            let pending = world
+                .world_slot_snapshot()
+                .unwrap()
+                .pending
+                .unwrap()
+                .allocation
+                .key;
+            world
+                .take_persistent_world_slot_retirement(&pending)
+                .unwrap();
+            let configuration = world
+                .counter_trial
+                .as_ref()
+                .unwrap()
+                .configuration()
+                .clone();
+            world.world_slot_trial = Some(Box::new(
+                crate::world_slot_trial::Trial::restore_guest_checked(
+                    configuration,
+                    u64::MAX,
+                    &mut None,
+                )
+                .unwrap(),
+            ));
+            world
+                .counter_domain
+                .as_mut()
+                .unwrap()
+                .slot
+                .as_mut()
+                .unwrap()
+                .high_water = u64::MAX;
+            let before = host_state(&world);
+            let slot_before = world.persistent_world_slot_metadata();
+            let error = world
+                .set_from_registered_guest_host_level(
+                    POSITION,
+                    binding.state_id(),
+                    "minecraft:overworld",
+                    Some(id),
+                    None,
+                )
+                .unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<RestoreError>(),
+                Some(&RestoreError::GenerationExhausted)
+            );
+            assert_eq!(host_state(&world), before);
+            assert_eq!(world.persistent_world_slot_metadata(), slot_before);
+            assert!(grant.spent);
         }
         #[test]
         fn persistent_guest_host_invalid_reply_preserves_record_and_first_fault() {
@@ -2728,6 +2931,34 @@ impl PersistentGuestPhaseToken {
         &self.phase
     }
 }
+struct PreparedGuestPair {
+    domain: Box<Domain>,
+    counter: Box<Trial>,
+    slot: Box<crate::world_slot_trial::Trial>,
+    key: RuntimeCounterKey,
+    slot_key: crate::world_slot_trial::SlotKey,
+}
+fn same_guest_binding(left: &NativeBinding, right: &NativeBinding) -> bool {
+    left.profile == NativeBindingProfile::RegisteredCube
+        && right.profile == NativeBindingProfile::RegisteredCube
+        && left.is_guest()
+        && right.is_guest()
+        && std::ptr::eq(left.registry, right.registry)
+        && left.package == right.package
+        && left.type_id() == right.type_id()
+        && left.block_id == right.block_id
+        && left.state_id == right.state_id
+}
+enum PreparedGuestPlacement {
+    First(PreparedGuestPair),
+    Readmit {
+        counter: crate::counter_trial::PersistentAdmission,
+        slot: crate::world_slot_trial::OwnedSlot,
+        placement: PlacementKey,
+        counter_generation: u64,
+        slot_generation: u64,
+    },
+}
 impl World {
     pub fn has_persistent_guest_counter(&self) -> bool {
         self.counter_domain
@@ -2740,6 +2971,22 @@ impl World {
         target: &CounterTarget,
         grant: &mut HostCounterBootstrap,
     ) -> Result<(RuntimeCounterKey, crate::world_slot_trial::SlotKey)> {
+        if self.registered_guest_placement.is_some() {
+            return Err(RestoreError::Occupied);
+        }
+        let staged =
+            self.prepare_registered_guest_pair(binding, target, grant, binding.state_id)?;
+        let result = (staged.key.clone(), staged.slot_key.clone());
+        self.publish_registered_guest_pair(staged, grant);
+        Ok(result)
+    }
+    fn prepare_registered_guest_pair(
+        &self,
+        binding: &NativeBinding,
+        target: &CounterTarget,
+        grant: &HostCounterBootstrap,
+        expected_current: BlockStateId,
+    ) -> Result<PreparedGuestPair> {
         use super::slot_restore::{SlotAllocation, SlotMetadataSnapshot, SlotStatus};
         if !binding.is_guest()
             || grant.spent
@@ -2759,7 +3006,7 @@ impl World {
         }
         self.vacant_counter_domain()?;
         if self.world_slot_trial.is_some()
-            || self.restore_current(target)? != binding.state_id
+            || self.restore_current(target)? != expected_current
             || binding.state_id == self.air
         {
             return Err(RestoreError::StateMismatch);
@@ -2825,11 +3072,232 @@ impl World {
                 status: SlotStatus::Healthy,
             }),
         });
-        self.counter_domain = Some(domain);
-        self.counter_trial = Some(trial);
-        self.world_slot_trial = Some(slot_trial);
+        Ok(PreparedGuestPair {
+            domain,
+            counter: trial,
+            slot: slot_trial,
+            key,
+            slot_key: slot,
+        })
+    }
+    fn publish_registered_guest_pair(
+        &mut self,
+        staged: PreparedGuestPair,
+        grant: &mut HostCounterBootstrap,
+    ) {
+        self.counter_domain = Some(staged.domain);
+        self.counter_trial = Some(staged.counter);
+        self.world_slot_trial = Some(staged.slot);
         grant.spent = true;
-        Ok((key, slot))
+    }
+    /// Captured policy data only. This does not create a domain or mint history.
+    pub fn install_registered_guest_placement_policy(
+        &mut self,
+        binding: &NativeBinding,
+    ) -> Result<()> {
+        if binding.profile != NativeBindingProfile::RegisteredCube || !binding.is_guest() {
+            return Err(RestoreError::BindingMismatch);
+        }
+        if let Some(policy) = &self.registered_guest_placement {
+            return if same_guest_binding(policy, binding) {
+                Ok(())
+            } else {
+                Err(RestoreError::BindingMismatch)
+            };
+        }
+        if let Some(domain) = &self.counter_domain {
+            domain.healthy()?;
+            if !same_guest_binding(&domain.binding, binding) {
+                return Err(RestoreError::BindingMismatch);
+            }
+            self.checked_slot_lifecycle()
+                .map_err(|_| RestoreError::StateMismatch)?;
+        } else {
+            self.vacant_counter_domain()?;
+            if self.world_slot_trial.is_some() {
+                return Err(RestoreError::Occupied);
+            }
+        }
+        self.registered_guest_placement = Some(Box::new(binding.clone()));
+        Ok(())
+    }
+    pub fn has_registered_guest_placement_policy(&self) -> bool {
+        self.registered_guest_placement.is_some()
+    }
+    pub(super) fn check_registered_guest_plain_write(
+        &self,
+        position: [i32; 3],
+        state: BlockStateId,
+    ) -> Result<()> {
+        let Some(policy) = &self.registered_guest_placement else {
+            return Ok(());
+        };
+        let current = self.block(position[0], position[1], position[2]);
+        if state == policy.state_id && current != state {
+            return Err(RestoreError::IdentityMismatch);
+        }
+        if current == policy.state_id
+            || self
+                .counter_domain
+                .as_ref()
+                .is_some_and(|d| d.target.position == position)
+        {
+            let domain = self
+                .counter_domain
+                .as_ref()
+                .ok_or(RestoreError::StateMismatch)?;
+            domain.healthy()?;
+            if domain.target.position != position || !same_guest_binding(&domain.binding, policy) {
+                return Err(RestoreError::BindingMismatch);
+            }
+            self.checked_slot_lifecycle()
+                .map_err(|_| RestoreError::StateMismatch)?;
+            if current == policy.state_id && domain.active_key.is_none() {
+                return Err(RestoreError::StateMismatch);
+            }
+        }
+        Ok(())
+    }
+    /// Native authoritative LevelAccess entry. The original session lends its
+    /// grant; a restored domain supplies its own checked readmission history.
+    pub fn set_from_registered_guest_host_level(
+        &mut self,
+        position: [i32; 3],
+        state: BlockStateId,
+        dimension: &str,
+        world: Option<WorldId>,
+        mut grant: Option<&mut HostCounterBootstrap>,
+    ) -> crate::Result<()> {
+        let [x, y, z] = position;
+        let Some(policy) = &self.registered_guest_placement else {
+            return self.set(x, y, z, state);
+        };
+        let world = world.ok_or(RestoreError::IdentityMismatch)?;
+        if self
+            .counter_domain
+            .as_ref()
+            .is_some_and(|domain| domain.world != world)
+        {
+            return Err(RestoreError::IdentityMismatch.into());
+        }
+        if state != policy.state_id || self.block(x, y, z) == state {
+            return self.set(x, y, z, state);
+        }
+        if dimension != "minecraft:overworld" {
+            return Err(RestoreError::IdentityMismatch.into());
+        }
+        let target = CounterTarget::new(dimension, position)?;
+        let current = self.restore_current(&target)?;
+        let staged = match &self.counter_domain {
+            None => {
+                if current != self.air {
+                    return Err(RestoreError::StateMismatch.into());
+                }
+                let actual_grant = grant.as_deref().ok_or(RestoreError::IdentityMismatch)?;
+                if actual_grant.world != world {
+                    return Err(RestoreError::IdentityMismatch.into());
+                }
+                PreparedGuestPlacement::First(self.prepare_registered_guest_pair(
+                    policy,
+                    &target,
+                    actual_grant,
+                    self.air,
+                )?)
+            }
+            Some(domain) => {
+                use super::slot_restore::SlotAllocation;
+                domain.healthy()?;
+                if domain.target != target || !same_guest_binding(&domain.binding, policy) {
+                    return Err(RestoreError::BindingMismatch.into());
+                }
+                let (metadata, anchor) = self
+                    .checked_slot_lifecycle()
+                    .map_err(|_| RestoreError::StateMismatch)?;
+                let counter = self.counter_trial.as_ref().ok_or(RestoreError::Detached)?;
+                let slot = self
+                    .world_slot_trial
+                    .as_ref()
+                    .ok_or(RestoreError::Detached)?;
+                if domain.active_key.is_some()
+                    || counter.snapshot().record().is_some()
+                    || !matches!(metadata.allocation, SlotAllocation::Dormant)
+                    || slot.borrowed().pending
+                    || slot.borrowed().active.is_some()
+                    || anchor.generation.is_some()
+                    || self.game_time < 0
+                    || !policy
+                        .registry
+                        .state(current)
+                        .is_some_and(|s| s.properties.is_empty())
+                {
+                    return Err(RestoreError::StateMismatch.into());
+                }
+                // Existing storage validation checks the complete retained history,
+                // including the observed dormant descriptor and Guest fault state.
+                self.guest_storage_counter()?;
+                let counter_generation = domain
+                    .high_water
+                    .checked_add(1)
+                    .ok_or(RestoreError::GenerationExhausted)?;
+                let slot_generation = metadata
+                    .high_water
+                    .checked_add(1)
+                    .ok_or(RestoreError::GenerationExhausted)?;
+                let counter = counter
+                    .persistent_prepare_admission()
+                    .map_err(|_| RestoreError::RuntimeExhausted)?;
+                let slot = slot
+                    .persistent_prepare_admission()
+                    .map_err(|_| RestoreError::RuntimeExhausted)?;
+                if crate::world_slot_trial::Trial::persistent_admission_key(&slot).incarnation()
+                    != slot_generation
+                {
+                    return Err(RestoreError::StateMismatch.into());
+                }
+                PreparedGuestPlacement::Readmit {
+                    counter,
+                    slot,
+                    placement: domain.key(counter_generation),
+                    counter_generation,
+                    slot_generation,
+                }
+            }
+        };
+        // Exclusive World/grant access and no callbacks keep the inspected
+        // source stable. Every returned-error operation precedes this write.
+        self.set_resident(x, y, z, state, false)?;
+        match staged {
+            PreparedGuestPlacement::First(staged) => {
+                self.publish_registered_guest_pair(staged, grant.take().unwrap());
+            }
+            PreparedGuestPlacement::Readmit {
+                counter,
+                slot,
+                placement,
+                counter_generation,
+                slot_generation,
+            } => {
+                use super::slot_restore::SlotAllocation;
+                self.counter_trial
+                    .as_mut()
+                    .unwrap()
+                    .persistent_publish_admission(counter);
+                self.world_slot_trial
+                    .as_mut()
+                    .unwrap()
+                    .persistent_publish_admission(slot);
+                let domain = self.counter_domain.as_mut().unwrap();
+                domain.high_water = counter_generation;
+                domain.active_key = Some(placement);
+                let metadata = domain.slot.as_mut().unwrap();
+                metadata.high_water = slot_generation;
+                metadata.allocation = SlotAllocation::Active {
+                    slot_generation,
+                    machine_generation: counter_generation,
+                };
+            }
+        }
+        Ok(())
     }
     pub(super) fn guest_storage_counter(&self) -> Result<GuestCounterFrameV3> {
         let d = self.counter_domain.as_ref().ok_or(RestoreError::Detached)?;

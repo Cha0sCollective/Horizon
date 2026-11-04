@@ -688,6 +688,10 @@ enum GuestUse {
 /// The client world as seen by the vanilla block-behaviour library.
 struct GameLevel<'w> {
     world: &'w mut World,
+    #[cfg(feature = "paired-packages")]
+    counter_bootstrap: Option<&'w mut horizon_client::world::counter_restore::HostCounterBootstrap>,
+    #[cfg(feature = "paired-packages")]
+    counter_world: Option<horizon_client::world::counter_restore::WorldId>,
     facts: &'w BlockFacts,
     collision: &'w BlockCollisionRegistry<'w>,
     events: &'w mut Vec<LevelEvent>,
@@ -1041,6 +1045,24 @@ impl LevelAccess for GameLevel<'_> {
             return None;
         }
         let previous = self.world.block(pos.x, pos.y, pos.z);
+        #[cfg(feature = "paired-packages")]
+        if !self.client_side {
+            let dimension = match self.dimension {
+                LevelDimension::Overworld => "minecraft:overworld",
+                LevelDimension::Nether => "minecraft:the_nether",
+                LevelDimension::End => "minecraft:the_end",
+            };
+            self.world
+                .set_from_registered_guest_host_level(
+                    [pos.x, pos.y, pos.z],
+                    state,
+                    dimension,
+                    self.counter_world,
+                    self.counter_bootstrap.as_deref_mut(),
+                )
+                .ok()?;
+            return Some(previous);
+        }
         self.world.set(pos.x, pos.y, pos.z, state).ok()?;
         Some(previous)
     }
@@ -3450,7 +3472,25 @@ impl Game<'_> {
             tnts: &self.tnts,
             falling: &self.falling,
         };
+        #[cfg(feature = "paired-packages")]
+        let counter_world = self
+            .session_lock
+            .as_ref()
+            .and_then(|s| s.expected_world())
+            .copied();
+        #[cfg(feature = "paired-packages")]
+        let counter_bootstrap = if self.remote.is_none() && self.integrated.is_none() {
+            self.session_lock
+                .as_mut()
+                .and_then(|session| session.counter_bootstrap())
+        } else {
+            None
+        };
         let mut level = GameLevel {
+            #[cfg(feature = "paired-packages")]
+            counter_bootstrap,
+            #[cfg(feature = "paired-packages")]
+            counter_world,
             cart_boxes,
             item_frames: &self.item_frames,
             cart_signals,

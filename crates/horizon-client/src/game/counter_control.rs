@@ -240,6 +240,12 @@ impl Game<'_> {
         if self.remote.is_some() || self.integrated.is_some() {
             return;
         }
+        if self.world.has_registered_guest_placement_policy()
+            && let Err(error) = self.service_registered_guest_lifecycle()
+        {
+            log::error!("Horizon: registered Guest custody retained: {error}");
+            return;
+        }
         let Some(before) = self.world.counter_trial_snapshot() else {
             return;
         };
@@ -680,6 +686,97 @@ impl GuestCounterToken {
     }
 }
 impl Game<'_> {
+    fn registered_guest_host_context(&self) -> Result<()> {
+        if self.remote.is_some()
+            || self.integrated.is_some()
+            || self.dim != super::Dim::Overworld
+            || (self.options.execution_role.is_client() && self.player.is_none())
+            || self
+                .session_lock
+                .as_ref()
+                .and_then(|s| s.expected_world())
+                .is_none()
+        {
+            return Err(
+                "registered Guest placement requires the actual identified authoritative Overworld"
+                    .into(),
+            );
+        }
+        if self.world.counter_domain_snapshot().is_some_and(|domain| {
+            Some(&domain.world) != self.session_lock.as_ref().and_then(|s| s.expected_world())
+        }) {
+            return Err(
+                "registered Guest placement domain belongs to another native session".into(),
+            );
+        }
+        Ok(())
+    }
+    /// Explicit internal arming only. Ordinary startup and positive ingress
+    /// remain fenced until their complete save/restart owners are connected.
+    #[allow(dead_code)]
+    pub(super) fn arm_registered_guest_placement(&mut self, type_id: &str) -> Result<()> {
+        #[cfg(not(feature = "mods"))]
+        {
+            let _ = type_id;
+            Err("registered Guest placement requires the actual mod runtime".into())
+        }
+        #[cfg(feature = "mods")]
+        {
+            self.registered_guest_host_context()?;
+            let catalog = self
+                .options
+                .mod_packages
+                .catalog()
+                .ok_or("captured Guest catalog absent")?;
+            if catalog.prepared().len() != 1 {
+                return Err("registered Guest placement supports one captured pair".into());
+            }
+            let prepared = catalog.prepared().values().next().unwrap().clone();
+            let binding = NativeBinding::from_registered_guest_prepared(
+                &prepared,
+                type_id,
+                self.pack.assets.registry,
+            )?;
+            let descriptor = binding.physical_descriptor();
+            let behaviour = self.res.behaviours();
+            let item = behaviour
+                .item_binding(&descriptor.name)
+                .ok_or("registered Guest BlockItem absent")?;
+            if self.res.items().get(&descriptor.name).is_none()
+                || item.kind != horizon_world::level::ItemKind::Block
+                || item.block != behaviour.block(binding.state_id())
+            {
+                return Err("registered Guest BlockItem does not match the actual binding".into());
+            }
+            self.mods.mods.prepare_counter_evaluator(
+                &prepared.bundle().content_owner().id,
+                prepared.identity(),
+            )?;
+            self.mods
+                .mods
+                .counter_evaluator(&prepared.bundle().content_owner().id, prepared.identity())?;
+            self.world
+                .install_registered_guest_placement_policy(&binding)?;
+            Ok(())
+        }
+    }
+    /// Move only the original pending slot through the existing checked native
+    /// retirement sink. An explicit paused call may finish custody, never tick.
+    pub(super) fn service_registered_guest_lifecycle(&mut self) -> Result<()> {
+        if !self.world.has_registered_guest_placement_policy() {
+            return Ok(());
+        }
+        self.registered_guest_host_context()?;
+        let pending = self
+            .world
+            .world_slot_snapshot()
+            .and_then(|snapshot| snapshot.pending.as_ref().map(|p| p.allocation.key.clone()));
+        if let Some(key) = pending {
+            self.deliver_pending_persistent_world_slot(&key)
+                .map_err(|error| format!("registered Guest retirement: {error:?}"))?;
+        }
+        Ok(())
+    }
     fn prepare_guest_counter_token(
         &mut self,
         running: bool,

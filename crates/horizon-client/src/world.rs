@@ -95,6 +95,9 @@ pub struct World {
     /// The session owns the strong marker; ordinary Worlds allocate none.
     #[cfg(feature = "paired-packages")]
     host_counter_bootstrap: Option<std::sync::Weak<counter_restore::HostCounterMarker>>,
+    /// Explicit host placement policy; contains no unused-history authority.
+    #[cfg(feature = "paired-packages")]
+    registered_guest_placement: Option<Box<counter_restore::NativeBinding>>,
     #[cfg(feature = "paired-packages")]
     pub(crate) world_slot_trial: Option<Box<crate::world_slot_trial::Trial>>,
     /// `ChunkAccess.inhabitedTime` of resident chunks: ticks a player spent
@@ -212,6 +215,8 @@ impl World {
             counter_domain: None,
             #[cfg(feature = "paired-packages")]
             host_counter_bootstrap: None,
+            #[cfg(feature = "paired-packages")]
+            registered_guest_placement: None,
             #[cfg(feature = "paired-packages")]
             world_slot_trial: None,
             inhabited: HashMap::new(),
@@ -595,6 +600,22 @@ impl World {
     /// section borders) for remeshing and the surrounding chunks for relighting.
     /// Neighbour updates, drops and block entities belong to the gameplay layer.
     pub fn set(&mut self, x: i32, y: i32, z: i32, state: BlockStateId) -> crate::Result<()> {
+        #[cfg(feature = "paired-packages")]
+        self.check_registered_guest_plain_write([x, y, z], state)?;
+        self.set_resident(x, y, z, state, true)
+    }
+    /// The admission caller has staged both owners before suppressing their old
+    /// changed-write hooks. All other native storage bookkeeping stays shared.
+    fn set_resident(
+        &mut self,
+        x: i32,
+        y: i32,
+        z: i32,
+        state: BlockStateId,
+        notify_pair: bool,
+    ) -> crate::Result<()> {
+        #[cfg(not(feature = "paired-packages"))]
+        let _ = notify_pair;
         let Some(chunk) = self.chunks.get_mut(&(x >> 4, z >> 4)) else {
             return Err("write outside resident chunks".into());
         };
@@ -604,19 +625,22 @@ impl World {
         let previous = Arc::make_mut(chunk).set(x & 15, y, z & 15, state.0);
         if previous != state.0 {
             #[cfg(feature = "paired-packages")]
-            if !self.has_persistent_slot_mode()
+            if notify_pair
+                && !self.has_persistent_slot_mode()
                 && let Some(trial) = &mut self.world_slot_trial
             {
                 trial.changed([x, y, z], state, self.game_time);
             }
             #[cfg(feature = "paired-packages")]
-            if self.counter_domain.is_some() {
-                self.persistent_counter_changed([x, y, z], state);
-            } else if let Some(trial) = &mut self.counter_trial {
-                trial.changed([x, y, z], state, self.game_time);
+            if notify_pair {
+                if self.counter_domain.is_some() {
+                    self.persistent_counter_changed([x, y, z], state);
+                } else if let Some(trial) = &mut self.counter_trial {
+                    trial.changed([x, y, z], state, self.game_time);
+                }
             }
             #[cfg(feature = "paired-packages")]
-            if self.has_persistent_slot_mode() {
+            if notify_pair && self.has_persistent_slot_mode() {
                 self.persistent_slot_changed([x, y, z], state);
             }
             self.block_entities

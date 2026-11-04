@@ -1095,7 +1095,7 @@ impl World {
         }
         Ok(anchor)
     }
-    fn checked_slot_lifecycle(
+    pub(super) fn checked_slot_lifecycle(
         &self,
     ) -> std::result::Result<
         (SlotMetadataSnapshot, super::counter_restore::SlotAnchor<'_>),

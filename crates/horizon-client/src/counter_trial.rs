@@ -199,6 +199,8 @@ pub struct Record {
     last_advanced: Option<i64>,
     resident: bool,
 }
+/// Immediate native admission staging; no public construction or cloning.
+pub(crate) struct PersistentAdmission(Record);
 impl Record {
     pub fn instance(&self) -> u64 {
         self.instance
@@ -388,6 +390,30 @@ impl Trial {
             resident: true,
         });
         Ok(instance)
+    }
+    pub(crate) fn persistent_prepare_admission(&self) -> Result<PersistentAdmission, Fault> {
+        self.persistent_prepare_admission_from(&LAST_INSTANCE)
+    }
+    fn persistent_prepare_admission_from(
+        &self,
+        allocator: &AtomicU64,
+    ) -> Result<PersistentAdmission, Fault> {
+        if let Some(fault) = self.fault {
+            return Err(fault);
+        }
+        if self.record.is_some() {
+            return Err(Fault::PersistentDomain);
+        }
+        Ok(PersistentAdmission(Record {
+            instance: allocate_instance(allocator)?,
+            counter: 0,
+            last_advanced: None,
+            resident: true,
+        }))
+    }
+    /// Only the immediate paired World stage publishes this prepared record.
+    pub(crate) fn persistent_publish_admission(&mut self, staged: PersistentAdmission) {
+        self.record = Some(staged.0);
     }
     pub(crate) fn new(configuration: Configuration, current: Option<BlockStateId>) -> Self {
         let mut trial = Self {
@@ -745,6 +771,38 @@ mod tests {
             .unwrap();
     }
 
+    #[test]
+    fn persistent_admission_stage_preserves_retirement_and_refuses_exhaustion_without_publication()
+    {
+        let mut trial = Trial::restore_native_from(
+            configuration("minecraft:overworld"),
+            Some((0, None)),
+            None,
+            0,
+            &AtomicU64::new(7),
+        )
+        .unwrap();
+        let unused = AtomicU64::new(20);
+        assert!(trial.persistent_prepare_admission_from(&unused).is_err());
+        assert_eq!(unused.load(Ordering::Relaxed), 20);
+        trial.retire(RetirementReason::BlockChanged, 0);
+        let before = trial.snapshot();
+        let exhausted = AtomicU64::new(u64::MAX);
+        assert!(matches!(
+            trial.persistent_prepare_admission_from(&exhausted),
+            Err(Fault::InstanceExhausted)
+        ));
+        assert_eq!(trial.snapshot(), before);
+        assert_eq!(exhausted.load(Ordering::Relaxed), u64::MAX);
+        let staged = trial.persistent_prepare_admission_from(&unused).unwrap();
+        assert_eq!(trial.snapshot(), before);
+        let instance = staged.0.instance;
+        trial.persistent_publish_admission(staged);
+        let after = trial.snapshot();
+        assert_eq!(after.record().unwrap().instance(), instance);
+        assert_eq!(after.record().unwrap().counter(), 0);
+        assert_eq!(after.last_retirement(), before.last_retirement());
+    }
     #[test]
     fn native_restore_factory_preserves_exact_payloads_and_atomic_reservation() {
         let allocator = AtomicU64::new(100);
