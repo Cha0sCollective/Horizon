@@ -827,6 +827,223 @@ pub(in crate::game) struct ParticipantRoster {
     level_player_uuid: Option<[i32; 4]>,
     identities: Vec<ParticipantIdentity>,
 }
+/// Coherent population only. LOCAL is a real in-frame body, never a Guest.
+#[cfg(feature = "paired-packages")]
+pub(in crate::game) enum CoherentParticipants {
+    Network(ParticipantRoster),
+    Local { record: [i32; 4], body: usize },
+}
+#[cfg(feature = "paired-packages")]
+impl Game<'_> {
+    pub(in crate::game) fn local_checkpoint_owner(&self) -> bool {
+        self.local_checkpoint_source
+            .as_ref()
+            .is_some_and(|source| source.matches(self))
+    }
+    fn preflight_local_checkpoint_player(&self) -> Result<()> {
+        if !self.local_checkpoint_owner()
+            || self.player.is_none()
+            || self.restore_player_state
+            || !self.levels.parked_dims().is_empty()
+            || !self.server_trips.is_empty()
+            || !self.level_teleports.is_empty()
+            || self.pending_save.is_some()
+            || self.pending_entry.is_some()
+            || self.world_loader.is_some()
+            || self.rest_loader.is_some()
+            || self.saved_for_exit
+            || self.inventory.len() != 36
+            || self.ender_items.len() != 27
+            || self.selected >= 9
+            || self.carried.is_some()
+            || self.craft_grid.iter().any(Option::is_some)
+            || self.scratch_slot.is_some()
+            || self.container.is_some()
+            || self.station.is_some()
+            || self.ender_open.is_some()
+            || self.craft_table.is_some()
+            || self.inv_drag.is_some()
+            || self.last_quick_moved.is_some()
+            || self.sleeping.is_some()
+            || self.sleep_timer != 0
+            || self.riding.is_some()
+            || self.using.is_some()
+            || !self.potions.effects.saved().is_empty()
+            || !self.adv.loaded
+            || !self.stats.loaded
+            || self.adv.tree.list.is_empty()
+            || self.adv.pending_tree.is_some()
+        {
+            return Err("unsupported or nonoriginal LOCAL checkpoint player".into());
+        }
+        let body = self.player.as_ref().unwrap();
+        if body.server_copy || [body.yaw, body.pitch] != [self.yaw, self.pitch] {
+            return Err("LOCAL body and actual input projection differ".into());
+        }
+        for stack in self
+            .inventory
+            .iter()
+            .chain(self.armor.iter())
+            .chain(std::iter::once(&self.offhand))
+            .chain(self.ender_items.iter())
+            .flatten()
+        {
+            super::levels::session_checkpoint::items::validate_live_stack(self, stack)?;
+            let tag = horizon_client::save::item_to_nbt(stack);
+            if !session_player_payload_supported(&tag)
+                || horizon_client::save::item_from_nbt(&tag).as_ref() != Some(stack)
+            {
+                return Err("LOCAL native codec changes an actual item owner".into());
+            }
+        }
+        Ok(())
+    }
+    pub(in crate::game) fn observe_coherent_participants(&self) -> Result<CoherentParticipants> {
+        if self.options.execution_role.is_client() {
+            self.preflight_local_checkpoint_player()?;
+            Ok(CoherentParticipants::Local {
+                record: self.level.player_uuid.ok_or("LOCAL UUID absent")?,
+                body: std::ptr::from_ref(self.player.as_ref().unwrap()) as usize,
+            })
+        } else {
+            self.observe_checkpoint_participants()
+                .map(CoherentParticipants::Network)
+                .map_err(|e| format!("coherent population: {e:?}").into())
+        }
+    }
+    pub(in crate::game) fn project_coherent_participants(
+        &self,
+        expected: &CoherentParticipants,
+    ) -> Result<Vec<SessionPlayerRow>> {
+        match expected {
+            CoherentParticipants::Network(roster) => self.project_session_participant_rows(roster),
+            CoherentParticipants::Local { record, body } => {
+                self.preflight_local_checkpoint_player()?;
+                if self.level.player_uuid != Some(*record)
+                    || std::ptr::from_ref(self.player.as_ref().unwrap()) as usize != *body
+                {
+                    return Err("original LOCAL body or record allocation changed".into());
+                }
+                Ok(vec![self.project_local_checkpoint_player()?])
+            }
+        }
+    }
+    pub(in crate::game) fn overlay_local_checkpoint_body(
+        &self,
+        level: &mut horizon_client::save::Level,
+    ) -> Result<()> {
+        self.preflight_local_checkpoint_player()?;
+        if self.sculk.tracker_loaded {
+            let extra = level
+                .player_extra
+                .get_or_insert_with(|| horizon_world::nbt::Tag::Compound(Default::default()));
+            let horizon_world::nbt::Tag::Compound(extra) = extra else {
+                return Err("LOCAL player extra is not a compound".into());
+            };
+            extra.insert("warden_spawn_tracker".into(), self.sculk.tracker.to_nbt());
+        } else if level
+            .player_extra
+            .as_ref()
+            .and_then(|extra| extra.get("warden_spawn_tracker"))
+            .is_some()
+        {
+            return Err("LOCAL saved tracker has no actual loaded owner".into());
+        }
+        overlay_checkpoint_body(
+            self.player.as_ref().unwrap(),
+            self.mode_id(),
+            level,
+            PlayerBodyProjection::RetainedNative,
+        )?;
+        validate_local_session_player_tag(&level.player_tag())
+    }
+    fn project_local_checkpoint_player(&self) -> Result<SessionPlayerRow> {
+        let mut level = self.level.clone();
+        self.project_sync_level(&mut level);
+        self.overlay_local_checkpoint_body(&mut level)?;
+        let record = level.player_uuid.ok_or("LOCAL UUID absent")?;
+        let profile_uuid = record
+            .into_iter()
+            .fold(0u128, |uuid, part| (uuid << 32) | u128::from(part as u32));
+        Ok(SessionPlayerRow {
+            conn: 0,
+            profile_uuid,
+            record_uuid: record,
+            integrated_owner: true,
+            dimension: self.dim.id().into(),
+            player: level.player_tag(),
+            advancements: self
+                .adv
+                .progress
+                .to_json(&self.adv.tree, horizon_world::DATA_VERSION),
+            stats: self.stats.to_json(),
+        })
+    }
+    pub(in crate::game) fn install_local_checkpoint_player(
+        &mut self,
+        checked: &super::levels::session_checkpoint::CheckedSessionPlayers,
+    ) -> Result<()> {
+        let [row] = checked.rows() else {
+            return Err("LOCAL recovery requires exactly one actual player".into());
+        };
+        let record = self
+            .level
+            .player_uuid
+            .ok_or("original LOCAL native UUID absent")?;
+        let profile = record
+            .into_iter()
+            .fold(0u128, |uuid, part| (uuid << 32) | u128::from(part as u32));
+        if !self.local_checkpoint_owner()
+            || self.lan.is_some()
+            || self.retained_server.is_some()
+            || !row.integrated_owner
+            || row.record_uuid != record
+            || row.profile_uuid != profile
+            || row.dimension != super::Dim::Overworld.id()
+            || !session_player_tags_equal(&self.level.player_tag(), &row.player)
+            || self.carried.is_some()
+            || self.container.is_some()
+            || self.station.is_some()
+        {
+            return Err("checked LOCAL player differs from original native construction".into());
+        }
+        validate_local_session_player_tag(&row.player)?;
+        let mut level = self.level.clone();
+        level.read_player(&row.player);
+        level.player_extra = Some(row.player.clone());
+        let body = stage_checkpoint_body(self, &level, false)?;
+        let progress = horizon_client::advancements::Progress::from_json(&row.advancements);
+        let stats = super::stats::Stats::from_saved_json(Some(&row.stats));
+        if self.adv.tree.list.is_empty()
+            || self.adv.pending_tree.is_some()
+            || progress.to_json(&self.adv.tree, horizon_world::DATA_VERSION) != row.advancements
+            || stats.to_json() != row.stats
+        {
+            return Err("LOCAL checked progress/statistics change on installation".into());
+        }
+        self.level = level;
+        self.restore_ordinary_native_player();
+        self.player = Some(*body);
+        self.yaw = self.level.rotation[0];
+        self.pitch = self.level.rotation[1];
+        self.restore_player_state = false;
+        self.adv.progress = progress;
+        self.adv.loaded = true;
+        self.stats = stats;
+        if let Some(tag) = row.player.get("warden_spawn_tracker") {
+            self.sculk.tracker = horizon_client::sculk::WardenSpawnTracker::from_nbt(tag);
+            self.sculk.tracker_loaded = true;
+        }
+        let actual = self.project_local_checkpoint_player()?;
+        if !session_player_tags_equal(&actual.player, &row.player)
+            || actual.advancements != row.advancements
+            || actual.stats != row.stats
+        {
+            return Err("installed actual LOCAL player differs from checked image".into());
+        }
+        Ok(())
+    }
+}
 #[cfg(feature = "paired-packages")]
 enum ParticipantHostIdentity {
     Legacy(Arc<lan::Shared>),
@@ -1569,37 +1786,10 @@ impl OrdinaryRecoveryPlayers {
             }
             let level = work.level.as_ref().unwrap();
             if work.body.is_none() {
-                let p = level.position.ok_or("checked recovery position absent")?;
-                work.body = Some(Box::new(horizon_client::motion::PlayerMotion::new(
-                    game.motion,
-                    Vec3::new(p[0], p[1], p[2]),
-                )?));
+                work.body = Some(stage_checkpoint_body(game, level, true)?);
             }
-            let body = work.body.as_mut().unwrap();
-            let mut pending = true;
-            body.load_saved_state_once(&mut pending, level)?;
-            body.internal_set_absorption(level.absorption)?;
-            let short = |key| {
-                horizon_client::save::number(work.row.player.get(key))
-                    .ok_or("checked saved body scalar absent")
-            };
-            body.fire_ticks = i32::try_from(short("Fire")?)?;
-            body.air = i32::try_from(short("Air")?)?;
-            body.fall_distance = level.fall_distance;
-            body.velocity = Vec3::new(level.motion[0], level.motion[1], level.motion[2]);
-            body.health.food.exhaustion = level.food_exhaustion;
-            body.health.food.timer = level.food_tick_timer;
-            body.yaw = level.rotation[0];
-            body.head_yaw = body.yaw;
-            body.pitch = level.rotation[1];
-            body.ground.on_ground = level.on_ground;
-            body.server_copy = true;
-            body.may_fly = matches!(level.mode(), 1 | 3);
-            body.invulnerable = body.may_fly;
-            body.spectator = level.mode() == 3;
-            body.flying = level.flying;
-            if pending || !session_body_matches_level(body, level) {
-                return Err("original staged recovery body differs from checked native row".into());
+            if !session_body_matches_level(work.body.as_deref().unwrap(), level) {
+                return Err("original staged recovery body changed".into());
             }
             work.progress = Some(horizon_client::advancements::Progress::from_json(
                 &work.row.advancements,
@@ -1858,6 +2048,27 @@ pub(in crate::game) fn session_empty_native_player(tag: &horizon_world::nbt::Tag
 /// This initial body profile supports only fields installed below. Unknown saved
 /// state cannot survive merely because player_extra would copy it back unchanged.
 #[cfg(feature = "paired-packages")]
+pub(in crate::game) fn validate_local_session_player_tag(
+    tag: &horizon_world::nbt::Tag,
+) -> Result<()> {
+    use horizon_world::nbt::Tag;
+    let Tag::Compound(mut fields) = tag.clone() else {
+        return Err("LOCAL player is not a compound".into());
+    };
+    if let Some(tracker) = fields.remove(&"warden_spawn_tracker".into()) {
+        let value = horizon_client::sculk::WardenSpawnTracker::from_nbt(&tracker);
+        if value.warning_level != 0
+            || value.cooldown_ticks != 0
+            || value.ticks_since_last_warning < 0
+            || value.to_nbt() != tracker
+        {
+            return Err("unsupported or malformed LOCAL warden tracker".into());
+        }
+    }
+    validate_session_player_tag(&Tag::Compound(fields))
+}
+
+#[cfg(feature = "paired-packages")]
 pub(in crate::game) fn validate_session_player_tag(tag: &horizon_world::nbt::Tag) -> Result<()> {
     use horizon_client::save::Level;
     use horizon_world::nbt::Tag;
@@ -2013,45 +2224,10 @@ fn pack_player_level(
     record_uuid: [i32; 4],
     profile: PlayerBodyProjection,
 ) -> Result<horizon_client::save::Level> {
-    use horizon_client::save::Level;
     let body = guest
         .motion
         .as_deref()
         .ok_or("session player has no live body")?;
-    if body.attributes.instances().any(|(_, key, value)| {
-        body.attributes
-            .catalog()
-            .default_base("minecraft:player", key.attribute())
-            != Some(value.base_value())
-            || (profile == PlayerBodyProjection::RetainedNative
-                && !value.permanent_modifiers().is_empty())
-            || value.modifiers().iter().any(|modifier| {
-                // Original ServerPlayer.updatePlayerAttributes derives these
-                // transient reach modifiers from creative mode each tick. The
-                // native codec persists that mode; keep the actual instances
-                // intact while checking their exact native derivation here.
-                let expected = match key.name() {
-                    "minecraft:block_interaction_range" => {
-                        Some(("minecraft:creative_mode_block_range", 0.5))
-                    }
-                    "minecraft:entity_interaction_range" => {
-                        Some(("minecraft:creative_mode_entity_range", 2.0))
-                    }
-                    _ => None,
-                };
-                profile != PlayerBodyProjection::RetainedNative
-                    || guest.game_mode != 1
-                    || value.modifiers().len() != 1
-                    || !expected.is_some_and(|(id, amount)| {
-                        modifier.id() == id
-                            && modifier.amount() == amount
-                            && modifier.operation()
-                                == horizon_world::attributes::Operation::AddValue
-                    })
-            })
-    }) {
-        return Err("nondefault session player body attributes are unsupported".into());
-    }
     // These mirror fields are native owners too. A stale guest cache cannot hide
     // a changed body, nor can a stale body silently replace a newer guest value.
     if !(0..=3).contains(&guest.game_mode)
@@ -2077,13 +2253,71 @@ fn pack_player_level(
     {
         return Err("unsupported or inconsistent actual session player body".into());
     }
-    // Every non-body value comes from the actual guest via the native writer.
-    // In particular the integrated owner's cached Level supplies no body values.
-    let mut level = Level {
+    let mut level = horizon_client::save::Level {
         player_uuid: Some(record_uuid),
-        ..Level::default()
+        ..Default::default()
     };
     playerdata::store(guest, &mut level);
+    overlay_checkpoint_body(body, guest.game_mode, &mut level, profile)?;
+    validate_session_player_tag(&level.player_tag())?;
+    Ok(level)
+}
+
+#[cfg(feature = "paired-packages")]
+fn overlay_checkpoint_body(
+    body: &horizon_client::motion::PlayerMotion,
+    mode: i32,
+    level: &mut horizon_client::save::Level,
+    profile: PlayerBodyProjection,
+) -> Result<()> {
+    if body.attributes.instances().any(|(_, key, value)| {
+        body.attributes
+            .catalog()
+            .default_base("minecraft:player", key.attribute())
+            != Some(value.base_value())
+            || (profile == PlayerBodyProjection::RetainedNative
+                && !value.permanent_modifiers().is_empty())
+            || value.modifiers().iter().any(|modifier| {
+                // Original ServerPlayer.updatePlayerAttributes derives these
+                // transient reach modifiers from creative mode each tick. The
+                // native codec persists that mode; keep the actual instances
+                // intact while checking their exact native derivation here.
+                let expected = match key.name() {
+                    "minecraft:block_interaction_range" => {
+                        Some(("minecraft:creative_mode_block_range", 0.5))
+                    }
+                    "minecraft:entity_interaction_range" => {
+                        Some(("minecraft:creative_mode_entity_range", 2.0))
+                    }
+                    _ => None,
+                };
+                profile != PlayerBodyProjection::RetainedNative
+                    || mode != 1
+                    || value.modifiers().len() != 1
+                    || !expected.is_some_and(|(id, amount)| {
+                        modifier.id() == id
+                            && modifier.amount() == amount
+                            && modifier.operation()
+                                == horizon_world::attributes::Operation::AddValue
+                    })
+            })
+    }) {
+        return Err("nondefault session player body attributes are unsupported".into());
+    }
+    if !(0..=3).contains(&mode)
+        || body.may_fly != matches!(mode, 1 | 3)
+        || body.invulnerable != matches!(mode, 1 | 3)
+        || body.spectator != (mode == 3)
+        || body.flying_speed != 0.05
+        || body.fall_flying
+        || body.ticks_frozen != 0
+        || (matches!(mode, 0 | 2) && body.flying)
+        || (mode == 3 && !body.flying)
+        || !(i16::MIN as i32..=i16::MAX as i32).contains(&body.fire_ticks)
+        || !(i16::MIN as i32..=i16::MAX as i32).contains(&body.air)
+    {
+        return Err("unsupported actual checkpoint body".into());
+    }
     level.position = Some([body.position.x, body.position.y, body.position.z]);
     level.rotation = [body.yaw, body.pitch];
     level.on_ground = body.ground.on_ground;
@@ -2107,8 +2341,46 @@ fn pack_player_level(
     level.motion = [body.velocity.x, body.velocity.y, body.velocity.z];
     level.food_exhaustion = body.health.food.exhaustion;
     level.food_tick_timer = body.health.food.timer;
-    validate_session_player_tag(&level.player_tag())?;
-    Ok(level)
+    Ok(())
+}
+
+#[cfg(feature = "paired-packages")]
+fn stage_checkpoint_body(
+    game: &Game<'_>,
+    level: &horizon_client::save::Level,
+    server_copy: bool,
+) -> Result<Box<horizon_client::motion::PlayerMotion>> {
+    let p = level.position.ok_or("checked recovery position absent")?;
+    let mut body = Box::new(horizon_client::motion::PlayerMotion::new(
+        game.motion,
+        Vec3::new(p[0], p[1], p[2]),
+    )?);
+    let mut pending = true;
+    body.load_saved_state_once(&mut pending, level)?;
+    body.internal_set_absorption(level.absorption)?;
+    let short = |key| {
+        horizon_client::save::number(level.player_extra.as_ref().and_then(|tag| tag.get(key)))
+            .ok_or("checked saved body scalar absent")
+    };
+    body.fire_ticks = i32::try_from(short("Fire")?)?;
+    body.air = i32::try_from(short("Air")?)?;
+    body.fall_distance = level.fall_distance;
+    body.velocity = Vec3::new(level.motion[0], level.motion[1], level.motion[2]);
+    body.health.food.exhaustion = level.food_exhaustion;
+    body.health.food.timer = level.food_tick_timer;
+    body.yaw = level.rotation[0];
+    body.head_yaw = body.yaw;
+    body.pitch = level.rotation[1];
+    body.ground.on_ground = level.on_ground;
+    body.server_copy = server_copy;
+    body.may_fly = matches!(level.mode(), 1 | 3);
+    body.invulnerable = body.may_fly;
+    body.spectator = level.mode() == 3;
+    body.flying = level.flying;
+    if pending || !session_body_matches_level(&body, level) {
+        return Err("original staged body differs from checked native row".into());
+    }
+    Ok(body)
 }
 
 #[cfg(feature = "paired-packages")]

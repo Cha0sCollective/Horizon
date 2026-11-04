@@ -1453,3 +1453,507 @@ mod placement_tests {
         }
     }
 }
+
+#[cfg(all(
+    feature = "mods",
+    feature = "native-writer-test-control",
+    debug_assertions
+))]
+mod local_tests {
+    use super::*;
+    use crate::game::{
+        GameCpuResources, InitialGameWorld, UiResources,
+        paired_close::{CloseOwner, CloseProfile, CloseStatus},
+        world_loading::{OrdinaryPreparation, PreparationCloseStatus, RetainedEntryIdentity},
+    };
+
+    fn local_game<'a>(
+        f: &'a Materialized,
+        startup: &Arc<crate::game::mod_packages::FrozenHostInputs>,
+        tree: &Arc<horizon_client::advancements::Tree>,
+        entry: &RetainedEntryIdentity,
+        request: Option<WorldRequest>,
+    ) -> Box<Game<'a>> {
+        let mut options = Options::read_from(vec![
+            "--resources".into(),
+            f.root.to_string_lossy().into_owned(),
+            "--in-frame".into(),
+            "--test-terrain".into(),
+            "--creative".into(),
+            "--name".into(),
+            "LocalFixture".into(),
+        ])
+        .unwrap()
+        .unwrap()
+        .options;
+        options.mod_packages = f.packages.clone();
+        assert!(options.execution_role.is_client() && options.dedicated.is_none());
+        let mut settings = Settings {
+            render_distance: 2,
+            simulation_distance: 2,
+            ..Default::default()
+        };
+        settings.horizon.lod_distance = 0;
+        settings.controller.enabled = false;
+        let activated = startup
+            .activate(ExecutionRole::Client, false, false, &settings)
+            .unwrap_or_else(|refused| {
+                panic!("actual LOCAL runtime activation: {}", refused.reason)
+            });
+        let ordinary = request.is_some();
+        let initial = if let Some(request) = request {
+            let preparation = OrdinaryPreparation::prepare(
+                request,
+                &f.resources,
+                &f.pack,
+                &options,
+                &settings,
+                entry,
+                startup.clone(),
+            );
+            let prepared = preparation
+                .into_prepared(entry)
+                .unwrap_or_else(|_| panic!("actual LOCAL preparation refused"));
+            InitialGameWorld::Ordinary(Box::new(prepared))
+        } else {
+            InitialGameWorld::OrdinaryRecoverySeed(startup.clone())
+        };
+        let mut game = Box::new(
+            Game::new_with_world(
+                &f.resources,
+                f.pack.clone(),
+                UiResources::load(&f.root, &f.base).unwrap(),
+                options,
+                settings,
+                horizon_client::audio::Audio::silent(&f.root),
+                Some(GameCpuResources::load(&f.root).unwrap()),
+                initial,
+            )
+            .unwrap(),
+        );
+        game.adopt_activated_startup(activated)
+            .unwrap_or_else(|refused| panic!("original LOCAL runtime transfer: {}", refused.1));
+        game.adv.tree = tree.clone();
+        if ordinary {
+            game.title = None;
+            game.screen = crate::game::Screen::Playing;
+            game.restore_ordinary_native_player();
+            game.load_world_state();
+            game.load_stats();
+            game.load_advancements();
+        }
+        game
+    }
+    fn close_local<'a>(
+        game: Box<Game<'a>>,
+        archive: &Path,
+        retry: bool,
+    ) -> crate::game::paired_close::OrdinaryClosedWorld {
+        let mut owner = CloseOwner::begin(
+            game,
+            CloseProfile::CoherentSession {
+                archive: archive.to_owned(),
+            },
+            until(),
+        );
+        let receipt = if retry {
+            let (control, receipt) =
+                CoherentImageTestControl::new(CoherentImageTestAction::FailCopied);
+            owner.local_image_control_for_test(control);
+            Some(receipt)
+        } else {
+            None
+        };
+        let mut retried = false;
+        loop {
+            match owner.poll() {
+                CloseStatus::Pending(_) => std::thread::yield_now(),
+                CloseStatus::NativeReady => break,
+                CloseStatus::Blocked(error) => {
+                    assert!(
+                        retry && !retried && receipt.as_ref().unwrap().entered(),
+                        "unexpected LOCAL close refusal: {error}"
+                    );
+                    assert!(epochs(archive).unwrap().is_empty());
+                    owner.retry(until()).unwrap();
+                    retried = true;
+                }
+            }
+        }
+        assert_eq!(retried, retry);
+        assert_eq!(owner.observe().participants, 1);
+        assert_eq!(
+            owner.local_cached_level_for_test().motion,
+            [0.125, -0.25, 0.5]
+        );
+        assert!(!owner.local_cached_level_for_test().on_ground);
+        assert_eq!(owner.local_cached_level_for_test().food_exhaustion, 2.25);
+        assert_eq!(owner.local_cached_level_for_test().food_tick_timer, 7);
+        assert_eq!(owner.local_cached_level_for_test().rotation, [91.0, -17.0]);
+        let ready = owner
+            .try_native_ready()
+            .unwrap_or_else(|_| panic!("actual LOCAL ready transfer refused"));
+        let mut disposed = ready
+            .try_dispose_dormant()
+            .unwrap_or_else(|(_, reason)| panic!("actual LOCAL completed disposal: {reason}"));
+        disposed
+            .take_ordinary_world()
+            .expect("actual consuming LOCAL completion")
+    }
+
+    #[test]
+    #[ignore = "isolated captured pair and native resources: actual ordinary LOCAL body, coherent Retry, unpublished recovery and cancellation"]
+    fn ordinary_local_actual_body_coherent_retry_recovery_and_cancel() {
+        let f = Materialized::new("local-coherent");
+        let startup = Arc::new(
+            f.packages
+                .freeze_peer_inputs(
+                    Arc::new(horizon_client::lan::data::SyncData::load(&f.root).unwrap()),
+                    f.pack.assets.registry,
+                )
+                .unwrap()
+                .unwrap(),
+        );
+        let tree = Arc::new(horizon_client::advancements::Tree::load(
+            &f.root.join("data"),
+        ));
+        assert!(!tree.list.is_empty());
+        for cancel in [true, false] {
+            let authority = f.scratch.join(format!("local-authority-{cancel}"));
+            let archive = f.scratch.join(format!("local-archive-{cancel}"));
+            let continuation = f.scratch.join(format!("local-continuation-{cancel}"));
+            for root in [&authority, &archive, &continuation] {
+                fs::create_dir(root).unwrap();
+            }
+            let namespace = crate::game::world_loading::host_identity::session_authority::AuthorityNamespace::new(&authority).unwrap();
+            let root = f.scratch.join(format!("local-world-{cancel}"));
+            let entry = RetainedEntryIdentity {
+                token: if cancel { 1 } else { 2 },
+                owner: Arc::new(()),
+            };
+            let mut request = WorldRequest::new(
+                "unused",
+                Some("Local coherent fixture"),
+                Some(17),
+                true,
+                None,
+            )
+            .unwrap()
+            .with_identity_intent(IdentityIntent::CreateNewIdentity)
+            .with_session_authority(namespace.clone());
+            request.save_root = root.clone();
+            let mut game = local_game(&f, &startup, &tree, &entry, Some(request));
+            assert!(game.local_checkpoint_owner() && game.native_close_owner_authorized());
+            assert!(!game.ui.rules.bool("spawn_mobs"));
+            eprintln!("LOCAL_ORIGINAL_CREATED={cancel}");
+            residency(&mut game, 2, (0, 0));
+            let deadline = until();
+            while game.player.is_none() {
+                update_native(&mut game);
+                game.spawn_player().unwrap();
+                assert!(Instant::now() < deadline);
+                std::thread::yield_now();
+            }
+            assert!(!game.restore_player_state);
+            residency(&mut game, 2, (0, 0));
+            eprintln!("LOCAL_ACTUAL_PLAYER_SPAWNED={cancel}");
+            game.load_stats();
+            game.load_advancements();
+            let body = game.player.as_mut().unwrap();
+            body.position = Vec3::new(2.5, 120.0, 0.5);
+            body.velocity = Vec3::new(0.125, -0.25, 0.5);
+            body.ground.on_ground = false;
+            body.health.food.food = 14;
+            body.health.food.saturation = 3.25;
+            body.health.food.exhaustion = 2.25;
+            body.health.food.timer = 7;
+            body.internal_set_absorption(1.25).unwrap();
+            body.fire_ticks = 23;
+            body.air = 245;
+            body.may_fly = true;
+            body.invulnerable = true;
+            body.spectator = false;
+            body.flying = true;
+            game.yaw = 23.0;
+            game.pitch = 11.0;
+            game.sync_player_body();
+            game.sculk.tracker_loaded = true;
+            game.sculk.tracker.ticks_since_last_warning = 123;
+            game.inventory = vec![None; 36];
+            game.inventory[0] = Some(ItemStack::new(f.alias.as_str(), 3));
+            game.inventory[1] = Some(session_items_rich());
+            game.ender_items[4] = Some(session_items_rich());
+            game.stats
+                .values
+                .entry("minecraft:custom".into())
+                .or_default()
+                .insert("minecraft:jump".into(), 7);
+            assert_eq!(game.stats.get("custom", "minecraft:jump"), 7);
+            let advancement = tree
+                .list
+                .iter()
+                .find(|advancement| !advancement.criteria.is_empty())
+                .unwrap();
+            let criterion = &advancement.criteria[0].name;
+            assert!(game.adv.progress.grant(
+                &advancement.id,
+                criterion,
+                "2026-01-01 00:00:00 +0000"
+            ));
+            game.arm_registered_guest_placement(&f.type_id).unwrap();
+            let stone = game
+                .pack
+                .assets
+                .registry
+                .default_state("minecraft:stone")
+                .unwrap();
+            game.world
+                .set(POSITION[0], POSITION[1] - 1, POSITION[2], stone)
+                .unwrap();
+            let hit = crate::game::Hit {
+                pos: [POSITION[0], POSITION[1] - 1, POSITION[2]],
+                face: [0, 1, 0],
+                point: [2.5, 120.0, 2.5],
+            };
+            game.use_hand(Some(&hit)).unwrap();
+            assert_eq!(
+                game.world.block(POSITION[0], POSITION[1], POSITION[2]),
+                f.binding().state_id()
+            );
+            let horizon_client::world::counter_restore::GuestRuntimeState::ReadyActive {
+                counter,
+                slot,
+            } = game.world.guest_runtime_state().unwrap()
+            else {
+                panic!("actual LOCAL Guest pair absent")
+            };
+            game.tickets.update(Some(Sources {
+                players: vec![(0, 0)],
+                forced: Vec::new(),
+                view_distance: 2,
+                simulation_distance: 2,
+            }));
+            let calls = crate::game::counter_control::guest_evaluation_calls();
+            game.world.game_time += 1;
+            game.tick_counter_trial(true);
+            assert_eq!(
+                crate::game::counter_control::guest_evaluation_calls(),
+                calls + 1
+            );
+            assert_eq!(
+                game.world
+                    .read_persistent_counter(&counter)
+                    .unwrap()
+                    .counter(),
+                1
+            );
+            assert!(
+                matches!(game.transfer_world_slot_inventory_cell(&slot, 1, Direction::IntoMachine, 3).unwrap(), TransferOutcome::Committed(row) if row.moved==3)
+            );
+            let mut rich = session_items_rich();
+            rich.count = 3;
+            retirement_raw_equal(
+                game.world
+                    .read_world_slot(&slot)
+                    .unwrap()
+                    .slot
+                    .stack()
+                    .unwrap(),
+                &rich,
+            );
+            let roster = game.observe_coherent_participants().unwrap();
+            let local_rows = game.project_coherent_participants(&roster).unwrap();
+            assert_eq!(local_rows.len(), 1);
+            assert!(
+                crate::game::lan::validate_local_session_player_tag(&local_rows[0].player).is_ok()
+            );
+            assert!(
+                crate::game::lan::validate_session_player_tag(&local_rows[0].player).is_err(),
+                "network row policy must remain strict about the local tracker"
+            );
+            game.adv.loaded = false;
+            assert!(game.prepare_coherent_image_context(&archive).is_err());
+            game.adv.loaded = true;
+            game.stats.loaded = false;
+            assert!(game.prepare_coherent_image_context(&archive).is_err());
+            game.stats.loaded = true;
+            let actual_uuid = game.level.player_uuid;
+            let mut wrong_uuid = actual_uuid.unwrap();
+            wrong_uuid[0] ^= 1;
+            game.level.player_uuid = Some(wrong_uuid);
+            assert!(game.prepare_coherent_image_context(&archive).is_err());
+            game.level.player_uuid = actual_uuid;
+            let untouched_archive = super::super::tree(&archive, &[]).unwrap();
+            assert!(
+                game.checkpoint_registered_guest_session(&archive, 1, until())
+                    .is_err()
+            );
+            assert_eq!(
+                super::super::tree(&archive, &[]).unwrap(),
+                untouched_archive
+            );
+            game.carried = Some(ItemStack::new("minecraft:stone", 1));
+            assert!(game.prepare_coherent_image_context(&archive).is_err());
+            game.carried = None;
+            let actual_source = game.local_checkpoint_source.take().unwrap();
+            assert!(game.prepare_coherent_image_context(&archive).is_err());
+            game.local_checkpoint_source = Some(actual_source);
+            let source =
+                OrdinaryRecoverySource::capture(&game, namespace, &archive, &continuation).unwrap();
+            // A raw expected UUID cannot enter LOCAL recovery or acquire a save.
+            let mut raw = WorldRequest::new("unused", None, None, false, None)
+                .unwrap()
+                .with_expected_checkpoint_world(source.world);
+            raw.save_root = f.scratch.join(format!("raw-local-{cancel}"));
+            let mut refused = OrdinaryPreparation::prepare(
+                raw,
+                &game.res,
+                &game.pack,
+                &game.options,
+                &game.settings,
+                &entry,
+                startup.clone(),
+            );
+            assert!(
+                refused
+                    .original_error()
+                    .unwrap()
+                    .contains("local-player adapter")
+            );
+            refused.begin_close(until());
+            loop {
+                match refused.poll_close() {
+                    PreparationCloseStatus::Pending => std::thread::yield_now(),
+                    PreparationCloseStatus::Complete => break,
+                    PreparationCloseStatus::Blocked(error) => {
+                        panic!("raw LOCAL refusal close: {error}")
+                    }
+                }
+            }
+            let _closed = refused
+                .finish_close()
+                .unwrap_or_else(|_| panic!("raw LOCAL refusal completion absent"));
+            game.yaw = 91.0;
+            game.pitch = -17.0;
+            assert!(
+                game.project_coherent_participants(&roster).is_err(),
+                "last mouse input differs until actual close sync"
+            );
+            let closed = close_local(game, &archive, !cancel);
+            eprintln!("LOCAL_COHERENT_CLOSED={cancel}");
+            let native = horizon_client::save::Level::read(&root).unwrap();
+            assert_eq!(native.motion, [0.125, -0.25, 0.5]);
+            assert_eq!(native.rotation, [91.0, -17.0]);
+            let world_before = super::super::tree(&root, &["session.lock"]).unwrap();
+            let request = source
+                .into_request(
+                    closed,
+                    f.scratch.join(format!("local-recovered-{cancel}")),
+                    until(),
+                )
+                .unwrap_or_else(|_| panic!("actual LOCAL source completion refused"));
+            let candidate = local_game(&f, &startup, &tree, &entry, None);
+            assert!(
+                candidate.fresh_session_candidate().is_err(),
+                "generic LOCAL candidate must remain closed"
+            );
+            let mut recovery = OrdinaryRecoveryWork::prepare(candidate, entry, request);
+            assert!(
+                recovery.original_error().is_none(),
+                "LOCAL native recovery: {:?}",
+                recovery.original_error()
+            );
+            assert!(recovery.game_mut().native_close_authority.is_none());
+            assert!(recovery.game_mut().local_checkpoint_owner());
+            eprintln!("LOCAL_NATIVE_RECOVERY_PREPARED={cancel}");
+            assert!(
+                recovery.game_mut().lan.is_none() && recovery.game_mut().retained_server.is_none()
+            );
+            if cancel {
+                recovery.fail("authored cancellation after LOCAL native acquisition".into());
+                recovery.begin_close(until());
+                loop {
+                    match recovery.poll_close() {
+                        PreparationCloseStatus::Pending => std::thread::yield_now(),
+                        PreparationCloseStatus::Complete => break,
+                        PreparationCloseStatus::Blocked(error) => {
+                            panic!("original LOCAL cancellation close: {error}")
+                        }
+                    }
+                }
+                let candidate = recovery.game_mut();
+                assert!(
+                    candidate.save.is_none()
+                        && candidate.streaming.is_vacant()
+                        && candidate.session_lock.is_none()
+                );
+                assert!(
+                    candidate.native_close_authority.is_none()
+                        && candidate.local_checkpoint_source.is_none()
+                );
+                assert_eq!(
+                    super::super::tree(&root, &["session.lock"]).unwrap(),
+                    world_before
+                );
+                eprintln!("LOCAL_ORIGINAL_CANCEL_PASS");
+            } else {
+                let game = recovery
+                    .try_activate()
+                    .unwrap()
+                    .expect("actual LOCAL activation without fake Hub");
+                assert!(game.native_close_owner_authorized() && game.local_checkpoint_owner());
+                assert_eq!(
+                    game.local_continuation_archive.as_deref(),
+                    Some(continuation.as_path())
+                );
+                let body = game.player.as_ref().unwrap();
+                assert!(!body.server_copy);
+                assert_eq!(body.velocity, Vec3::new(0.125, -0.25, 0.5));
+                assert!(!body.ground.on_ground);
+                assert_eq!([body.yaw, body.pitch], [91.0, -17.0]);
+                assert_eq!(body.health.food.exhaustion, 2.25);
+                assert_eq!(body.health.food.timer, 7);
+                assert_eq!(body.fire_ticks, 23);
+                assert_eq!(body.air, 245);
+                assert_eq!(body.health.absorption(), 1.25);
+                assert_eq!(game.stats.get("custom", "minecraft:jump"), 7);
+                assert_eq!(game.sculk.tracker.ticks_since_last_warning, 123);
+                assert!(game.adv.progress.has(&advancement.id, criterion));
+                let horizon_client::world::counter_restore::GuestRuntimeState::ReadyActive {
+                    counter,
+                    slot,
+                } = game.world.guest_runtime_state().unwrap()
+                else {
+                    panic!("restored original pair absent")
+                };
+                assert_eq!(
+                    game.world
+                        .read_persistent_counter(&counter)
+                        .unwrap()
+                        .counter(),
+                    1
+                );
+                retirement_raw_equal(
+                    game.world
+                        .read_world_slot(&slot)
+                        .unwrap()
+                        .slot
+                        .stack()
+                        .unwrap(),
+                    &rich,
+                );
+                rich.count = 4;
+                retirement_raw_equal(game.inventory[1].as_ref().unwrap(), &rich);
+                rich.count = 7;
+                retirement_raw_equal(game.ender_items[4].as_ref().unwrap(), &rich);
+                let _next_closed = close_local(game, &continuation, false);
+                assert_eq!(epochs(&continuation).unwrap().len(), 1);
+                eprintln!("LOCAL_ACTUAL_BODY_RETRY_RECOVERY_CONTINUATION_PASS");
+            }
+        }
+        // Retain original controlled failed publication and native worlds. Do not
+        // traverse/copy materialized resource links to preserve them.
+        eprintln!("LOCAL_NATIVE_EVIDENCE_ROOT={}", f.scratch.display());
+        std::mem::forget(f);
+    }
+}

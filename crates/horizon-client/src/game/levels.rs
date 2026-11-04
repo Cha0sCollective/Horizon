@@ -2132,10 +2132,16 @@ impl Game<'_> {
     /// independently project the checked persistent counter and slot before
     /// accounting the sole supported slot. No research profile is enabled here.
     pub(in crate::game) fn inspect_session_checkpoint_owners(&self) -> Result<()> {
+        self.inspect_session_checkpoint_owners_for_candidate(false)
+    }
+    // Only the owned ordinary recovery work may pass an actual LOCAL vacant seed.
+    fn inspect_session_checkpoint_owners_for_candidate(&self, local_candidate: bool) -> Result<()> {
         use horizon_client::world::WorldOwnerKind as K;
         if self.remote.is_some()
             || self.integrated.is_some()
-            || self.options.execution_role.is_client()
+            || (self.options.execution_role.is_client()
+                && !self.local_checkpoint_owner()
+                && !local_candidate)
             || self.lan_acting.is_some()
             || self.dim != Dim::Overworld
             || !self.levels.parked.is_empty()

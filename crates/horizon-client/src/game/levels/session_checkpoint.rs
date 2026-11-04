@@ -69,6 +69,7 @@ pub(in crate::game) struct SessionValidationContext {
     assets: Arc<horizon_client::assets::Assets>,
     packages: crate::game::mod_packages::Packages,
     advancement_tree: Arc<horizon_client::advancements::Tree>,
+    local_player: bool,
 }
 impl SessionValidationContext {
     fn from_game(game: &Game<'_>) -> Self {
@@ -77,6 +78,7 @@ impl SessionValidationContext {
             assets: game.pack.assets.clone(),
             packages: game.options.mod_packages.clone(),
             advancement_tree: game.adv.tree.clone(),
+            local_player: game.local_checkpoint_owner(),
         }
     }
     fn same_owners(&self, game: &Game<'_>) -> bool {
@@ -88,6 +90,13 @@ impl SessionValidationContext {
                 (None, None) => true,
                 _ => false,
             }
+    }
+    fn validate_player(&self, tag: &Tag) -> SResult<()> {
+        checked(if self.local_player {
+            lan::validate_local_session_player_tag(tag)
+        } else {
+            lan::validate_session_player_tag(tag)
+        })
     }
     pub(in crate::game) fn validate_column(
         &self,
@@ -274,6 +283,43 @@ pub(in crate::game) struct OrdinaryRecoveryRequest {
     source: OrdinaryRecoverySource,
     _closed: crate::game::paired_close::OrdinaryClosedWorld,
     managed: ManagedRecoveryRequest,
+}
+/// Sealed by the owned ordinary recovery after original source/closed-world and
+/// namespace lease checks. An expected UUID alone cannot prepare a LOCAL world.
+pub(in crate::game) struct LocalRecoveryPreparation {
+    context: SessionValidationContext,
+    startup: Arc<crate::game::mod_packages::FrozenHostInputs>,
+    world: WorldId,
+    destination: PathBuf,
+    player: [i32; 4],
+}
+impl LocalRecoveryPreparation {
+    pub(in crate::game) fn permits(
+        &self,
+        destination: &Path,
+        world: Option<WorldId>,
+        startup: &Arc<crate::game::mod_packages::FrozenHostInputs>,
+    ) -> bool {
+        self.context.local_player
+            && destination == self.destination
+            && world == Some(self.world)
+            && Arc::ptr_eq(startup, &self.startup)
+    }
+    pub(in crate::game) fn native_player(&self) -> [i32; 4] {
+        self.player
+    }
+    fn permits_seed(&self, game: &Game<'_>) -> bool {
+        self.context.local_player
+            && self.context.same_owners(game)
+            && game.options.execution_role.is_client()
+            && !game.options.server_thread
+            && game.options.server.is_none()
+            && game.options.dedicated.is_none()
+            && game
+                .ordinary_startup
+                .as_ref()
+                .is_some_and(|startup| Arc::ptr_eq(startup, &self.startup))
+    }
 }
 impl OrdinaryRecoverySource {
     pub(in crate::game) fn capture(
@@ -1489,7 +1535,7 @@ fn raid_metadata(root: &Path) -> SResult<Option<Tag>> {
     Ok(current)
 }
 fn sidecars(root: &Path, players: &[PlayerDescriptor]) -> SResult<()> {
-    sidecars_with_initial_owner(root, players, None)
+    sidecars_with_initial_owner(root, players, None, false)
 }
 // Only the first pre-final read can supply this captured original owner UUID.
 // Final images and recovery always enter through strict sidecars().
@@ -1497,6 +1543,7 @@ fn sidecars_with_initial_owner(
     root: &Path,
     players: &[PlayerDescriptor],
     initial_owner: Option<[i32; 4]>,
+    local_player: bool,
 ) -> SResult<()> {
     let local_uuid = native_local_uuid(root)?;
     let inventory = tree(root, &["session.lock"])?;
@@ -1526,13 +1573,24 @@ fn sidecars_with_initial_owner(
             .find(|row| player_path(row, "data").strip_prefix("world/") == Some(name))
         {
             let tag = compressed_nbt(&bytes)?;
-            validate_player_sidecar(
-                &tag,
-                row.path.ends_with("_old"),
-                player,
-                local_uuid,
-                initial_owner,
-            )?;
+            if local_player {
+                validate_player_sidecar_profile(
+                    &tag,
+                    row.path.ends_with("_old"),
+                    player,
+                    local_uuid,
+                    initial_owner,
+                    local_player,
+                )?;
+            } else {
+                validate_player_sidecar(
+                    &tag,
+                    row.path.ends_with("_old"),
+                    player,
+                    local_uuid,
+                    initial_owner,
+                )?;
+            }
             continue;
         }
         if players.iter().any(|row| {
@@ -1623,6 +1681,16 @@ fn validate_player_sidecar(
     local_uuid: [i32; 4],
     initial_owner: Option<[i32; 4]>,
 ) -> SResult<()> {
+    validate_player_sidecar_profile(tag, backup, player, local_uuid, initial_owner, false)
+}
+fn validate_player_sidecar_profile(
+    tag: &Tag,
+    backup: bool,
+    player: &PlayerDescriptor,
+    local_uuid: [i32; 4],
+    initial_owner: Option<[i32; 4]>,
+    local_player: bool,
+) -> SResult<()> {
     let initial = player.integrated_owner
         && player.record_uuid == local_uuid
         && initial_owner == Some(local_uuid)
@@ -1630,7 +1698,11 @@ fn validate_player_sidecar(
     if (backup || initial) && lan::session_empty_native_player(tag) {
         return Ok(());
     }
-    checked(lan::validate_session_player_tag(tag))
+    checked(if local_player {
+        lan::validate_local_session_player_tag(tag)
+    } else {
+        lan::validate_session_player_tag(tag)
+    })
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1665,6 +1737,10 @@ fn player_rows_context(
     descriptors: &[PlayerDescriptor],
 ) -> SResult<Vec<SessionPlayerRow>> {
     require(descriptors.len() <= NODES, "participant structured bound")?;
+    require(
+        !context.local_player || descriptors.len() == 1,
+        "LOCAL image must contain exactly one actual player",
+    )?;
     let mut profiles = BTreeSet::new();
     let mut records = BTreeSet::new();
     let mut owners = 0;
@@ -1680,6 +1756,13 @@ fn player_rows_context(
         )?;
         let profile_uuid = checked(u128::from_str_radix(&descriptor.profile_uuid, 16))?;
         require(
+            !context.local_player
+                || (descriptor.integrated_owner
+                    && horizon_client::lan::playerdata::uuid_ints(profile_uuid)
+                        == descriptor.record_uuid),
+            "LOCAL image player mapping changed",
+        )?;
+        require(
             profiles.insert(profile_uuid)
                 && records.insert(descriptor.record_uuid)
                 && descriptor.dimension == Dim::Overworld.id(),
@@ -1691,7 +1774,7 @@ fn player_rows_context(
             &root.join(player_path(descriptor, "data")),
             STRUCTURED_LIMIT,
         )?)?;
-        checked(lan::validate_session_player_tag(&player))?;
+        context.validate_player(&player)?;
         require(
             player.get("UUID") == Some(&Tag::IntArray(descriptor.record_uuid.to_vec()))
                 && text(player.get("Dimension"))? == descriptor.dimension,
@@ -1880,7 +1963,11 @@ fn verify_image_context(
     let slot = checked(counter.decode_slot(&slot_bytes, context.res.items()))?;
     correlate(&manifest, &counter, &slot)?;
     let rows = player_rows_context(context, root, &manifest.players)?;
-    sidecars(&world, &manifest.players)?;
+    if context.local_player {
+        sidecars_with_initial_owner(&world, &manifest.players, None, true)?;
+    } else {
+        sidecars(&world, &manifest.players)?;
+    }
     let raids = raid_metadata(&world)?;
     validate_native_local_player(&world, &manifest.players)?;
     let columns = columns_context(context, &world, manifest.saved_clock)?;
@@ -2637,7 +2724,7 @@ pub(in crate::game) struct CoherentImageContext {
     world: WorldId,
     counter: SessionCounter,
     slot: Vec<u8>,
-    roster: lan::ParticipantRoster,
+    roster: lan::CoherentParticipants,
     players: Vec<SessionPlayerRow>,
     residents: Vec<(i32, i32)>,
     live_raids: Option<Tag>,
@@ -2730,11 +2817,7 @@ impl CoherentImageContext {
                 && checked(game.session_checkpoint_raids())? == self.live_raids,
             "coherent image original frame, native route or owner state changed",
         )?;
-        checked(
-            game.preflight_checkpoint_participants(&self.roster)
-                .map_err(|e| format!("{e:?}")),
-        )?;
-        let players = checked(game.project_session_participant_rows(&self.roster))?;
+        let players = checked(game.project_coherent_participants(&self.roster))?;
         require(
             same_players(&self.players, &players)
                 && self.players.iter().all(|a| {
@@ -2798,6 +2881,7 @@ impl CoherentImageReadInput {
             (next_epoch == 1)
                 .then_some(context.initial_integrated_record)
                 .flatten(),
+            context.validation.local_player,
         )?;
         let local_uuid = validate_native_local_player(&source, &descriptors)?;
         require(
@@ -3408,11 +3492,8 @@ impl Game<'_> {
         let _ = binding_context(&validation, &counter)?;
         let slot = checked(counter.slot_bytes(&self.world, validation.res.items()))?;
         let parsed = checked(counter.decode_slot(&slot, validation.res.items()))?;
-        let roster = checked(
-            self.observe_checkpoint_participants()
-                .map_err(|e| format!("{e:?}")),
-        )?;
-        let players = checked(self.project_session_participant_rows(&roster))?;
+        let roster = checked(self.observe_coherent_participants())?;
+        let players = checked(self.project_coherent_participants(&roster))?;
         checked(self.inspect_session_checkpoint_owners())?;
         if players.iter().all(|row| !row.integrated_owner) {
             require(
@@ -3439,7 +3520,7 @@ impl Game<'_> {
         };
         correlate(&manifest, &counter, &parsed)?;
         for row in &players {
-            checked(lan::validate_session_player_tag(&row.player))?;
+            SessionValidationContext::from_game(self).validate_player(&row.player)?;
             validate_player_items_context(&validation, &row.player)?;
             validate_player_json_context(&validation, &row.advancements, &row.stats)?;
             let _ = nbt_bytes(&row.player)?;
@@ -3463,16 +3544,19 @@ impl Game<'_> {
             residents,
             live_raids: checked(self.session_checkpoint_raids())?,
             local_uuid: self.level.player_uuid,
-            initial_integrated_record: self
-                .native_close_authority
-                .as_ref()
-                .filter(|authority| authority.retains_ordinary_source(self))
-                .and_then(|_| {
-                    self.retained_server
-                        .as_ref()?
-                        .integrated_owner()
-                        .map(|(_, record)| record)
-                }),
+            initial_integrated_record: if self.local_checkpoint_owner() {
+                self.level.player_uuid
+            } else {
+                self.native_close_authority
+                    .as_ref()
+                    .filter(|authority| authority.retains_ordinary_source(self))
+                    .and_then(|_| {
+                        self.retained_server
+                            .as_ref()?
+                            .integrated_owner()
+                            .map(|(_, record)| record)
+                    })
+            },
             clocks: (self.world.game_time, self.world.day_time),
             random: self.world.random.state(),
             entity_head: self.next_entity,
@@ -3560,11 +3644,8 @@ impl Game<'_> {
         let _ = binding(self, &counter)?;
         let slot = checked(counter.slot_bytes(&self.world, self.res.items()))?;
         let parsed = checked(counter.decode_slot(&slot, self.res.items()))?;
-        let roster = checked(
-            self.observe_checkpoint_participants()
-                .map_err(|e| format!("{e:?}")),
-        )?;
-        let players = checked(self.project_session_participant_rows(&roster))?;
+        let roster = checked(self.observe_coherent_participants())?;
+        let players = checked(self.project_coherent_participants(&roster))?;
         checked(self.inspect_session_checkpoint_owners())?;
         let descriptors = players.iter().map(descriptor).collect::<Vec<_>>();
         require(
@@ -3599,7 +3680,7 @@ impl Game<'_> {
         };
         correlate(&manifest, &counter, &parsed)?;
         for row in &players {
-            checked(lan::validate_session_player_tag(&row.player))?;
+            SessionValidationContext::from_game(self).validate_player(&row.player)?;
             let _ = nbt_bytes(&row.player)?;
             let _ = json_bytes(&row.advancements, STRUCTURED_LIMIT)?;
             let _ = json_bytes(&row.stats, STRUCTURED_LIMIT)?;
@@ -3646,7 +3727,7 @@ impl Game<'_> {
             self.remote.is_none()
                 && self.integrated.is_none()
                 && self.lan_acting.is_none()
-                && !self.options.execution_role.is_client()
+                && (!self.options.execution_role.is_client() || self.local_checkpoint_owner())
                 && self.dim == Dim::Overworld
                 && self.levels.parked.is_empty(),
             "single authoritative native Overworld required",
@@ -3753,11 +3834,8 @@ impl Game<'_> {
         Ok(snapshot)
     }
     fn session_snapshot_cpu(&self, raids: Option<Tag>, local_uuid: [i32; 4]) -> SResult<Snapshot> {
-        let roster = checked(
-            self.observe_checkpoint_participants()
-                .map_err(|e| format!("{e:?}")),
-        )?;
-        let players = checked(self.project_session_participant_rows(&roster))?;
+        let roster = checked(self.observe_coherent_participants())?;
+        let players = checked(self.project_coherent_participants(&roster))?;
         self.session_snapshot_from_players(raids, local_uuid, players)
     }
     fn session_snapshot_from_players(
@@ -3832,7 +3910,7 @@ impl Game<'_> {
         };
         correlate(&manifest, &counter, &parsed)?;
         for row in &players {
-            checked(lan::validate_session_player_tag(&row.player))?;
+            SessionValidationContext::from_game(self).validate_player(&row.player)?;
             let _ = nbt_bytes(&row.player)?;
             let _ = json_bytes(&row.advancements, STRUCTURED_LIMIT)?;
             let _ = json_bytes(&row.stats, STRUCTURED_LIMIT)?;
@@ -3951,6 +4029,10 @@ impl Game<'_> {
         until: Instant,
         mut step: impl FnMut(Step) -> SResult<()>,
     ) -> SResult<CheckpointReceipt> {
+        require(
+            !self.options.execution_role.is_client(),
+            "LOCAL checkpoints require the original coherent close owner",
+        )?;
         let mut publication = Publication::NotPublished;
         let mut item_identities_assigned = 0;
         let result = (|| {
@@ -4319,6 +4401,13 @@ struct SessionItemLoadTest {
 }
 impl<'a> Game<'a> {
     fn fresh_session_candidate(&self) -> SResult<()> {
+        self.fresh_session_candidate_for_local(None)
+    }
+    fn fresh_session_candidate_for_local(
+        &self,
+        local: Option<&LocalRecoveryPreparation>,
+    ) -> SResult<()> {
+        let local_candidate = local.is_some_and(|permit| permit.permits_seed(self));
         if self.ordinary_startup.is_some() {
             require(
                 self.save.is_none() && self.streaming.is_vacant(),
@@ -4337,7 +4426,7 @@ impl<'a> Game<'a> {
                 && self.lan.is_none()
                 && self.lan_acting.is_none()
                 && self.serving.is_none()
-                && !self.options.execution_role.is_client(),
+                && (!self.options.execution_role.is_client() || local_candidate),
             "fresh headless candidate required",
         )?;
         require(
@@ -4379,7 +4468,7 @@ impl<'a> Game<'a> {
                 && self.options.look.is_none(),
             "recovery native overrides refused",
         )?;
-        checked(self.inspect_session_checkpoint_owners())
+        checked(self.inspect_session_checkpoint_owners_for_candidate(local_candidate))
     }
     /// Failure consumes and drops the entire unpublished Game. There is no
     /// rollback claim, partial Game return, reused live host, tick or as_guest.
@@ -4586,6 +4675,7 @@ struct SessionRecoveryWork<'a> {
         Arc<crate::game::mod_packages::FrozenHostInputs>,
     )>,
     unpublished: Option<crate::game::world_loading::UnpublishedRecoveryNative>,
+    local: Option<LocalRecoveryPreparation>,
     armed: bool,
 }
 enum RecoveryPreparation {
@@ -4705,6 +4795,7 @@ impl<'a> SessionRecoveryWork<'a> {
             preparation: None,
             ordinary: None,
             unpublished: None,
+            local: None,
             armed: false,
         }
     }
@@ -4721,7 +4812,7 @@ impl<'a> SessionRecoveryWork<'a> {
             .game
             .as_mut()
             .expect("same original recovery candidate");
-        game.fresh_session_candidate()?;
+        game.fresh_session_candidate_for_local(self.local.as_ref())?;
         deadline(request.deadline)?;
         let _ = game.advancement_tree();
         let archive = directory(&request.archive_root)?;
@@ -4745,8 +4836,13 @@ impl<'a> SessionRecoveryWork<'a> {
             .ok_or_else(|| fail("no complete published epoch"))?;
         // Newest complete name is authoritative: corrupt/incompatible successors
         // refuse. Never borrow older frames or silently fall back to an old epoch.
-        let verified = verify_image(
-            game,
+        let validation = self
+            .local
+            .as_ref()
+            .map(|local| local.context.clone())
+            .unwrap_or_else(|| SessionValidationContext::from_game(game));
+        let verified = verify_image_context(
+            &validation,
             &selected,
             epoch,
             request.expected_world,
@@ -4800,7 +4896,7 @@ impl<'a> SessionRecoveryWork<'a> {
         open.save_root = request.destination.clone();
         let open = open.with_expected_checkpoint_world(request.expected_world);
         self.preparation = Some(if let Some((entry, startup)) = self.ordinary.as_ref() {
-            let preparation = crate::game::world_loading::OrdinaryPreparation::prepare(
+            let preparation = crate::game::world_loading::OrdinaryPreparation::prepare_recovery(
                 open,
                 &game.res,
                 &game.pack,
@@ -4808,6 +4904,7 @@ impl<'a> SessionRecoveryWork<'a> {
                 &game.settings,
                 entry,
                 startup.clone(),
+                self.local.as_ref(),
             );
             match preparation.into_prepared(entry) {
                 Ok(prepared) => RecoveryPreparation::Ordinary(prepared),
@@ -5063,7 +5160,7 @@ impl<'a> SessionRecoveryWork<'a> {
         // The working owner retains Game, failed preparation and unpublished
         // constructor token across every fallible step below.
         if self.ordinary.is_some() {
-            game.fresh_session_candidate()?;
+            game.fresh_session_candidate_for_local(self.local.as_ref())?;
         }
         let prepared = match self
             .preparation
@@ -5073,15 +5170,15 @@ impl<'a> SessionRecoveryWork<'a> {
             RecoveryPreparation::Legacy(prepared) => prepared,
             RecoveryPreparation::Ordinary(prepared) => {
                 let (prepared, original) = prepared.into_unpublished_recovery();
-                game.retained_server = Some(
+                game.retained_server = original.server_profile().map(|profile| {
                     crate::game::retained_server::ServerGameState::from_ordinary(
-                        original.server_profile(),
+                        profile,
                         game.ordinary_startup
                             .as_ref()
                             .expect("same startup")
                             .clone(),
-                    ),
-                );
+                    )
+                });
                 self.unpublished = Some(original);
                 prepared
             }
@@ -5090,6 +5187,14 @@ impl<'a> SessionRecoveryWork<'a> {
             }
         };
         checked(game.finish_open_world(prepared))?;
+        if self.local.is_some() {
+            game.local_checkpoint_source = Some(checked(
+                self.unpublished
+                    .as_ref()
+                    .ok_or_else(|| fail("original LOCAL constructor absent"))?
+                    .observe_local_checkpoint_source(game),
+            )?);
+        }
         let random = game.world.random.state();
         require(
             random == recovery_random,
@@ -5203,6 +5308,21 @@ impl<'a> OrdinaryRecoveryWork<'a> {
             world == source.world,
             "original source identity changed before managed recovery",
         )?;
+        if source.role.is_client() {
+            require(
+                source.context.local_player && source.guest,
+                "LOCAL recovery requires the original captured Guest profile",
+            )?;
+            self.work.local = Some(LocalRecoveryPreparation {
+                context: source.context.clone(),
+                startup: source.startup.clone(),
+                world,
+                destination: self.request.managed.destination.clone(),
+                player: source
+                    .native_player_uuid
+                    .ok_or_else(|| fail("actual LOCAL UUID absent"))?,
+            });
+        }
         let request = RecoveryRequest {
             expected_world: world,
             expected_target: self.request.managed.expected_target.clone(),
@@ -5252,35 +5372,38 @@ impl<'a> OrdinaryRecoveryWork<'a> {
             .as_ref()
             .ok_or_else(|| fail("actual recovered image absent"))?;
         let game = self.work.game.as_mut().unwrap();
-        let expected_count = if game
-            .retained_server
-            .as_ref()
-            .and_then(|server| server.integrated_owner())
-            .is_some()
-        {
-            1
+        if self.work.local.is_some() {
+            checked(game.install_local_checkpoint_player(&data.verified.players))?;
         } else {
-            2
-        };
-        let count = game
-            .lan
-            .as_ref()
-            .ok_or_else(|| fail("original recovery Hub absent"))?
-            .hub
-            .guests
-            .len();
-        if count < expected_count {
-            return Ok(None);
+            let expected_count = if game
+                .retained_server
+                .as_ref()
+                .and_then(|server| server.integrated_owner())
+                .is_some()
+            {
+                1
+            } else {
+                2
+            };
+            let count = game
+                .lan
+                .as_ref()
+                .ok_or_else(|| fail("original recovery Hub absent"))?
+                .hub
+                .guests
+                .len();
+            if count < expected_count {
+                return Ok(None);
+            }
+            require(count == expected_count, "extra actual recovery participant")?;
+            if self.players.is_none() {
+                self.players = Some(checked(lan::OrdinaryRecoveryPlayers::bind(
+                    game,
+                    &data.verified.players,
+                ))?);
+            }
+            checked(self.players.as_mut().unwrap().install(game))?;
         }
-        require(count == expected_count, "extra actual recovery participant")?;
-        if self.players.is_none() {
-            self.players = Some(checked(lan::OrdinaryRecoveryPlayers::bind(
-                game,
-                &data.verified.players,
-            ))?);
-        }
-        let players = self.players.as_mut().unwrap();
-        checked(players.install(game))?;
         match &data.receipt.state {
             CoreRecoveryState::Native(RegisteredRecoveryState::Active { counter, slot }) => {
                 checked(game.world.read_persistent_counter(counter))?;
@@ -5330,7 +5453,12 @@ impl<'a> OrdinaryRecoveryWork<'a> {
         }
         game.session_fence(data.request.deadline)?;
         game.session_context()?;
-        let rows = checked(players.project(game))?;
+        let rows = if self.work.local.is_some() {
+            let roster = checked(game.observe_coherent_participants())?;
+            checked(game.project_coherent_participants(&roster))?
+        } else {
+            checked(self.players.as_ref().unwrap().project(game))?
+        };
         let local_uuid = native_local_uuid(&game.world_root)?;
         let snapshot =
             game.session_snapshot_from_players(game.effective_session_raids()?, local_uuid, rows)?;
@@ -5349,6 +5477,11 @@ impl<'a> OrdinaryRecoveryWork<'a> {
             data.random,
             snapshot,
         )?;
+        require(
+            game.retained_server.is_some()
+                || (self.work.local.is_some() && game.local_checkpoint_owner()),
+            "recovered continuation has no original LOCAL owner",
+        )?;
         let original = self
             .work
             .unpublished
@@ -5360,18 +5493,16 @@ impl<'a> OrdinaryRecoveryWork<'a> {
                 "verified recovered native construction association changed",
             ));
         }
-        game.retained_server
-            .as_mut()
-            .unwrap()
-            .set_continuation_archive(self.request.source.continuation.clone());
+        if let Some(server) = game.retained_server.as_mut() {
+            server.set_continuation_archive(self.request.source.continuation.clone());
+        } else {
+            game.local_continuation_archive = Some(self.request.source.continuation.clone());
+        }
         #[cfg(all(test, feature = "mods", target_os = "linux"))]
         if let Some(control) = game
             .retained_server
             .as_ref()
-            .unwrap()
-            .test
-            .ordinary
-            .as_ref()
+            .and_then(|server| server.test.ordinary.as_ref())
         {
             let control: &crate::game::retained_server::OrdinaryControl = control;
             control.record_recovered(observation);

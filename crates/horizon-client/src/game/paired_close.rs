@@ -1192,6 +1192,30 @@ impl NativeReady<'_> {
                 "remaining original asynchronous or transport owners require composition".into(),
             ));
         }
+        let ordinary_world = if self.owner.game.as_ref().unwrap().ordinary_startup.is_some()
+            && self
+                .owner
+                .game
+                .as_ref()
+                .unwrap()
+                .options
+                .execution_role
+                .is_client()
+        {
+            let game = self.owner.game.as_mut().unwrap();
+            if !game.local_checkpoint_owner() || !game.native_close_owner_authorized() {
+                return Err((
+                    self,
+                    "original ordinary LOCAL close authority changed".into(),
+                ));
+            }
+            match OrdinaryClosedWorld::from_completed(game, &self.owner.profile) {
+                Some(closed) => Some(closed),
+                None => return Err((self, "original ordinary LOCAL completion absent".into())),
+            }
+        } else {
+            None
+        };
         self.owner.armed = false;
         // Metadata has already been acknowledged and every native actual handle
         // is terminal; remaining native file/resource owners have no writer.
@@ -1199,7 +1223,7 @@ impl NativeReady<'_> {
         Ok(NativeDisposed {
             _native_only: (),
             server_transport: None,
-            ordinary_world: None,
+            ordinary_world,
         })
     }
 }
@@ -1376,6 +1400,17 @@ pub(super) struct CloseOwner<'window> {
     read_control: Option<super::levels::session_checkpoint::CoherentImageTestControl>,
 }
 impl<'window> CloseOwner<'window> {
+    #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+    pub(in crate::game) fn local_image_control_for_test(
+        &mut self,
+        control: super::levels::session_checkpoint::CoherentImageTestControl,
+    ) {
+        self.image_control = Some(control);
+    }
+    #[cfg(all(test, feature = "native-writer-test-control", debug_assertions))]
+    pub(in crate::game) fn local_cached_level_for_test(&self) -> &horizon_client::save::Level {
+        &self.game.as_ref().unwrap().level
+    }
     pub(super) fn window_presentation(&self) -> super::window_close::Presentation {
         super::window_close::presentation(self.game.as_ref().unwrap())
     }
@@ -1414,10 +1449,14 @@ impl<'window> CloseOwner<'window> {
         WindowIoTestGate(receipt)
     }
     pub(super) fn begin(
-        game: Box<Game<'window>>,
+        mut game: Box<Game<'window>>,
         profile: CloseProfile,
         deadline: Instant,
     ) -> Box<Self> {
+        if matches!(profile, CloseProfile::CoherentSession { .. }) && game.local_checkpoint_owner()
+        {
+            game.sync_player_body();
+        }
         let mut metadata = MetadataState::new(deadline);
         metadata.level_raids = true;
         Box::new(Self {
@@ -1489,7 +1528,14 @@ impl<'window> CloseOwner<'window> {
         CloseObservation {
             phase: self.phase,
             dimension: game.dim,
-            participants: game.lan.as_ref().map_or(0, |host| host.hub.guests.len()),
+            participants: if matches!(self.profile, CloseProfile::CoherentSession { .. })
+                && game.local_checkpoint_owner()
+                && game.player.is_some()
+            {
+                1
+            } else {
+                game.lan.as_ref().map_or(0, |host| host.hub.guests.len())
+            },
             levels: self.writers.len(),
             identity_preparations: self.identity_preparations,
             failed_attempts: self.failed_native_attempts.len() + self.io_uncertainties.len(),
@@ -1848,7 +1894,12 @@ impl<'window> CloseOwner<'window> {
                         .unwrap()
                         .raids
                         .apply_to_level(&mut level);
-                    let (expected, input) = game.prepare_retained_level_metadata_from(level)?;
+                    let (expected, input) =
+                        if matches!(self.profile, CloseProfile::CoherentSession { .. }) {
+                            game.prepare_coherent_level_metadata_from(level)?
+                        } else {
+                            game.prepare_retained_level_metadata_from(level)?
+                        };
                     let session_raids =
                         if matches!(self.profile, CloseProfile::CoherentSession { .. }) {
                             game.session_checkpoint_raids()

@@ -89,8 +89,95 @@ enum NativeProfile {
     IntegratedServer { owner: u128 },
 }
 
+/// Constructor observation only: never a native close, publication or bootstrap
+/// authority. In particular an unpublished recovery retains its original owner.
+#[cfg(feature = "paired-packages")]
+pub(in crate::game) struct LocalCheckpointSource {
+    save: std::sync::Weak<SaveDir>,
+    origin: std::sync::Weak<()>,
+    startup: Arc<super::mod_packages::FrozenHostInputs>,
+    world: horizon_client::world::counter_restore::WorldId,
+    root: PathBuf,
+    player: [i32; 4],
+}
+#[cfg(feature = "paired-packages")]
+impl LocalCheckpointSource {
+    pub(in crate::game) fn matches(&self, game: &Game<'_>) -> bool {
+        game.options.execution_role.is_client()
+            && !game.options.server_thread
+            && game.options.server.is_none()
+            && game.options.dedicated.is_none()
+            && game.options.dimension.is_none()
+            && game.remote.is_none()
+            && game.integrated.is_none()
+            && game.serving.is_none()
+            && game.lan.is_none()
+            && game.retained_server.is_none()
+            && game.lan_acting.is_none()
+            && game.dim == Dim::Overworld
+            && game.level.dimension == Dim::Overworld.id()
+            && game.world_root == self.root
+            && game.level.player_uuid == Some(self.player)
+            && game
+                .session_lock
+                .as_ref()
+                .and_then(WorldSession::expected_world)
+                == Some(&self.world)
+            && game
+                .ordinary_startup
+                .as_ref()
+                .is_some_and(|startup| Arc::ptr_eq(startup, &self.startup))
+            && self
+                .startup
+                .retains_startup(&game.options.mod_packages, game.pack.assets.registry)
+            && game.save.as_ref().is_some_and(|save| {
+                self.save
+                    .upgrade()
+                    .is_some_and(|original| Arc::ptr_eq(&original, save))
+                    && game
+                        .native_checkpoint_origin
+                        .as_ref()
+                        .is_some_and(|origin| {
+                            self.origin
+                                .upgrade()
+                                .is_some_and(|original| Arc::ptr_eq(&original, &origin.identity))
+                                && origin.validate(&self.root, Dim::Overworld, save).is_ok()
+                        })
+            })
+    }
+}
+
 #[cfg(feature = "paired-packages")]
 impl NativeCloseAuthority {
+    pub(in crate::game) fn local_checkpoint_source(
+        &self,
+        game: &Game<'_>,
+    ) -> Result<LocalCheckpointSource> {
+        if self.profile != NativeProfile::InFrameClient
+            || !self.authorizes(game)
+            || !self.retains_ordinary_source(game)
+        {
+            return Err("LOCAL checkpoint requires its original ordinary constructor".into());
+        }
+        let source = LocalCheckpointSource {
+            save: self.save.clone(),
+            origin: self.origin.clone(),
+            startup: self
+                .ordinary
+                .as_ref()
+                .expect("checked ordinary owner")
+                .clone(),
+            world: self.world,
+            root: self.root.clone(),
+            player: self
+                .native_player_uuid
+                .ok_or("actual local native UUID absent")?,
+        };
+        if !source.matches(game) {
+            return Err("LOCAL constructor observation changed".into());
+        }
+        Ok(source)
+    }
     pub(in crate::game) fn retains_ordinary_source(&self, game: &Game<'_>) -> bool {
         self.ordinary.as_ref().is_some_and(|startup| {
             game.ordinary_startup
@@ -328,10 +415,17 @@ pub(in crate::game) struct UnpublishedRecoveryNative {
 }
 #[cfg(feature = "paired-packages")]
 impl UnpublishedRecoveryNative {
-    pub(in crate::game) fn server_profile(&self) -> super::retained_server::ServerProfile {
-        self.authority
-            .server_profile()
-            .expect("headless ordinary recovery")
+    pub(in crate::game) fn server_profile(&self) -> Option<super::retained_server::ServerProfile> {
+        self.authority.server_profile()
+    }
+    pub(in crate::game) fn observe_local_checkpoint_source(
+        &self,
+        game: &Game<'_>,
+    ) -> Result<LocalCheckpointSource> {
+        if !self.matches_game(game) {
+            return Err("original unpublished LOCAL constructor changed".into());
+        }
+        self.authority.local_checkpoint_source(game)
     }
     fn matches_game(&self, game: &Game<'_>) -> bool {
         game.ordinary_startup
@@ -421,6 +515,8 @@ impl UnpublishedRecoveryNative {
             native_checkpoint_origin: game.native_checkpoint_origin.take(),
         };
         game.end.set_locator(None);
+        game.local_checkpoint_source = None;
+        game.local_continuation_archive = None;
         Ok(OrdinaryPreparedWorld {
             prepared,
             authority: self.authority,
@@ -450,7 +546,24 @@ impl OrdinaryPreparation {
         entry: &RetainedEntryIdentity,
         startup: Arc<super::mod_packages::FrozenHostInputs>,
     ) -> Self {
-        Self::prepare_inner(request, res, pack, options, settings, entry, startup, None)
+        Self::prepare_inner(
+            request, res, pack, options, settings, entry, startup, None, None,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::game) fn prepare_recovery(
+        request: WorldRequest,
+        res: &Resources,
+        pack: &PackResources,
+        options: &Options,
+        settings: &Settings,
+        entry: &RetainedEntryIdentity,
+        startup: Arc<super::mod_packages::FrozenHostInputs>,
+        local: Option<&super::levels::session_checkpoint::LocalRecoveryPreparation>,
+    ) -> Self {
+        Self::prepare_inner(
+            request, res, pack, options, settings, entry, startup, None, local,
+        )
     }
     #[allow(clippy::too_many_arguments)]
     fn prepare_inner(
@@ -462,6 +575,7 @@ impl OrdinaryPreparation {
         entry: &RetainedEntryIdentity,
         startup: Arc<super::mod_packages::FrozenHostInputs>,
         cancel: Option<&std::sync::atomic::AtomicBool>,
+        local: Option<&super::levels::session_checkpoint::LocalRecoveryPreparation>,
     ) -> Self {
         use super::execution_role::ExecutionRole;
         let profile = match options.execution_role {
@@ -510,6 +624,13 @@ impl OrdinaryPreparation {
             if profile == NativeProfile::InFrameClient
                 && owner.request.expected_checkpoint_world.is_some()
                 && owner.request.ordinary_reopen.is_none()
+                && !local.is_some_and(|permit| {
+                    permit.permits(
+                        &owner.request.save_root,
+                        owner.request.expected_checkpoint_world,
+                        &startup,
+                    )
+                })
             {
                 return Err(
                     "persistent in-frame recovery requires the local-player adapter".into(),
@@ -532,6 +653,9 @@ impl OrdinaryPreparation {
                 return Err(
                     "ordinary recovery/reopen cannot invent a missing native record UUID".into(),
                 );
+            }
+            if local.is_some_and(|permit| level.player_uuid != Some(permit.native_player())) {
+                return Err("LOCAL prepared native player differs from original source".into());
             }
             Ok(())
         })();
@@ -668,6 +792,7 @@ impl OrdinaryWorldLoader {
                     &entry,
                     startup,
                     Some(&intent),
+                    None,
                 )
             })?;
         Ok(Self {

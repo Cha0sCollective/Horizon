@@ -1635,6 +1635,7 @@ pub(in crate::game) struct NativeLevelExpected {
     offhand: Option<ItemStack>,
     ender_items: Vec<Option<ItemStack>>,
     owner_projected: bool,
+    local_body_projected: bool,
     clock_bits: [u32; 2],
     clock_paused: bool,
 }
@@ -1771,6 +1772,7 @@ impl Game<'_> {
     fn project_native_level(
         &self,
         level: &mut Level,
+        local_body: bool,
     ) -> std::result::Result<Vec<Option<ItemStack>>, String> {
         // Preserve the ordinary raid -> warden -> local player -> owner order.
         if self.sculk.tracker_loaded && !self.no_player_here() {
@@ -1782,6 +1784,10 @@ impl Game<'_> {
             }
         }
         self.project_sync_level(level);
+        if local_body {
+            self.overlay_local_checkpoint_body(level)
+                .map_err(|error| error.to_string())?;
+        }
         let local_ender_items = level.ender_items.clone();
         self.project_native_owner(level)?;
         Ok(local_ender_items)
@@ -1803,7 +1809,20 @@ impl Game<'_> {
     /// extra applied. No other native field may differ before common packing.
     pub(in crate::game) fn prepare_retained_level_metadata_from(
         &self,
+        prepared: Level,
+    ) -> std::result::Result<(NativeLevelExpected, NativeLevelInput), String> {
+        self.prepare_level_metadata_from(prepared, false)
+    }
+    pub(in crate::game) fn prepare_coherent_level_metadata_from(
+        &self,
+        prepared: Level,
+    ) -> std::result::Result<(NativeLevelExpected, NativeLevelInput), String> {
+        self.prepare_level_metadata_from(prepared, self.local_checkpoint_owner())
+    }
+    fn prepare_level_metadata_from(
+        &self,
         mut prepared: Level,
+        local_body_projected: bool,
     ) -> std::result::Result<(NativeLevelExpected, NativeLevelInput), String> {
         if self.remote.is_some()
             || self.integrated.is_some()
@@ -1822,12 +1841,13 @@ impl Game<'_> {
             );
         }
         let (participants, participant_input) = self.prepare_native_participants()?;
-        let local_ender_items = self.project_native_level(&mut prepared)?;
+        let local_ender_items = self.project_native_level(&mut prepared, local_body_projected)?;
         if prepared.world_spawn.is_none() && prepared.spawn.is_some() {
             return Err("native close world spawn preparation is missing".into());
         }
         let association = Arc::new(());
-        let owner_projected = self.lan.as_ref().is_some_and(|host| host.owner.is_some());
+        let owner_projected =
+            local_body_projected || self.lan.as_ref().is_some_and(|host| host.owner.is_some());
         let native = horizon_client::save::NativeLevelWriteInput::new(
             self.world_root.clone(),
             prepared.clone(),
@@ -1856,6 +1876,7 @@ impl Game<'_> {
                 offhand: self.offhand.clone(),
                 ender_items: self.ender_items.clone(),
                 owner_projected,
+                local_body_projected,
                 clock_bits: [
                     self.ui.clock.partial.to_bits(),
                     self.ui.clock.rate.to_bits(),
@@ -1907,7 +1928,8 @@ impl Game<'_> {
         self.preflight_native_participants(&expected.participants)?;
         let mut projected = self.level.clone();
         projected.player_extra = expected.prepared_extra.clone();
-        let local_ender_items = self.project_native_level(&mut projected)?;
+        let local_ender_items =
+            self.project_native_level(&mut projected, expected.local_body_projected)?;
         if !native_levels_equal(&projected, &expected.projected)
             || local_ender_items != post.local_ender_items
         {
@@ -2101,6 +2123,10 @@ struct Game<'a> {
     native_checkpoint_origin: Option<world_loading::NativeCheckpointOrigin>,
     #[cfg(feature = "paired-packages")]
     native_close_authority: Option<world_loading::NativeCloseAuthority>,
+    #[cfg(feature = "paired-packages")]
+    local_checkpoint_source: Option<world_loading::LocalCheckpointSource>,
+    #[cfg(feature = "paired-packages")]
+    local_continuation_archive: Option<PathBuf>,
     #[cfg(feature = "paired-packages")]
     ordinary_startup: Option<Arc<mod_packages::FrozenHostInputs>>,
     #[cfg(feature = "paired-packages")]
@@ -9637,6 +9663,11 @@ impl Game<'_> {
 
     fn finish_open_world(&mut self, prepared: world_loading::PreparedWorld) -> Result<()> {
         #[cfg(feature = "paired-packages")]
+        {
+            self.local_checkpoint_source = None;
+            self.local_continuation_archive = None;
+        }
+        #[cfg(feature = "paired-packages")]
         let ordinary_recovery = self.ordinary_startup.is_some();
         #[cfg(not(feature = "paired-packages"))]
         let ordinary_recovery = false;
@@ -15363,10 +15394,13 @@ impl<'a> Game<'a> {
             #[cfg(feature = "paired-packages")]
             InitialGameWorld::OrdinaryRecoverySeed(startup) => {
                 assert!(
-                    !options.execution_role.is_client()
-                        && !options.server_thread
+                    !options.server_thread
+                        && (!options.execution_role.is_client()
+                            || (options.server.is_none()
+                                && options.dedicated.is_none()
+                                && options.dimension.is_none()))
                         && startup.retains_startup(&options.mod_packages, pack.assets.registry),
-                    "headless recovery seed requires its actual final startup"
+                    "vacant recovery seed requires its actual final startup"
                 );
                 ordinary_initial = Some(startup);
                 (
@@ -15564,6 +15598,10 @@ impl<'a> Game<'a> {
             native_checkpoint_origin: None,
             #[cfg(feature = "paired-packages")]
             native_close_authority: None,
+            #[cfg(feature = "paired-packages")]
+            local_checkpoint_source: None,
+            #[cfg(feature = "paired-packages")]
+            local_continuation_archive: None,
             #[cfg(feature = "paired-packages")]
             ordinary_startup: None,
             #[cfg(feature = "paired-packages")]
@@ -15849,6 +15887,14 @@ impl<'a> Game<'a> {
                 game.native_close_authority = Some(authority);
                 game.block_ticks = Ticks::new(game.level.seed as i32);
                 game.dim = Dim::Overworld;
+                if game.options.execution_role.is_client() && game.ordinary_startup.is_some() {
+                    game.local_checkpoint_source = Some(
+                        game.native_close_authority
+                            .as_ref()
+                            .unwrap()
+                            .local_checkpoint_source(&game)?,
+                    );
+                }
             }
             if let Some((remote, kind)) = remote_initial {
                 game.remote = Some(remote);
